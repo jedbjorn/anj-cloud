@@ -1,0 +1,626 @@
+#!/usr/bin/python3 -I
+"""Health watchdog, PM2 app `watchdog` (spec #21 VM Operations 1; decisions #85, #91 (f), #113).
+
+Every 60 s: each stack app is PM2 `online` with its container running and healthy; the gateway
+answers spec #20's production healthcheck (PROXY v2 LOCAL to the socket); the HAProxy path (TLS to
+the bind address with SNI <host>, issuer-pinned, /health); Nextcloud status.php from the internal
+network; the operations apps `alerts` and `watchers` are online; spec #27's console backend
+(`console`) is online and its socket answers; the DDNS last-success age.
+
+- Failures: PM2 `errored`, or an app PM2 reports `online` whose checks fail. Three consecutive
+  failures of one app -> `pm2 restart <app>` and one "restarted <service>" message. A round in
+  which an app's dependency fails is not counted toward its restart, and clears nothing: the app's
+  clock keeps aging. It defers its own "down" while the dependency is on its own clock, has
+  alerted, or was stopped on purpose, and gets a fresh window only after that dependency is
+  healthy again; a dependency that only flaps never hides it.
+- Still failing 5 minutes after the restart -> one "down" alert; healthy again -> one "recovered".
+- At most 2 watchdog restarts per app per hour, each with its "restarted" message; a third is not
+  attempted and alerts "down, not restarting" instead.
+- `haproxy` and `gateway` held by the emergency-stop flag are reported "stopped by emergency stop"
+  and never restarted. A PM2 `stopped` app (prod.py stop) is intentional and never counted.
+
+Decision #113: every quiet or "not yet" state is bounded, and its expiry raises exactly one alert
+naming the reason (the "down" episode it opens ends with one "recovered"):
+
+- Crash loop: 3 or more PM2 restarts of one app within 10 minutes (PM2's own restarts; the
+  watchdog's are not counted) -> one "crash loop" alert; no watchdog restart while PM2 restarts it.
+  The crash-loop state ends after a full 10 minutes with no PM2 restart, whatever the health: a
+  still failing app then gets normal handling (2 restarts an hour, then "down, not restarting"),
+  inside the same down episode, which one healthy round closes with one "recovered".
+- Flapping: unhealthy in at least half of the last 30 rounds (and healthy in at least one) -> one
+  "flapping" alert, unless a down or crash-loop episode is open for the app; 30 healthy rounds in a
+  row close it with one "recovered". A down bound reached inside it alerts nothing more. The round
+  history survives a recovery: a down episode whose window already flapped before the app turned
+  healthy (a healthy round earlier than the recovery) stays open as flapping, so repeated down/up
+  cycles are one episode; a single outage, however long, recovers on its first healthy round.
+- Flapping and the conversion count only the window from its first unhealthy round: the healthy
+  rounds before an outage never make a single outage "flapping" (a single Nextcloud outage is one
+  urgent "down" at 15 minutes and "recovered" on its first healthy round).
+- An episode is marked alerted only once its alert was queued; a refused alert is retried once
+  every 5 rounds, bypassing the dispatcher's throttle (a retry counts only when queued, never
+  when an earlier episode's delivery of the same key holds it back). The cap branch never opens a
+  silent episode.
+- "Not yet" (PM2 launching or waiting restart, a container not yet created, Docker health
+  `starting`, or the app missing from PM2) lasts at most twice the app's health window
+  (vmops.health_window) since it was last healthy -> one "down" alert naming the state (the
+  same episode as "still failing 5 minutes after a restart"). PM2 not answering at all: one
+  alert per episode once 4 minutes of it add up; the episode survives answering gaps shorter than
+  10 minutes, and its rounds freeze (never clear) every app's counts and clocks.
+- Nextcloud in maintenance mode with no backup or restore marker: 30 minutes -> one alert, no
+  restart (a failed `occ upgrade` leaves it there).
+- Quiet reasons (nothing counted or restarted): spec #22's backup or restore marker before its
+  deadline (its own bound); every mutating maintenance run, at most 15 minutes from first sight: an
+  anj-cloud-setup install/adopt/restore, prod.py up/stop/redeploy, apt/dpkg/unattended-upgrade or the
+  update run (a short tail after the run stays inside the same 15 minutes), the system starting or
+  stopping and the first 10 minutes after boot. Past its bound a reason no longer suppresses
+  anything and one "watchdog suppressed by <reason>" alert is sent (also throttled per hour by the
+  dispatcher).
+- DDNS is never restarted (PM2 runs it every 5 minutes); spec #23's updater alerts its own
+  failures with --every 0, so the watchdog alerts only when it has stopped running at all
+  (last success over 30 minutes old while its own failure count is below its alert threshold).
+
+- Robustness: an unreadable backup or restore marker suppresses nothing (one alert per episode);
+  a watchdog.json of the wrong shape is reset with one alert; a round that raises never resets the
+  state and alerts at most once an hour (a fork failure is a failed check, not an exception); a
+  stored time ahead of the clock (a backward step) counts as now.
+
+    watchdog [--once]           # --once: one round (tests, manual)
+State: state/run/watchdog.json (0600).
+"""
+
+import argparse
+import os
+from pathlib import Path
+import sys
+import time
+
+sys.path.insert(0, str(Path(os.path.realpath(__file__)).parent))
+
+import vmops  # noqa: E402
+from vmops import paths  # noqa: E402
+
+INTERVAL = 60
+FAILURES_BEFORE_RESTART = 3
+DOWN_AFTER = 300
+RESTARTS_PER_HOUR = 2          # decision #113
+DDNS_STALE = 1800
+DDNS_ALERT_AFTER = 3            # spec #23: its own alert on the 3rd consecutive failure
+AFTER_UPGRADE = 600             # quiet after the update run, inside its 15-minute budget (#111)
+CRASH_LOOP_RESTARTS = 3         # this many PM2 restarts or more ...
+CRASH_LOOP_WINDOW = 600         # ... within this many seconds is a crash loop (decision #113)
+NOT_YET_FACTOR = 2              # "not yet" lasts at most this many health windows since last healthy
+MAINTENANCE_LIMIT = 1800        # Nextcloud maintenance with no backup/restore marker
+QUIET_FORGET = 600              # a quiet reason absent this long starts a new episode
+INTENTIONAL = ("pm2-stopped",)  # prod.py stop, or the stop of an app with autorestart off
+INTENTIONAL_RESULTS = tuple(vmops.WAIT + why for why in INTENTIONAL)
+WATCHED = paths.STACK_APPS + paths.WATCHED_EXTRA_APPS   # alerts, watchers, console (spec #27)
+SUPPRESSED_KEY = "watchdog:suppressed:"
+ERROR_ALERT_EVERY = 3600        # watchdog:error at most once an hour (decision #113)
+PM2_FORGET = 600                # a PM2-unreadable episode ends after this long answering again
+FLAP_ROUNDS = 30                # flapping (decision #113): unhealthy in at least half of the last 30
+FLAP_UNHEALTHY = 15             # rounds -> one alert; closed by 30 consecutive healthy rounds
+THROTTLED_KEYS = ("watchdog:suppressed:", "watchdog:error")   # also throttled hourly by the dispatcher
+ROUND = INTERVAL                # one round, for the unreadable total when rounds are not adjacent
+RETRY_ROUNDS = 5                # a refused alert is retried once every 5 rounds (review L6)
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _optional_number(value):
+    return value is None or _number(value)
+
+
+APP_FIELDS = {"fails": _number, "restarted_at": _optional_number, "down": lambda v: isinstance(v, bool),
+              "cap_alerted_at": _optional_number, "unhealthy_since": _optional_number,
+              "maintenance_since": _optional_number, "pm2_restarts": _optional_number, "own_restarts": _number,
+              "crash_loop": lambda v: isinstance(v, bool), "blocked_by_down": lambda v: isinstance(v, bool),
+              "flapping": lambda v: isinstance(v, bool), "healthy_streak": _number,
+              "history": lambda v: isinstance(v, list) and all(item in (0, 1) for item in v),
+              "restarts": lambda v: isinstance(v, list) and all(_number(t) for t in v),
+              "restart_events": lambda v: isinstance(v, list) and all(
+                  isinstance(e, list) and len(e) == 2 and _number(e[0]) and _number(e[1]) for e in v)}
+
+
+def valid_state(state):
+    """True when `state` (watchdog.json) has the shape the watchdog writes. A wrong shape (a bad
+    seed, a hand edit) would otherwise raise on every round (review L-b)."""
+    if not isinstance(state, dict):
+        return False
+    apps, quiet = state.get("apps", {}), state.get("quiet", {})
+    if not isinstance(apps, dict) or not isinstance(quiet, dict):
+        return False
+    for row in apps.values():
+        if not isinstance(row, dict) or any(key in row and not check(row[key]) for key, check in APP_FIELDS.items()):
+            return False
+    for row in quiet.values():
+        if not isinstance(row, dict) or not all(_number(row.get(key)) for key in ("first", "last")):
+            return False
+    for key in ("upgrade_seen", "upgrade_first", "ddns_first_seen"):
+        if not _optional_number(state.get(key)):
+            return False
+    unreadable = state.get("pm2_unreadable")
+    if unreadable is not None and (not isinstance(unreadable, dict) or not all(
+            _optional_number(unreadable.get(key)) for key in ("since", "last", "total"))):
+        return False
+    return isinstance(state.get("markers_alerted", []), list)
+
+
+def service_name(app):
+    return paths.COMPOSE_SERVICE.get(app, app)
+
+
+def minutes(seconds):
+    return int(seconds // 60)
+
+
+class Watchdog:
+    """The decision logic, with the clock, probe and actions injected (unit-tested)."""
+
+    def __init__(self, *, probe, restart, alert, clock=time.time, state=None, quiet=lambda: [],
+                 emergency=lambda: False, ddns=lambda: None, pm2=lambda: {}, restart_counts=None, bounds=None,
+                 unreadable=lambda: []):
+        self.probe, self.restart, self.alert, self.clock = probe, restart, alert, clock
+        self.quiet, self.emergency, self.ddns, self.pm2 = quiet, emergency, ddns, pm2
+        # {app: PM2 restart_time} of the probe's own snapshot; default: read it from pm2().
+        self.restart_counts = restart_counts or self.counts_from_pm2
+        self._bounds = bounds
+        self.unreadable = unreadable           # unreadable backup/restore markers (no suppression)
+        self._retry_at = {}                    # alert key -> earliest retry after a refusal (L6)
+        self.state_reset = state is not None and not valid_state(state)
+        self.state = state if state is not None and not self.state_reset else {}
+        self.state.setdefault("apps", {})
+        self.state.setdefault("quiet", {})
+
+    @property
+    def bounds(self):
+        """Read each round (as the probe does): a redeploy may change compose.prod.json."""
+        return self._bounds if self._bounds is not None else vmops.health_bounds()
+
+    def counts_from_pm2(self):
+        return {name: row.get("restarts") for name, row in (self.pm2() or {}).items() if isinstance(row, dict)}
+
+    def app(self, name):
+        row = self.state["apps"].setdefault(name, {})
+        for key, value in (("fails", 0), ("restarts", []), ("restarted_at", None), ("down", False),
+                           ("cap_alerted_at", None), ("unhealthy_since", None), ("maintenance_since", None),
+                           ("pm2_restarts", None), ("own_restarts", 0), ("restart_events", []),
+                           ("crash_loop", False), ("blocked_by_down", False), ("flapping", False),
+                           ("healthy_streak", 0), ("history", [])):
+            row.setdefault(key, list(value) if isinstance(value, list) else value)
+        return row
+
+    # Quiet reasons (decision #113) -------------------------------------------------------------
+    def quiet_reasons(self, now):
+        """(active, expired): the reasons that still suppress, and those past their bound. One
+        alert per expired reason and episode; an episode ends when the reason has been gone for
+        QUIET_FORGET seconds."""
+        seen = list(dict.fromkeys(self.quiet()))
+        track = self.state["quiet"]
+        for reason in seen:
+            track.setdefault(reason, {"first": now, "alerted": False})["last"] = now
+        for reason in [r for r, row in track.items() if r not in seen and now - float(row.get("last", 0)) > QUIET_FORGET]:
+            del track[reason]
+        active, expired = [], []
+        for reason in seen:
+            bound = vmops.quiet_bound(reason)
+            if bound is None or now - float(track[reason]["first"]) < bound:
+                active.append(reason)
+                continue
+            expired.append(reason)
+            if not track[reason].get("alerted"):
+                track[reason]["alerted"] = self.send(
+                    SUPPRESSED_KEY + vmops.alert_slug(reason), "anj-cloud watchdog no longer suppressed",
+                    f"watchdog suppressed by {reason} for {minutes(now - float(track[reason]['first']))} min; "
+                    "checks resumed.")
+        if "upgrade" in active:
+            self.state.update(upgrade_seen=now, upgrade_first=float(track["upgrade"]["first"]))
+        elif "upgrade" not in seen and now - float(self.state.get("upgrade_seen") or 0) < AFTER_UPGRADE and \
+                now - float(self.state.get("upgrade_first") or 0) < vmops.quiet_bound("upgrade"):
+            active.append("after upgrade")      # inside the update run's own 15 minutes (#111)
+        return active, expired
+
+    # PM2 restart counting (crash loop, decision #113) -----------------------------------------
+    def crash_loop_count(self, row, current, now):
+        """PM2 restarts of this app in the last CRASH_LOOP_WINDOW seconds, the watchdog's own excluded."""
+        if current is not None:
+            try:
+                current = int(current)
+            except (TypeError, ValueError):
+                current = None
+        if current is not None:
+            last = row["pm2_restarts"]
+            if last is not None and current > last:
+                delta = current - last - int(row["own_restarts"] or 0)
+                if delta > 0:
+                    row["restart_events"].append([now, delta])
+            row["pm2_restarts"] = current          # a lower count: PM2 was restarted, a new baseline
+            row["own_restarts"] = 0
+        row["restart_events"] = [event for event in row["restart_events"] if now - event[0] < CRASH_LOOP_WINDOW]
+        return sum(event[1] for event in row["restart_events"])
+
+    def reset_after_quiet(self):
+        """Intentional work (backup, restore, redeploy, update, reboot, boot): nothing counts and
+        every clock restarts afterwards; a restart already made keeps its 5-minute verdict."""
+        for row in self.state["apps"].values():
+            row.update(fails=0, unhealthy_since=None, maintenance_since=None, pm2_restarts=None, own_restarts=0,
+                       restart_events=[])
+
+    def send(self, key, title, message, priority="high"):
+        """Queue one alert; True unless the dispatcher refused it (review L4). The episode flag
+        that guards a repeat is set only after a True, so a refused alert is retried, at most
+        once every RETRY_ROUNDS rounds while the dispatcher keeps refusing (L6)."""
+        now = self.clock()
+        if now < self._retry_at.get(key, 0):
+            return False
+        sent = self.alert(key, title, message, priority=priority) is not False
+        if sent:
+            self._retry_at.pop(key, None)
+        else:
+            self._retry_at[key] = now + RETRY_ROUNDS * ROUND - 1
+        return sent
+
+    def clamp_times(self, now):
+        """A stored time ahead of now means the clock stepped back: treat it as now (review L-b), so
+        no bound is stretched by the step."""
+        limit = now + vmops.CLOCK_SLACK
+
+        def clamp(value):
+            return now if _number(value) and value > limit else value
+        for row in self.state["apps"].values():
+            for key in ("restarted_at", "cap_alerted_at", "unhealthy_since", "maintenance_since"):
+                row[key] = clamp(row.get(key))
+            row["restarts"] = [clamp(t) for t in row.get("restarts") or []]
+            row["restart_events"] = [[clamp(t), n] for t, n in row.get("restart_events") or []]
+        for row in self.state["quiet"].values():
+            for key in ("first", "last"):
+                row[key] = clamp(row.get(key))
+        for key in ("upgrade_seen", "upgrade_first", "ddns_first_seen"):
+            if key in self.state:
+                self.state[key] = clamp(self.state[key])
+        unreadable = self.state.get("pm2_unreadable")
+        if unreadable:
+            for key in ("since", "last"):
+                unreadable[key] = clamp(unreadable.get(key))
+
+    def check_markers(self):
+        """An unreadable backup or restore marker suppresses nothing; one alert per marker episode."""
+        names = sorted(set(self.unreadable() or []))
+        alerted = [name for name in self.state.get("markers_alerted", []) if name in names]
+        for name in names:
+            if name not in alerted and self.send(
+                    "watchdog:marker:" + vmops.alert_slug(name), "anj-cloud marker unreadable",
+                    f"The {name} marker cannot be read; the watchdog ignores it and keeps checking."):
+                alerted.append(name)
+        self.state["markers_alerted"] = alerted
+
+    # One round ---------------------------------------------------------------------------------
+    def tick(self):
+        now = self.clock()
+        report = {"time": vmops.iso(now), "result": "checked", "apps": {}}
+        if self.state_reset:
+            self.state_reset = not self.send(
+                "watchdog:state-reset", "anj-cloud watchdog state reset",
+                "The watchdog's state file had an unexpected shape and was reset; checks continue.")
+        self.clamp_times(now)
+        self.check_markers()
+        reasons, expired = self.quiet_reasons(now)
+        if expired:
+            report["suppression_expired"] = sorted(expired)
+        if reasons:
+            self.reset_after_quiet()
+            report.update(result="suppressed", reason=",".join(sorted(set(reasons))))
+            return report
+        flagged = self.emergency()
+        held = paths.EMERGENCY_APPS if flagged else ()
+        results = dict(self.probe(WATCHED, skip=held))
+        if results and all(value == vmops.WAIT + "pm2-unreadable" for value in results.values()):
+            # Freeze, never clear: per-app counts and clocks keep their values across the gap (W2).
+            report.update(result="pm2 unreadable", apps={app: "not yet: pm2-unreadable" for app in results})
+            self.check_pm2_unreadable(now)
+            return report
+        unreadable = self.state.get("pm2_unreadable")
+        if unreadable and now - float(unreadable.get("last") or 0) > PM2_FORGET:
+            self.state.pop("pm2_unreadable", None)      # answering again for long enough: episode over
+        counts = self.restart_counts() or {}
+        loops = {}
+        for app in WATCHED:
+            if app in held:
+                continue
+            row = self.app(app)
+            loops[app] = self.crash_loop_count(row, counts.get(app), now)
+            if loops[app] >= CRASH_LOOP_RESTARTS:
+                row["crash_loop"] = True
+            if row["crash_loop"]:
+                # The crash-loop state lasts while PM2 restarted it in the last window (W1: a crash
+                # every 4 minutes is one episode). After a full window with no PM2 restart it ends,
+                # whatever the health (decision #113, X1): normal failure handling applies again,
+                # while the down episode it opened stays open until a healthy round.
+                if row["restart_events"]:
+                    results[app] = "crash-loop"
+                else:
+                    row["crash_loop"] = False
+        not_ready = {app for app, failure in results.items() if failure}
+        for app in WATCHED:
+            row = self.app(app)
+            if app in held:
+                row.update(fails=0, restarted_at=None, unhealthy_since=None, maintenance_since=None)
+                report["apps"][app] = "stopped by emergency stop"
+                continue
+            failure = results.get(app)
+            blocked = [dep for dep in paths.DEPENDENCIES.get(app, ()) if dep in not_ready]
+            if row["blocked_by_down"] and not blocked:
+                # Its dependency's down episode is over and it was healthy this round: this app's
+                # own start gets a fresh window (W2: only then, never on a single failing round).
+                row.update(blocked_by_down=False, unhealthy_since=None, fails=0)
+            if failure and blocked and failure not in INTENTIONAL_RESULTS:
+                # The dependency is the likely cause: this round neither counts toward a restart nor
+                # clears anything (W2: frozen count, the clock keeps aging). The app defers its own
+                # alert while the dependency is on its own clock, has alerted, or was stopped on
+                # purpose; a dependency that only flaps (no running clock) never hides it.
+                row["maintenance_since"] = None
+                if row["unhealthy_since"] is None:
+                    row["unhealthy_since"] = now
+                deps = [self.app(dep) for dep in blocked]
+                covered = any(dep["down"] or dep["blocked_by_down"] for dep in deps) or \
+                    any(results.get(dep) in INTENTIONAL_RESULTS for dep in blocked)
+                pending = any(dep["unhealthy_since"] is not None for dep in deps)
+                row["blocked_by_down"] = row["blocked_by_down"] or covered
+                if not (covered or pending):
+                    self.check_not_yet_bound(app, row, "waiting for " + ",".join(blocked), now)
+                report["apps"][app] = "waiting for " + ",".join(blocked)
+                continue
+            if not failure:
+                row.update(fails=0, restarted_at=None, unhealthy_since=None, maintenance_since=None)
+                self.observe(app, row, False)
+                if row["down"] and not row["flapping"] and self.flapping_window(row, earlier=True):
+                    # Y1: a recovery inside a window that already flapped before this round (half of
+                    # it unhealthy, and a healthy round earlier than this one) keeps the episode
+                    # open as flapping (its down or cap alert opened it: nothing more is sent); it
+                    # closes after 30 healthy rounds in a row with one "recovered". A single outage,
+                    # however long, gets its "recovered" on its first healthy round.
+                    row.update(flapping=True, healthy_streak=0)
+                if row["flapping"]:
+                    row["healthy_streak"] += 1
+                    if row["healthy_streak"] >= FLAP_ROUNDS and self.send(
+                            f"watchdog:recovered:{app}", "anj-cloud recovered",
+                            f"{service_name(app)} is healthy again ({FLAP_ROUNDS} checks in a row).", priority="default"):
+                        row.update(flapping=False, down=False, healthy_streak=0, history=[])
+                elif row["down"] and self.send(f"watchdog:recovered:{app}", "anj-cloud recovered",
+                                               f"{service_name(app)} is healthy again.", priority="default"):
+                    row["down"] = False          # the round history is kept across a recovery (Y1)
+                report["apps"][app] = "ok"
+                continue
+            if failure == "crash-loop":
+                report["apps"][app] = self.handle_crash_loop(app, row, loops[app], now)
+                self.observe(app, row, True)
+                continue
+            if failure.startswith(vmops.WAIT):
+                why = failure[len(vmops.WAIT):]
+                report["apps"][app] = self.handle_not_yet(app, row, why, now)
+                if why not in INTENTIONAL and why != "maintenance":   # those have their own rules
+                    self.observe(app, row, True)
+                continue
+            row["fails"] += 1
+            row["maintenance_since"] = None
+            if row["unhealthy_since"] is None:
+                row["unhealthy_since"] = now
+            report["apps"][app] = failure
+            self.handle_failure(app, row, failure, now)
+            self.check_not_yet_bound(app, row, failure, now)
+            self.observe(app, row, True)
+        report["ddns"] = self.check_ddns(now)
+        return report
+
+    def check_pm2_unreadable(self, now):
+        """PM2 itself does not answer: one episode for every app, kept across short answering gaps
+        (PM2_FORGET), alerted once when the unreadable time in it reaches 4 minutes (W2)."""
+        track = self.state.get("pm2_unreadable")
+        if not track or now - float(track.get("last") or 0) > PM2_FORGET:
+            track = self.state["pm2_unreadable"] = {"since": now, "last": now, "total": 0, "alerted": False}
+        else:
+            gap = now - float(track["last"])
+            track["total"] = float(track.get("total") or 0) + (gap if gap <= 1.5 * ROUND else ROUND)
+            track["last"] = now
+        if track["total"] >= NOT_YET_FACTOR * vmops.CONTAINER_PENDING_GRACE and not track.get("alerted"):
+            track["alerted"] = self.send(
+                "watchdog:pm2-unreadable", "anj-cloud PM2 not answering",
+                f"PM2 has not answered for {minutes(track['total'])} minutes; the stack cannot be checked.",
+                priority="urgent")
+
+    def mark_down(self, row, key, title, message, priority="urgent"):
+        """One alert per episode: the first bound that expires opens it; "recovered" closes it."""
+        if row["down"]:
+            return False
+        if row["flapping"]:
+            row["down"] = True
+            return False                 # the open flapping episode already alerted for this app
+        row["down"] = self.send(key, title, message, priority=priority)   # retried next round if refused
+        return row["down"]
+
+    def observe(self, app, row, unhealthy):
+        """Flapping (decision #113): one alert when the app was unhealthy in at least half of the
+        last 30 rounds and healthy in at least one of them, unless a down or crash-loop episode is
+        already open for it."""
+        row["history"] = (row["history"] + [1 if unhealthy else 0])[-FLAP_ROUNDS:]
+        if not unhealthy:
+            return
+        row["healthy_streak"] = 0
+        if not row["flapping"] and not row["down"] and self.flapping_window(row):
+            row["flapping"] = self.send(f"watchdog:flapping:{app}", "anj-cloud flapping",
+                                        f"{service_name(app)} was unhealthy in {sum(row['history'])} of the last "
+                                        f"{len(row['history'])} checks (flapping).")
+
+    @staticmethod
+    def flapping_window(row, earlier=False):
+        """Unhealthy in at least half of the last 30 rounds and healthy in at least one: a
+        continuous outage is not flapping (its own bounds report it, e.g. Nextcloud's 15 minutes).
+        `earlier`: the round just recorded (a recovery) does not count as that healthy round. Only
+        a healthy round between two unhealthy ones counts (review Z1)."""
+        history = row["history"][:-1] if earlier else row["history"]
+        # Z1: only the healthy rounds after the window's first unhealthy one count, so healthy
+        # rounds before an outage (a warm history) never make a single outage look like flapping.
+        if 1 in history:
+            history = history[history.index(1):]
+        return sum(history) >= FLAP_UNHEALTHY and 0 in history
+
+    def handle_crash_loop(self, app, row, count, now):
+        row.update(fails=0, maintenance_since=None)
+        if row["unhealthy_since"] is None:
+            row["unhealthy_since"] = now
+        self.mark_down(row, f"watchdog:crashloop:{app}", "anj-cloud crash loop",
+                       f"{service_name(app)} was restarted {count} times by PM2 in the last "
+                       f"{minutes(CRASH_LOOP_WINDOW)} minutes (crash loop). The watchdog does not restart it "
+                       "while PM2 does; once PM2 stops, a still failing app gets the watchdog's restarts.")
+        return f"crash loop: {count} PM2 restarts in {minutes(CRASH_LOOP_WINDOW)} min"
+
+    def handle_not_yet(self, app, row, why, now):
+        row["fails"] = 0                       # not a failure: intentional, or not yet started
+        if why in INTENTIONAL:
+            row.update(unhealthy_since=None, maintenance_since=None)
+            return "not yet: " + why
+        if why == "maintenance":
+            # Its own bound (decision #113); the not-yet clock restarts when maintenance ends.
+            row["unhealthy_since"] = now
+            if row["maintenance_since"] is None:
+                row["maintenance_since"] = now
+            elapsed = now - row["maintenance_since"]
+            if elapsed >= MAINTENANCE_LIMIT:
+                self.mark_down(row, f"watchdog:maintenance:{app}", "anj-cloud stuck in maintenance",
+                               f"{service_name(app)} has been in maintenance mode for {minutes(elapsed)} minutes with "
+                               "no backup or restore running.")
+            return "not yet: maintenance"
+        row["maintenance_since"] = None
+        if row["unhealthy_since"] is None:
+            row["unhealthy_since"] = now
+        self.check_not_yet_bound(app, row, why, now)
+        return "not yet: " + why
+
+    def check_not_yet_bound(self, app, row, why, now):
+        limit = NOT_YET_FACTOR * vmops.health_window(app, self.bounds)
+        elapsed = now - row["unhealthy_since"]
+        if elapsed >= limit:
+            # The same "down" episode spec #21 names (one down, then one recovered), whichever
+            # bound opens it: this one, or 5 minutes after a watchdog restart.
+            self.mark_down(row, f"watchdog:down:{app}", "anj-cloud DOWN",
+                           f"{service_name(app)} has not been healthy for {minutes(elapsed)} minutes ({why}).")
+
+    def handle_failure(self, app, row, failure, now):
+        if row["restarted_at"] is not None:
+            if now - row["restarted_at"] < DOWN_AFTER:
+                return
+            # Five minutes after our restart it still fails: down (once per episode), and the
+            # restart budget may try again after three more failures.
+            self.mark_down(row, f"watchdog:down:{app}", "anj-cloud DOWN",
+                           f"{service_name(app)} is still failing ({failure}) 5 minutes after a restart.")
+            row.update(restarted_at=None, fails=0)
+            return
+        if row["fails"] < FAILURES_BEFORE_RESTART:
+            return
+        row["restarts"] = [t for t in row["restarts"] if now - t < 3600]
+        if len(row["restarts"]) >= RESTARTS_PER_HOUR:
+            if row["cap_alerted_at"] is None or now - row["cap_alerted_at"] >= 3600:
+                if self.send(f"watchdog:cap:{app}", "anj-cloud DOWN, not restarting",
+                             f"{service_name(app)} is down ({failure}) after {RESTARTS_PER_HOUR} restarts in the "
+                             "last hour; down, not restarting.", priority="urgent"):
+                    row["cap_alerted_at"] = now
+                    row["down"] = True       # Y1: an episode is marked down only with its alert sent
+            row["fails"] = 0
+            return
+        self.restart(app)
+        row["restarts"].append(now)
+        row["own_restarts"] = int(row["own_restarts"] or 0) + 1
+        row.update(restarted_at=now, fails=0)
+        self.alert(f"watchdog:restart:{app}", "anj-cloud restarted", f"restarted {service_name(app)} ({failure}).")
+
+    def check_ddns(self, now):
+        if paths.DDNS_APP not in (self.pm2() or {}):
+            return "not installed"
+        state = self.ddns() or {}
+        first_seen = self.state.setdefault("ddns_first_seen", now)
+        last = state.get("last_success") or first_seen
+        failures = int(state.get("failures") or 0)
+        if now - float(last) <= DDNS_STALE:
+            self.state["ddns_alerted"] = False
+            return "ok"
+        if failures >= DDNS_ALERT_AFTER:
+            return "failing (alerted by DDNS itself)"
+        if not self.state.get("ddns_alerted"):
+            self.state["ddns_alerted"] = self.send(
+                "watchdog:ddns", "anj-cloud DDNS not running",
+                f"DDNS has not completed a cycle for {int((now - float(last)) // 60)} minutes.")
+        return "stale"
+
+
+def build(runner, state):
+    snapshot = {}
+    refused = set()                          # keys whose last enqueue failed (review L4)
+
+    def probe(apps, skip=()):
+        check = vmops.Probe(runner)
+        results = check.results(apps, skip=skip)
+        snapshot["pm2"] = check.pm2           # the same PM2 snapshot for the crash-loop count and DDNS
+        return results
+
+    def pm2():
+        return snapshot["pm2"] if snapshot.get("pm2") is not None else vmops.pm2_apps(runner)
+
+    def restart(app):
+        code, _out, _err = runner.run(["pm2", "restart", app], timeout=180)
+        vmops.log("watchdog-restart", app=app, result="ok" if code == 0 else f"exit {code}")
+
+    def alert(key, title, message, priority="high"):
+        # Watchdog alerts are one per episode by construction (--every 0); a suppression-expired
+        # alert is also throttled per hour by the dispatcher (decision #113: no repeats).
+        # A retry of an alert this episode never delivered bypasses the dispatcher's throttle and
+        # counts only when queued, so an earlier episode's delivery of the same key can never
+        # swallow it (review L5); the watchdog spaces retries 5 rounds apart (L6).
+        retry = key in refused
+        every = 0 if retry else vmops.ALERT_EVERY_DEFAULT if key.startswith(THROTTLED_KEYS) else 0
+        result = vmops.send_alert_result(runner, key, title, message, every=every, priority=priority)
+        sent = result == "queued" or (result == "suppressed" and every > 0)
+        (refused.discard if sent else refused.add)(key)
+        vmops.log("watchdog-alert", key=key, queued=sent, result=result)
+        return sent
+
+    def quiet():
+        snapshot.pop("pm2", None)
+        return vmops.maintenance_markers() + vmops.busy_processes() + vmops.system_quiet(runner)
+
+    return Watchdog(probe=probe, restart=restart, alert=alert, state=state, quiet=quiet,
+                    emergency=vmops.emergency_stopped, ddns=vmops.ddns_state, pm2=pm2,
+                    unreadable=vmops.unreadable_markers)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="anj-cloud health watchdog (PM2 app)")
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args(argv)
+    state_path = paths.STATE_ROOT / paths.RUN_DIR.name / "watchdog.json"
+    watchdog = build(vmops.Runner(), vmops.load_json(state_path, {}))
+    error_alerted = None
+    while True:
+        started = time.monotonic()
+        try:
+            report = watchdog.tick()
+        except Exception as error:  # noqa: BLE001 - an unwatched watchdog would be silent (review L-b)
+            # Decision #113 (review X2): a round error never resets the state (the restart cap, the
+            # down flags and every bound survive it), and its alert goes out at most once an hour.
+            report = {"result": "error", "error": type(error).__name__}
+            if error_alerted is None or time.monotonic() - error_alerted >= ERROR_ALERT_EVERY:
+                error_alerted = time.monotonic()
+                watchdog.alert("watchdog:error", "anj-cloud watchdog failing",
+                               f"The watchdog failed a round ({type(error).__name__}); it keeps checking.")
+        vmops.log("watchdog", **{k: v for k, v in report.items() if k != "time"})
+        try:
+            vmops.save_json(state_path, watchdog.state)
+        except OSError as error:
+            vmops.log("watchdog-state-unwritable", reason=type(error).__name__)
+        if args.once:
+            return 0
+        time.sleep(max(1.0, INTERVAL - (time.monotonic() - started)))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

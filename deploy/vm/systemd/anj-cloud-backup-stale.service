@@ -1,0 +1,13 @@
+# Spec #22 rev7: hourly freshness and stale-marker check. One alert after 36 h without a
+# successful backup (decision #69 (d)); a marker past its deadline alerts once and, when no run
+# holds the lock, maintenance is cleared so a crash does not leave production at 503.
+[Unit]
+Description=anj-cloud backup freshness and marker check (spec #22)
+After=docker.service
+
+[Service]
+Type=oneshot
+User=@USER@
+ExecStart=/usr/bin/python3 -I @SOURCE@/deploy/backup.py status --alert-stale
+TimeoutStartSec=10min
+Environment=PYTHONDONTWRITEBYTECODE=1

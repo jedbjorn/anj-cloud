@@ -1,0 +1,19 @@
+# anj-cloud (spec #21 step 5): DNAT the household LAN address:443 to the production VM, source preserved.
+# Loads only the anj-owned table ip anj_cloud_fwd; never flushes the ruleset.
+[Unit]
+Description=anj-cloud 443 forward to the production VM
+Wants=network-online.target
+After=network-online.target libvirtd.service
+# Emergency stop (halo-vm.sh --forward off): while this flag exists the unit never starts, so a
+# reboot or anj-cloud-vm.service's Wants= cannot reopen 443. Only --forward on removes it.
+ConditionPathExists=!/etc/anj-cloud-host/forward-off
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/nft -c -f /etc/anj-cloud-host/anj-cloud-fwd.nft
+ExecStart=/usr/bin/nft -f /etc/anj-cloud-host/anj-cloud-fwd.nft
+ExecStop=-/usr/bin/nft delete table ip anj_cloud_fwd
+
+[Install]
+WantedBy=multi-user.target

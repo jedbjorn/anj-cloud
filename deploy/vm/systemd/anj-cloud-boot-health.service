@@ -1,0 +1,19 @@
+# Spec #21 VM Operations 6 (decision #86): once per boot, after PM2 resurrected the stack, one
+# "back healthy" message or, at 10 minutes, one alert naming the failed checks.
+[Unit]
+Description=anj-cloud boot health notice (spec #21)
+After=pm2-@USER@.service docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=exec, not oneshot: multi-user.target (and cloud-final after it) never waits up to 10 minutes
+# for this check. It always exits 0; the ntfy message or alert is its result, so an unhealthy
+# stack does not also mark the system degraded.
+Type=exec
+User=@USER@
+ExecStart=/usr/bin/python3 -I @SOURCE@/deploy/vm/ops/boot-health
+TimeoutStartSec=15min
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=multi-user.target

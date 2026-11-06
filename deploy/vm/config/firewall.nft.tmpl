@@ -1,0 +1,21 @@
+#!/usr/sbin/nft -f
+# anj-cloud VM firewall (spec #21 step 5), rendered by deploy/vm/anj-cloud-setup.
+# Only this table is (re)loaded: never `flush ruleset`, never /etc/nftables.conf, so Docker's own
+# tables stay intact. Inbound: loopback, established, ICMP, DHCP replies, TCP 443 to the bind
+# address, TCP 22 from the admin SSH source (The VM host, #89 (5)); everything else is dropped.
+# `nft -f` applies this whole file as one transaction: the old table is replaced atomically.
+table inet anj_cloud {}
+delete table inet anj_cloud
+table inet anj_cloud {
+	chain input {
+		type filter hook input priority filter; policy drop;
+		iif "lo" accept
+		ct state established,related accept
+		ct state invalid drop
+		meta l4proto { icmp, ipv6-icmp } accept
+		udp sport 67 udp dport 68 accept
+		udp sport 547 udp dport 546 accept
+		ip daddr {{BIND_ADDRESS}} tcp dport 443 accept
+		ip saddr {{ADMIN_SOURCE}} tcp dport 22 accept
+	}
+}

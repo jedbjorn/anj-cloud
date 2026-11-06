@@ -1,0 +1,15 @@
+{
+  "comment": "Spec #37 U-core cross-language vector. Throwaway test key, NOT the household release key; its private half was discarded.",
+  "public_key_file": "# test key\ned25519 rsh8m9SpNtyp8fRsWDIFmtuiFkLLq2cxtWSJYPjgP1c=\n",
+  "key_id": "7e727f278f601578",
+  "manifest": {
+    "target": "linux-x86_64",
+    "version": "2026.11.05.612",
+    "version_code": 612,
+    "size": 48213377,
+    "sha256": "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+    "key_id": "7e727f278f601578",
+    "signature": "3pb4St/EdIaRUOqPMszXjNRtAW0BK2owuMn47Gf8gxmgLQclDHh8G1e+poiqc83iZ6yBkKvqm+xjNrodPxFhBg=="
+  },
+  "signed_message": "anj-cloud release v1\ntarget linux-x86_64\nversion 2026.11.05.612\nversion_code 612\nsize 48213377\nsha256 5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f\nkey_id 7e727f278f601578\n"
+}

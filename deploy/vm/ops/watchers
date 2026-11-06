@@ -1,0 +1,243 @@
+#!/usr/bin/python3 -I
+"""Journal and state watchers, PM2 app `watchers` (spec #21 VM Operations 2; #91 (a)).
+
+Every 60 s, from the VM's system journal (the gateway logs to journald with tag
+anj-cloud-prod-access-1 from dockerd, _UID=0; user `anj` reads it as a systemd-journal member):
+
+- each `enroll-block` event: one alert per block, at most 6 block alerts per hour, the rest folded
+  into one hourly summary (#91 (a));
+- >= 20 enrollment 429s within 5 minutes;
+- >= 10 401/403 from one source within 5 minutes;
+- the household issuer or the server certificate expiring within 30 days;
+- a daily digest of totals (requests, refusals, blocks, backup result, DDNS failures);
+- housekeeping: removes the first pairing code file once its invitation expired and the
+  no-terminal ntfy subscribe link after a day.
+
+Backup failure, cap and 36 h freshness (spec #22) and DDNS failures (spec #23) are alerted by
+their owners through this dispatcher; the watchers only count them in the digest, so one
+condition never raises two alerts (DDNS alerts with --every 0, decision #99).
+Alerts carry sources, counts and times only: never codes, file names or secrets.
+
+    watchers [--once] [--dry-run]
+State: state/run/watchers.json (0600).
+"""
+
+import argparse
+from collections import Counter
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+sys.path.insert(0, str(Path(os.path.realpath(__file__)).parent))
+
+import vmops  # noqa: E402
+from vmops import paths  # noqa: E402
+
+INTERVAL = 60
+WINDOW = 300
+BLOCK_CAP = 6
+ENROLL_429 = 20
+AUTH_BURST = 10
+CERT_DAYS = 30
+FIRST_LOOKBACK = "-10min"
+JOURNAL_ID = vmops.ACCESS_CONTAINER
+
+
+def journal(runner, cursor):
+    """(entries, last cursor) of gateway lines after `cursor`; entries None when unreadable."""
+    argv = ["journalctl", "--no-pager", "-o", "json", "_UID=0", f"SYSLOG_IDENTIFIER={JOURNAL_ID}"]
+    argv += ["--after-cursor", cursor] if cursor else ["--since", FIRST_LOOKBACK]
+    code, out, _err = runner.run(argv, timeout=120)
+    if code not in (0, 1):
+        return None, cursor
+    entries = []
+    for line in out.splitlines():
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            continue
+    return entries, (entries[-1].get("__CURSOR") if entries else cursor)
+
+
+def events(entries):
+    result = []
+    for entry in entries:
+        message = entry.get("MESSAGE")
+        if isinstance(message, list):
+            message = bytes(message).decode("utf-8", "replace")
+        try:
+            event = json.loads(message)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(event, dict):
+            try:
+                event["_t"] = int(entry["__REALTIME_TIMESTAMP"]) / 1e6
+            except (KeyError, ValueError):
+                event["_t"] = vmops.now()
+            result.append(event)
+    return result
+
+
+class Watchers:
+    """Decision logic over parsed gateway events (clock injected; unit-tested)."""
+
+    def __init__(self, state=None, clock=time.time):
+        self.state = state if state is not None else {}
+        self.clock = clock
+
+    def gateway(self, items, alerts, digest):
+        now = self.clock()
+        horizon = now - WINDOW
+        enroll_429 = [tuple(row) for row in self.state.get("enroll_429", []) if row[0] >= horizon]
+        auth = [tuple(row) for row in self.state.get("auth", []) if row[0] >= horizon]
+        blocks = self.state.setdefault("blocks", {"hour": None, "sent": 0, "folded": []})
+        for event in items:
+            kind, when = event.get("event"), event["_t"]
+            if kind == "enroll-block":
+                digest["enroll-blocks"] += 1
+                source = str(event.get("source", "unknown"))[:64]
+                hour = int(when // 3600)
+                if blocks["hour"] != hour:
+                    self.flush(blocks, alerts)
+                    blocks.update(hour=hour, sent=0, folded=[])
+                if blocks["sent"] < BLOCK_CAP:
+                    blocks["sent"] += 1
+                    alerts.append(("watchers:enroll-block", "anj-cloud enrollment blocked",
+                                   f"Enrollment blocked for source {source} after {event.get('failures', '?')} failed "
+                                   f"attempts, until {event.get('block_end', '?')}.", 0))
+                else:
+                    blocks["folded"].append(source)
+            elif kind == "summary":
+                counts = event.get("counts") or {}
+                limited = sum(int(v) for k, v in counts.items() if str(k).startswith("enroll") or k == "limit")
+                if limited:
+                    enroll_429.append((when, limited))
+                    digest["enroll-429"] += limited
+                digest["refused"] += sum(int(v) for k, v in counts.items()
+                                         if not (str(k).startswith("enroll") or k == "limit"))
+            elif kind == "request":
+                digest["requests"] += 1
+                if event.get("status") in (401, 403):
+                    digest["unauthorized"] += 1
+                    auth.append((when, str(event.get("source", "unknown"))[:64]))
+        if blocks["hour"] is not None and blocks["hour"] != int(now // 3600):
+            self.flush(blocks, alerts)
+            blocks.update(hour=None, sent=0, folded=[])
+        enroll_429 = [row for row in enroll_429 if row[0] >= horizon]
+        auth = [row for row in auth if row[0] >= horizon]
+        total = sum(count for _when, count in enroll_429)
+        if total >= ENROLL_429:
+            alerts.append(("watchers:enroll-429", "anj-cloud enrollment limit",
+                           f"{total} enrollment requests were refused with 429 in the last 5 minutes.", 3600))
+        for source, count in Counter(source for _when, source in auth).items():
+            if count >= AUTH_BURST:
+                alerts.append((f"watchers:auth:{re.sub(r'[^A-Za-z0-9.:_-]', '_', source)[:40]}",
+                               "anj-cloud unauthorized burst",
+                               f"{count} requests from {source} were refused with 401/403 in the last 5 minutes.", 3600))
+        self.state["enroll_429"] = enroll_429
+        self.state["auth"] = auth
+
+    @staticmethod
+    def flush(blocks, alerts):
+        folded = blocks.get("folded") or []
+        if folded:
+            sources = sorted(set(folded))
+            alerts.append(("watchers:enroll-block-summary", "anj-cloud enrollment blocks (summary)",
+                           f"{len(folded)} more enrollment blocks in the hour beyond the {BLOCK_CAP} alerted; "
+                           f"sources: {', '.join(sources[:20])}.", 0))
+
+    def certificates(self, days_left, alerts):
+        for name, label in (("server.crt", "server certificate"), ("issuer.crt", "household issuer")):
+            days = days_left(name)
+            if days is None:
+                continue
+            if days < CERT_DAYS:
+                alerts.append((f"watchers:cert:{name.split('.')[0]}", "anj-cloud certificate expiring",
+                               f"The production {label} expires in {max(days, 0):.0f} days.", 86400))
+
+    def digest(self, counts, extra, alerts):
+        totals = Counter(self.state.get("digest", {}))
+        totals.update(counts)
+        today = datetime.date.fromtimestamp(self.clock()).isoformat()
+        day = self.state.get("digest_day") or today
+        if day != today:
+            if totals or extra:
+                parts = [f"{k} {v}" for k, v in sorted(totals.items())] + [f"{k} {v}" for k, v in sorted(extra.items())]
+                alerts.append((f"watchers:digest:{day}", "anj-cloud daily digest",
+                               f"Totals for {day}: " + ", ".join(parts) + ".", 86400))
+            totals, day = Counter(), today
+        self.state["digest"] = dict(totals)
+        self.state["digest_day"] = day
+
+
+def certificate_days(runner, name, state_root=paths.STATE_ROOT, clock=time.time):
+    path = Path(state_root) / paths.OPERATOR_DIR.name / name
+    if not path.exists():
+        return None
+    code, out, _err = runner.run(["openssl", "x509", "-noout", "-enddate", "-in", str(path)])
+    match = re.search(r"notAfter=(.+)", out or "") if code == 0 else None
+    if not match:
+        return -1.0  # unreadable: report as expiring so it is looked at
+    try:
+        end = datetime.datetime.strptime(match.group(1).strip(), "%b %d %H:%M:%S %Y %Z")
+    except ValueError:
+        return -1.0
+    return (end.replace(tzinfo=datetime.timezone.utc).timestamp() - clock()) / 86400
+
+
+def owner_facts(state_root=paths.STATE_ROOT):
+    """Digest-only facts of the conditions their owners alert themselves (spec #22, #23)."""
+    facts = {}
+    status = vmops.load_json(Path(state_root) / "backup-status.json", {})
+    last = status.get("last_run") if isinstance(status, dict) else None
+    if isinstance(last, dict) and last.get("result"):
+        facts["backup-last"] = last["result"]
+    ddns = vmops.ddns_state(state_root) or {}
+    if ddns.get("failures"):
+        facts["ddns-consecutive-failures"] = int(ddns["failures"])
+    return facts
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="anj-cloud journal watchers (PM2 app)")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Print alerts instead of queueing them")
+    args = parser.parse_args(argv)
+    runner = vmops.Runner()
+    state_path = paths.STATE_ROOT / paths.RUN_DIR.name / "watchers.json"
+    watchers = Watchers(vmops.load_json(state_path, {}))
+    while True:
+        started = time.monotonic()
+        alerts, counts = [], Counter()
+        entries, cursor = journal(runner, watchers.state.get("cursor"))
+        if entries is None:
+            alerts.append(("watchers:journal", "anj-cloud watcher", "The gateway journal is unreadable.", 3600))
+        else:
+            watchers.state["cursor"] = cursor
+            watchers.gateway(events(entries), alerts, counts)
+        watchers.certificates(lambda name: certificate_days(runner, name), alerts)
+        watchers.digest(counts, owner_facts(), alerts)
+        for name in vmops.sweep_one_time_secrets():
+            vmops.log("watchers-removed", file=name)   # an expired one-time secret file (spec #21)
+        for key, title, message, every in alerts:
+            if args.dry_run:
+                vmops.log("watchers-alert", key=key, title=title, dry_run=True)
+                continue
+            sent = vmops.send_alert(runner, key, title, message, every=every,
+                                    priority="default" if "digest" in key else "high")
+            vmops.log("watchers-alert", key=key, queued=sent)
+        try:
+            vmops.save_json(state_path, watchers.state)
+        except OSError as error:
+            vmops.log("watchers-state-unwritable", reason=type(error).__name__)
+        if args.once:
+            return 0
+        time.sleep(max(1.0, INTERVAL - (time.monotonic() - started)))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

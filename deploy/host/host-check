@@ -1,0 +1,243 @@
+#!/usr/bin/python3 -I
+"""The VM host checks for the production VM (spec #21 Host Checks and Alerts; #90 (3); #91 (f)).
+
+    host-check [--check]   one pass (manual run and the pacman hook; hook targets on stdin with --hook)
+    host-check --boot      after boot: waits until up, alerting only if not up 10 minutes after boot
+    host-check --watchdog  5-minute timer: down after two failed rechecks at 1-minute intervals; one
+                           "down" and one "recovered" message per transition; between 04:00 and 05:00
+                           a down must persist 10 minutes (the VM's guarded reboot window, #86)
+
+Reachability: the VM is running, the forward table and the anj-cloud-vm route rules are present
+(a missing forward table is re-applied, then alerted), and TLS to the production hostname via
+192.168.0.10:443 gets any HTTP response (issuer-pinned when /etc/anj-cloud-host/issuer.crt exists).
+The VM proves readiness; a 503 during the backup window is "up" for the VM host. --check also reports
+the backup drive and a pending host reboot. Root only; alerts go through the host anj-alert.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import socket
+import ssl
+import subprocess
+import sys
+import time
+
+HERE = Path(os.path.realpath(__file__)).parent
+CONFIG_DIR = Path(os.environ.get("ANJ_HOST_CONFIG_DIR", "/etc/anj-cloud-host"))
+STATE_DIR = Path(os.environ.get("ANJ_HOST_STATE_DIR", "/var/lib/anj-cloud-host"))
+DEFAULTS = {"domain": "anj-prod", "host": "gateway.example.com", "lan_addr": "192.168.0.10",
+            "backup_mount": "/mnt/anj-backup", "forward_unit": "anj-cloud-forward.service",
+            "forward_table": "anj_cloud_fwd", "route_comment": "anj-cloud-vm inbound 443"}
+VM_PACKAGES = ("linux", "qemu", "libvirt", "edk2-ovmf", "virtiofsd")
+
+
+def config():
+    values = dict(DEFAULTS)
+    try:
+        values.update(json.loads((CONFIG_DIR / "anj-cloud-host.json").read_text()))
+    except (FileNotFoundError, ValueError):
+        pass
+    return values
+
+
+def run(argv, timeout=30):
+    try:
+        # LC_ALL=C: virsh, ufw and nft output is parsed (virsh translates "running").
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False,
+                                env={**os.environ, "LC_ALL": "C"})
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 127, ""
+    return result.returncode, result.stdout
+
+
+def now():
+    return float(os.environ.get("ANJ_HOST_NOW") or time.time())
+
+
+def alert(key, title, message, every=3600, priority="high"):
+    argv = [sys.executable, "-I", str(HERE / "anj-alert"), "--key", key, "--every", str(every), "--title", title,
+            "--priority", priority, "--", message]
+    code, _ = run(argv, timeout=120)
+    return code == 0
+
+
+def forward_off():
+    return (CONFIG_DIR / "forward-off").exists()
+
+
+def tls_up(cfg):
+    """Any HTTP response over TLS to the production name via the LAN address counts as up."""
+    # Pinned once the operator copies the production issuer here, after the bootstrap (spec #21 B2) created
+    # it inside the VM. B2 cannot write the VM host's /etc from the VM and the VM host changes stay operator-run (#49),
+    # so its summary prints the one command (deploy/vm/bootstrap.py HALO_ISSUER_COMMAND): copy over
+    # ssh to a temp file, check it with `openssl x509 -noout`, install it atomically; a failed ssh
+    # never installs an empty file. Until then the TLS reachability check runs unpinned.
+    issuer = CONFIG_DIR / "issuer.crt"
+    context = ssl.create_default_context(cafile=str(issuer)) if issuer.exists() else ssl._create_unverified_context()
+    try:
+        with socket.create_connection((cfg["lan_addr"], 443), timeout=10) as raw:
+            with context.wrap_socket(raw, server_hostname=cfg["host"]) as tls:
+                tls.sendall(f"GET /health HTTP/1.1\r\nHost: {cfg['host']}\r\nConnection: close\r\n\r\n".encode())
+                return tls.recv(64).startswith(b"HTTP/")
+    except (OSError, ssl.SSLError):
+        return False
+
+
+def reachability(cfg, heal=True):
+    """(failures, notes) for the VM, the forward and TLS through the forward."""
+    failures, notes = [], []
+    _code, state = run(["virsh", "-c", "qemu:///system", "domstate", cfg["domain"]])
+    if state.strip() != "running":
+        failures.append("vm-not-running")
+    if forward_off():
+        notes.append("forward off by emergency stop")
+        return failures, notes
+    code, _ = run(["nft", "list", "table", "ip", cfg["forward_table"]])
+    if code != 0:
+        if heal:
+            run(["systemctl", "restart", cfg["forward_unit"]], timeout=60)
+            code, _ = run(["nft", "list", "table", "ip", cfg["forward_table"]])
+            alert("host:forward-reapplied", "anj-cloud forward re-applied",
+                  "The 443 forward table was missing and was re-applied" + ("." if code == 0 else ", but it is still missing."))
+        if code != 0:
+            failures.append("forward-table-missing")
+    code, out = run(["ufw", "status"])
+    if code != 0 or cfg["route_comment"] not in out:
+        failures.append("forward-route-rule-missing")
+    if not tls_up(cfg):
+        failures.append("tls-no-response")
+    return failures, notes
+
+
+def host_notes(cfg, targets=()):
+    failures, notes = [], []
+    if not os.path.ismount(cfg["backup_mount"]):
+        failures.append("backup-drive-not-mounted")
+    _code, release = run(["uname", "-r"])
+    if release.strip() and not Path("/usr/lib/modules", release.strip()).exists():
+        notes.append("host reboot pending (running kernel no longer installed)")
+    touched = sorted({t for t in targets if t.startswith(VM_PACKAGES)})
+    if touched:
+        notes.append("kernel/QEMU/libvirt updated: the VM runs the old QEMU until its next restart")
+    return failures, notes
+
+
+def load_state():
+    try:
+        return json.loads((STATE_DIR / "watchdog.json").read_text())
+    except (FileNotFoundError, ValueError):
+        return {"state": "up"}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (STATE_DIR / "watchdog.json").write_text(json.dumps(state))
+
+
+def in_reboot_window(timestamp):
+    return time.localtime(timestamp).tm_hour == 4
+
+
+def mode_check(cfg, targets):
+    failures, notes = reachability(cfg)
+    more, more_notes = host_notes(cfg, targets)
+    failures += more
+    notes += more_notes
+    record = {"mode": "check", "pass": not failures, "failures": failures, "notes": notes}
+    if failures:
+        record["alerted"] = alert("host:check", "anj-cloud host check failed",
+                                  "Host check failed: " + ", ".join(failures) + (". " + "; ".join(notes) if notes else ""))
+    return record
+
+
+def mode_boot(cfg):
+    uptime = float(Path(os.environ.get("ANJ_HOST_UPTIME", "/proc/uptime")).read_text().split()[0])
+    deadline = now() + max(0.0, 600.0 - uptime)
+    interval = float(os.environ.get("ANJ_HOST_RECHECK_SECONDS", "30"))
+    while True:
+        failures, notes = reachability(cfg)
+        if not failures or now() >= deadline:
+            break
+        time.sleep(interval)
+    more, more_notes = host_notes(cfg)
+    record = {"mode": "boot", "pass": not failures and not more, "failures": failures + more, "notes": notes + more_notes}
+    if failures:
+        record["alerted"] = alert("host:boot", "anj-cloud not up after boot",
+                                  "Not up 10 minutes after the VM host boot: " + ", ".join(failures + more), every=0)
+    elif more:
+        record["alerted"] = alert("host:boot-notes", "anj-cloud host after boot", "After boot: " + ", ".join(more))
+    return record
+
+
+def flush_suppressed():
+    """Send the pending "alerts suppressed (N)" notice for sudo-path alerts over the floor."""
+    run([sys.executable, "-I", str(HERE / "anj-alert"), "--flush-suppressed"], timeout=120)
+
+
+def mode_watchdog(cfg):
+    flush_suppressed()
+    interval = float(os.environ.get("ANJ_HOST_RECHECK_SECONDS", "60"))
+    failures, notes = reachability(cfg)
+    for _ in range(2):
+        if not failures:
+            break
+        time.sleep(interval)
+        failures, notes = reachability(cfg)
+    state = load_state()
+    current = now()
+    record = {"mode": "watchdog", "previous": state.get("state"), "failures": failures, "notes": notes}
+    if failures:
+        state.setdefault("first_failure", current)
+        persisted = current - state["first_failure"]
+        if state.get("state") != "down":
+            if in_reboot_window(current) and persisted < 600:
+                record["result"] = "failing-in-reboot-window"
+            else:
+                if alert("host:down", "anj-cloud DOWN", "Production VM or forward down: " + ", ".join(failures),
+                         every=0, priority="urgent"):
+                    state["state"] = "down"
+                    state["since"] = current
+                record["result"] = "down"
+        else:
+            record["result"] = "still-down"
+    else:
+        if state.get("state") == "down":
+            if alert("host:recovered", "anj-cloud recovered", "Production VM and forward reachable again.",
+                     every=0, priority="default"):
+                state = {"state": "up"}
+        else:
+            state = {"state": "up"}
+        record["result"] = "up"
+    save_state(state)
+    return record
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="The VM host checks for the anj-cloud production VM")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--check", action="store_true")
+    group.add_argument("--boot", action="store_true")
+    group.add_argument("--watchdog", action="store_true")
+    parser.add_argument("--hook", action="store_true", help="pacman hook: read transaction targets from stdin")
+    args = parser.parse_args(argv)
+    if os.geteuid() != 0 and not os.environ.get("ANJ_HOST_TEST"):
+        print("host-check: root only", file=sys.stderr)
+        return 2
+    cfg = config()
+    targets = sys.stdin.read().split() if args.hook else []
+    if args.boot:
+        record = mode_boot(cfg)
+    elif args.watchdog:
+        record = mode_watchdog(cfg)
+    else:
+        record = mode_check(cfg, targets)
+    record["time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now()))
+    print(json.dumps(record))
+    # The pacman hook must never fail the transaction; the timer units record failures.
+    return 0 if args.hook or not record.get("failures") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

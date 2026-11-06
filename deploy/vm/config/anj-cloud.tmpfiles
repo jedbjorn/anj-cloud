@@ -1,0 +1,9 @@
+# anj-cloud runtime sockets (spec #20 paths.py; spec #21 step 9). /run is tmpfs: recreated at boot.
+# Gateway socket directory: uid 10001, group anj-gw (10002), setgid 0750.
+d @GATEWAY_SOCKET_DIR@ 2750 @GATEWAY_UID@ @GATEWAY_GID@ -
+# HAProxy admin socket directory: root, group anj, 0750.
+d @HAPROXY_RUN_DIR@ 0750 root @VM_GROUP@ -
+# Console backend socket directory (spec #27; decision #112 (1)): owner anj, group anj-gw (10002),
+# setgid 2750. The backend (PM2 app console, user anj) creates backend.sock 0660 in it; the gateway
+# reaches it through its supplementary group anj-gw.
+d @CONSOLE_DIR@ 2750 @USER@ @GATEWAY_GID@ -

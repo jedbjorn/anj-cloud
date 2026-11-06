@@ -1,0 +1,11 @@
+{
+  "profile": "0123456789abcdef0123456789abcdef",
+  "device": "11111111-2222-4333-8444-555555555555",
+  "key_fingerprint": "1c7a2097bb499f85c7081b038a79efb58182d7f18bf93b4074baa42b6ca21b94",
+  "csr_fingerprint": "1c7a2097bb499f85c7081b038a79efb58182d7f18bf93b4074baa42b6ca21b94",
+  "certificates": {
+    "issuer": {"fingerprint": "4d210cac112956da2ea9f012f8952ed04c51485ab38a70af6ef6043214490f52", "not_after": "2099-12-31 23:59:59Z", "subject": "CN=anj-cloud Fixture issuer"},
+    "leaf_utc": {"fingerprint": "1c7a2097bb499f85c7081b038a79efb58182d7f18bf93b4074baa42b6ca21b94", "not_after": "2049-12-31 23:59:59Z", "subject": "CN=11111111-2222-4333-8444-555555555555"},
+    "leaf_generalized": {"fingerprint": "1c7a2097bb499f85c7081b038a79efb58182d7f18bf93b4074baa42b6ca21b94", "not_after": "2099-01-01 00:00:00Z", "subject": "CN=11111111-2222-4333-8444-555555555555"}
+  }
+}

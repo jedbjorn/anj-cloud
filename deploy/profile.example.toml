@@ -1,0 +1,40 @@
+# anj-cloud deployment profile (placeholders). Copy to ~/.local/share/anj-cloud/profile.toml
+# (mode 0600) and fill in your own household's values. See deploy/deployment_profile.py for the
+# lookup order. Nothing here is a secret: keys and tokens live in their own files.
+
+[gateway]
+host = "gateway.example.com"            # public DNS name of your gateway
+origin = "https://gateway.example.com"  # the client's default server
+
+[host]
+name = "vm-host"                      # hostname of the machine that runs the VM (halo-vm.sh refuses any other)
+interface = "eth0"                      # its LAN network interface
+backup_uuid = "00000000-0000-4000-8000-000000000000"   # filesystem UUID of the backup drive
+
+[network]
+lan_addr = "192.168.0.10"               # the VM host's LAN address that receives port 443
+router = "192.168.0.1"
+household_lan = "192.168.0.0/24"
+bind_address = "10.77.10.10"            # the VM's address on the host-only network
+admin_ssh_source = "10.77.10.1"
+
+[dns]
+provider = "cloudflare"
+zone_id = "00000000000000000000000000000000"   # 32 hex characters
+
+[household]
+accounts = ["sam", "alex"]              # first accounts offered at setup
+
+[release]
+# The household release public key line (`ed25519 <base64>`), written by `deploy/release.py keygen`.
+# Empty: clients built from this profile carry no key and refuse desktop self-update.
+public_key = ""
+key_id = ""                              # first 16 hex of the key's SHA-256; asserted before publishing
+android_signer_sha256 = ""              # SHA-256 of the Android release certificate (64 lowercase hex)
+
+[lab]
+# Development test seats (optional). MAC_TEST_HOST in the environment overrides it.
+mac_test_host = "user@mac-test"         # a macOS guest reachable over Tailscale SSH
+
+[repo]
+github = "owner/anj-cloud"              # where releases and issues live

@@ -1,0 +1,5 @@
+# anj-cloud (spec #21 step 4; decision #115): installed as /etc/sysusers.d/anj-cloud-backup.conf.
+# The system account that owns DOS_BACKUP/anj-cloud-prod (mode 0700): no login, no password, no
+# home, never uid 1000, so the operator's user and the VM host's agents cannot read or write the backups. The
+# production VM's anj (1000:1000) reaches the share through virtiofsd-anj-cloud's mapping to it.
+u anj-cloud-backup - "anj-cloud backup share owner" - -

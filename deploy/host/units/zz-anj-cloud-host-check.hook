@@ -1,0 +1,14 @@
+# anj-cloud (spec #21 Host Checks 3): host check after every package transaction. Never fails the
+# transaction; after a kernel, QEMU or libvirt update it notes that the VM runs the old QEMU.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Checking the anj-cloud production VM and forward...
+When = PostTransaction
+NeedsTargets
+Exec = /bin/sh -c '/usr/bin/timeout 120 /usr/bin/python3 -I /usr/local/lib/anj-cloud-host/host-check --hook || true'

@@ -1,0 +1,265 @@
+#!/usr/bin/python3 -I
+"""Weekly container image security check, `anj-cloud-image-check.timer` (spec #21 VM Operations 7; #45).
+
+Runs in the anj-prod VM as user anj. Reports, for the pins of the live release
+(/srv/anj-cloud/release/current, or --source DIR):
+- a newer digest for each pinned base tag (Docker Hub), and newer point releases in the pinned
+  series: Python 3.14.x, Nextcloud 33.0.x, PostgreSQL 17.x, Redis 7.4.x;
+- Debian security updates inside the pinned Python image (`apt-get -s upgrade` in a throwaway
+  container of that exact digest);
+- known vulnerabilities in services/access/requirements.txt from OSV (the database pip-audit uses).
+HAProxy is pinned to a minor tag (3.4): its point releases arrive as a newer digest of that tag.
+
+Alerts once when an internet-facing pin (Python base, HAProxy, OpenSSL, aiohttp, cryptography) is
+more than 7 days behind a security fix, or any other pin more than 30 days behind. "Behind" counts
+from the fix's publication when known, otherwise from the first run that saw it.
+Remediation: planner opens the pin bump; developer bumps; review; then on the VM host
+`deploy/vm/stage.py anj-prod --commit <sha> --upgrade` (decision #122).
+
+    image-check [--source DIR] [--dry-run]
+State: state/run/image-check/ (0700).
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, str(Path(os.path.realpath(__file__)).parent))
+
+import vmops  # noqa: E402
+from vmops import paths  # noqa: E402
+
+FILES = ("services/access/Dockerfile", "services/access/requirements.txt", "deploy/compose.prod.json")
+INTERNET_FACING_PACKAGES = {"aiohttp", "cryptography"}
+INTERNET_FACING_IMAGES = {"python", "haproxy"}
+INTERNET_FACING_DEBIAN = re.compile(r"^(openssl|libssl\S*)$")
+FAST, SLOW = 7, 30
+RUNNER = vmops.Runner()
+IMAGE = re.compile(r"(?:(?P<repo>[a-z0-9._/-]+):)(?P<tag>[A-Za-z0-9._-]+)@(?P<digest>sha256:[0-9a-f]{64})")
+
+
+def api(name, default):
+    url = os.environ.get(name, default).rstrip("/")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" and not (parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost")):
+        raise ValueError(f"{name} must be https (http only for a loopback test server)")
+    return url
+
+
+def fetch_json(url, data=None):
+    request = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None,
+                                     headers={"Content-Type": "application/json", "User-Agent": "anj-image-check"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read(4 * 1024 * 1024))
+
+
+def read_sources(source):
+    """The pinned files of DIR, or of the live release source (release/current)."""
+    directory = Path(source) if source else paths.RELEASE_CURRENT
+    try:
+        files = {name: (directory / name).read_text() for name in FILES}
+    except OSError:
+        raise RuntimeError("Cannot read the release pins") from None
+    release = vmops.stack_config().get("release") if not source else None
+    return files, ("release:" + release[:12]) if release else "source"
+
+
+def image_pins(files):
+    pins = []
+    texts = [files["services/access/Dockerfile"], files["deploy/compose.prod.json"]]
+    for text in texts:
+        for match in IMAGE.finditer(text):
+            pin = match.groupdict()
+            if pin not in pins:
+                pins.append(pin)
+    return pins
+
+
+def requirement_pins(text):
+    pins = []
+    for line in text.splitlines():
+        match = re.fullmatch(r"\s*([A-Za-z0-9._-]+)==([A-Za-z0-9.+!-]+)\s*(#.*)?", line)
+        if match:
+            pins.append((match.group(1).lower(), match.group(2)))
+    return pins
+
+
+def split_tag(tag):
+    """'3.14.10-slim-bookworm' -> ('3.14.10', [3, 14, 10], '-slim-bookworm')."""
+    match = re.fullmatch(r"(\d+(?:\.\d+)*)(.*)", tag)
+    if not match:
+        return None
+    return match.group(1), [int(part) for part in match.group(1).split(".")], match.group(2)
+
+
+def hub_repo(repo):
+    return repo if "/" in repo else "library/" + repo
+
+
+def check_image(hub, pin):
+    """Findings for one image pin: newer digest of the same tag, newer point release in the series."""
+    findings = []
+    namespace, name = hub_repo(pin["repo"]).split("/", 1)
+    base = f"{hub}/v2/namespaces/{namespace}/repositories/{name}/tags"
+    info = fetch_json(f"{base}/{urllib.parse.quote(pin['tag'])}")
+    current = info.get("digest")
+    if current and current != pin["digest"]:
+        findings.append({"kind": "newer-digest", "detail": f"{pin['repo']}:{pin['tag']} has a newer digest",
+                         "published": info.get("last_updated"), "id": f"digest:{pin['repo']}:{pin['tag']}:{current}"})
+    parts = split_tag(pin["tag"])
+    if parts and len(parts[1]) >= 3:  # a minor tag (haproxy:3.4) gets its point releases as a new digest
+        version, numbers, suffix = parts
+        series = numbers[:-1]
+        prefix = ".".join(str(n) for n in series) + "."
+        listing = fetch_json(f"{base}?name={urllib.parse.quote(prefix)}&page_size=100")
+        best = None
+        for row in listing.get("results", []):
+            candidate = split_tag(row.get("name", ""))
+            if not candidate or candidate[2] != suffix or candidate[1][:-1] != series or len(candidate[1]) != len(numbers):
+                continue
+            if candidate[1] > numbers and (best is None or candidate[1] > best[0]):
+                best = (candidate[1], candidate[0], row.get("tag_last_pushed") or row.get("last_updated"))
+        if best:
+            findings.append({"kind": "newer-point", "detail": f"{pin['repo']} {best[1]} is available (pinned {version})",
+                             "published": best[2], "id": f"point:{pin['repo']}:{best[1]}"})
+    return findings
+
+
+def debian_security(pin):
+    """Debian security updates pending inside the pinned image (bounded throwaway container)."""
+    script = ("apt-get update -qq >/dev/null 2>&1 && apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null"
+              " | grep '^Inst ' || true")
+    code, out, _err = RUNNER.run(["docker", "run", "--rm", "--pull", "missing", "--memory", "1g", "--memory-swap", "1g",
+                                  "--pids-limit", "256", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                                  "--label", "anj-cloud.job=image-check", "--entrypoint", "sh",
+                                  f"{pin['repo']}@{pin['digest']}", "-c", script], timeout=600)
+    if code != 0:
+        raise RuntimeError("Debian update check container failed")
+    findings = []
+    for line in out.splitlines():
+        match = re.match(r"Inst (\S+) \[([^\]]+)\] \((\S+) ([^)]*)\)", line)
+        if match and "security" in match.group(4).lower():
+            package = match.group(1)
+            findings.append({"kind": "debian-security", "package": package,
+                             "detail": f"Debian security update {package} {match.group(3)}",
+                             "internet_facing": bool(INTERNET_FACING_DEBIAN.match(package)),
+                             "id": f"debian:{package}:{match.group(3)}"})
+    return findings
+
+
+def osv(osv_api, requirements):
+    queries = [{"package": {"name": name, "ecosystem": "PyPI"}, "version": version} for name, version in requirements]
+    result = fetch_json(f"{osv_api}/v1/querybatch", {"queries": queries})
+    findings = []
+    for (name, version), row in zip(requirements, result.get("results", []), strict=True):
+        for vuln in row.get("vulns", []) or []:
+            identifier = vuln.get("id", "unknown")
+            published = vuln.get("published")
+            if not published:
+                try:
+                    published = fetch_json(f"{osv_api}/v1/vulns/{urllib.parse.quote(identifier)}").get("published")
+                except (urllib.error.URLError, OSError, ValueError):
+                    published = None
+            findings.append({"kind": "vulnerability", "package": name,
+                             "detail": f"{name} {version}: {identifier}", "published": published,
+                             "internet_facing": name in INTERNET_FACING_PACKAGES,
+                             "id": f"osv:{name}:{version}:{identifier}"})
+    return findings
+
+
+def parse_time(value):
+    if not value:
+        return None
+    match = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", str(value))
+    if not match:
+        return None
+    import calendar
+    import time
+    return float(calendar.timegm(time.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S")))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="anj-cloud weekly image security check")
+    parser.add_argument("--source", help="Directory holding the pinned files (default: the recorded release)")
+    parser.add_argument("--dry-run", action="store_true", help="Report only; send no alert")
+    args = parser.parse_args(argv)
+    directory = paths.STATE_ROOT / paths.RUN_DIR.name / "image-check"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    seen_path = directory / "first-seen.json"
+    seen = vmops.load_json(seen_path, {})
+    current = vmops.now()
+    report = {"time": vmops.iso(), "pins": [], "errors": []}
+    try:
+        hub = api("ANJ_HUB_API", "https://hub.docker.com")
+        osv_api = api("ANJ_OSV_API", "https://api.osv.dev")
+        files, origin = read_sources(args.source)
+    except (OSError, RuntimeError, ValueError) as error:
+        report["errors"].append(str(error) if isinstance(error, (RuntimeError, ValueError)) else type(error).__name__)
+        print(json.dumps(report, indent=1))
+        if not args.dry_run:
+            vmops.send_alert(RUNNER, "image-check:error", "anj-cloud image check", "The weekly image check could not run.")
+        return 1
+    report["origin"] = origin
+
+    rows = []
+    for pin in image_pins(files):
+        internet = pin["repo"] in INTERNET_FACING_IMAGES
+        row = {"pin": f"{pin['repo']}:{pin['tag']}", "digest": pin["digest"][:19], "internet_facing": internet,
+               "findings": []}
+        try:
+            row["findings"] = check_image(hub, pin)
+            for finding in row["findings"]:
+                finding["internet_facing"] = internet
+            if pin["repo"] == "python":
+                row["findings"] += debian_security(pin)
+        except (urllib.error.URLError, OSError, ValueError, RuntimeError) as error:
+            row["error"] = type(error).__name__
+        rows.append(row)
+    requirements = requirement_pins(files["services/access/requirements.txt"])
+    row = {"pin": "services/access/requirements.txt", "packages": len(requirements), "findings": []}
+    try:
+        row["findings"] = osv(osv_api, requirements)
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        row["error"] = type(error).__name__
+    rows.append(row)
+
+    overdue = []
+    live_ids = set()
+    for row in rows:
+        for finding in row["findings"]:
+            identifier = finding["id"]
+            live_ids.add(identifier)
+            first = seen.setdefault(identifier, current)
+            published = parse_time(finding.get("published"))
+            since = min(first, published) if published else first
+            finding["days_behind"] = round((current - since) / 86400, 1)
+            limit = FAST if finding.get("internet_facing") else SLOW
+            finding["limit_days"] = limit
+            finding["overdue"] = finding["days_behind"] > limit
+            if finding["overdue"]:
+                overdue.append(f"{finding['detail']} ({finding['days_behind']:.0f} days)")
+        row["status"] = "error" if row.get("error") else ("overdue" if any(f["overdue"] for f in row["findings"])
+                                                          else "behind" if row["findings"] else "current")
+    seen = {key: value for key, value in seen.items() if key in live_ids}
+    vmops.save_json(seen_path, seen)
+    report["pins"] = rows
+    report["overdue"] = len(overdue)
+    vmops.save_json(directory / "report.json", report)
+    print(json.dumps(report, indent=1))
+    if overdue and not args.dry_run:
+        vmops.send_alert(RUNNER, "image-check:overdue", "anj-cloud image pins behind",
+                           f"{len(overdue)} pin finding(s) past their limit: " + "; ".join(overdue[:8]), every=6 * 86400)
+    if any(row.get("error") for row in rows) and not args.dry_run:
+        vmops.send_alert(RUNNER, "image-check:partial", "anj-cloud image check",
+                           "Some pins could not be checked this week.", every=6 * 86400, priority="default")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,14 @@
+# anj-prod answers (spec #21): for `--adopt-data` after `halo-vm.sh --recreate-os`, or a scripted
+# install. The first production install is interactive (the operator types the token at a hidden prompt).
+# Production writes ddns = "on" explicitly (spec #23: DDNS is opt-in).
+host = "gateway.example.com"
+ddns = "on"
+zone_id = "00000000000000000000000000000000"
+# Only needed when the data disk (or, with --restore-from, the snapshot) holds no
+# secrets/cloudflare-dns-token yet; with --adopt-data it is looked for after the disk is mounted:
+# token_file = "/root/cloudflare-dns-token"
+accounts = ["sam", "alex"]
+household_lan = "192.168.0.0/24"
+bind_address = "10.77.10.10"
+admin_ssh_source = "10.77.10.1"
+timezone = "UTC"

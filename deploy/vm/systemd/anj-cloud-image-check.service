@@ -1,0 +1,12 @@
+# Spec #21 VM Operations 7: weekly image and dependency security check of the live release.
+[Unit]
+Description=anj-cloud weekly image check (spec #21)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+ExecStart=/usr/bin/python3 -I @SOURCE@/deploy/vm/ops/image-check
+TimeoutStartSec=1h
+Environment=PYTHONDONTWRITEBYTECODE=1

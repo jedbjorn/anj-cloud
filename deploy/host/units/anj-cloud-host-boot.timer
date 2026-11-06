@@ -1,0 +1,10 @@
+# anj-cloud: the boot check 3 minutes after boot.
+[Unit]
+Description=anj-cloud host check 3 minutes after boot
+
+[Timer]
+OnBootSec=3min
+Unit=anj-cloud-host-boot.service
+
+[Install]
+WantedBy=timers.target

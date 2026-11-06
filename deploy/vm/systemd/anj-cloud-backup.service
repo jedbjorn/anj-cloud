@@ -1,0 +1,20 @@
+# Spec #22 rev7: nightly encrypted backup inside the anj-prod VM. Shipped as a template and
+# installed by spec #21's bootstrap via `backup.py units --source <dir>`, which fills in the release
+# source directory and the VM user (paths.VM_USER).
+# A systemd unit, not a PM2 app: a PM2 restart never starts a backup (decision #89 (4)).
+[Unit]
+Description=anj-cloud nightly encrypted backup (spec #22)
+After=docker.service network-online.target
+Wants=docker.service
+
+[Service]
+Type=oneshot
+User=@USER@
+# The 30-minute hard cap applies to the maintenance window; forget/prune/check follow it under
+# the same lock and markers. SIGTERM unwinds through maintenance-off and stops restic.
+ExecStart=/usr/bin/python3 -I @SOURCE@/deploy/backup.py run
+TimeoutStartSec=6h
+KillMode=mixed
+# The SIGTERM unwind (restic stop, maintenance off with retries) needs up to a few minutes.
+TimeoutStopSec=300
+Environment=PYTHONDONTWRITEBYTECODE=1

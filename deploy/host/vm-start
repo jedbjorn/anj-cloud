@@ -1,0 +1,175 @@
+#!/usr/bin/python3 -I
+"""Start anj-prod with or without the backup share (spec #21 step 6; decision #89 (2)).
+
+Run by anj-cloud-vm.service at boot (libvirt autostart is off for anj-prod) and on demand:
+- DOS_BACKUP mounted with anj-cloud-prod/ present, owned by anj-cloud-backup and mode 0700
+  (decision #115) -> the definition carries the virtiofs share, served by the root-owned wrapper
+  virtiofsd-anj-cloud, which maps the guest's anj (1000:1000) to that account;
+- otherwise -> the definition without the share, the VM starts anyway, and one "running without
+  backups" alert is sent (naming the ownership problem when that is the cause); backups then fail
+  their preflight until the drive (or the ownership) is fixed and the VM is restarted (cold).
+The persistent definition is switched between the two variants only while the domain is shut off,
+and only in its share; anything else that differs from the template is left to halo-vm.sh.
+
+    vm-start [--stop]     --stop: clean shutdown, done only at "shut off" (120 s timeout; exit 1 on
+                          timeout); anj-cloud-vm-stop.service
+A start waits for "shut off" (never switches the definition of a domain still shutting down). If
+the domain fails to start with the share (the share's virtiofsd failed), it is redefined and
+started without the share, with one "running without backups" alert naming the virtiofsd log.
+"""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = Path(os.path.realpath(__file__)).parent
+sys.path.insert(0, str(HERE))
+
+import anjvm  # noqa: E402
+
+VIRSH = ["virsh", "-q", "-c", "qemu:///system"]
+NAME = "anj-prod"
+MOUNT = os.environ.get("ANJ_BACKUP_MOUNT", "/mnt/anj-backup")
+SHARE = MOUNT + "/anj-cloud-prod"
+
+
+def virsh(*args, timeout=120):
+    # LC_ALL=C: virsh translates states ("running") under other locales.
+    result = subprocess.run([*VIRSH, *args], capture_output=True, text=True, timeout=timeout, check=False,
+                            env={**os.environ, "LC_ALL": "C"})
+    return result.returncode, result.stdout.strip()
+
+
+def alert(key, title, message):
+    subprocess.run([sys.executable, "-I", str(HERE / "anj-alert"), "--key", key, "--every", "0", "--title", title,
+                    "--", message], capture_output=True, timeout=120, check=False)
+
+
+VIRTIOFSD_LOG = "/var/log/libvirt/qemu/anj-prod-fs0-virtiofsd.log"
+
+
+def state():
+    return virsh("domstate", NAME)[1]
+
+
+def timeout():
+    return float(os.environ.get("ANJ_VM_STOP_TIMEOUT", "120"))
+
+
+def wait_shut_off(deadline):
+    """Done only at "shut off": "in shutdown" (and any other state) is still on its way."""
+    while True:
+        current = state()
+        if current == "shut off":
+            return True, current
+        if time.time() >= deadline:
+            return False, current
+        time.sleep(2)
+
+
+def defined():
+    """The domain's uuid, or None when virsh cannot name it (undefined, or libvirt unreachable)."""
+    code, uuid = virsh("domuuid", NAME)
+    return uuid.strip() if code == 0 and uuid.strip() else None
+
+
+def stop():
+    if defined() is None:
+        return {"result": "not-defined"}   # nothing to shut down (e.g. mid --recreate): no wait
+    if state() == "shut off":
+        return {"result": "not-running"}
+    virsh("shutdown", NAME)
+    done, current = wait_shut_off(time.time() + timeout())
+    if done:
+        return {"result": "shut-off"}
+    return {"result": "timeout", "state": current, "note": "guest not shut off within the timeout"}
+
+
+def define(xml):
+    with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as handle:
+        handle.write(xml)
+    try:
+        return virsh("define", handle.name)[0]
+    finally:
+        os.unlink(handle.name)
+
+
+def start():
+    uuid = defined()
+    if uuid is None:
+        alert("vm:undefined", "anj-cloud VM missing", "The production VM is not defined on the VM host.")
+        return {"result": "error", "reason": "domain not defined; run halo-vm.sh --apply"}
+    current = state()
+    if current == "running":
+        return {"result": "already-running"}
+    if current != "shut off":
+        # e.g. "in shutdown" right after a stop: switching the definition then would race it.
+        done, current = wait_shut_off(time.time() + timeout())
+        if not done:
+            alert("vm:start", "anj-cloud VM not started", f"The production VM is '{current}', not shut off; not started.")
+            return {"result": "error", "reason": f"domain is {current}, not shut off"}
+    mounted = os.path.ismount(MOUNT) or bool(os.environ.get("ANJ_HOST_TEST") and os.environ.get("ANJ_HOST_TEST_MOUNTED"))
+    share = mounted and os.path.isdir(SHARE)
+    owner_problems = []
+    if share:
+        passwd = os.environ.get("ANJ_HOST_PASSWD") if os.environ.get("ANJ_HOST_TEST") else None
+        owner_problems = anjvm.share_check(SHARE, anjvm.SHARE_ACCOUNT, passwd)["problems"]
+        share = not owner_problems
+    wanted = anjvm.render_domain(NAME, uuid, SHARE if share else None)
+    _code, current_xml = virsh("dumpxml", "--inactive", NAME)
+    record = {"share": share}
+    if owner_problems:
+        record["share_problems"] = owner_problems
+    if anjvm.domain_facts(current_xml)["shares"] != anjvm.domain_facts(wanted)["shares"]:
+        if define(wanted) != 0:
+            alert("vm:define", "anj-cloud VM not started", "The production VM definition could not be switched.")
+            return {"result": "error", "reason": "define failed"}
+        record["redefined"] = "with share" if share else "without share"
+    code, _ = virsh("start", NAME)
+    share_failed = False
+    if code != 0 and share:
+        # The share's virtiofsd (the wrapper) failed: production never stays down for the share
+        # (#89 (2)). Start without it; the next cold restart tries the share again.
+        share_failed = True
+        record.update(share=False, share_start_failed=True, virtiofsd_log=VIRTIOFSD_LOG)
+        if define(anjvm.render_domain(NAME, uuid, None)) != 0:
+            alert("vm:define", "anj-cloud VM not started", "The production VM definition could not be switched.")
+            record["result"] = "error"
+            return record
+        record["redefined"] = "without share (share start failed)"
+        code, _ = virsh("start", NAME)
+    if code != 0:
+        alert("vm:start", "anj-cloud VM not started", "The production VM failed to start.")
+        record["result"] = "error"
+        return record
+    if share_failed:
+        alert("vm:no-share", "anj-cloud running without backups",
+              "The production VM did not start with the backup share (its virtiofsd failed; see the anj-prod "
+              "fs0 virtiofsd log in libvirt's qemu log directory) and was started without it; backups fail until "
+              "that is fixed and the VM restarts.")
+    elif owner_problems:
+        alert("vm:no-share", "anj-cloud running without backups",
+              "The production VM started without the backup share: it is not owned by anj-cloud-backup with mode 0700; "
+              "run halo-vm.sh --apply, then restart the VM.")
+    elif not share:
+        alert("vm:no-share", "anj-cloud running without backups",
+              "The production VM started without the backup drive; backups fail until the drive returns and the VM restarts.")
+    record["result"] = "started"
+    return record
+
+
+def main():
+    if os.geteuid() != 0 and not os.environ.get("ANJ_HOST_TEST"):
+        print("vm-start: root only", file=sys.stderr)
+        return 2
+    record = stop() if "--stop" in sys.argv[1:] else start()
+    print(json.dumps(record))
+    return 1 if record["result"] in ("error", "timeout") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

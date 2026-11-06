@@ -1,0 +1,20 @@
+# anj-cloud (spec #21 step 6; decision #89 (2)): start the production VM at boot (libvirt autostart
+# is off for anj-prod), with the backup share when DOS_BACKUP is mounted, else without it and one
+# "running without backups" alert.
+[Unit]
+Description=anj-cloud production VM
+Wants=libvirtd.service anj-cloud-forward.service mnt-anj\x2dbackup.mount
+# After libvirt-guests too: its ON_BOOT start of a previously running anj-prod must not race
+# vm-start's choice of definition (with or without the backup share).
+After=libvirtd.service libvirt-guests.service anj-cloud-forward.service mnt-anj\x2dbackup.mount network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -I /usr/local/lib/anj-cloud-host/vm-start
+TimeoutStartSec=5min
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,91 @@
+<!-- anj-cloud qualification VM (spec #21 Qualification Budget; decision #89 (6)): same shape and threads as production, own isolated network, destroyed after every run.
+     4 GiB fixed, no balloon, shared memfd backing (virtiofs); 4 vCPUs = cores 14 and 15
+     (threads 14,30,15,31) with the emulator on the same set; UEFI without secure boot (the
+     Debian 13 cloud kernel resets under SeaBIOS on the VM host); vda OS, vdb data, NoCloud seed.
+     halo-vm.sh fills in the UUID (kept across redefinitions) and the share placeholder (an optional scratch or read-only virtiofs share given to the qual mode,
+     served by the virtiofsd-anj-cloud wrapper as in production, decision #115; by default nothing). -->
+<domain type='kvm'>
+  <name>anj-qual</name>
+  <uuid>@UUID@</uuid>
+  <memory unit='KiB'>4194304</memory>
+  <currentMemory unit='KiB'>4194304</currentMemory>
+  <memoryBacking>
+    <source type='memfd'/>
+    <access mode='shared'/>
+  </memoryBacking>
+  <vcpu placement='static'>4</vcpu>
+  <cputune>
+    <vcpupin vcpu='0' cpuset='14'/>
+    <vcpupin vcpu='1' cpuset='30'/>
+    <vcpupin vcpu='2' cpuset='15'/>
+    <vcpupin vcpu='3' cpuset='31'/>
+    <emulatorpin cpuset='14-15,30-31'/>
+  </cputune>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <firmware>
+      <feature enabled='no' name='enrolled-keys'/>
+      <feature enabled='no' name='secure-boot'/>
+    </firmware>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-model' check='partial'>
+    <topology sockets='1' dies='1' clusters='1' cores='2' threads='2'/>
+  </cpu>
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='volume' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source pool='anj-qual' volume='anj-qual-os.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='volume' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source pool='anj-qual' volume='anj-qual-data.qcow2'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <disk type='volume' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source pool='anj-qual' volume='anj-qual-seed.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+    <interface type='network'>
+      <mac address='52:54:00:a7:11:10'/>
+      <source network='anj-qual'/>
+      <model type='virtio'/>
+    </interface>
+    <!--@SHARE@-->
+    <serial type='pty'>
+      <target type='isa-serial' port='0'>
+        <model name='isa-serial'/>
+      </target>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <memballoon model='none'/>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>

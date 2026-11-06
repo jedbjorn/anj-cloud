@@ -1,0 +1,11 @@
+[Unit]
+Description=anj-cloud weekly image check (spec #21)
+
+[Timer]
+OnCalendar=Mon *-*-* 10:00:00
+Persistent=true
+RandomizedDelaySec=1h
+Unit=anj-cloud-image-check.service
+
+[Install]
+WantedBy=timers.target

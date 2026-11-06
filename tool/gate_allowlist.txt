@@ -1,0 +1,6 @@
+# Lines exempt from the identifier scan: <path regex><TAB><line regex>.
+# Keep this list short and each entry specific.
+# Class name of the host-side qualification driver (a code identifier, not a household name)
+deploy/backup_qualify\.py	class Halo|Halo\(
+tests/test_backup\.py	Halo\(
+tool/export_(gate\.py|public\.sh)	Subfloor|super-coder

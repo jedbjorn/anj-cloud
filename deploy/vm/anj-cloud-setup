@@ -1,0 +1,17 @@
+#!/usr/bin/python3 -I
+"""anj-cloud-setup: guided, idempotent bootstrap of an anj-cloud server on Debian 13 (spec #21).
+
+See deploy/vm/bootstrap.py and deploy/README.md ("Bootstrap and VM operations"). Run with sudo.
+"""
+
+from pathlib import Path
+import os
+import sys
+
+sys.dont_write_bytecode = True     # --dry-run, status and doctor write nothing, not even __pycache__
+sys.path.insert(0, str(Path(os.path.realpath(__file__)).parent.parent.parent))
+
+from deploy.vm import bootstrap  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(bootstrap.main())

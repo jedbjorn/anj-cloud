@@ -1,0 +1,13 @@
+# anj-cloud (spec #21, #89 (4)): PM2 app logs of user anj (haproxy, gateway wrapper, watchdog,
+# watchers, alerts, ddns). Nextcloud, cron, db and redis log to /dev/null (#68 (5)).
+@PM2_LOGS@/*.log {
+	daily
+	rotate 14
+	maxsize 50M
+	compress
+	delaycompress
+	missingok
+	notifempty
+	copytruncate
+	su @USER@ @USER@
+}

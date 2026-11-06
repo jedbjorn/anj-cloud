@@ -1,0 +1,11 @@
+# anj-cloud (spec #21 Host Checks 2): one host check pass (manual runs).
+[Unit]
+Description=anj-cloud host check (production VM and forward)
+After=anj-cloud-vm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/anj-cloud-host/host-check --check
+TimeoutStartSec=5min
+MemoryMax=256M
+TasksMax=64

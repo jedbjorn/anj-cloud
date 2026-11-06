@@ -1,0 +1,70 @@
+#!/usr/bin/python3 -I
+"""Boot health notice, `anj-cloud-boot-health.service` (spec #21 VM Operations 6; decision #86).
+
+Once per boot, after pm2-anj.service, as user anj: waits up to 10 minutes after boot for the stack
+(every active app online and healthy, the production healthcheck and the HAProxy path, as the
+watchdog checks them). Healthy -> one "anj-cloud back healthy after reboot" message (stating an
+emergency stop when one is in place); not healthy at 10 minutes -> one alert naming the failed
+checks. Both go through the in-VM dispatcher with --every 0 (one per boot by construction).
+"""
+
+import argparse
+import os
+from pathlib import Path
+import sys
+import time
+
+sys.path.insert(0, str(Path(os.path.realpath(__file__)).parent))
+
+import vmops  # noqa: E402
+from vmops import paths  # noqa: E402
+
+LIMIT = 600
+INTERVAL = 15
+EMERGENCY_NOTE = " (public access stays off: emergency stop in place)"
+
+
+def uptime():
+    with open("/proc/uptime") as stream:
+        return float(stream.read().split()[0])
+
+
+def wait_healthy(*, probe, emergency, alert, uptime=uptime, sleep=time.sleep, limit=LIMIT, interval=INTERVAL):
+    """Returns ("healthy"|"unhealthy", failures). Injected probe, clock and alert (unit-tested)."""
+    while True:
+        flagged = emergency()
+        held = paths.EMERGENCY_APPS if flagged else ()
+        results = probe(paths.STACK_APPS, skip=held)
+        failures = sorted(f"{app}:{failure.replace(vmops.WAIT, '')}" for app, failure in results.items() if failure)
+        if not failures:
+            note = EMERGENCY_NOTE if flagged else ""
+            alert("boot-health", "anj-cloud back healthy", "anj-cloud back healthy after reboot" + note + ".",
+                  "default")
+            return "healthy", []
+        if uptime() >= limit:
+            alert("boot-health", "anj-cloud not healthy after reboot",
+                  "anj-cloud is not healthy 10 minutes after boot: " + ", ".join(failures) + ".", "urgent")
+            return "unhealthy", failures
+        sleep(interval)
+
+
+def main(argv=None):
+    argparse.ArgumentParser(description="anj-cloud boot health notice").parse_args(argv)
+    runner = vmops.Runner()
+    sent = {}
+
+    def alert(key, title, message, priority):
+        # The log says whether the message stated the emergency stop (spec #20/#21 row), never the text.
+        sent["emergency_stop_stated"] = EMERGENCY_NOTE in message
+        vmops.log("boot-health-alert", key=key, queued=vmops.send_alert(runner, key, title, message, every=0,
+                                                                         priority=priority))
+
+    result, failures = wait_healthy(probe=lambda apps, skip=(): vmops.Probe(runner).results(apps, skip=skip),
+                                    emergency=vmops.emergency_stopped, alert=alert)
+    vmops.log("boot-health", result=result, failures=failures,
+              emergency_stop_stated=sent.get("emergency_stop_stated", False))
+    return 0   # the message or alert is the result; never a failed unit (systemd "degraded")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

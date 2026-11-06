@@ -1,0 +1,14 @@
+# 03:30 local every night. Persistent=false: a night missed while the VM was off is not caught
+# up at boot; it runs the next night at 03:30 (decision #69 (d)).
+[Unit]
+Description=anj-cloud nightly backup at 03:30 (spec #22)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=false
+AccuracySec=1min
+RandomizedDelaySec=0
+Unit=anj-cloud-backup.service
+
+[Install]
+WantedBy=timers.target

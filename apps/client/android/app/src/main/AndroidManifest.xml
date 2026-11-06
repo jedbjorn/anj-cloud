@@ -1,0 +1,114 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- The gateway over mTLS (spec #28 Device Identity and mTLS). -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- Live invitation scan (#108 Q12), requested only when the user taps Scan. The camera
+         plugin brings more permissions than a QR scan needs; they are removed, so the scanner
+         adds CAMERA and nothing else (spec #28 A3): no audio, no shared storage (also the
+         READ_EXTERNAL_STORAGE implied by the plugin's WRITE_EXTERNAL_STORAGE).
+         ACCESS_NETWORK_STATE stays: background sync declares it below (A4). A phone without a camera still installs and pairs by typed entry. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO" tools:node="remove"/>
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove"/>
+    <uses-feature android:name="android.hardware.camera.any" android:required="false"
+        tools:replace="android:required"/>
+    <!-- Background sync and the network setting (spec #28 A4, #108 Q3/Q4): the default
+         network's transports decide "Wi-Fi only"; WorkManager reschedules after reboot. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <!-- The dataSync foreground service while transfers run, and its notifications (#108 Q14). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- The in-app updater installs through a PackageInstaller session after the user
+         allows "Install unknown apps" for AnJ Cloud (spec #28 A7). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- allowBackup and dataExtractionRules: no backup, no device transfer (row 15). -->
+    <application
+        android:label="${appLabel}"
+        android:name=".AnjApplication"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <!-- Runs only while files transfer and stops when the queue drains (spec #28 A4). -->
+        <service
+            android:name=".TransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
+        <!-- WorkManager's own foreground service, used if expedited work ever runs as a foreground
+             service (SyncWorker.getForegroundInfo): it carries the same dataSync type, which Android 14+
+             requires and the release build's lint enforces (spec #40 R1). -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge"/>
+        <!-- Install session status for the in-app updater; only the system's PendingIntent reaches it. -->
+        <receiver
+            android:name=".UpdateStatusReceiver"
+            android:exported="false"/>
+        <!-- The "AnJ Cloud" documents provider (spec #28 A5, decision #127). MANAGE_DOCUMENTS:
+             only the system Files app and picker query it directly; other apps hold URI grants,
+             and the provider refuses any app the user has not approved for that folder. -->
+        <provider
+            android:name=".AnjDocumentsProvider"
+            android:authorities="${applicationId}.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER"/>
+            </intent-filter>
+        </provider>
+        <!-- The commit a release was built from (spec #40 R1); deploy/release.py checks it is on main. -->
+        <meta-data
+            android:name="cloud.anj.source_head"
+            android:value="${sourceHead}" />
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- "Apps with access" lists the launchable apps so the user can approve one (decision
+             #127). This launcher query is the package visibility it needs; QUERY_ALL_PACKAGES is
+             not requested. An app that calls the provider is visible to us anyway. -->
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LAUNCHER"/>
+        </intent>
+    </queries>
+</manifest>

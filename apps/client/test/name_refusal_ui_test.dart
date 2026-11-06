@@ -1,0 +1,156 @@
+import 'dart:io';
+
+import 'package:anj_cloud/core/app/controller.dart';
+import 'package:anj_cloud/core/sync/name_policy.dart';
+import 'package:anj_cloud/ui/app.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+Map<String, dynamic> _row(
+  String path, {
+  String kind = 'file',
+  String status = 'current local',
+  bool refused = false,
+}) => {
+  'path': path,
+  'kind': kind,
+  'selectionVersion': '1',
+  'status': status,
+  'effectiveRetention': 'local',
+  'nameRefused': refused,
+  'presentationErrors': refused ? [nameNotAllowedStatus] : <String>[],
+  'syncPending': refused,
+};
+
+class _Controller extends ClientController {
+  _Controller(super.profile);
+  final renames = <String>[];
+  Object? failure;
+
+  @override
+  Future<String> renameLocal(String path, String name) async {
+    renames.add('$path -> $name');
+    if (failure case final error?) throw error;
+    return '${path.substring(0, path.lastIndexOf('/') + 1)}$name';
+  }
+}
+
+void main() {
+  late Directory profile;
+  late _Controller controller;
+  setUp(() {
+    profile = Directory.systemTemp.createTempSync('anj-name-refusal-ui-');
+    controller = _Controller(profile)
+      ..root = '/synthetic/files'
+      ..entries = [
+        _row('Documents', kind: 'directory'),
+        _row('Documents/CON.txt', status: nameNotAllowedStatus, refused: true),
+        _row('Documents/readme.txt'),
+        _row('Documents/.bashrc'),
+        _row('Documents/old.txt', status: 'removed locally'),
+      ];
+  });
+  tearDown(() {
+    controller.dispose();
+    profile.deleteSync(recursive: true);
+  });
+
+  Future<void> open(WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1280, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(CloudApp(controller: controller));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('toggle:Documents')));
+    await tester.pumpAndSettle();
+  }
+
+  Finder inCard(String path, Finder matching) => find.descendant(
+    of: find.byKey(ValueKey('card:$path')),
+    matching: matching,
+  );
+
+  testWidgets('the row reads the refusal, is amber, and offers Rename only '
+      'there', (tester) async {
+    await open(tester);
+    expect(
+      inCard('Documents/CON.txt', find.text(nameNotAllowedStatus)),
+      findsOneWidget,
+    );
+    expect(
+      inCard('Documents/CON.txt', find.widgetWithText(Chip, 'Needs attention')),
+      findsOneWidget,
+    );
+    final container = tester.widget<Container>(
+      find.byKey(const ValueKey('attention:Documents/CON.txt')),
+    );
+    final border = (container.decoration as BoxDecoration).border as Border;
+    expect(border.left.color, Colors.amber);
+    expect(
+      find.byKey(const ValueKey('rename:Documents/CON.txt')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('rename:Documents/readme.txt')),
+      findsNothing,
+    );
+    expect(
+      find.byKey(const ValueKey('rename:Documents/.bashrc')),
+      findsNothing,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Rename explains, validates with NamePolicy and renames', (
+    tester,
+  ) async {
+    await open(tester);
+    await tester.tap(find.byKey(const ValueKey('rename:Documents/CON.txt')));
+    await tester.pumpAndSettle();
+    expect(find.text('Rename CON.txt'), findsOneWidget);
+    expect(find.textContaining('Windows reserves this name'), findsOneWidget);
+    final field = find.byKey(const ValueKey('rename-name'));
+    for (final (name, message) in [
+      ('aux.txt', 'Windows reserves'),
+      ('notes.', 'end with a dot'),
+      ('a:b', 'cannot contain'),
+      ('README.TXT', 'upper/lower case'),
+      ('readme.txt', 'already uses'),
+      ('CON.txt', 'different name'),
+    ]) {
+      await tester.enterText(field, name);
+      await tester.tap(find.byKey(const ValueKey('confirm-rename')));
+      await tester.pumpAndSettle();
+      expect(find.textContaining(message), findsWidgets, reason: name);
+    }
+    expect(controller.renames, isEmpty);
+    // A name used only by a hidden, completed deletion is free.
+    await tester.enterText(field, 'old.txt');
+    await tester.pumpAndSettle();
+    expect(find.textContaining('already uses'), findsNothing);
+    await tester.enterText(field, 'console.txt');
+    await tester.tap(find.byKey(const ValueKey('confirm-rename')));
+    await tester.pumpAndSettle();
+    expect(controller.renames, ['Documents/CON.txt -> console.txt']);
+    expect(find.text('Rename CON.txt'), findsNothing);
+    expect(find.text('Renamed to console.txt'), findsOneWidget);
+  });
+
+  testWidgets('a refused rename keeps the dialog open with the reason', (
+    tester,
+  ) async {
+    controller.failure = const FileSystemException(
+      'Could not rename: The item changed or is gone.',
+    );
+    await open(tester);
+    await tester.tap(find.byKey(const ValueKey('rename:Documents/CON.txt')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const ValueKey('rename-name')), 'x.txt');
+    await tester.tap(find.byKey(const ValueKey('confirm-rename')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('rename-error')), findsOneWidget);
+    expect(find.textContaining('changed or is gone'), findsOneWidget);
+    expect(find.text('Rename CON.txt'), findsOneWidget);
+  });
+}

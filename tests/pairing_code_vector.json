@@ -1,0 +1,9 @@
+{
+  "secret_bytes": 7,
+  "ca_pin_bytes": 10,
+  "legacy_length": 32,
+  "length": 28,
+  "secret_hex": "00010203040506",
+  "pin_hex": "c8c9cacbcccdcecfd0d1",
+  "code": "0001081G8186S34WNJYCSQ7CZM6H"
+}

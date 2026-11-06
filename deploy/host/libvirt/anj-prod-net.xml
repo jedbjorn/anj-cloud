@@ -1,0 +1,13 @@
+<!-- anj-cloud production NAT network (spec #21 step 2; decisions #84, #89 (8)).
+     Rendered by halo-vm.sh: @FORWARD_MODE@ is nat (default) or open (then anj_cloud_fwd masquerades). -->
+<network>
+  <name>anj-prod</name>
+  <forward mode='@FORWARD_MODE@'/>
+  <bridge name='virbr-anjprod' stp='on' delay='0'/>
+  <ip address='10.77.10.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='10.77.10.100' end='10.77.10.199'/>
+      <host mac='52:54:00:a7:10:10' name='anj-prod' ip='10.77.10.10'/>
+    </dhcp>
+  </ip>
+</network>

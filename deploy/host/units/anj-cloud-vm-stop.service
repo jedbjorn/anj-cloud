@@ -1,0 +1,15 @@
+# anj-cloud (spec #21 step 6): clean guest shutdown before libvirt (and libvirt-guests) stop at
+# host shutdown: units stop in reverse start order, so this runs first. 120 s timeout.
+[Unit]
+Description=anj-cloud production VM clean shutdown
+After=libvirtd.service libvirt-guests.service anj-cloud-vm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/bin/python3 -I /usr/local/lib/anj-cloud-host/vm-start --stop
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target

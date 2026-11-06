@@ -1,0 +1,12 @@
+# anj-cloud: watchdog every 5 minutes (detection within about 7 minutes, #91 (f)).
+[Unit]
+Description=anj-cloud host watchdog every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Unit=anj-cloud-host-watchdog.service
+
+[Install]
+WantedBy=timers.target

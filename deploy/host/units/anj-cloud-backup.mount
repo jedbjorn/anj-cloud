@@ -1,0 +1,15 @@
+# anj-cloud (spec #21 step 4): the shared backup drive DOS_BACKUP, installed as
+# mnt-anj\x2dbackup.mount. No idle unmount: virtiofsd holds the share open. Never formatted;
+# production sees only anj-cloud-prod/ through the virtiofs share.
+[Unit]
+Description=anj-cloud backup drive (DOS_BACKUP)
+
+[Mount]
+What=/dev/disk/by-uuid/@BACKUP_UUID@
+Where=/mnt/anj-backup
+Type=ext4
+Options=nodev,nosuid,noexec
+TimeoutSec=60
+
+[Install]
+WantedBy=multi-user.target

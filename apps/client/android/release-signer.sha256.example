@@ -1,0 +1,3 @@
+# Example only. The pin comes from the deployment profile ([release] android_signer_sha256), or from a
+# file release-signer.sha256 (untracked) holding one line: the SHA-256 of the Android release certificate.
+0000000000000000000000000000000000000000000000000000000000000000

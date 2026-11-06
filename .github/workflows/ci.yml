@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.47.9"
+  FLUTTER_SHA256: "25ed8c3c29d51a7353f2a944310b478af8214920639524b19c50a19e6c044c5a"
+  # Tests run against the committed placeholder profile, never a real one.
+  ANJ_PROFILE: ${{ github.workspace }}/deploy/profile.example.toml
+
+jobs:
+  server:
+    name: Gateway and deploy tests (Python, seat-independent subset)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install pinned dependencies
+        run: python3 deploy/dev.py deps
+      - name: Unit tests
+        run: deploy/.local/access-venv/bin/python -W error::ResourceWarning tool/ci_python_tests.py
+
+  client:
+    name: Client analysis and tests (Flutter, Linux, seat-independent subset)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Linux build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libsecret-1-dev openssl
+      - name: Flutter SDK (pinned, checksum verified)
+        run: |
+          mkdir -p "$HOME/.local/share/anj-cloud/toolchains/flutter-$FLUTTER_VERSION"
+          curl -fsSL -o flutter.tar.xz "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+          echo "$FLUTTER_SHA256  flutter.tar.xz" | sha256sum -c -
+          tar -xJf flutter.tar.xz -C "$HOME/.local/share/anj-cloud/toolchains/flutter-$FLUTTER_VERSION" --strip-components=1
+          git config --global --add safe.directory "$HOME/.local/share/anj-cloud/toolchains/flutter-$FLUTTER_VERSION"
+      - name: Client checks (apps/client/tool/check.sh)
+        env:
+          # Test files that depend on the maintainer's seat (filesystem identity, OpenSSL CLI build, timing);
+          # run them with the full check.sh on a matching seat (docs/development.md).
+          ANJ_TEST_EXCLUDE: 'test/(root_identity|identity_shares|no_openssl_cli|edit_completion|identity_cloud_moves|recover_dismiss|recent_new|incremental_index|device_crypto)_test\.dart'
+        run: |
+          export FLUTTER_SDK="$HOME/.local/share/anj-cloud/toolchains/flutter-$FLUTTER_VERSION"
+          python3 apps/client/tool/deps.py
+          bash apps/client/tool/check.sh

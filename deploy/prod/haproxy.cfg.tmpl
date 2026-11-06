@@ -1,0 +1,63 @@
+# anj-cloud production ingress inside the anj-prod VM (spec #20 rev7; decisions #64, #68, #69 (b), #84, #85, #89 (1)).
+#
+# Template: deploy/vm/render.py fills the placeholders and prod.py writes the result to
+# state/release/<commit12>/haproxy.cfg (0644), mounted read-only into the `haproxy` container
+# (network_mode host, PM2 app `haproxy`). TLS passthrough: HAProxy never terminates TLS. It
+# relays TCP to the gateway's Unix socket with a PROXY v2 header carrying the client's source;
+# The VM host DNATs 443 to this VM preserving that source.
+
+global
+    # Logs go to the container's stdout (PM2 log for `haproxy`, rotated by spec #21).
+    log stdout format raw local0 info
+    # Starts as container root holding only NET_BIND_SERVICE, CHOWN, SETUID and SETGID: binds
+    # 443, creates the admin socket, then runs as the image user with the gateway socket's group
+    # (anj-gw) and no capabilities. No chroot: the gateway socket must stay on HAProxy's path.
+    user haproxy
+    gid {{GATEWAY_GID}}
+    maxconn 256
+    # Admin runtime socket for spec #23's DDNS app (group anj): it replaces the household ACL's
+    # file-backed entry here without a reload.
+    stats socket {{ADMIN_SOCKET}} mode 660 gid {{VM_GID}} level admin
+
+defaults
+    mode tcp
+    log global
+    option tcplog
+    timeout connect 5s
+    # Inactivity in either direction, for every route alike: TLS passes through untouched, so
+    # HAProxy never sees a path. Slow admin actions are answered by the gateway within 25 s and
+    # polled (SC-041; services/access/console.py OPERATION_HOLD; tests/test_admin_timeouts.py).
+    timeout client 120s
+    timeout server 120s
+    timeout queue 5s
+
+frontend anj_ingress
+    # The VM's address only (never 0.0.0.0 or IPv6). The VM host forwards 192.168.0.10:443 here, so LAN
+    # and internet use one origin.
+    bind {{BIND_ADDRESS}}:{{BIND_PORT}}
+    maxconn 256
+
+    # One household ACL: the home LAN, plus the home's published public IPv4 when hairpin NAT
+    # presents it as the source (file-backed; spec #23 writes the file and replaces the runtime
+    # entry). Sources the VM host presents after DNAT fall in the LAN range. Every exemption keys on it.
+    acl household src {{HOUSEHOLD_LAN}}
+    acl household src -f {{HOUSEHOLD_ACL}}
+
+    # Per-source concurrency and new-connection rate.
+    stick-table type ip size 64k expire 10m store conn_cur,conn_rate(60s)
+    tcp-request connection track-sc0 src
+
+    # A TLS ClientHello must arrive within 10 s. Limit rejections are content rules so the
+    # refused connection is logged with its source.
+    tcp-request inspect-delay 10s
+    tcp-request content reject if household { sc0_conn_cur gt 64 }
+    tcp-request content reject if !household { sc0_conn_cur gt 20 }
+    tcp-request content reject if !household { sc0_conn_rate gt 60 }
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    tcp-request content reject
+
+    default_backend anj_gateway
+
+backend anj_gateway
+    # The gateway caps itself at 128 connections; HAProxy queues beyond that.
+    server gateway unix@{{GATEWAY_SOCKET}} send-proxy-v2 maxconn 128

@@ -1,0 +1,31 @@
+# Application secrets and local deployment state
+.env
+.env.*
+!.env.example
+secrets/
+/deploy/.local/
+*.key
+*.p12
+*.pfx
+*.pem
+*.keystore
+*.jks
+
+# Runtime data and generated build output
+data/
+backups/
+.venv/
+__pycache__/
+*.pyc
+.dart_tool/
+.flutter-plugins-dependencies
+build/
+node_modules/
+dist/
+.DS_Store
+Thumbs.db
+
+# Per-deployment files generated or supplied from the deployment profile (deploy/deployment_profile.py)
+/apps/client/assets/release/household-release-key.pub
+/apps/client/android/release-signer.sha256
+/apps/client/anj-defines.env

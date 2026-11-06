@@ -1,0 +1,14 @@
+# 04:15 local: after the 03:30 backup's 30-minute cap and the update run (after 04:10, #98).
+# Persistent=false: a missed night is not caught up at boot.
+[Unit]
+Description=anj-cloud reboot window guard at 04:15 (spec #21)
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=false
+AccuracySec=1min
+RandomizedDelaySec=0
+Unit=anj-cloud-reboot-guard.service
+
+[Install]
+WantedBy=timers.target

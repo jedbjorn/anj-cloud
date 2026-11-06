@@ -1,0 +1,8 @@
+#!/bin/sh
+# Recovery CLI (spec #27). Installed into the VM by spec #21 B2; runs the live release's module.
+# ANJ_PYTHON: the interpreter prod.py uses (with cryptography); B2 sets it.
+# Usage: anj-cloud-admin <command> [...]   (anj-cloud-admin --help)
+set -eu
+release="${ANJ_RELEASE_SOURCE:-/srv/anj-cloud/release/current}"
+cd "$release"
+exec "${ANJ_PYTHON:-python3}" -I -c 'import sys; sys.path.insert(0, "."); from deploy.vm.anj_cloud_admin import main; sys.exit(main())' "$@"

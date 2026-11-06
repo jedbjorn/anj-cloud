@@ -1,0 +1,10 @@
+{
+  "name": "anj-cloud-pm2",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned PM2 for the anj-cloud production VM (spec #21 step 2); installed with npm ci",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "pm2": "7.1.1"
+  }
+}

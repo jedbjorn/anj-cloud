@@ -1,0 +1,9 @@
+# anj-qual qualification answers (spec #21 "Bootstrap via answers file"; #89 (6)).
+# Never acts as production: no DDNS, no forward; the Cloudflare token is a scratch value written by
+# deploy/vm/qualify.py (never a real token), so the token path is exercised without credentials.
+# Secrets only by file path. Everything not named here takes its default (see anj-cloud-setup --help).
+ddns = "off"
+token_file = "/var/lib/anj-cloud-setup/qual-scratch-token"
+accounts = ["sam", "alex"]
+data_disk_init = true
+alerts_tag = "qualification"

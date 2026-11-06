@@ -1,0 +1,4 @@
+// anj-cloud (spec #21 VM Operations 4): refresh the lists and run unattended-upgrades daily; the
+// run itself is timed by the apt-daily-upgrade.timer drop-in (after 04:10, decision #98).
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";

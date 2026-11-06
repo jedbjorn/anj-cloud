@@ -1,0 +1,23 @@
+anj-cloud
+Copyright 2026 the anj-cloud contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+The name "AnJ Cloud" and the cloud-seal logo are not licensed under the Apache
+License; see section 6 of the License.
+
+Third-party software used by this project, under its own licenses:
+
+- Flutter and Dart SDK and the Dart packages listed in apps/client/pubspec.lock.
+  They are used under BSD-3-Clause, MIT or Apache-2.0 terms, with one exception
+  below. Each package carries its own license text.
+- dbus (Dart package, Canonical): Mozilla Public License 2.0. It is a
+  dependency, not vendored or modified. Changes to its own files would have to
+  stay under MPL-2.0.
+- Python packages listed in services/access/requirements.txt (aiohttp,
+  cryptography, attrs, cffi, and their dependencies): Apache-2.0, BSD, MIT and
+  PSF-2.0.
+- Gradle wrapper (gradlew, gradlew.bat, gradle-wrapper.jar): Apache-2.0,
+  Copyright Gradle Inc.
+- PM2 (deploy/vm/pm2/package.json) is installed from npm on the production VM
+  and run as a separate process. It is licensed under AGPL-3.0 and is not
+  part of this repository; keep that in mind if you redistribute a VM image.

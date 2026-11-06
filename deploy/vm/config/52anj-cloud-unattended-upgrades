@@ -1,0 +1,10 @@
+// anj-cloud (spec #21 VM Operations 4; decision #86): security updates only. The origins list is
+// cleared first, because apt appends list entries across files. The reboot guard reboots, inside
+// the nightly window; unattended-upgrades never does.
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+	"origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+	"origin=Debian,codename=${distro_codename},label=Debian-Security";
+@EXTRA_ORIGINS@};
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";

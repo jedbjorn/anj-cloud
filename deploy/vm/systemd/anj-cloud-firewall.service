@@ -1,0 +1,20 @@
+# Spec #21 step 5: the VM firewall. Loads only `table inet anj_cloud` from its own file; never
+# `flush ruleset`, never /etc/nftables.conf, so Docker's tables stay intact. Installed by the
+# bootstrap (deploy/vm/anj-cloud-setup).
+[Unit]
+Description=anj-cloud VM firewall (table inet anj_cloud)
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The file replaces the table in one nft transaction (declare, delete, recreate), so a reload never
+# leaves input open. No ExecStop: stopping or restarting the unit never deletes the table.
+ExecStart=/usr/sbin/nft -f /etc/anj-cloud/firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/anj-cloud/firewall.nft
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,17 @@
+# Reviewed false positives for the export gate (gitleaks). Everything else fails the gate.
+title = "anj-cloud export gate"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test fixtures and public values reviewed in the open-source audit"
+paths = [
+  '''apps/client/test/fixtures/device_crypto/expected\.json''',
+  '''tests/test_backup\.py''',
+  '''deploy/vm/bootstrap\.py''',
+]
+
+[[allowlists]]
+description = "A fake private-key header used as dummy secret material in a Windows session test"
+paths = ['''apps/client/test/windows_session_native_test\.dart''']

@@ -1,0 +1,265 @@
+{
+  "services": {
+    "db": {
+      "image": "postgres:17.11-bookworm@sha256:839fbb5a4942a7758dd93e18b42ea5649807491a0545b5eeeb8f0b8bb11857a5",
+      "environment": {
+        "POSTGRES_DB": "anj",
+        "POSTGRES_USER": "anj",
+        "POSTGRES_PASSWORD_FILE": "/run/secrets/database"
+      },
+      "secrets": [
+        "database"
+      ],
+      "volumes": [
+        "database:/var/lib/postgresql/data"
+      ],
+      "networks": [
+        "backend"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "anj",
+          "-d",
+          "anj"
+        ],
+        "interval": "5s",
+        "timeout": "5s",
+        "retries": 30
+      },
+      "mem_limit": "512m",
+      "cpus": 1,
+      "pids_limit": 128,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
+    },
+    "redis": {
+      "image": "redis:7.4.12-bookworm@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5",
+      "command": [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory",
+        "128mb",
+        "--maxmemory-policy",
+        "noeviction"
+      ],
+      "volumes": [
+        "redis:/data"
+      ],
+      "networks": [
+        "backend"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "redis-cli",
+          "ping"
+        ],
+        "interval": "5s",
+        "timeout": "5s",
+        "retries": 30
+      },
+      "mem_limit": "256m",
+      "cpus": 0.5,
+      "pids_limit": 64,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
+    },
+    "nextcloud": {
+      "image": "nextcloud:33.0.10-apache@sha256:5ded1127972ea84c29792215f0621c71929ed315cc47be946b489c7a1c1ad305",
+      "environment": {
+        "POSTGRES_DB": "anj",
+        "POSTGRES_USER": "anj",
+        "POSTGRES_HOST": "db",
+        "POSTGRES_PASSWORD_FILE": "/run/secrets/database",
+        "NEXTCLOUD_ADMIN_USER": "${ANJ_ADMIN_USER:-anj-dev-admin}",
+        "NEXTCLOUD_ADMIN_PASSWORD_FILE": "/run/secrets/admin",
+        "NEXTCLOUD_TRUSTED_DOMAINS": "${ANJ_TRUSTED_DOMAINS:-localhost 127.0.0.1 nextcloud}",
+        "REDIS_HOST": "redis",
+        "PHP_MEMORY_LIMIT": "256M",
+        "PHP_UPLOAD_LIMIT": "64M"
+      },
+      "secrets": [
+        "database",
+        "admin"
+      ],
+      "volumes": [
+        "nextcloud:/var/www/html"
+      ],
+      "networks": [
+        "proxy",
+        "backend"
+      ],
+      "depends_on": {
+        "db": {
+          "condition": "service_healthy"
+        },
+        "redis": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "php",
+          "-r",
+          "$$s=json_decode(@file_get_contents('http://127.0.0.1/status.php'),true);exit(($$s['installed']??false)&&!($$s['maintenance']??true)?0:1);"
+        ],
+        "interval": "5s",
+        "timeout": "5s",
+        "start_period": "30s",
+        "retries": 60
+      },
+      "mem_limit": "1536m",
+      "cpus": 2,
+      "pids_limit": 256,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
+    },
+    "cron": {
+      "image": "nextcloud:33.0.10-apache@sha256:5ded1127972ea84c29792215f0621c71929ed315cc47be946b489c7a1c1ad305",
+      "entrypoint": "/cron.sh",
+      "environment": {
+        "REDIS_HOST": "redis"
+      },
+      "volumes": [
+        "nextcloud:/var/www/html"
+      ],
+      "networks": [
+        "backend"
+      ],
+      "depends_on": {
+        "nextcloud": {
+          "condition": "service_healthy"
+        }
+      },
+      "mem_limit": "384m",
+      "cpus": 0.5,
+      "pids_limit": 64,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
+    },
+    "access": {
+      "build": {
+        "context": "..",
+        "dockerfile": "services/access/Dockerfile"
+      },
+      "image": "${COMPOSE_PROJECT_NAME}-access:unit2",
+      "user": "0:0",
+      "ports": [
+        "127.0.0.1:${SC_DEV_PORT:-8834}:8443"
+      ],
+      "environment": {
+        "ANJ_ORIGIN": "https://127.0.0.1:${SC_DEV_PORT:-8834}",
+        "ANJ_DEV_STREAM_DELAY": "${ANJ_DEV_STREAM_DELAY:-0}",
+        "ANJ_MAX_TRANSFER_BYTES": "${ANJ_MAX_TRANSFER_BYTES:-67108864}",
+        "ANJ_STAGING_BYTES": "${ANJ_STAGING_BYTES:-134217728}"
+      },
+      "volumes": [
+        "access:/var/lib/anj",
+        "${ANJ_CONSOLE_DIR:?Run deploy/dev.py setup}:/run/anj-console"
+      ],
+      "secrets": [
+        "issuer_crt",
+        "server_crt",
+        "server_key"
+      ],
+      "networks": [
+        "frontend",
+        "proxy"
+      ],
+      "depends_on": {
+        "nextcloud": {
+          "condition": "service_healthy"
+        }
+      },
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:size=16m,mode=1777"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python",
+          "-c",
+          "import ssl,urllib.request;urllib.request.urlopen('https://127.0.0.1:8443/health',context=ssl.create_default_context(cafile='/run/secrets/issuer_crt'),timeout=5).read()"
+        ],
+        "interval": "5s",
+        "timeout": "10s",
+        "start_period": "10s",
+        "retries": 30
+      },
+      "mem_limit": "256m",
+      "cpus": 1,
+      "pids_limit": 64,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
+    }
+  },
+  "networks": {
+    "frontend": {},
+    "backend": {
+      "internal": true
+    },
+    "proxy": {
+      "internal": true
+    }
+  },
+  "volumes": {
+    "nextcloud": {},
+    "database": {},
+    "redis": {},
+    "access": {}
+  },
+  "secrets": {
+    "database": {
+      "file": "${ANJ_SECRETS_DIR:?Run deploy/dev.py setup}/database"
+    },
+    "admin": {
+      "file": "${ANJ_SECRETS_DIR:?Run deploy/dev.py setup}/admin"
+    },
+    "issuer_crt": {
+      "file": "${ANJ_OPERATOR_DIR:?Run setup}/issuer.crt"
+    },
+    "server_crt": {
+      "file": "${ANJ_OPERATOR_DIR:?Run setup}/server.crt"
+    },
+    "server_key": {
+      "file": "${ANJ_OPERATOR_DIR:?Run setup}/server.key"
+    }
+  }
+}

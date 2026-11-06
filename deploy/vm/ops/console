@@ -1,0 +1,24 @@
+#!/usr/bin/python3 -I
+"""Console backend, PM2 app `console` (spec #27; decision #112 (1)), run as `anj`.
+
+Starts deploy/vm/console_backend.py of the release this file belongs to, with the production
+defaults: project anj-cloud-prod, state root /srv/anj-cloud/state, socket
+/run/anj-console/backend.sock (tmpfiles: owner anj, group anj-gw, setgid 2750; socket 0660). It
+opens no network port. The watchdog checks that the socket answers (vmops.console_answers).
+
+    console            # PM2 runs it with /usr/bin/python3 -I
+"""
+
+import os
+from pathlib import Path
+import sys
+
+# The release source root (deploy/vm/ops/console -> three levels up), resolved through
+# release/current at start: the backend keeps the release it started with until PM2 restarts it.
+sys.path.insert(0, str(Path(os.path.realpath(__file__)).parent.parent.parent.parent))
+sys.dont_write_bytecode = True        # -I ignores PYTHONDONTWRITEBYTECODE; keep the release tree as built
+
+from deploy.vm.console_backend import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

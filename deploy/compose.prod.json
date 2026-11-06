@@ -1,0 +1,369 @@
+{
+  "services": {
+    "db": {
+      "image": "postgres:17.11-bookworm@sha256:839fbb5a4942a7758dd93e18b42ea5649807491a0545b5eeeb8f0b8bb11857a5",
+      "environment": {
+        "POSTGRES_DB": "anj",
+        "POSTGRES_USER": "anj",
+        "POSTGRES_PASSWORD_FILE": "/run/secrets/database"
+      },
+      "secrets": [
+        "database"
+      ],
+      "volumes": [
+        "database:/var/lib/postgresql/data"
+      ],
+      "networks": [
+        "backend"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "anj",
+          "-d",
+          "anj"
+        ],
+        "interval": "5s",
+        "timeout": "5s",
+        "retries": 30
+      },
+      "mem_limit": "512m",
+      "cpus": 1,
+      "pids_limit": 128,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      },
+      "restart": "no"
+    },
+    "redis": {
+      "image": "redis:7.4.12-bookworm@sha256:b6b6e3dc0c0952737748e55d5d885272840c7e42ba41ab1d5489f693419882f5",
+      "command": [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory",
+        "128mb",
+        "--maxmemory-policy",
+        "noeviction"
+      ],
+      "volumes": [
+        "redis:/data"
+      ],
+      "networks": [
+        "backend"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "redis-cli",
+          "ping"
+        ],
+        "interval": "5s",
+        "timeout": "5s",
+        "retries": 30
+      },
+      "mem_limit": "256m",
+      "cpus": 0.5,
+      "pids_limit": 64,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      },
+      "restart": "no"
+    },
+    "nextcloud": {
+      "image": "nextcloud:33.0.10-apache@sha256:5ded1127972ea84c29792215f0621c71929ed315cc47be946b489c7a1c1ad305",
+      "environment": {
+        "POSTGRES_DB": "anj",
+        "POSTGRES_USER": "anj",
+        "POSTGRES_HOST": "db",
+        "POSTGRES_PASSWORD_FILE": "/run/secrets/database",
+        "NEXTCLOUD_ADMIN_USER": "${ANJ_ADMIN_USER:?Run deploy/prod.py setup}",
+        "NEXTCLOUD_ADMIN_PASSWORD_FILE": "/run/secrets/admin",
+        "NEXTCLOUD_TRUSTED_DOMAINS": "${ANJ_TRUSTED_DOMAINS:?Run deploy/prod.py setup}",
+        "REDIS_HOST": "redis",
+        "PHP_MEMORY_LIMIT": "256M",
+        "PHP_UPLOAD_LIMIT": "64M"
+      },
+      "secrets": [
+        "database",
+        "admin"
+      ],
+      "volumes": [
+        "nextcloud:/var/www/html"
+      ],
+      "networks": [
+        "proxy",
+        "backend"
+      ],
+      "depends_on": {
+        "db": {
+          "condition": "service_healthy"
+        },
+        "redis": {
+          "condition": "service_healthy"
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "php",
+          "-r",
+          "$$s=json_decode(@file_get_contents('http://127.0.0.1/status.php'),true);exit(($$s['installed']??false)&&!($$s['maintenance']??true)?0:1);"
+        ],
+        "interval": "5s",
+        "timeout": "5s",
+        "start_period": "30s",
+        "retries": 60
+      },
+      "mem_limit": "1536m",
+      "cpus": 2,
+      "pids_limit": 256,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      },
+      "restart": "no"
+    },
+    "cron": {
+      "image": "nextcloud:33.0.10-apache@sha256:5ded1127972ea84c29792215f0621c71929ed315cc47be946b489c7a1c1ad305",
+      "entrypoint": "/cron.sh",
+      "environment": {
+        "REDIS_HOST": "redis"
+      },
+      "volumes": [
+        "nextcloud:/var/www/html"
+      ],
+      "networks": [
+        "backend"
+      ],
+      "depends_on": {
+        "nextcloud": {
+          "condition": "service_healthy"
+        }
+      },
+      "mem_limit": "384m",
+      "cpus": 0.5,
+      "pids_limit": 64,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      },
+      "restart": "no"
+    },
+    "access": {
+      "image": "${ANJ_ACCESS_IMAGE:?Run deploy/prod.py up}",
+      "pull_policy": "never",
+      "user": "0:0",
+      "command": [
+        "python",
+        "-m",
+        "access.start"
+      ],
+      "environment": {
+        "ANJ_ORIGIN": "https://${ANJ_HOST:?Run deploy/prod.py setup}",
+        "ANJ_LISTENER": "proxy-unix",
+        "ANJ_SOCKET": "/run/anj-cloud-gw/gateway.sock",
+        "ANJ_TLS_DIR": "/run/anj-tls",
+        "ANJ_MAX_TRANSFER_BYTES": "67108864",
+        "ANJ_STAGING_BYTES": "134217728",
+        "ANJ_RUN_AS": "10001",
+        "ANJ_RUN_GROUPS": "10002"
+      },
+      "secrets": [
+        "issuer_crt",
+        "server_crt",
+        "server_key"
+      ],
+      "volumes": [
+        "access:/var/lib/anj",
+        {
+          "type": "bind",
+          "source": "${ANJ_SOCKET_DIR:?Run deploy/prod.py setup}",
+          "target": "/run/anj-cloud-gw",
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${ANJ_CONSOLE_DIR:?Run deploy/prod.py setup}",
+          "target": "/run/anj-console",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "networks": [
+        "proxy"
+      ],
+      "depends_on": {
+        "nextcloud": {
+          "condition": "service_healthy"
+        }
+      },
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:size=16m,mode=1777",
+        "/run/anj-tls:size=64k,mode=0700"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "cap_add": [
+        "CHOWN",
+        "DAC_READ_SEARCH",
+        "SETGID",
+        "SETUID"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python",
+          "-m",
+          "access.health"
+        ],
+        "interval": "30s",
+        "timeout": "10s",
+        "start_period": "30s",
+        "start_interval": "2s",
+        "retries": 3
+      },
+      "restart": "no",
+      "mem_limit": "256m",
+      "cpus": 1,
+      "pids_limit": 64,
+      "logging": {
+        "driver": "journald",
+        "options": {
+          "tag": "{{.Name}}"
+        }
+      }
+    },
+    "haproxy": {
+      "image": "haproxy:3.4@sha256:64378482a9ad183747a0416fcaaae7f5f46bd7dac9ddd6805aa5db806a2a83ad",
+      "user": "0:0",
+      "entrypoint": [
+        "haproxy"
+      ],
+      "command": [
+        "-db",
+        "-f",
+        "/usr/local/etc/haproxy/haproxy.cfg"
+      ],
+      "network_mode": "host",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${ANJ_HAPROXY_CFG:?Run deploy/prod.py up}",
+          "target": "/usr/local/etc/haproxy/haproxy.cfg",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${ANJ_HAPROXY_STATE:?Run deploy/prod.py setup}",
+          "target": "/srv/anj-cloud/state/haproxy",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${ANJ_SOCKET_DIR:?Run deploy/prod.py setup}",
+          "target": "/run/anj-cloud-gw",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${ANJ_HAPROXY_RUN_DIR:?Run deploy/prod.py setup}",
+          "target": "/run/anj-haproxy",
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "cap_add": [
+        "CHOWN",
+        "NET_BIND_SERVICE",
+        "SETGID",
+        "SETUID"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "stop_grace_period": "20s",
+      "restart": "no",
+      "mem_limit": "128m",
+      "cpus": 0.5,
+      "pids_limit": 64,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
+    }
+  },
+  "networks": {
+    "backend": {
+      "internal": true
+    },
+    "proxy": {
+      "internal": true
+    }
+  },
+  "volumes": {
+    "nextcloud": {},
+    "database": {},
+    "redis": {},
+    "access": {}
+  },
+  "secrets": {
+    "database": {
+      "file": "${ANJ_SECRETS_DIR:?Run deploy/prod.py setup}/database"
+    },
+    "admin": {
+      "file": "${ANJ_SECRETS_DIR:?Run deploy/prod.py setup}/admin"
+    },
+    "issuer_crt": {
+      "file": "${ANJ_OPERATOR_DIR:?Run deploy/prod.py setup}/issuer.crt"
+    },
+    "server_crt": {
+      "file": "${ANJ_OPERATOR_DIR:?Run deploy/prod.py setup}/server.crt"
+    },
+    "server_key": {
+      "file": "${ANJ_OPERATOR_DIR:?Run deploy/prod.py setup}/server.key"
+    }
+  }
+}

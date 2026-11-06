@@ -1,0 +1,12 @@
+# Spec #21 VM Operations 5 (decision #86): reboot for a pending security update only between
+# 04:00 and 05:00, never during a backup or restore, never while dpkg runs. Root: it reboots.
+[Unit]
+Description=anj-cloud reboot window guard (spec #21)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I @SOURCE@/deploy/vm/ops/reboot-guard
+# Waits in 5-minute steps until 05:00 at the latest.
+TimeoutStartSec=55min
+Environment=PYTHONDONTWRITEBYTECODE=1

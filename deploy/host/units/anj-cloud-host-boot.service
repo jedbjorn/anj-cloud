@@ -1,0 +1,11 @@
+# anj-cloud (spec #21 Host Checks 4): after boot, alert only if not up 10 minutes after boot.
+[Unit]
+Description=anj-cloud host check after boot
+After=anj-cloud-vm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/anj-cloud-host/host-check --boot
+TimeoutStartSec=12min
+MemoryMax=256M
+TasksMax=64

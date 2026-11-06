@@ -1,0 +1,196 @@
+#!/usr/bin/python3 -I
+"""Reboot window guard, `anj-cloud-reboot-guard.timer` at 04:15 (spec #21 VM Operations 5; #86).
+
+Root oneshot. Reboots only when all hold:
+- /run/reboot-required exists (written by the security update run);
+- the local time is between 04:00 and 05:00;
+- spec #22's window check is clear (`backup.py window --check`: no backup or restore marker before
+  its deadline, no backup or restore process holding its lock; an error counts as busy);
+- no backup, restore or restic process runs;
+- the dpkg lock is free and no update run is active.
+Otherwise it rechecks every 5 minutes until 05:00, then skips to the next night. A reboot pending
+for more than 3 nights sends one ntfy alert. Every decision is one JSON line in the journal.
+
+    reboot-guard [--dry-run]     # --dry-run: decide and log, never reboot
+State: /var/lib/anj-cloud/reboot-guard.json (root, 0600).
+"""
+
+import argparse
+import datetime
+import errno
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+sys.path.insert(0, str(Path(os.path.realpath(__file__)).parent))
+
+import vmops  # noqa: E402
+from vmops import paths  # noqa: E402
+
+WINDOW = (datetime.time(4, 0), datetime.time(5, 0))
+STEP = 300
+PENDING_NIGHTS_ALERT = 3
+REBOOT_REQUIRED = Path("/run/reboot-required")
+STATE_FILE = Path("/var/lib/anj-cloud/reboot-guard.json")
+DPKG_LOCKS = (Path("/var/lib/dpkg/lock-frontend"), Path("/var/lib/dpkg/lock"))
+BACKUP_ACTIONS = {"run", "seed", "restore", "drill-checks", "check", "init"}
+
+
+def in_window(local):
+    return WINDOW[0] <= local.time() < WINDOW[1]
+
+
+def decide(local, *, reboot_required, window_busy, processes, dpkg_busy):
+    """('none'|'reboot'|'wait'|'skip', reasons) for one moment. Pure (unit-tested)."""
+    if not reboot_required:
+        return "none", []
+    if not in_window(local):
+        return "skip", ["outside 04:00-05:00"]
+    reasons = list(window_busy) + list(processes) + (["dpkg-lock"] if dpkg_busy else [])
+    if reasons:
+        next_check = local + datetime.timedelta(seconds=STEP)
+        return ("wait" if in_window(next_check) else "skip"), reasons
+    return "reboot", []
+
+
+def nights_pending(since, today):
+    return (today - datetime.date.fromisoformat(since)).days if since else 0
+
+
+class Guard:
+    """One guard run with every probe injected (clock, markers, processes, locks, reboot)."""
+
+    def __init__(self, *, clock, sleep, reboot_required, window_busy, processes, dpkg_busy, reboot, alert,
+                 state, save, log=vmops.log):
+        self.clock, self.sleep, self.reboot, self.alert, self.log = clock, sleep, reboot, alert, log
+        self.reboot_required, self.window_busy, self.processes, self.dpkg_busy = (
+            reboot_required, window_busy, processes, dpkg_busy)
+        self.state, self.save = state, save
+
+    def run(self):
+        while True:
+            local = self.clock()
+            required = self.reboot_required()
+            self.track_pending(required, local.date())
+            action, reasons = decide(local, reboot_required=required,
+                                     window_busy=self.window_busy() if required else [],
+                                     processes=self.processes() if required else [],
+                                     dpkg_busy=self.dpkg_busy() if required else False)
+            self.log("reboot-guard", decision=action, reasons=reasons, local=local.strftime("%H:%M"),
+                     pending_nights=nights_pending(self.state.get("pending_since"), local.date()))
+            if action == "wait":
+                self.sleep(STEP)
+                continue
+            if action == "reboot":
+                self.state["last_reboot"] = local.isoformat(timespec="minutes")
+                self.save(self.state)
+                self.reboot()
+            return action
+
+    def track_pending(self, required, today):
+        if not required:
+            if self.state.get("pending_since"):
+                self.state = {k: v for k, v in self.state.items() if k not in ("pending_since", "alerted")}
+                self.save(self.state)
+            return
+        if not self.state.get("pending_since"):
+            self.state["pending_since"] = today.isoformat()
+            self.save(self.state)
+        nights = nights_pending(self.state["pending_since"], today)
+        if nights > PENDING_NIGHTS_ALERT and not self.state.get("alerted"):
+            self.alert("reboot-guard:pending", "anj-cloud reboot pending",
+                       f"A security update has waited {nights} nights for its reboot; the nightly window was busy "
+                       "each time. Reboot the VM in a quiet moment.")
+            self.state["alerted"] = True
+            self.save(self.state)
+
+
+# Real probes ---------------------------------------------------------------------------------
+
+def window_busy(runner):
+    """spec #22's read-only, root-capable window check; anything but exit 0 is busy."""
+    script = paths.RELEASE_CURRENT / "deploy" / "backup.py"
+    code, out, _err = runner.run(["/usr/bin/python3", "-I", str(script), "window", "--check"], timeout=60)
+    if code == 0:
+        return []
+    try:
+        busy = json.loads(out.strip().splitlines()[-1]).get("busy") or ["window-check-error"]
+    except (ValueError, IndexError, AttributeError):
+        busy = ["window-check-error"]
+    return [str(item) for item in busy]
+
+
+def backup_processes(proc=Path("/proc")):
+    found = set()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        words = [part.decode("utf-8", "replace") for part in argv if part]
+        if any(Path(word).name == "restic" for word in words[:1]):
+            found.add("restic")
+        if any(word.endswith("deploy/backup.py") for word in words) and BACKUP_ACTIONS & set(words):
+            found.add("backup-process")
+    return sorted(found)
+
+
+def lock_held(path):
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in (errno.EAGAIN, errno.EACCES):
+            return True
+        raise
+    else:
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return False
+
+
+def dpkg_busy(runner, locks=DPKG_LOCKS):
+    _code, out, _err = runner.run(["systemctl", "is-active", "apt-daily-upgrade.service"])
+    if set(out.split()) & {"active", "activating", "reloading", "deactivating"}:
+        return True
+    return any(lock_held(path) for path in locks)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="anj-cloud reboot window guard (root)")
+    parser.add_argument("--dry-run", action="store_true", help="Decide and log; never reboot")
+    args = parser.parse_args(argv)
+    if os.geteuid() != 0:
+        print("reboot-guard: run as root (systemd unit)", file=sys.stderr)
+        return 2
+    runner = vmops.Runner()
+    STATE_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def reboot():
+        if args.dry_run:
+            vmops.log("reboot-guard", decision="reboot (dry run: not rebooting)")
+            return
+        runner.run(["systemctl", "reboot"], timeout=60)
+
+    def alert(key, title, message):
+        vmops.send_alert(runner, key, title, message, every=0)
+
+    guard = Guard(clock=lambda: datetime.datetime.now().astimezone(), sleep=time.sleep,
+                  reboot_required=REBOOT_REQUIRED.exists, window_busy=lambda: window_busy(runner),
+                  processes=backup_processes, dpkg_busy=lambda: dpkg_busy(runner), reboot=reboot, alert=alert,
+                  state=vmops.load_json(STATE_FILE, {}), save=lambda data: vmops.save_json(STATE_FILE, data))
+    guard.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+[Unit]
+Description=anj-cloud hourly backup freshness check (spec #22)
+
+[Timer]
+OnCalendar=hourly
+Persistent=false
+Unit=anj-cloud-backup-stale.service
+
+[Install]
+WantedBy=timers.target

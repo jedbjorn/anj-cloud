@@ -1,0 +1,298 @@
+#!/usr/bin/python3 -I
+"""anj-alert (anj-prod VM): the in-VM alert dispatcher (spec #21 VM Operations 3; #90 (2)).
+
+    anj-alert [--key KEY] [--every SECONDS] [--title T] [--priority P] [--dry-run] -- MESSAGE
+    anj-alert --drain [--once]          # PM2 app `alerts`
+
+Enqueue (spec #20's paths.ALERT_COMMAND contract): one record per alert in paths.ALERT_SPOOL
+(state/run/alerts/, 0700), written atomically, 0600, named "<UTC yyyymmddTHHMMSS.ffffffZ>-<key>.json"
+with exactly the fields of paths.ALERT_SPOOL_FIELDS. At most one alert per key per --every seconds
+(default 3600); --every 0 always enqueues (callers that throttle themselves, decision #99). A
+suppressed alert exits 0 and prints "suppressed". Root callers (the reboot guard, the update run's
+window check) are switched to the state root's owner before anything is written.
+
+Drain (PM2 app `alerts`): posts each record to ntfy.sh on the topic in secrets/ntfy-topic (0600,
+never printed, logged or passed on a command line), oldest first, retrying with backoff; a record
+is removed only once it was delivered (or after 7 days, logged). Messages and titles are scrubbed
+of path-like text and long hex/base64 runs and capped, so no file name, code or secret leaves the
+VM (#90 (2)). Code carried from d1b705c's dispatcher.
+
+Exit codes: 0 queued, suppressed or drained; 2 refused (bad arguments, no state root).
+"""
+
+import argparse
+import calendar
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = Path(os.path.realpath(__file__)).parent
+sys.dont_write_bytecode = True     # never a __pycache__ in the private state tree (state/bin)
+if (HERE / "paths.py").is_file():  # state/bin holds paths.py beside this file
+    sys.path.insert(0, str(HERE))
+    import paths  # noqa: E402
+else:  # the release source: deploy/vm/ops/anj-alert
+    sys.path.insert(0, str(HERE.parent.parent.parent))
+    from deploy.vm import paths  # noqa: E402
+
+# The state root moves only for the non-root unit tests.
+TEST = os.geteuid() != 0 and bool(os.environ.get("ANJ_ALERT_TEST"))
+STATE_ROOT = Path(os.environ["ANJ_ALERT_STATE_ROOT"]) if TEST and os.environ.get("ANJ_ALERT_STATE_ROOT") else paths.STATE_ROOT
+SPOOL = STATE_ROOT / paths.RUN_DIR.name / paths.ALERT_SPOOL.name
+TOPIC_FILE = STATE_ROOT / paths.SECRETS_DIR.name / paths.NTFY_TOPIC.name
+OPS_CONFIG = STATE_ROOT / paths.RUN_DIR.name / "ops.json"   # machine-local (run/ is never backed up)
+THROTTLE = ".throttle"
+LOCK = ".lock"
+MAX_MESSAGE = 600
+MAX_TITLE = 80
+MAX_AGE = 7 * 86400
+PRIORITIES = ("min", "low", "default", "high", "urgent")
+KEY = re.compile(r"[A-Za-z0-9:._-]{1,64}")
+TOPIC = re.compile(r"[A-Za-z0-9_-]{24,64}")
+RECORD = re.compile(r"\d{8}T\d{6}\.\d{6}Z-[A-Za-z0-9:._-]{1,64}\.json")
+PATHLIKE = re.compile(r"(?<!\S)(~|\.{1,2})?/\S*|(?<!\S)[^\s/]+/\S*\.[A-Za-z0-9]{1,5}(?!\S)|[A-Za-z]:\\\S+")
+SECRETLIKE = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
+ALLOWED_PATHLIKE = {"/health", "/v1/enroll", "/v1/enroll/status"}
+
+
+def scrub(text, limit=MAX_MESSAGE, topic=None):
+    text = str(text).replace("\r", " ").replace("\n", " ")
+    if topic:
+        text = text.replace(topic, "[redacted]")
+    text = SECRETLIKE.sub("[redacted]", text)
+    text = PATHLIKE.sub(lambda m: m.group(0) if m.group(0) in ALLOWED_PATHLIKE else "[path]", text)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def log(event, **fields):
+    print(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event, **fields},
+                     sort_keys=True), flush=True)
+
+
+def drop_to_owner():
+    """Root callers act as the state root's owner (anj), so the spool stays anj's."""
+    if os.geteuid() != 0:
+        return
+    info = os.stat(STATE_ROOT)
+    if info.st_uid == 0:
+        raise PermissionError("the state root must not be owned by root")
+    user = pwd.getpwuid(info.st_uid)
+    os.setgroups([])
+    os.setgid(user.pw_gid)
+    os.setuid(user.pw_uid)
+    os.environ["HOME"] = user.pw_dir
+
+
+def ensure_spool():
+    run_dir = SPOOL.parent
+    if not run_dir.is_dir():
+        raise FileNotFoundError("run directory missing")
+    try:
+        os.mkdir(SPOOL, 0o700)
+    except FileExistsError:
+        pass
+    info = os.lstat(SPOOL)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise PermissionError("the alert spool must be a directory owned by this user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        os.chmod(SPOOL, 0o700)
+
+
+class Locked:
+    def __enter__(self):
+        self.fd = os.open(SPOOL / LOCK, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
+
+def atomic_write(path, text):
+    temporary = path.with_name("." + path.name + ".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def throttled(key, every, current):
+    """True when `key` was queued within `every` seconds; records this one otherwise (lock held)."""
+    path = SPOOL / THROTTLE
+    try:
+        sent = json.loads(path.read_text())
+    except (OSError, ValueError):
+        sent = {}
+    if every > 0 and key in sent and current - float(sent[key]) < every:
+        return True
+    sent[key] = current
+    sent = {k: v for k, v in sent.items() if float(v) >= current - 8 * 86400}
+    atomic_write(path, json.dumps(sent, sort_keys=True))
+    return False
+
+
+def ops_config():
+    try:
+        return json.loads(OPS_CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def enqueue(key, every, title, priority, message, current=None):
+    current = time.time() if current is None else current
+    ensure_spool()
+    tag = ops_config().get("alerts_tag")
+    if tag:
+        title = f"[{tag}] {title}"
+    record = {"key": key, "title": scrub(title, MAX_TITLE), "priority": priority, "message": scrub(message),
+              "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(current))}
+    with Locked():
+        if throttled(key, every, current):
+            return "suppressed"
+        micros = int(current * 1e6)
+        while True:  # two alerts of one key in the same microsecond keep both
+            name = (time.strftime("%Y%m%dT%H%M%S", time.gmtime(micros // 1000000)) + f".{micros % 1000000:06d}Z-{key}.json")
+            if not (SPOOL / name).exists():
+                break
+            micros += 1
+        atomic_write(SPOOL / name, json.dumps({field: record[field] for field in paths.ALERT_SPOOL_FIELDS}) + "\n")
+    return "queued"
+
+
+# Drain (PM2 app `alerts`) -------------------------------------------------------------------
+
+def read_topic():
+    fd = os.open(TOPIC_FILE, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise PermissionError("the ntfy topic file must be a regular 0600 file owned by this user")
+        topic = os.read(fd, 128).decode("ascii", "replace").strip()
+    finally:
+        os.close(fd)
+    if not TOPIC.fullmatch(topic):
+        raise ValueError("the ntfy topic must be 24-64 letters, digits, '-' or '_'")
+    return topic
+
+
+def server_url():
+    server = (os.environ.get("ANJ_NTFY_SERVER") if TEST else None) or ops_config().get("ntfy_server") or "https://ntfy.sh"
+    parts = urllib.parse.urlsplit(server)
+    if parts.scheme != "https" and not (parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1")):
+        raise ValueError("the ntfy server must be https (http only for a loopback test server)")
+    return server.rstrip("/")
+
+
+def post(url, record, topic):
+    """True delivered, False retry later, None never deliverable (a 4xx other than 429)."""
+    title = scrub(record.get("title", "anj-cloud"), MAX_TITLE, topic).encode("ascii", "replace").decode("ascii")
+    message = scrub(record.get("message", ""), MAX_MESSAGE, topic)
+    priority = record.get("priority") if record.get("priority") in PRIORITIES else "high"
+    request = urllib.request.Request(url, data=message.encode("utf-8"), method="POST", headers={
+        "Title": title, "Priority": priority, "Tags": "warning", "Content-Type": "text/plain; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return 200 <= response.status < 300
+    except urllib.error.HTTPError as error:
+        return None if 400 <= error.code < 500 and error.code != 429 else False
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def pending():
+    return sorted(path for path in SPOOL.iterdir() if RECORD.fullmatch(path.name))
+
+
+def drain_once(current=None):
+    """Send what is queued; returns (sent, kept). Stops at the first transient failure (order kept)."""
+    current = time.time() if current is None else current
+    ensure_spool()
+    try:
+        topic, url = read_topic(), server_url()
+    except (OSError, ValueError) as error:
+        log("alerts-not-configured", reason=type(error).__name__, queued=len(pending()))
+        return 0, len(pending())
+    sent = 0
+    for path in pending():
+        try:
+            record = json.loads(path.read_text())
+            created = calendar.timegm(time.strptime(record["created"][:19], "%Y-%m-%dT%H:%M:%S"))
+        except (OSError, ValueError, KeyError, TypeError):
+            log("alert-dropped", reason="unreadable")
+            path.unlink(missing_ok=True)
+            continue
+        if current - created > MAX_AGE:
+            log("alert-dropped", key=record.get("key"), reason="older than 7 days")
+            path.unlink(missing_ok=True)
+            continue
+        result = post(url + "/" + topic, record, topic)
+        if result is None:
+            log("alert-dropped", key=record.get("key"), reason="refused by the server")
+            path.unlink(missing_ok=True)
+        elif result:
+            log("alert-sent", key=record.get("key"), title=scrub(record.get("title", ""), MAX_TITLE, topic))
+            path.unlink(missing_ok=True)
+            sent += 1
+        else:
+            log("alert-retry", key=record.get("key"))
+            break
+    return sent, len(pending())
+
+
+def drain(once=False, sleep=time.sleep):
+    backoff = 5
+    while True:
+        try:
+            _sent, kept = drain_once()
+        except OSError as error:
+            log("alerts-error", reason=type(error).__name__)
+            kept = 1
+        if once:
+            return 0
+        backoff = 5 if not kept else min(backoff * 2, 300)
+        sleep(backoff if kept else 5)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Queue one alert for the operator's ntfy topic, or drain the queue")
+    parser.add_argument("--key", default="general", type=lambda v: v if KEY.fullmatch(v) else
+                        parser.error("--key: 1-64 letters, digits, ':', '.', '_' or '-'"))
+    parser.add_argument("--every", default=3600, type=lambda v: int(v) if v.isdigit() and int(v) <= 7 * 86400 else
+                        parser.error("--every: 0-604800 seconds"))
+    parser.add_argument("--title", default="anj-cloud")
+    parser.add_argument("--priority", default="high", choices=PRIORITIES)
+    parser.add_argument("--dry-run", action="store_true", help="Scrub and print; queue nothing")
+    parser.add_argument("--drain", action="store_true", help="PM2 app `alerts`: send queued alerts")
+    parser.add_argument("--once", action="store_true", help="With --drain: one pass")
+    parser.add_argument("message", nargs="*")
+    args = parser.parse_args(argv)
+    if args.dry_run:
+        print(json.dumps({"key": args.key, "title": scrub(args.title, MAX_TITLE), "priority": args.priority,
+                          "message": scrub(" ".join(args.message))}))
+        return 0
+    try:
+        drop_to_owner()
+        if args.drain:
+            return drain(args.once)
+        if not args.message:
+            parser.error("a message is required")
+        print(enqueue(args.key, args.every, args.title, args.priority, " ".join(args.message)))
+        return 0
+    except (OSError, ValueError) as error:
+        print(f"anj-alert: refused ({type(error).__name__})", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

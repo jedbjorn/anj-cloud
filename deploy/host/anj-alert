@@ -1,0 +1,265 @@
+#!/usr/bin/python3 -I
+"""anj-alert (The VM host): post one "The VM host:" alert to the operator's ntfy topic (spec #21 Host Checks 1).
+
+    anj-alert [--key KEY --every SECONDS] [--title T] [--priority P] [--dry-run] -- MESSAGE
+
+Root only. The topic is read from /etc/anj-cloud-host/ntfy-topic (regular file, owned by root,
+mode 0600) and is never printed, logged or passed on a command line. The server defaults to
+https://ntfy.sh; ANJ_NTFY_SERVER (or "ntfy_server" in /etc/anj-cloud-host/anj-cloud-host.json)
+overrides it, plain http only for a loopback test server.
+
+--key/--every: at most one alert per key per interval (default one hour); a suppressed alert exits
+0 with "suppressed". Messages are scrubbed of path-like text and long hex/base64 runs and capped,
+so no file name, code or secret leaves the VM host (#90 (2)). Code carried from d1b705c's dispatcher.
+
+Through sudo (SUDO_USER set) at most 10 alerts per 10 minutes are sent across all keys; an alert
+over that floor is queued as a count, exits 5 (not sent), and one "alerts suppressed (N)" notice
+follows with the next sent alert or the host watchdog's --flush-suppressed run.
+Exit codes: 0 sent or suppressed by its key, 1 delivery failed, 2 refused, 5 queued over the floor.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# The operator user may run this as root through /etc/sudoers.d/anj-cloud-host-alert (golive.py's
+# emergency-stop fallback). Arguments are therefore untrusted: they are parsed by argparse, never
+# evaluated by a shell, scrubbed and capped; the topic file is read by root and never echoed; and
+# no environment variable redirects the topic, state or server unless this is the non-root test.
+TEST = os.geteuid() != 0 and bool(os.environ.get("ANJ_HOST_TEST"))
+CONFIG_DIR = Path(os.environ["ANJ_HOST_CONFIG_DIR"] if TEST and os.environ.get("ANJ_HOST_CONFIG_DIR") else "/etc/anj-cloud-host")
+STATE_DIR = Path(os.environ["ANJ_HOST_STATE_DIR"] if TEST and os.environ.get("ANJ_HOST_STATE_DIR") else "/var/lib/anj-cloud-host")
+MAX_MESSAGE = 600
+# Through sudo (golive's fallback, any process running as the operator user can call it) at most
+# FLOOR_COUNT sends per FLOOR_WINDOW seconds across all keys; the rest are queued as a count and
+# announced once later ("alerts suppressed (N)"), so the topic's ntfy quota cannot be exhausted.
+FLOOR_COUNT, FLOOR_WINDOW = 10, 600
+VIA_SUDO = bool(os.environ.get("SUDO_USER")) and (os.geteuid() == 0 or TEST)
+PREFIX = "VM host: "
+TOPIC = re.compile(r"[A-Za-z0-9_-]{24,64}")
+# A token that starts like a path (/x, ~/x, ./x), a relative path ending in a file extension, or a
+# Windows path. CIDR suffixes such as 192.168.0.0/24 are not path-like.
+PATHLIKE = re.compile(r"(?<!\S)(~|\.{1,2})?/\S*|(?<!\S)[^\s/]+/\S*\.[A-Za-z0-9]{1,5}(?!\S)|[A-Za-z]:\\\S+")
+SECRETLIKE = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
+ALLOWED_PATHLIKE = {"/health"}
+
+
+def scrub(text, topic=None):
+    text = text.replace("\r", " ").replace("\n", " ")
+    if topic:
+        text = text.replace(topic, "[redacted]")
+    text = SECRETLIKE.sub("[redacted]", text)
+    text = PATHLIKE.sub(lambda m: m.group(0) if m.group(0) in ALLOWED_PATHLIKE else "[path]", text)
+    return text if len(text) <= MAX_MESSAGE else text[:MAX_MESSAGE - 1] + "…"
+
+
+def config():
+    try:
+        return json.loads((CONFIG_DIR / "anj-cloud-host.json").read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def read_topic():
+    fd = os.open(CONFIG_DIR / "ntfy-topic", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise PermissionError("the ntfy topic file must be a regular 0600 file owned by root")
+        topic = os.read(fd, 128).decode("ascii", "replace").strip()
+    finally:
+        os.close(fd)
+    if not TOPIC.fullmatch(topic):
+        raise ValueError("the ntfy topic must be 24-64 letters, digits, '-' or '_'")
+    return topic
+
+
+def server_url():
+    server = (os.environ.get("ANJ_NTFY_SERVER") if TEST else None) or config().get("ntfy_server") or "https://ntfy.sh"
+    parts = urllib.parse.urlsplit(server)
+    if parts.scheme != "https" and not (parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1")):
+        raise ValueError("the ntfy server must be https (http only for a loopback test server)")
+    return server.rstrip("/")
+
+
+def throttled(key, every):
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = STATE_DIR / "alerts.json"
+    lock = os.open(STATE_DIR / ".alerts.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            sent = json.loads(path.read_text())
+        except (FileNotFoundError, ValueError):
+            sent = {}
+        now = time.time()
+        if key in sent and now - sent[key] < every:
+            return True
+        sent[key] = now
+        sent = {k: v for k, v in sent.items() if v >= now - 7 * 86400}
+        temporary = path.with_name(".alerts.json.tmp")
+        temporary.write_text(json.dumps(sent))
+        os.replace(temporary, path)
+        return False
+    finally:
+        os.close(lock)
+
+
+def _locked_state(name, update):
+    """Apply update(dict) -> result to STATE_DIR/name under the alerts lock; return the result."""
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = STATE_DIR / name
+    lock = os.open(STATE_DIR / ".alerts.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            data = json.loads(path.read_text())
+        except (FileNotFoundError, ValueError):
+            data = {}
+        result = update(data)
+        temporary = path.with_name("." + name + ".tmp")
+        temporary.write_text(json.dumps(data))
+        os.replace(temporary, path)
+        return result
+    finally:
+        os.close(lock)
+
+
+def floor_allows():
+    """Sudo path: record a send if under the floor; otherwise count it as suppressed."""
+    def update(data):
+        now = time.time()
+        sends = [t for t in data.get("sends", []) if t >= now - FLOOR_WINDOW]
+        if len(sends) >= FLOOR_COUNT:
+            data["sends"] = sends
+            data["suppressed"] = int(data.get("suppressed", 0)) + 1
+            return False
+        data["sends"] = sends + [now]
+        return True
+    return _locked_state("floor.json", update)
+
+
+def take_suppressed():
+    def update(data):
+        count = int(data.get("suppressed", 0))
+        data["suppressed"] = 0
+        return count
+    return _locked_state("floor.json", update)
+
+
+def return_suppressed(count):
+    def update(data):
+        data["suppressed"] = int(data.get("suppressed", 0)) + count
+    _locked_state("floor.json", update)
+
+
+def flush_suppressed(url, topic):
+    """Send one "alerts suppressed (N)" notice for queued sudo alerts; keep the count on failure."""
+    count = take_suppressed()
+    if not count:
+        return True
+    if post(url + "/" + topic, PREFIX + "anj-cloud alerts suppressed",
+            PREFIX + f"alerts suppressed ({count}): more than {FLOOR_COUNT} alerts in {FLOOR_WINDOW // 60} "
+            "minutes were requested through sudo.", "high", "warning"):
+        return True
+    return_suppressed(count)
+    return False
+
+
+def forget(key):
+    path = STATE_DIR / "alerts.json"
+    try:
+        sent = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return
+    sent.pop(key, None)
+    path.write_text(json.dumps(sent))
+
+
+def post(url, title, message, priority, tags):
+    request = urllib.request.Request(url, data=message.encode("utf-8"), method="POST", headers={
+        "Title": title.encode("ascii", "replace").decode("ascii"), "Priority": priority, "Tags": tags,
+        "Content-Type": "text/plain; charset=utf-8"})
+    last = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                if 200 <= response.status < 300:
+                    return True
+                last = f"HTTP {response.status}"
+        except urllib.error.HTTPError as error:
+            last = f"HTTP {error.code}"
+            if 400 <= error.code < 500 and error.code != 429:
+                break
+        except (urllib.error.URLError, OSError) as error:
+            last = type(error).__name__
+        time.sleep(2 * (attempt + 1))
+    print(f"anj-alert: delivery failed ({last})", file=sys.stderr)
+    return False
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Post one the VM host alert to the operator's ntfy topic")
+    parser.add_argument("--key", type=lambda v: v if re.fullmatch(r"[A-Za-z0-9:._-]{1,64}", v) else
+                        parser.error("--key: 1-64 letters, digits, ':', '.', '_' or '-'"),
+                        help="Condition key for rate limiting")
+    parser.add_argument("--every", type=lambda v: int(v) if v.isdigit() and int(v) <= 7 * 86400 else
+                        parser.error("--every: 0-604800 seconds"), default=3600, help="Seconds between alerts for one key")
+    parser.add_argument("--title", default="anj-cloud")
+    parser.add_argument("--priority", default="high", choices=["min", "low", "default", "high", "urgent"])
+    parser.add_argument("--tags", default="warning", type=lambda v: v if re.fullmatch(r"[A-Za-z0-9_,-]{1,64}", v) else
+                        parser.error("--tags: letters, digits, '_', ',' or '-'"))
+    parser.add_argument("--dry-run", action="store_true", help="Scrub and print; send nothing")
+    parser.add_argument("--flush-suppressed", action="store_true",
+                        help="Only send the pending 'alerts suppressed (N)' notice, if any (root timers)")
+    parser.add_argument("message", nargs="*")
+    args = parser.parse_args(argv)
+    if not args.message and not args.flush_suppressed:
+        parser.error("a message is required")
+    if os.geteuid() != 0 and not TEST:
+        print("anj-alert: root only (The VM host topic file is root-only)", file=sys.stderr)
+        return 2
+    try:
+        topic = None if args.dry_run else read_topic()
+        url = server_url()
+    except (OSError, ValueError) as error:
+        print(f"anj-alert: {error if isinstance(error, ValueError) else type(error).__name__}", file=sys.stderr)
+        return 2
+    if args.flush_suppressed:
+        if VIA_SUDO:
+            print("anj-alert: --flush-suppressed is for root timers", file=sys.stderr)
+            return 2
+        return 0 if args.dry_run or flush_suppressed(url, topic) else 1
+    title = PREFIX + scrub(args.title, topic)[:72]
+    message = PREFIX + scrub(" ".join(args.message), topic)
+    if args.dry_run:
+        print(json.dumps({"title": title, "message": message, "priority": args.priority}))
+        return 0
+    if args.key and throttled(args.key, args.every):
+        print("suppressed")
+        return 0
+    if VIA_SUDO and not floor_allows():
+        if args.key:
+            forget(args.key)
+        print(f"anj-alert: queued, not sent: over {FLOOR_COUNT} sudo alerts in {FLOOR_WINDOW} s", file=sys.stderr)
+        return 5
+    flush_suppressed(url, topic)
+    if not post(url + "/" + topic, title, message, args.priority, args.tags):
+        if args.key:
+            forget(args.key)
+        return 1
+    print("sent")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

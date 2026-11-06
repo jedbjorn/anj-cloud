@@ -1,0 +1,99 @@
+#!/usr/bin/python3 -I
+"""virtiofsd for the anj-cloud backup share (spec #21 step 4; decision #115).
+
+libvirt's <binary path> for the share's filesystem device; installed root-owned (0755) at
+/usr/local/lib/anj-cloud-host/virtiofsd-anj-cloud by halo-vm.sh step 4, next to anjvm.py.
+It runs /usr/lib/virtiofsd with libvirt's arguments plus
+
+    --translate-uid squash-guest:0:<owner uid>:1  --translate-uid forbid-guest:1:999
+    --translate-uid map:1000:<owner uid>:1        --translate-uid forbid-guest:1001:<max>
+    (and the same for gids)
+
+so the guest's anj (1000:1000) reads and writes as the share directory's owner on the VM host:
+anj-cloud-backup for production, a scratch owner for qualification. Guest root (restic runs as its
+container's root) also creates as the owner, so the VM host sees one owner and the guest sees anj on every
+file; any other guest uid/gid gets an error when it tries to create or chown on the share.
+libvirt's <idmap> cannot do this under qemu:///system: it becomes --uid-map, which virtiofsd
+refuses when run as root ("uid_map can only be used by unprivileged user").
+
+Fails closed (exit 1): libvirt then reports "virtiofsd died unexpectedly" and vm-start starts
+anj-prod again WITHOUT the share, with one "running without backups" alert naming the virtiofsd log
+(production never stays down for the share, #89 (2)). It refuses:
+- any argument outside libvirt 12.8's shape: --fd=N --shared-dir PATH [--readonly], or a lone
+  --print-capabilities (libvirt's probe, passed through unchanged); so no -o, --sandbox, --seccomp,
+  --modcaps, --xattr or mapping of libvirt's own;
+- a directory other than /mnt/anj-backup/anj-cloud-prod or ~/.local/share/anj-cloud/qualification/<name>
+  of a the VM host user, a path with a symlink, a share owned by root or uid/gid 1000, or not mode 0700.
+The directory is opened once (O_DIRECTORY|O_NOFOLLOW), checked through that descriptor, and the
+path must still name the same inode before virtiofsd is exec'd. That narrows the check-to-use
+window but does not close it: virtiofsd re-opens --shared-dir by path. For the production share
+every component is root-owned, so it cannot be raced; for a qualification share only the owner of
+its parent (The VM host user, already root-equivalent through the libvirt group) could race it. Test hooks (ANJ_HOST_TEST,
+ANJ_VIRTIOFSD, the owner overlay) are honoured only when not running as root.
+"""
+
+import os
+from pathlib import Path
+import sys
+
+HERE = Path(os.path.realpath(__file__)).parent
+sys.path.insert(0, str(HERE))
+
+import anjvm  # noqa: E402
+
+import re  # noqa: E402
+
+REAL = "/usr/lib/virtiofsd"
+TEST = os.geteuid() != 0 and bool(os.environ.get("ANJ_HOST_TEST"))
+if TEST and os.environ.get("ANJ_VIRTIOFSD"):
+    REAL = os.environ["ANJ_VIRTIOFSD"]   # test harness only, never as root
+
+
+def fail(message):
+    print(f"virtiofsd-anj-cloud: {message}", file=sys.stderr)
+    return 1
+
+
+def parse(argv):
+    """(share, problems) for libvirt's argument shape; share is None for the capability probe."""
+    if argv == ["--print-capabilities"]:
+        return None, []
+    share, fds, problems, index = None, 0, [], 0
+    while index < len(argv):
+        arg = argv[index]
+        if re.fullmatch(r"--fd=[0-9]{1,6}", arg):
+            fds += 1
+        elif arg == "--shared-dir" and index + 1 < len(argv) and share is None:
+            share = argv[index + 1]
+            index += 1
+        elif arg.startswith("--shared-dir=") and share is None:
+            share = arg.split("=", 1)[1]
+        elif arg == "--readonly":
+            pass
+        else:
+            problems.append(arg)
+        index += 1
+    if share is None or fds != 1:
+        problems.append("expected exactly --fd=N --shared-dir PATH")
+    return share, problems
+
+
+def main(argv):
+    share, problems = parse(argv)
+    if problems:
+        return fail("refusing arguments outside libvirt's --fd=N --shared-dir PATH [--readonly]: "
+                    + " ".join(problems)[:300])
+    if share is None:
+        os.execv(REAL, [REAL, *argv])
+    if os.geteuid() != 0 and not TEST:
+        return fail("runs as root under qemu:///system only (the mapping uses host ids)")
+    try:
+        mapping = anjvm.serve_check(share)
+    except (OSError, ValueError) as error:
+        return fail(str(error))
+    os.execv(REAL, [REAL, *argv, *mapping])
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

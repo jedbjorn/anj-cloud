@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""PM2 app wrapper: run one production service's container attached (spec #20 Supervision 2).
+
+    run-service <app> [--state-root /srv/anj-cloud/state] [--project anj-cloud-prod]
+
+1. `gateway` and `haproxy` refuse while state/run/emergency-stop exists, exiting with the code
+   listed in PM2's stop_exit_codes, so the stop survives PM2 restarts and VM reboots.
+2. Waits until every dependency's container is running and healthy (db and redis -> nextcloud
+   -> gateway and cron; gateway -> haproxy); gives up after a bound so PM2 backs off.
+3. Runs `docker compose up --no-deps --no-log-prefix --exit-code-from <service> <service>`
+   attached. A container exit ends this process and PM2 restarts it. SIGTERM/SIGINT handlers
+   are installed before anything starts: on pm2 stop/restart it stops the container by name
+   (`docker stop --time 30`) and exits within the grace counted from the signal, below PM2's
+   kill_timeout. The compose child also gets SIGTERM if this wrapper dies (PR_SET_PDEATHSIG).
+
+Standard library only; installed with paths.py and stackenv.py in state/bin by prod.py.
+"""
+
+import argparse
+import json
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+# state/bin is part of the 0700/0600 private state tree (prod.py check_private_tree): importing
+# paths.py and stackenv.py from it must never create a 0755 __pycache__ there (anj-qual b2dev-3).
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from deploy.vm import paths, stackenv  # imported as a module (tests, checkout)
+except ImportError:
+    import paths  # state/bin
+    import stackenv
+
+
+def container_ready(project, service, docker="docker"):
+    """Running, and healthy when the service defines a healthcheck."""
+    result = subprocess.run([docker, "inspect", "--format", "{{json .State}}", f"{project}-{service}-1"],
+                            capture_output=True, text=True, timeout=30, check=False)
+    if result.returncode:
+        return False
+    try:
+        state = json.loads(result.stdout)
+    except ValueError:
+        return False
+    health = (state.get("Health") or {}).get("Status")
+    return bool(state.get("Running")) and health in (None, "healthy")
+
+
+def wait_for_dependencies(app, project, *, timeout=paths.DEPENDENCY_WAIT_SECONDS, interval=2.0, ready=container_ready,
+                          clock=time.monotonic, sleep=time.sleep, stopping=()):
+    """[] when every dependency is healthy (or a stop arrived); the missing services on timeout."""
+    deadline = clock() + timeout
+    pending = [paths.COMPOSE_SERVICE[name] for name in paths.DEPENDENCIES[app]]
+    while pending and not stopping:
+        pending = [service for service in pending if not ready(project, service)]
+        if not pending or stopping:
+            break
+        if clock() >= deadline:
+            return pending
+        sleep(interval)
+    return []
+
+
+def stop_container(project, service, docker="docker"):
+    """Stop the service's container by name within the grace (docker stop: SIGTERM, then SIGKILL)."""
+    subprocess.run([docker, "stop", "--time", str(paths.STOP_GRACE_SECONDS), f"{project}-{service}-1"],
+                   capture_output=True, timeout=paths.STOP_GRACE_SECONDS + 20, check=False)
+
+
+def parent_death_signal():
+    """preexec_fn: the compose child gets SIGTERM if this wrapper dies, even by SIGKILL, and
+    attached `docker compose up` then stops its container."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, int(signal.SIGTERM), 0, 0, 0)  # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        pass
+
+
+def run(app, state_root=paths.STATE_ROOT, project=paths.PROJECT, *, popen=subprocess.Popen, ready=container_ready,
+        sleep=time.sleep, clock=time.monotonic, timeout=paths.DEPENDENCY_WAIT_SECONDS, stop=stop_container):
+    state_root = Path(state_root)
+    if app not in paths.STACK_APPS:
+        print(f"run-service: unknown app {app!r}", file=sys.stderr)
+        return 2
+    if app in paths.EMERGENCY_APPS and (state_root / "run" / "emergency-stop").exists():
+        print(f"run-service: {app} refused: emergency stop is active (prod.py resume on the operator's instruction)", flush=True)
+        return paths.EMERGENCY_EXIT_CODE
+    config = stackenv.load_config(state_root)
+    if not config.get("release") or not config.get("host"):
+        print("run-service: no recorded production setup in the state root", file=sys.stderr)
+        return 1
+    service = paths.COMPOSE_SERVICE[app]
+    stopping = []  # [(signal, time)] once pm2 stop/restart arrives
+    started = []   # the compose child once it exists
+
+    def on_signal(signum, frame):
+        if stopping:
+            return
+        stopping.append((signum, clock()))
+        if started:
+            stop(project, service)
+
+    # Handlers first: a signal at any point, including while compose starts, is honoured.
+    previous = {number: signal.signal(number, on_signal) for number in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        missing = wait_for_dependencies(app, project, timeout=timeout, ready=ready, clock=clock, sleep=sleep,
+                                        stopping=stopping)
+        if stopping:
+            return 0
+        if missing:
+            print("run-service: dependencies not healthy: " + ", ".join(missing), file=sys.stderr, flush=True)
+            return 1
+        base = stackenv.compose_command(state_root, config, project)
+        environment = stackenv.environment(state_root, config, project)
+        child = popen([*base, "up", "--no-deps", "--no-log-prefix", "--exit-code-from", service, service],
+                      env=environment, preexec_fn=parent_death_signal)
+        started.append(child)
+        if stopping:  # the signal arrived while compose was starting
+            stop(project, service)
+        code = supervise(child, stopping, clock=clock)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    return 0 if stopping else code
+
+
+def supervise(child, stopping, *, clock=time.monotonic, grace=paths.STOP_GRACE_SECONDS + 15):
+    """Wait for the attached compose process; after a stop signal, never outlive the grace,
+    counted from the signal (so the total stays below PM2's kill_timeout)."""
+    while True:
+        try:
+            return child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        except KeyboardInterrupt:
+            continue
+        if stopping and clock() - stopping[0][1] > grace:
+            child.terminate()
+            try:
+                return child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                return child.wait()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("app", choices=paths.STACK_APPS)
+    parser.add_argument("--state-root", default=str(paths.STATE_ROOT))
+    parser.add_argument("--project", default=paths.PROJECT)
+    args = parser.parse_args(argv)
+    return run(args.app, args.state_root, args.project)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

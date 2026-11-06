@@ -1,0 +1,13 @@
+<!-- anj-cloud qualification NAT network (spec #21 Qualification Budget; decision #89 (6)): isolated, no DNAT, no DDNS.
+     Rendered by halo-vm.sh: always nat. -->
+<network>
+  <name>anj-qual</name>
+  <forward mode='nat'/>
+  <bridge name='virbr-anjqual' stp='on' delay='0'/>
+  <ip address='10.77.11.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='10.77.11.100' end='10.77.11.199'/>
+      <host mac='52:54:00:a7:11:10' name='anj-qual' ip='10.77.11.10'/>
+    </dhcp>
+  </ip>
+</network>

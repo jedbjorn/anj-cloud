@@ -1,0 +1,10 @@
+# anj-cloud (spec #21 Host Checks 5): VM and forward watchdog.
+[Unit]
+Description=anj-cloud host watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/anj-cloud-host/host-check --watchdog
+TimeoutStartSec=5min
+MemoryMax=256M
+TasksMax=64

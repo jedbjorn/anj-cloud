@@ -1,0 +1,41 @@
+// Application-level settings for the Runner target (spec #31, M0).
+
+// The bundle and window name. The .app is "AnJ Cloud.app".
+PRODUCT_NAME = AnJ Cloud
+
+// Fixed from M0: keychain items, the LaunchAgent label and privacy rows key
+// on it. The Linux id cloud.anj.anj_cloud with the illegal underscore
+// replaced by a hyphen.
+PRODUCT_BUNDLE_IDENTIFIER = cloud.anj.anj-cloud
+
+// The copyright displayed in application information
+PRODUCT_COPYRIGHT = Copyright © 2026 anj-cloud household.
+
+// Apple silicon only (decision #42); macOS 26 is the only qualified version.
+ARCHS = arm64
+EXCLUDED_ARCHS = x86_64
+MACOSX_DEPLOYMENT_TARGET = 26.0
+
+// Ad-hoc signing ("Sign to Run Locally", decision #117 (3)): no team, no
+// provisioning profile. Hardened runtime on, so DYLD_* environment insertion
+// is ignored. No sandbox and no restricted entitlements (decision #42).
+//
+// M0 finding on mac-test: under the hardened runtime, library validation
+// refuses every embedded ad-hoc framework ("different Team IDs", starting
+// with FlutterMacOS.framework), so Release.entitlements carries
+// com.apple.security.cs.disable-library-validation, as the signing spike
+// found for the self-signed identity. Profile (AOT, hardened, for DevTools
+// profiling) needs it too: Runner/Profile.entitlements, plus the
+// get-task-allow Xcode adds so a profiler can attach. Xcode signs Debug
+// (debug-dylib mode) without the runtime flag. Only Release builds are
+// handed out.
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
+ENABLE_HARDENED_RUNTIME = YES
+// No get-task-allow in Release: a debugger cannot attach to a handed-out build.
+CODE_SIGN_INJECT_BASE_ENTITLEMENTS[config=Release] = NO
+
+// Test seams of the Swift runner (spec #31 M3), Debug only, as
+// ANJ_TEST_SEAMS gates the native library's: never in Profile or Release
+// (tool/macos/verify_bundle.sh checks the Release and Profile binaries).
+SWIFT_ACTIVE_COMPILATION_CONDITIONS[config=Debug] = $(inherited) ANJ_TEST_SEAMS
