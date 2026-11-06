@@ -57,54 +57,70 @@ Cloudflare DNS), [the VM host and gateway VM](docs/self-hosting/host-and-vm.md),
 
 ## Install a client
 
-You need a pairing code from your server's admin ([how to make one](docs/pairing.md)). The commands below use
-placeholders: `gateway.example.com` is your server. Each section says how to get the app, how to install it,
-and how to pair. Fuller instructions are in [docs/clients.md](docs/clients.md).
+Download official Linux, macOS and Android builds, their `.sha256` files and `SHA256SUMS` from
+[GitHub Releases](https://github.com/jedbjorn/anj-cloud/releases). You also need a pairing code from your
+server's admin ([how to make one](docs/pairing.md)). Fuller instructions and build alternatives are in
+[docs/clients.md](docs/clients.md).
+
+Official builds carry the maintainer's keys: the Android APK is signed with the maintainer's APK signing key,
+and the desktop apps embed the maintainer's Ed25519 update key (macOS builds are ad-hoc code-signed). They pair with any AnJ Cloud server: type your server
+address in the editable **Server** field when pairing. The default `https://gateway.example.com` is a
+placeholder. In-app updates only accept releases signed with those same keys, served by your paired gateway.
+A household that wants its own update feed builds and signs its own clients
+([keys and releases](docs/self-hosting/keys-and-releases.md)).
+
+For desktop installation, obtain the install manager from this repository's reviewed source (the paths below
+are relative to a source checkout). Replace the example filenames and `<hex>` with your release's filename
+and SHA-256. Check the downloaded file against its checksum and the value on the release page before installing.
 
 ### Linux
 
-- **Get it:** build the release archive from a clean checkout (Docker is used for an isolated build), or take the
-  archive your server's admin built:
-  `python3 apps/client/tool/package_linux.py /absolute/absent/output-dir`. It prints the archive's SHA-256.
-- **Install** (no root; installs under your home directory, adds the `anj-cloud` command and a menu entry):
-  `python3 apps/client/tool/linux_install.py install <archive>.tar.gz --sha256 <hex>`, then
-  `~/.local/bin/anj-cloud run`. It needs a desktop keyring (GNOME Keyring or KWallet); the tray item needs a tray
-  host (KDE has one; GNOME needs an AppIndicator extension).
-- **Pair:** choose **Pair device**, check the server is `https://gateway.example.com`, type the code, pick a local
-  folder. Updates then arrive in the app.
+Download the Linux x86_64 `.tar.gz` and its `.sha256`, then:
+
+```bash
+sha256sum -c '<archive>.tar.gz.sha256'
+python3 apps/client/tool/linux_install.py install '<archive>.tar.gz' --sha256 <hex>
+~/.local/bin/anj-cloud run
+```
+
+No root is needed. It installs under your home directory and adds a menu entry. A desktop keyring
+(GNOME Keyring or KWallet) and tray host are needed (KDE has one; GNOME needs an AppIndicator extension).
+Choose **Pair device**, enter your server address and code, then pick a local folder.
+Building your own archive remains an [alternative](docs/clients.md#building-your-own-clients).
 
 ### macOS (Apple silicon)
 
-- **Get it:** on a Mac with Xcode command line tools and the pinned Flutter SDK, from `apps/client`:
-  `zsh tool/macos/package_release.sh build/release`; it writes a `.zip`, its `.sha256` and a receipt.
-- **Install:** `sh tool/macos/anj-cloud-macos-install.sh install <zip> --sha256 <hex>` (no sudo; installs to
-  `~/Applications`, ad-hoc signed; `autostart on` enables start at login).
-- **Pair:** open the app, **Pair device**, server `https://gateway.example.com`, code. Later updates arrive in the app.
+Download the macOS arm64 `.zip` and its `.sha256`, then:
+
+```bash
+shasum -a 256 -c '<archive>.zip.sha256'
+sh apps/client/tool/macos/anj-cloud-macos-install.sh install '<archive>.zip' --sha256 <hex>
+```
+
+No sudo is needed; it installs to `~/Applications`. The app is ad-hoc signed, without Apple notarization;
+its in-app release verification trusts the maintainer's Ed25519 key. Open the app, choose **Pair device**,
+and enter your server address and code. Building your own zip remains an
+[alternative](docs/clients.md#building-your-own-clients).
 
 ### Windows (x86_64)
 
-- **Status:** an installer and update manager exist; **in-app updates are not available yet**, so you update by
-  running the manager again with a new archive. Treat it as early.
-- **Get it:** on Windows with Visual Studio Build Tools 2022 (C++ workload and ATL) and the pinned Flutter SDK,
-  build with `flutter build windows --release`, then package with `apps/client/tool/windows/package.ps1`; it writes
-  a `.zip` and prints its SHA-256.
-- **Install:** run the packaged `anj-cloud-manager.exe install <zip> --sha256 <hex>`, then `run`;
-  `autostart enable` starts it at login.
-- **Pair:** as on the other desktops.
+There is **no official Windows build yet**. An installer and update manager exist; in-app updates are not
+available yet. See [building and installing on Windows](docs/clients.md#windows).
 
 ### Android (arm64)
 
-- **Get it:** the first install comes from the signed APK on this repository's
-  [GitHub Releases](https://github.com/jedbjorn/anj-cloud/releases) page, if its publisher attached one, or from an
-  APK you build for your own household (`apps/client/tool/android/release_android.py build`). The release page
-  shows the APK's **SHA-256**: compare it with `sha256sum <apk>` before installing.
-- **Install:** open the APK on the phone (allow installs from that source). Android only installs later updates
-  signed with the same certificate; the app offers them from your server.
-- **Pair:** open the app, **Pair device**, enter the server and the code (or **Scan QR code**), choose a folder.
+Download the release `.apk` and its `.sha256`, then check it on a computer:
 
-Use the APK from a release only if you trust its publisher: a release built by someone else is signed by their
-key, so it can only update from their server. To run your own server, build and sign your own
-([keys and releases](docs/self-hosting/keys-and-releases.md)).
+```bash
+sha256sum -c 'anj-cloud-<version>.apk.sha256'
+# If using Android platform-tools with a connected phone:
+adb install 'anj-cloud-<version>.apk'
+```
+
+On macOS use `shasum -a 256 -c` instead. Alternatively, transfer the checked APK to your phone and open it
+(allow installs from that source). Choose **Pair device**, enter your server address and code (or scan its
+QR code), and choose a folder. Android requires the same signing certificate for later updates.
+Building and signing your own APK remains an [alternative](docs/clients.md#building-your-own-clients).
 
 ## Documentation
 

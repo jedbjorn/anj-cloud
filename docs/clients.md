@@ -1,70 +1,101 @@
 # Installing the clients
 
-All clients are built from `apps/client/`. Release archives are produced by the packaging tools below and are
-installed with a checksum you pass explicitly. Builds carry your gateway's address and, for desktop updates,
-your release key, both read from your deployment profile at build time (see [self-hosting/README.md](self-hosting/README.md)).
+Official Linux x86_64, macOS arm64 and Android arm64 clients are available from
+[GitHub Releases](https://github.com/jedbjorn/anj-cloud/releases). Download your artifact and its `.sha256`
+file; compare the digest with the release page, then run the checksum command below. `SHA256SUMS` lists all
+artifacts in the release. Replace the example filenames and `<hex>` with the downloaded filename and digest.
 
-| Platform | State | Install |
+Official builds carry the maintainer's keys: the Android APK is signed with the maintainer's APK signing key,
+and the desktop apps embed the maintainer's Ed25519 update key (macOS builds are ad-hoc code-signed). They pair with any AnJ Cloud server: type your server
+address in the editable **Server** field at pairing. `https://gateway.example.com` is only the default text.
+In-app updates are downloaded from your paired gateway and only accept releases signed with those same
+keys (Ed25519 on desktop; the Android signing certificate on Android). A household that wants its own update
+feed builds and signs its own clients; see [keys and releases](self-hosting/keys-and-releases.md).
+
+Desktop commands below use the install managers from this repository's reviewed source, relative to the
+repository root. Obtain that source before installing; an archive checksum alone does not authenticate an
+installer script.
+
+| Platform | Official download | Install |
 |---|---|---|
-| Linux x86_64 | Usable | `linux_install.py` from a packaged archive |
-| macOS (Apple silicon) | Usable | `anj-cloud-macos-install.sh` from a packaged zip |
-| Android (arm64) | Usable | Signed APK |
-| Windows (x86_64) | Early | `anj-cloud-manager.exe` from a packaged zip; no in-app updates yet |
+| Linux x86_64 | `.tar.gz` | `linux_install.py` |
+| macOS (Apple silicon) | `.zip` | `anj-cloud-macos-install.sh` |
+| Android (arm64) | Signed `.apk` | Open APK on phone, or `adb install` |
+| Windows (x86_64) | None yet | Build your own; no in-app updates yet |
 
 ## Linux
 
-Needs a desktop session with a secret-service keyring (GNOME Keyring or KWallet) and, for the tray item, a
-tray host (KDE Plasma has one; GNOME needs an AppIndicator extension).
+Download the Linux archive and checksum from [Releases](https://github.com/jedbjorn/anj-cloud/releases).
+Needs a desktop session with a secret-service keyring (GNOME Keyring or KWallet) and a tray host
+(KDE Plasma has one; GNOME needs an AppIndicator extension).
 
 ```bash
-# Build a release archive from a clean checkout of a commit (Docker is used for an isolated build):
-python3 apps/client/tool/package_linux.py /absolute/absent/output-dir
-
-# Install it (the digest is in the printed output and the .sha256 file next to the archive):
-python3 apps/client/tool/linux_install.py install /path/to/anj-cloud-linux-x86_64-<commit>.tar.gz --sha256 <hex>
+sha256sum -c '<archive>.tar.gz.sha256'
+python3 apps/client/tool/linux_install.py install '<archive>.tar.gz' --sha256 <hex>
 ~/.local/bin/anj-cloud status
 ~/.local/bin/anj-cloud run
 ```
 
-The app installs under your home directory (no root), puts a menu entry and the `anj-cloud` command in place,
-starts hidden in the tray, and keeps syncing when the window is closed. Start at login is a toggle in the app
-(`~/.config/autostart/anj-cloud.desktop`). `apps/client/LINUX_INSTALL.md` is the full reference: paths, tray
-behavior, in-app and explicit updates, switching profiles, and moving the synced folder.
+The app installs under your home directory (no root), adds a menu entry and the `anj-cloud` command,
+starts hidden in the tray, and keeps syncing when the window is closed. Start at login is a toggle in the app.
+`apps/client/LINUX_INSTALL.md` is the full reference for installation, updates and profiles.
 
 ## macOS
 
-Needs Apple silicon and a Mac with Xcode command line tools and the pinned Flutter SDK for building.
+Download the Apple silicon zip and checksum from [Releases](https://github.com/jedbjorn/anj-cloud/releases).
+Installing needs only base macOS tools:
 
 ```bash
-# On the Mac, from the client directory, build and package a release:
-zsh tool/macos/package_release.sh build/release
-# Install or update with the manager (POSIX sh, no sudo, base macOS tools only):
-sh tool/macos/anj-cloud-macos-install.sh install build/release/anj-cloud-macos-arm64-<version>.zip --sha256 <hex>
+shasum -a 256 -c '<archive>.zip.sha256'
+sh apps/client/tool/macos/anj-cloud-macos-install.sh install '<archive>.zip' --sha256 <hex>
 ```
 
-The app is ad-hoc signed. The manager installs into `~/Applications`, can enable start at login, and the app
-updates itself from your gateway afterwards (after you install a first release by hand). See
-`apps/client/ARCHITECTURE.md` (macOS) for what the manager guards: journaled swaps, a launch check and
-automatic rollback.
+The manager installs into `~/Applications` without sudo and can enable start at login. The app is ad-hoc
+signed, without Apple notarization; its in-app release verification trusts the maintainer's Ed25519 key.
+See `apps/client/ARCHITECTURE.md` (macOS) for journaled swaps, launch checks and rollback.
 
 ![The macOS client before pairing: choose a root folder, then pair this device](images/macos-pairing.png)
 
 ## Android
 
+Download the APK and checksum from [Releases](https://github.com/jedbjorn/anj-cloud/releases).
+Check on a computer, then install with Android platform-tools if available:
+
 ```bash
-python3 apps/client/tool/android/release_android.py keygen    # once: your signing key (keep an offline copy)
-python3 apps/client/tool/android/release_android.py build /absolute/absent/output-dir
+sha256sum -c 'anj-cloud-<version>.apk.sha256'
+adb install 'anj-cloud-<version>.apk'
 ```
 
-Install the signed APK on the phone (allow installs from the source you use). From then on the app offers
-updates it downloads from your gateway; Android installs them only if they carry the same signing certificate
-(see [updates-and-signing.md](updates-and-signing.md)). The synced folder is a folder you choose in shared
-storage, visible to file managers and other apps you authorize.
+On macOS use `shasum -a 256 -c` instead. Alternatively, transfer the checked APK to your phone and open it,
+allowing installs from that source. Android accepts updates only with the same signing certificate.
+The synced folder is chosen in shared storage, visible to file managers and other apps you authorize.
+
+## Building your own clients
+
+Building is an alternative to the official downloads. Set up your deployment profile with your default
+server address and release keys ([self-hosting guide](self-hosting/README.md)). The address is editable at
+pairing; the embedded release key determines which in-app updates the client accepts.
+
+```bash
+# Linux: clean committed source, pinned Flutter SDK and Docker:
+python3 apps/client/tool/package_linux.py /absolute/absent/output-dir
+
+# Android: pinned Flutter/Android toolchains; create your signing key once and back it up offline:
+python3 apps/client/tool/android/release_android.py keygen
+python3 apps/client/tool/android/release_android.py build /absolute/absent/output-dir
+
+# macOS: from the Linux build host, over SSH to a configured macOS build host with Xcode and pinned Flutter:
+bash apps/client/tool/macos/release_macos.sh HEAD /absolute/absent/output-dir
+```
+
+The packaging tools write checksums alongside the artifacts. Install with the same platform commands above.
+Keep your signing keys safe; publish your signed updates through your gateway as described in
+[keys and releases](self-hosting/keys-and-releases.md).
 
 ## Windows
 
-An installer and update manager exist; **in-app updates are not available yet**, so you update by running the
-manager with a new archive. Treat the Windows client as early.
+There is **no official Windows build yet**. An installer and update manager exist; in-app updates are not
+available yet, so you update by running the manager with a new archive. Treat the Windows client as early.
 
 Building needs Windows x86_64 with Visual Studio Build Tools 2022 (C++ workload and C++ ATL) and the pinned
 Flutter SDK (`apps/client/tool/windows/install.ps1` installs them on a build seat).
@@ -84,7 +115,7 @@ notification-area icon. Pairing is as on the other desktops.
 
 ## First launch on any platform
 
-1. Open the app and choose **Pair device** ([pairing.md](pairing.md)).
+1. Open the app, choose **Pair device**, and enter your server address and pairing code ([pairing.md](pairing.md)).
 2. Pick a local folder as your root.
 3. Choose which folders stay on the device on the first-sync screen, then **Start sync**.
 
