@@ -264,7 +264,11 @@ class Pm2Permissions(unittest.TestCase):
                        # Simulate root npm replacing its private dependency tree in this unprivileged test.
                        "dep=p('node_modules/dependency')\n"
                        "if dep.exists(): dep.chmod(0o755)\n"
-                       "shutil.rmtree('node_modules',ignore_errors=True)\n"
+                       # npm ci removes installed packages but retains node_modules and its mode.
+                       "p('node_modules').mkdir(exist_ok=True)\n"
+                       "for child in p('node_modules').iterdir():\n"
+                       " if child.is_dir(): shutil.rmtree(child)\n"
+                       " else: child.unlink()\n"
                        "p('node_modules/pm2/bin').mkdir(parents=True)\n"
                        "p('node_modules/dependency').mkdir()\n"
                        "p('node_modules/dependency/index.js').write_text('module.exports = {};')\n"
@@ -295,6 +299,24 @@ class Pm2Permissions(unittest.TestCase):
             os.umask(previous)
         self.assertEqual((self.directory / "node_modules").stat().st_mode & 0o777, 0o755)
         self.assertEqual((self.directory / "node_modules/dependency/index.js").stat().st_mode & 0o777, 0o644)
+        self.assertFalse((self.directory / "daemon-started").exists())
+
+    def test_reinstall_repairs_existing_private_node_modules_directory(self):
+        self.step.apply()
+        modules = self.directory / "node_modules"
+        modules.chmod(0o700)
+        previous = os.umask(0o077)
+        try:
+            self.step.apply()
+            private_file = self.temp / "still-private-after-repair"
+            private_file.write_text("private fixture")
+        finally:
+            os.umask(previous)
+        self.assertEqual(modules.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((modules / "dependency/index.js").stat().st_mode & 0o777, 0o644)
+        self.assertEqual(private_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.directory / "install-count").read_text(), "2")
+        self.assertTrue(self.step.verify()[0])
         self.assertFalse((self.directory / "daemon-started").exists())
 
     @unittest.skipIf(os.geteuid() == 0, "permission denial fixture requires an unprivileged test runner")
