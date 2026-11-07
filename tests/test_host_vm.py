@@ -404,42 +404,151 @@ class HaloVmTests(unittest.TestCase):
         statuses = {s["step"]: s["status"] for s in summary["steps"]}
         self.assertTrue(all(v == "pass" for v in statuses.values()), (statuses, self.h.output))
 
+    def assertProdSshEffective(self, config, key, known_hosts):
+        result = subprocess.run(["ssh", "-G", "-F", str(config), "anj-prod"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = {}
+        for line in result.stdout.splitlines():
+            name, value = line.split(None, 1)
+            values.setdefault(name, []).append(value)
+        expected = {"hostname": "10.77.10.10", "user": "anj", "identityfile": str(key)[:-4],
+                    "userknownhostsfile": str(known_hosts), "identitiesonly": "yes",
+                    "stricthostkeychecking": "accept-new", "connecttimeout": "5", "batchmode": "yes"}
+        for name, value in expected.items():
+            self.assertEqual(values.get(name), [value], name)
+
     def test_apply_writes_prod_ssh_alias_and_preserves_other_blocks(self):
         config = self.h.root / HOME.lstrip("/") / ".local/share/anj-cloud/prod-vm/ssh_config"
         config.parent.mkdir(parents=True)
-        unmarked = ("Host anj-prod\n  HostName 192.0.2.99\n  IdentityFile /stale/key\n"
-                    "  # retain this operator comment\n\n")
-        unrelated = ("Host elsewhere\n  HostName 192.0.2.1\nMatch host elsewhere\n  User preserved\n"
-                     "Host anj-prod.example\n  HostName 192.0.2.2\n")
+        unmarked = ("Host anj-prod # legacy production\n  HostName 192.0.2.99\n  User stale\n"
+                    "  IdentityFile /stale/key\n  # retain this operator comment\n\n")
+        wildcard = "Host *\n  HostName 192.0.2.200\n  User wildcard\n"
+        unrelated = "Host elsewhere\n  HostName 192.0.2.1\nHost anj-prod.example\n  HostName 192.0.2.2\n"
         marked = ("# >>> anj-prod (halo-vm.sh --apply) >>>\nHost anj-prod\n  HostName 192.0.2.100\n"
                   "# <<< anj-prod <<<\n")
         qual = ("# >>> anj-qual (halo-vm.sh --qual) >>>\nHost anj-qual\n  HostName 10.77.11.10\n"
                 "# <<< anj-qual <<<\n")
-        config.write_text(unmarked + unrelated + qual + marked)
+        config.write_text(unmarked + wildcard + unrelated + qual + marked)
+        config.chmod(0o640)
         key = self.h.tmp / "configured.pub"
         key.write_text(KEY + "\n")
         result = self.h.run("--apply", "--key", str(key), "--net-mode", "open")
         self.assertEqual(result.returncode, 0, self.h.output)
+        calls = self.h.calls()
+        root_work = next(Path(arg).parent for call in calls for arg in call if arg.endswith("/net.xml"))
+        artifacts = [Path(arg) for call in calls if call[0] == "runuser" for arg in call
+                     if arg.endswith(("/candidate", "/effective", "/install"))]
+        self.assertTrue(artifacts)
+        for artifact in artifacts:
+            self.assertTrue(artifact.is_relative_to(config.parent), artifact)
+            self.assertFalse(artifact.is_relative_to(root_work), artifact)
+            self.assertTrue(artifact.parent.name.startswith(".anj-prod-ssh."), artifact)
+        self.assertFalse([arg for call in calls for arg in call if "prod_ssh_" in arg])
+        self.assertFalse(list(config.parent.glob(".anj-prod-ssh.*")))
         text = config.read_text()
+        self.assertIn(wildcard, text)
         self.assertIn(unrelated, text)
         self.assertIn(qual, text)
+        self.assertIn("# legacy production", text)
         self.assertIn("# retain this operator comment", text)
         self.assertNotIn("192.0.2.99", text)
         self.assertNotIn("192.0.2.100", text)
         self.assertNotIn("/stale/key", text)
         self.assertEqual(text.count("Host anj-prod\n"), 1)
-        self.assertIn("HostName 10.77.10.10", text)
-        self.assertIn(f"IdentityFile {str(key)[:-4]}\n", text)
+        self.assertLess(text.index("Host anj-prod\n"), text.index("Host *"))
+        self.assertLess(text.index("Host anj-prod\n"), text.index("Host elsewhere"))
+        self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(config.stat().st_uid, os.getuid())
         known_hosts = self.h.root / HOME.lstrip("/") / ".ssh/known_hosts.anj-prod"
-        self.assertIn(f"UserKnownHostsFile {known_hosts}\n", text)
-        self.assertIn("StrictHostKeyChecking accept-new\n", text)
-        self.assertIn("BatchMode yes\n", text)
+        self.assertProdSshEffective(config, key, known_hosts)
         host_config = json.loads((self.h.root / "etc/anj-cloud-host/anj-cloud-host.json").read_text())
         self.assertEqual(host_config["net_mode"], "open")
         self.assertEqual(self.h.run("--apply", "--key", str(key), "--net-mode", "open").returncode, 0, self.h.output)
         self.assertEqual(config.read_text(), text)
         self.assertEqual(config.read_text().count("Host anj-prod\n"), 1)
+        self.assertProdSshEffective(config, key, known_hosts)
         self.assertIn("ssh alias unchanged", self.h.output)
+        self.assertFalse(list(config.parent.glob(".anj-prod-ssh.*")))
+
+    def assertProdSshRefused(self, config, original, message):
+        config.write_bytes(original)
+        result = self.h.run("--apply")
+        self.assertEqual(result.returncode, 1, self.h.output)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertIn(message, self.h.output)
+        self.assertFalse(list(config.parent.glob("ssh_config.tmp.*")))
+        self.assertFalse(list(config.parent.glob(".anj-prod-ssh.*")))
+
+    def test_prod_ssh_alias_refuses_every_match_without_execution(self):
+        config = self.h.root / HOME.lstrip("/") / ".local/share/anj-cloud/prod-vm/ssh_config"
+        config.parent.mkdir(parents=True)
+        canary = self.h.tmp / "match-exec-canary"
+        include = self.h.tmp / "include-canary"
+        include.write_text(f'Match exec "touch {canary}"\n')
+        ordinary = "Host elsewhere\n  HostName 192.0.2.1\n"
+        managed = ("# >>> anj-prod (halo-vm.sh --apply) >>>\nHost anj-prod\n  HostName 192.0.2.100\n"
+                   "# <<< anj-prod <<<\n")
+        cases = (
+            (f'Match exec "touch {canary}" host anj-prod\n  HostName 192.0.2.99\n', "Match blocks"),
+            (f'Match host anj-prod exec "touch {canary}"\n  HostName 192.0.2.99\n', "Match blocks"),
+            (ordinary + f'Match=host anj-prod exec "touch {canary}"\n', "Match blocks"),
+            (managed + f'Match=host anj-prod exec "touch {canary}"\n', "Match blocks"),
+            (ordinary + f'mAtCh \t=\t host anj-prod exec "touch {canary}"\n', "Match blocks"),
+            (ordinary + f'Include={include}\n', "Include"),
+            (ordinary + f'InClUdE \t=\t {include}\n', "Include"),
+        )
+        for original, message in cases:
+            with self.subTest(original=original):
+                config.write_bytes(original.encode())
+                self.h.reset_calls()
+                result = self.h.run("--apply")
+                self.assertEqual(result.returncode, 1, self.h.output)
+                self.assertEqual(config.read_bytes(), original.encode())
+                self.assertIn(message, self.h.output)
+                self.assertFalse(canary.exists())
+                self.assertFalse([call for call in self.h.calls() if call[0] == "ssh" and "-G" in call])
+                self.assertFalse(list(config.parent.glob(".anj-prod-ssh.*")))
+
+    def test_prod_ssh_alias_refuses_ambiguous_or_uncertain_config(self):
+        config = self.h.root / HOME.lstrip("/") / ".local/share/anj-cloud/prod-vm/ssh_config"
+        config.parent.mkdir(parents=True)
+        cases = (
+            ("mixed alias", b"Host anj-prod anj-other\n  HostName 192.0.2.99\n", "mixed-alias"),
+            ("include", b"Include other.conf\nHost anj-prod\n  HostName 192.0.2.99\n", "Include"),
+            ("global", b"HostName 192.0.2.99\nHost anj-prod\n  User stale\n", "global directive"),
+        )
+        for name, original, message in cases:
+            with self.subTest(name):
+                self.assertProdSshRefused(config, original, message)
+
+    def test_prod_ssh_alias_malformed_markers_leave_original_unchanged(self):
+        config = self.h.root / HOME.lstrip("/") / ".local/share/anj-cloud/prod-vm/ssh_config"
+        config.parent.mkdir(parents=True)
+        cases = (
+            ("unterminated", b"# >>> anj-prod (halo-vm.sh --apply) >>>\nHost anj-prod\n"
+                             b"Host elsewhere\n  HostName 192.0.2.1\n"),
+            ("nested", b"# >>> anj-prod (halo-vm.sh --apply) >>>\n# >>> anj-prod (halo-vm.sh --apply) >>>\n"
+                       b"# <<< anj-prod <<<\nHost elsewhere\n"),
+            ("stray close", b"# <<< anj-prod <<<\nHost elsewhere\n  HostName 192.0.2.1"),
+        )
+        for name, original in cases:
+            with self.subTest(name):
+                self.assertProdSshRefused(config, original, "marker")
+
+    def test_prod_ssh_alias_copy_failure_leaves_original_unchanged(self):
+        config = self.h.root / HOME.lstrip("/") / ".local/share/anj-cloud/prod-vm/ssh_config"
+        config.parent.mkdir(parents=True)
+        original = b"Host elsewhere\n  HostName 192.0.2.1\n"
+        config.write_bytes(original)
+        config.chmod(0o640)
+        self.fail_on("runuser", "cp")
+        result = self.h.run("--apply")
+        self.assertEqual(result.returncode, 1, self.h.output)
+        self.assertEqual(config.read_bytes(), original)
+        self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+        self.assertIn("original left unchanged", self.h.output)
+        self.assertFalse(list(config.parent.glob("ssh_config.tmp.*")))
+        self.assertFalse(list(config.parent.glob(".anj-prod-ssh.*")))
 
     def fail_on(self, command, word):
         self.h.load_state()

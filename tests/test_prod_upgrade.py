@@ -837,7 +837,7 @@ class StageUpgradeTests(unittest.TestCase):
                                   order.append(("upgrade", target, commit, no_backup)) or 7), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(7, stage.main(["anj-prod", "--commit", "bbbb", "--upgrade"]))
-        self.assertEqual([("check", "anj-prod", "b" * 40), ("stage", "anj-prod", "bbbb"),
+        self.assertEqual([("check", "anj-prod", "b" * 40), ("stage", "anj-prod", "b" * 40),
                           ("upgrade", "anj-prod", "b" * 40, False)], order)
         with mock.patch.object(stage, "resolve", return_value="b" * 40), \
                 mock.patch.object(stage, "check_upgrade", side_effect=RuntimeError("x is not merged")), \
@@ -847,6 +847,29 @@ class StageUpgradeTests(unittest.TestCase):
         self.assertIn("stage: x is not merged", err.getvalue())
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             stage.main(["anj-prod", "--upgrade", "--with-secrets"])
+
+    def test_main_stages_the_exact_checked_commit_if_head_moves(self):
+        order = []
+        resolutions = iter(("a" * 40, "b" * 40))
+
+        def resolve(commit, _checkout):
+            order.append(("resolve", commit))
+            return next(resolutions)
+
+        def staged(_runner, _target, commit, checkout):
+            order.append(("stage", commit))
+            return {"commit": resolve(commit, checkout) if commit == "HEAD" else commit}
+
+        with mock.patch.object(stage, "resolve", side_effect=resolve), \
+                mock.patch.object(stage, "check_upgrade",
+                                  side_effect=lambda _target, commit, _checkout: order.append(("check", commit))), \
+                mock.patch.object(stage, "stage", side_effect=staged), \
+                mock.patch.object(stage, "run_upgrade", side_effect=lambda _target, commit, no_backup=False:
+                                  order.append(("upgrade", commit)) or 0), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(stage.main(["anj-prod", "--upgrade"]), 0)
+        self.assertEqual(order, [("resolve", "HEAD"), ("check", "a" * 40), ("stage", "a" * 40),
+                                 ("upgrade", "a" * 40)])
 
 
 class LocalUpgradeTests(unittest.TestCase):
