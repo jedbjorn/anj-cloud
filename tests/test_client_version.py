@@ -53,3 +53,46 @@ class ClientVersionTests(unittest.TestCase):
             release.check_source({'source_head': 'a'*40, 'version_code': 167}, fetch=False, runner=runner)
             with self.assertRaises(release.Refused):
                 release.check_source({'source_head': 'a'*40, 'version_code': 6}, fetch=False, runner=runner)
+
+
+class GitHubVersionTests(unittest.TestCase):
+    def check(self, code, records, *, status=0):
+        def runner(argv, **kwargs):
+            self.assertIn('--paginate', argv)
+            self.assertIn('--slurp', argv)
+            return subprocess.CompletedProcess(argv, status, json.dumps(records), '')
+        return client_version.check_github_version('jedbjorn/anj-cloud', code, runner)
+
+    def test_existing_unified166_allows167(self):
+        record = {'tag_name': 'v2026.11.06.166', 'assets': [
+            {'name': 'anj-cloud-2026.11.06.166.apk'},
+            {'name': 'anj-cloud-macos-arm64-0.1.0+166-2371b402931f.zip'},
+            {'name': 'anj-cloud-linux-x86_64-2371b402931f.tar.gz'}]}
+        self.assertEqual(166, self.check(167, [[record]]))
+        for code in (6, 165, 166):
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, 'not above GitHub'):
+                self.check(code, [[record]])
+
+    def test_reuse_on_another_date_and_older_codes_refused_across_pages(self):
+        pages = [[{'tag_name': 'android-2026.11.07.167', 'assets': []}],
+                 [{'tag_name': 'android-168', 'assets': []}]]
+        for code in (166, 167, 168):
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, 'not above GitHub'):
+                self.check(code, pages)
+        self.assertEqual(168, self.check(169, pages))
+
+    def test_unknown_client_assets_or_inconsistent_metadata_refused(self):
+        for record in (
+            {'tag_name': 'latest', 'assets': [{'name': 'anj-cloud-unknown.apk'}]},
+            {'tag_name': 'v2026.11.07.167', 'assets': [{'name': 'anj-cloud-2026.11.07.168.apk'}]},
+            {'tag_name': 'android-bogus', 'assets': []},
+        ):
+            with self.subTest(record=record), self.assertRaisesRegex(ValueError, 'Cannot determine'):
+                self.check(169, [[record]])
+
+    def test_network_and_parse_failures_never_publish(self):
+        with self.assertRaisesRegex(ValueError, 'Cannot verify'):
+            self.check(167, [], status=1)
+        for records in ({}, [None], [[{}]], [[{'tag_name': 'x', 'assets': None}]]):
+            with self.subTest(records=records), self.assertRaisesRegex(ValueError, 'Cannot determine'):
+                self.check(167, records)

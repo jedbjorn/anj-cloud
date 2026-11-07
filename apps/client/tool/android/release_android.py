@@ -19,7 +19,7 @@
         .sha256 and build-receipt.json. The signer must be the pinned certificate.
 
     release_android.py github-release --apk APK [--create | --source-ref REF]
-        The first-install path (#131): a GitHub release tagged android-<version> on the APK's
+        The first-install path (#131): a GitHub release tagged android-<version_code> on the APK's
         commit, with the APK and its .sha256 as assets. The APK passes the publish checks first
         (pinned signer, commit on origin/main, versionCode). Without --create it only prints
         what it would run; --create needs the operator's go-ahead.
@@ -185,7 +185,7 @@ def github_release(apk, *, create=False, runner=subprocess.run, fetch=True, sour
     release.check_android(facts, release.android_pin())
     release.check_source(facts, source_ref or release.SOURCE_REF, fetch=fetch)
     version, head = facts["version"], facts["source_head"]
-    tag, name = f"android-{version}", f"anj-cloud-{version}.apk"
+    tag, name = f"android-{facts['version_code']}", f"anj-cloud-{version}.apk"
     notes = (f"AnJ Cloud for Android {version} (versionCode {facts['version_code']}), built from {head}.\n\n"
              f"First install only (decision #131): download {name} on the phone, check its SHA-256 against "
              f"{name}.sha256, then install it. Later updates come from the household server in the app.\n\n"
@@ -203,9 +203,10 @@ def github_release(apk, *, create=False, runner=subprocess.run, fetch=True, sour
                             "--target", head, "--title", f"AnJ Cloud for Android {version}", "--notes", "…"]}
         if not create:
             return {**plan, "state": "dry-run: no GitHub release created"}
-        exists = runner(["gh", "release", "view", tag, "--repo", REPOSITORY], capture_output=True)
-        if exists.returncode == 0:
-            raise Refused(f"GitHub release {tag} already exists; releases are never replaced")
+        try:
+            client_version.check_github_version(REPOSITORY, facts["version_code"], runner)
+        except ValueError as error:
+            raise Refused(str(error)) from error
         done = runner(argv, capture_output=True, text=True)
         if done.returncode:
             raise Refused("gh release create failed: " + (done.stderr or "")[-300:])
