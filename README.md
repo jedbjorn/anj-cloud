@@ -36,7 +36,7 @@ AnJ Cloud is young software built for one household first.
 
 | Platform | State |
 |---|---|
-| Gateway (Debian 13 amd64 VM or dedicated machine) | Guided installer. **[Server quick start](docs/self-hosting/quickstart.md)** (clean-path validation pending) |
+| Gateway (Debian 13 amd64 VM or dedicated machine) | Guided installer tested in a Debian VM lab. **[Server quick start](docs/self-hosting/quickstart.md)** explains the validation limits. |
 | Linux client (x86_64) | Usable: installer, tray, start at login, in-app update |
 | Android client (arm64) | Usable: signed APK, in-app update |
 | macOS client (Apple silicon) | Usable: installer, menu-bar item, in-app update |
@@ -57,8 +57,9 @@ exactly one blank data disk, a public DNS hostname, and a router that can forwar
 explains its detected defaults and asks for confirmation before formatting the data disk. No Subfloor,
 Flutter, deployment profile, or client build/signing keys are needed.
 
-The exact generic clean-install path has not yet completed end-to-end validation. Follow its stop conditions
-rather than treating an unfinished run as successful.
+Unattended Debian VM installs, synthetic-device access, and local upgrades have passed lab checks. The
+complete interactive public walkthrough and real-network setup remain unverified; the quick start states
+the exact tested commits and limits. Follow its stop conditions.
 
 Read [requirements](docs/self-hosting/requirements.md),
 [DNS, TLS and forwarding](docs/self-hosting/dns-tls-forwarding.md), and

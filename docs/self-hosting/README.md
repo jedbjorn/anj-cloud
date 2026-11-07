@@ -8,8 +8,9 @@ separate data disk.
 the machine, create DNS and forwarding, run the installer, check health, and pair the first admin device.
 It needs neither Subfloor nor client build/signing tools.
 
-> The exact generic-Debian clean-install path has not yet completed end-to-end validation. Treat its
-> documented stop conditions as part of the procedure; do not infer success from an unfinished run.
+> Unattended Debian VM installs, synthetic-device access, and local upgrades have passed lab checks.
+> The complete interactive public walkthrough and real-network setup remain unverified. Read the
+> quick start's exact validation scope and follow its stop conditions.
 
 ## Read alongside the quick start
 
@@ -39,7 +40,8 @@ disk is not a backup, and local ntfy alerts are not independent external monitor
 ## Operate the server
 
 - [Upgrades](upgrades.md): the generic `local_upgrade.py` route first, with `stage.py anj-prod` kept for the
-  advanced libvirt route. A live generic upgrade has not passed yet.
+  advanced libvirt route. Local upgrades and explicit rollback passed in the lab; automatic failure
+  fallback and the live advanced staging route were not exercised.
 - [Troubleshooting](troubleshooting.md): generic-first status, health, pairing, DDNS, upgrade, and emergency
   checks, with host-only commands labelled separately.
 - [Backups and restore](backups.md): the existing encrypted virtiofs workflow, explicitly scoped to the

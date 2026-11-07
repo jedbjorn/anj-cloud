@@ -4,9 +4,17 @@ This is the canonical installation path for a new self-hosted server. It uses on
 amd64** machine, the guided installer from the public checkout, and an official AnJ Cloud client. It does
 not require Subfloor, Flutter, a client build, a deployment profile, or client signing keys.
 
-> **Validation status:** this exact clean-install path has not yet completed end-to-end validation. The
-> commands below are the intended public interface and may be adjusted after that validation. Stop on an
-> unexpected disk, prompt, or error rather than improvising a workaround.
+> **Validation status (2026-11-07):** fresh Debian 13 amd64 lab installs passed at `006a642e` with umask
+> `022` and `49702e44` with umask `077`, including status, doctor, and production checks. Final installer
+> code `9e299cfa` passed a full permission-repair rerun on an existing installation and a real local
+> upgrade; a fresh install was not repeated at that commit. Lab runs also verified synthetic first-device
+> pairing through HAProxy on TCP 443 and authenticated mTLS DAV writes and reads.
+>
+> Testing used unattended answers, cloud-init account/SSH provisioning, a local Git remote fixture, DDNS
+> off, no ntfy receiver, and no backup share. The complete interactive walkthrough, deployment from GitHub
+> main, real Cloudflare/DDNS, router forwarding, outside-LAN official-client pairing, hairpin/split DNS,
+> phone-alert delivery, and backup/restore remain unverified. Stop on an unexpected disk, prompt, or error
+> rather than improvising a workaround.
 
 When you finish, you will have a healthy Nextcloud-backed AnJ Cloud server, a public hostname, one router
 forward, and a first device paired to the first household admin. **This path does not configure backups.**
@@ -258,7 +266,7 @@ conditions.
   [backup workflow](backups.md#scope-the-existing-workflow-is-advanced-only) is advanced-only, not a generic
   same-disk workaround.
 - **Server upgrades:** the generic route is `python3 deploy/vm/local_upgrade.py` from a fast-forwarded,
-  clean public clone. See [Upgrades](upgrades.md); a live generic upgrade has not passed yet, and the
+  clean public clone. See [Upgrades](upgrades.md) for the successful lab checks and their limits. The
   quick-start path has no pre-upgrade restore point.
 - **Ongoing checks:** use `anj-cloud-setup status` and `sudo anj-cloud-setup doctor`. If something looks
   wrong after go-live, remove or disable the router forward first, then investigate. See

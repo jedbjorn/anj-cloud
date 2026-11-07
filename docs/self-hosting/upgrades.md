@@ -4,9 +4,18 @@ A server upgrade installs the source from an exact reviewed commit, builds and c
 the affected services, and switches `release/current` only after the new stack is healthy. The previous
 release's source remains available for a release rollback.
 
-> **Validation status:** the generic `local_upgrade.py` route has been source-reviewed, but a live generic
-> upgrade has not passed yet. Keep the pre-upgrade checks and stop conditions in this page; do not infer a
-> successful upgrade from a wrapper that is still running or has failed its checks.
+> **Validation status (2026-11-07):** the real `local_upgrade.py` path passed Debian VM lab upgrades from
+> `006a642e` to `49702e44` and from `49702e44` to `9e299cfa`. Each switch retained the previous source,
+> passed health checks, and preserved the synthetic device's certificate and original file while allowing
+> new mTLS DAV writes and reads. At `49702e44`, a same-release no-op and dirty-checkout refusal left the
+> release, process IDs, and restart counts unchanged. Explicit rollback to `006a642e` and forward upgrade
+> to `49702e44` also passed health and device-access checks.
+>
+> These runs used a local Git remote fixture and no backups. They did not exercise deployment from
+> GitHub main, automatic fallback after an injected switch failure, pre-upgrade backups, restore, or
+> rollback across data migrations. The live advanced `stage.py` route was not exercised. See the
+> [quick start](quickstart.md) for the remaining real-network and client limits. Keep the checks below;
+> a running wrapper or an unsuccessful check does not establish a successful upgrade.
 
 ## Generic VM or dedicated machine
 
