@@ -325,9 +325,11 @@ def main(argv=None):
     if args.no_backup and not args.upgrade:
         parser.error("--no-backup goes with --upgrade")
     try:
+        commit = args.commit
         if args.upgrade:
-            check_upgrade(args.target, resolve(args.commit, Path(args.checkout)), Path(args.checkout))
-        result = stage(Runner(), args.target, args.commit, Path(args.checkout))
+            commit = resolve(commit, Path(args.checkout))
+            check_upgrade(args.target, commit, Path(args.checkout))
+        result = stage(Runner(), args.target, commit, Path(args.checkout))
     except RuntimeError as error:
         print(f"stage: {error}", file=sys.stderr)
         return 1

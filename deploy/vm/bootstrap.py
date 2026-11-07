@@ -1852,8 +1852,11 @@ class Setup:
         steps = []
         if self.on_halo():
             steps.append(("The VM host", "one command, in a terminal ON THE VM HOST, not here: see \"VM host step\" below"))
-        if backup == "set up":
+        if backup == "set up" and "last success" in str(status.get("backup")):
             steps.append(("Backups", "set up ✓"))
+        elif backup == "set up":
+            steps.append(("Backups", f"⚠ mandatory first backup: python3 {paths.RELEASE_CURRENT}/deploy/backup.py "
+                                      "seed --cap <minutes>"))
         elif backup == "ready":
             steps.append(("Backups", f"⚠ not set up: sudo {command} backup (at a terminal; you save one password)"))
         else:
@@ -1919,10 +1922,12 @@ class Setup:
         if result is None:
             return 1
         self.backup_done = result.get("escrow")
-        self.say(f"Backups are set up (repository {str(result.get('repository_id', ''))[:8]}).")
+        self.say(f"Backup repository initialized ({str(result.get('repository_id', ''))[:8]}).")
         if result.get("escrow") != "confirmed":
             self.say(f"⚠ The backup password was not confirmed: sudo {setup_command()} backup --show-password shows it again.")
-        self.say("First full backup: tonight at 03:30, while the household is asleep.")
+        self.say("Run the first full backup before relying on the timers: cd /srv/anj-cloud/release/current && "
+                 "python3 deploy/backup.py seed --cap <minutes>")
+        self.say("Nightly runs refuse, and the 36-hour stale alert stays unarmed, until that first backup succeeds.")
         return 0
 
     def farewell(self, evidence=None):
@@ -3833,7 +3838,7 @@ def render_summary_status(status, answers, backup):
         ddns = "checks every 5 minutes — first update pending"
     if backup == "set up":
         backups = status.get("backup") if "last success" in str(status.get("backup")) else \
-            "set up — first backup tonight at 03:30"
+            "⚠ repository initialized — mandatory first backup required"
     elif backup == "ready":
         backups = "⚠ not set up yet (next: Backups, below)"
     else:

@@ -93,8 +93,8 @@ void main() {
         .toString();
   }
 
-  /// A pinned code (spec #35): 20 secret bytes and the first 16 bytes of
-  /// the CA certificate's SHA-256 (DER), in the 32-character alphabet.
+  /// A pinned code (spec #35): 7 secret bytes and the first 10 bytes of
+  /// the CA certificate's SHA-256 (DER), encoded as 28 characters.
   Future<String> pinnedCode({bool otherCa = false}) async {
     final der = File('${fixture.path}/ca.der');
     await openssl([
