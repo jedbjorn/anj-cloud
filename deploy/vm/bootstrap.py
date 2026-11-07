@@ -2401,6 +2401,9 @@ class Pm2(Step):
     def apply(self):
         self.system.mkdir(PM2_DIR.parent, mode=0o755)
         self.system.mkdir(PM2_DIR, mode=0o755)
+        # npm ci replaces the packages but retains this directory and its old mode.
+        # Repair the public package directory too when resuming a restrictive install.
+        self.system.mkdir(PM2_DIR / "node_modules", mode=0o755)
         for name in ("package.json", "package-lock.json"):
             self.system.write(PM2_DIR / name, (SOURCE_DIR / "pm2" / name).read_bytes())
         # Only npm's public package tree needs this mask; preserve the installer's
