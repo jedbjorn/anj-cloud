@@ -203,6 +203,13 @@ p+p {
   font-size:.7rem;
   color:var(--muted);
 }
+.lead strong,.hero-note strong {
+  color:var(--ink);
+  font-weight:600;
+}
+.hero-note strong {
+  font-size:.82rem;
+}
 .hero-art {
   position:relative;
   align-self:center;
