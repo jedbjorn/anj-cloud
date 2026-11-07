@@ -374,7 +374,11 @@ void main() {
       var closed = 0;
       await tester.pumpWidget(
         MaterialApp(
-          home: AdminPage(call: api.call, onNotAdmin: () => closed++),
+          home: AdminPage(
+            call: api.call,
+            onNotAdmin: () => closed++,
+            server: 'https://gateway.example.com',
+          ),
         ),
       );
       await tester.pumpAndSettle();
@@ -439,7 +443,11 @@ void main() {
       final api = FakeAdmin();
       await tester.pumpWidget(
         MaterialApp(
-          home: AdminPage(call: api.call, onNotAdmin: () {}),
+          home: AdminPage(
+            call: api.call,
+            onNotAdmin: () {},
+            server: 'https://gateway.example.com',
+          ),
         ),
       );
       await tester.pumpAndSettle();

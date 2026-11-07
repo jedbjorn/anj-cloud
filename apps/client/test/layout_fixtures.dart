@@ -106,6 +106,7 @@ LayoutController layoutController({
 }) {
   final controller = LayoutController(pairingOptions: pairingOptions)
     ..root = '/home/demo/anj-cloud'
+    ..server = 'https://gateway.example.com'
     ..pairingState = 'paired'
     ..accountRights = 'write'
     ..isAdmin = admin

@@ -276,14 +276,87 @@ void main() {
     return chars.join();
   }
 
+  group('pairing server origin normalization', () {
+    test('bare hosts default to HTTPS and explicit HTTPS is preserved', () {
+      const cases = {
+        'gateway.example.com': 'https://gateway.example.com',
+        '127.0.0.1:8834': 'https://127.0.0.1:8834',
+        'https://gateway.example.com/': 'https://gateway.example.com',
+        '  gateway.example.com\n': 'https://gateway.example.com',
+        '[::1]:8834': 'https://[::1]:8834',
+        'https://[::1]/': 'https://[::1]',
+      };
+      for (final input in cases.keys) {
+        expect(normalizeServerOrigin(input), cases[input], reason: input);
+      }
+    });
+
+    test('explicit HTTP is rejected for remote and loopback addresses', () {
+      for (final input in [
+        'http://gateway.example.com',
+        'http://127.0.0.1:8834',
+      ]) {
+        expect(
+          () => normalizeServerOrigin(input),
+          throwsFormatException,
+          reason: input,
+        );
+      }
+    });
+
+    test(
+      'raw authority, port, path, query and fragment forms are validated',
+      () {
+        const invalid = [
+          '',
+          '   ',
+          'not a host',
+          'not%20a%20host',
+          '%65xample.com',
+          'example%2ecom',
+          '127.0.0.1:not-a-port',
+          'example.com:',
+          'https://example.com:',
+          'example.com:65536',
+          'https://example.com:65536',
+          'ftp://gateway.example.com',
+          'https://',
+          '::1',
+          'https://example.com\\',
+          'https://example.com/%2e',
+          'https://gateway.example.com/pair',
+          'https://user:secret@gateway.example.com',
+          'https://example.com?',
+          'https://example.com#',
+          'https://gateway.example.com?next=pair',
+          'https://gateway.example.com#pair',
+        ];
+        for (final input in invalid) {
+          expect(
+            () => normalizeServerOrigin(input),
+            throwsFormatException,
+            reason: input,
+          );
+        }
+      },
+    );
+  });
+
   Future<void> pairOnce(ClientController controller) async {
-    final origin = 'https://127.0.0.1:${server.port}';
+    final address = '127.0.0.1:${server.port}';
+    final origin = 'https://$address';
     approve = false;
-    await controller.pair(origin, _code, caPath: path('issuer.crt'));
+    await controller.pair('  $address  ', _code, caPath: path('issuer.crt'));
     expect(controller.pairingState, 'pending');
     approve = true;
-    await controller.pair(origin, _code, caPath: path('issuer.crt'));
+    await controller.pair(address, _code, caPath: path('issuer.crt'));
     expect(controller.pairingState, 'paired');
+    expect(controller.server, origin);
+    expect(controller.serverOrigin, origin);
+    final store = Manifest(controller.profile);
+    expect(store.setting('server'), origin);
+    expect(store.setting('accountOrigin'), origin);
+    store.close();
   }
 
   test(
@@ -417,14 +490,19 @@ void main() {
     expect(store.setting(firstSyncSetting), isNull);
     store.close();
 
-    // The right code pairs at once: the server approves by itself.
-    await controller.pair(origin, pinnedCode());
+    // The right code pairs at once from a bare host: the server approves by
+    // itself, and every later request uses the stored canonical HTTPS origin.
+    await controller.pair('  127.0.0.1:${server.port}  ', pinnedCode());
     expect(controller.pairingState, 'paired');
     expect(controller.awaitingFingerprintApproval, isFalse);
+    expect(controller.server, origin);
+    expect(controller.serverOrigin, origin);
     // Label: the phone's name, control characters removed, 80 characters.
     expect(labels.first, startsWith('Pixel of sam'));
     expect(labels.first!.length, 80);
     store = Manifest(profile);
+    expect(store.setting('server'), origin);
+    expect(store.setting('accountOrigin'), origin);
     final kept = store.setting('ca')!;
     expect(p.dirname(kept), profile.path);
     expect(

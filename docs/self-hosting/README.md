@@ -1,7 +1,9 @@
 # Self-hosting AnJ Cloud
 
-This guide takes you from an empty Linux machine to a working household server and a first paired device. Read it
-in order the first time; each page ends with what to do next.
+AnJ Cloud is built on Nextcloud: Nextcloud stores the household's files and provides sharing, while the AnJ Cloud
+gateway adds device pairing, per-device access control and client updates. This guide takes you from an empty Linux
+machine to a working household server and a first paired device. Read it in order the first time; each page ends
+with what to do next.
 
 1. [Requirements](requirements.md): what you need before you start.
 2. [The VM host and the gateway VM](host-and-vm.md): your deployment profile, the host side, the VM, the guided install.

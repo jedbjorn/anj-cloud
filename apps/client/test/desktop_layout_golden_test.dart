@@ -34,7 +34,12 @@ Future<void> _pumpAdmin(WidgetTester tester, AdminView view) async {
   await tester.pumpWidget(
     MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: AdminPage(call: api.call, onNotAdmin: () {}, initial: view),
+      home: AdminPage(
+        call: api.call,
+        onNotAdmin: () {},
+        server: 'https://gateway.example.com',
+        initial: view,
+      ),
     ),
   );
   await tester.pumpAndSettle();
