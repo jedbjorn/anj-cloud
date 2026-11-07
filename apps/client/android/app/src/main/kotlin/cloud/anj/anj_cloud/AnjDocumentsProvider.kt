@@ -145,6 +145,14 @@ class AnjDocumentsProvider : DocumentsProvider() {
         false
     }
 
+    override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): DocumentsContract.Path {
+        @Suppress("UNCHECKED_CAST")
+        val ids = call("findPath", mapOf("parent" to parentDocumentId, "id" to childDocumentId,
+            "caller" to caller(null))) as List<String>
+        // A provider root id identifies the sidebar root; "root" is its document id.
+        return DocumentsContract.Path(if (parentDocumentId == null) "anj" else null, ids)
+    }
+
     override fun openDocument(documentId: String, mode: String, signal: CancellationSignal?): ParcelFileDescriptor {
         val bits = ParcelFileDescriptor.parseMode(mode)
         // An open may download a Cloud-only file into a working copy first. Dart gives up at 600 s
