@@ -10,8 +10,8 @@ device.
 - Or on the VM: `anj-cloud-admin invite --user <account>`; for the very first device,
   `sudo anj-cloud-setup pair`.
 
-A code is random, single use, and valid for ten minutes. It also carries the first 16 bytes of the SHA-256 of
-your household certificate authority.
+A code is random, single use, and valid for ten minutes. It also carries the first 10 bytes (80 bits) of the
+SHA-256 of your household certificate authority.
 
 ![The Users page of the Admin section on a phone](images/android-admin-users.png)
 

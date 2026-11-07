@@ -42,7 +42,7 @@ Use the same project name, port, checkout and retained private state for subsequ
 
 ## Pair and operate
 
-A pairing code carries the first 16 bytes of the issuer certificate's SHA-256 (decision #151, spec #35): the client fetches `GET /v1/ca` and accepts the CA only when it matches the code, so no CA file is copied. Never accept a CA the code does not pin, disable certificate validation or omit hostname checks. Certificate/key material stays outside the client's watched root.
+A pairing code carries the first 10 bytes (80 bits) of the issuer certificate's SHA-256 (decision #151, spec #35): the client fetches `GET /v1/ca` and accepts the CA only when it matches the code, so no CA file is copied. Never accept a CA the code does not pin, disable certificate validation or omit hostname checks. Certificate/key material stays outside the client's watched root.
 
 ```bash
 deploy/.local/access-venv/bin/python -m deploy.access_operator trust

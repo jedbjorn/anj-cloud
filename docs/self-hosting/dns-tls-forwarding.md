@@ -124,8 +124,9 @@ For the generic VM or dedicated machine, create this router rule:
 For the advanced libvirt VM-host route, the internal destination is the VM host's fixed LAN address instead;
 the VM host's own rules then forward TCP 443 to the VM.
 
-Using the standard HTTPS port means the client URL needs no explicit port. Current setup and client
-networking assume 443, so this documentation does not offer alternate external or internal ports.
+Using the standard HTTPS port means the client URL needs no explicit port. The supported and qualified
+server/router configuration is **external TCP 443 to internal TCP 443**. Alternate external ports are not
+documented, supported, or qualified for this deployment.
 
 Do **not** configure:
 
@@ -155,8 +156,8 @@ Debian VM or machine at <SERVER_LAN_IPV4>:443
 Setup creates a **household certificate authority (CA)** and a server certificate for the public hostname.
 You do not need Let's Encrypt or another public certificate for this client protocol.
 
-Pairing carries the first 16 bytes of the CA's SHA-256 fingerprint inside the one-time code. The app
-fetches the CA without trusting it blindly, checks it against the code, generates its own device key, and
+Pairing carries the first 10 bytes (80 bits) of the CA's SHA-256 fingerprint inside the one-time code. The
+app fetches the CA without trusting it blindly, checks it against the code, generates its own device key, and
 receives a per-device client certificate. Later connections use mutual TLS: the device verifies the server
 and the server verifies the device.
 

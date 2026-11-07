@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#0f766e"/>
+    </marker>
+    <style>
+      .title { font: 700 30px 'DejaVu Sans', sans-serif; fill: #0f172a; }
+      .heading { font: 700 22px 'DejaVu Sans', sans-serif; fill: #0f172a; }
+      .text { font: 18px 'DejaVu Sans', sans-serif; fill: #334155; }
+      .small { font: 16px 'DejaVu Sans', sans-serif; fill: #475569; }
+      .box { fill: #f0fdfa; stroke: #0f766e; stroke-width: 2; rx: 18; }
+      .dns { fill: #f8fafc; stroke: #64748b; stroke-width: 2; rx: 18; }
+      .arrow { stroke: #0f766e; stroke-width: 4; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 9 7; }
+    </style>
+  </defs>
+  <rect width="1200" height="560" fill="#ffffff"/>
+  <text x="600" y="48" text-anchor="middle" class="title">Default AnJ Cloud network path</text>
+
+  <rect x="55" y="180" width="250" height="150" class="box"/>
+  <text x="180" y="222" text-anchor="middle" class="heading">AnJ app</text>
+  <text x="180" y="258" text-anchor="middle" class="text">Mobile data or LAN</text>
+  <text x="180" y="290" text-anchor="middle" class="small">Household CA + device mTLS</text>
+
+  <rect x="475" y="180" width="250" height="150" class="box"/>
+  <text x="600" y="222" text-anchor="middle" class="heading">Home router</text>
+  <text x="600" y="258" text-anchor="middle" class="text">External TCP 443</text>
+  <text x="600" y="290" text-anchor="middle" class="small">Public WAN IPv4</text>
+
+  <rect x="895" y="160" width="250" height="190" class="box"/>
+  <text x="1020" y="202" text-anchor="middle" class="heading">Debian 13 VM</text>
+  <text x="1020" y="238" text-anchor="middle" class="text">Internal TCP 443</text>
+  <text x="1020" y="270" text-anchor="middle" class="small">HAProxy → gateway</text>
+  <text x="1020" y="300" text-anchor="middle" class="small">→ Nextcloud</text>
+  <text x="1020" y="330" text-anchor="middle" class="small">LAN: 192.0.2.20</text>
+
+  <path d="M305 255 L461 255" class="arrow"/>
+  <path d="M725 255 L881 255" class="arrow"/>
+  <text x="390" y="235" text-anchor="middle" class="small">TLS</text>
+  <text x="810" y="235" text-anchor="middle" class="small">Forward</text>
+
+  <rect x="220" y="395" width="760" height="85" class="dns"/>
+  <text x="600" y="429" text-anchor="middle" class="heading">Cloudflare DNS only</text>
+  <text x="600" y="460" text-anchor="middle" class="text">cloud.example.com → 203.0.113.10 (example public address)</text>
+  <path d="M270 395 C300 365 320 350 340 330" class="arrow dash"/>
+
+  <text x="600" y="522" text-anchor="middle" class="small">Forward only TCP 443. No DMZ, port triggering, public SSH, or Cloudflare proxy.</text>
+</svg>

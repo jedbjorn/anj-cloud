@@ -38,10 +38,10 @@ mistaking a LAN-only or hairpin-NAT path for a working public server.
    This existing example image shows the placeholder `gateway.example.com`; replace it with your own server
    address.
 
-3. The app fetches the household CA and accepts it only when the first 16 bytes of its SHA-256 fingerprint
-   match the pin carried in the code. It generates a device-specific key and receives a certificate tied to
-   the account. Redeeming a valid current code approves the device automatically; no CA file or separate
-   trust store is installed by hand.
+3. The app fetches the household CA and accepts it only when the first 10 bytes (80 bits) of its SHA-256
+   fingerprint match the pin carried in the code. It generates a device-specific key and receives a
+   certificate tied to the account. Redeeming a valid current code approves the device automatically; no CA
+   file or separate trust store is installed by hand.
 
 4. Wait for the server to print `Paired: <account>'s device …`. The app's **Admin** section appears for the
    first admin. Follow the app's choices for the local root folder and which folders to keep on the device.
