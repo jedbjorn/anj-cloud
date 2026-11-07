@@ -122,6 +122,7 @@ USER_UID=""
 USER_HOME=""
 EVID=""
 WORK=""
+PROD_SSH_WORK=""
 FAILED=0
 STOPPED=""
 COMPLETED=()
@@ -438,6 +439,7 @@ setup_evidence() {
 
 finish() {
     local code=$?
+    prod_ssh_cleanup
     [[ -n "$EVID" && -d "$EVID" ]] || exit "$code"
     printf 'finished\t%s\nexit\t%s\nstopped\t%s\ncompleted\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$code" \
         "$STOPPED" "${COMPLETED[*]:-}" >> "$EVID/run.meta"
@@ -1035,6 +1037,7 @@ step_3() {
                 record 3 "$([[ "$phase" == plan ]] && echo planned || echo changed)" "" "defined" "4 GiB memfd, pinned 14,30,15,31, UEFI"
             fi
             has 'Autostart:.*disable' V dominfo "$PROD" || change V autostart --disable "$PROD"
+            write_prod_ssh_config "$phase"
             ;;
         verify)
             uuid="$(domain_uuid)"
@@ -1694,9 +1697,135 @@ mode_forward() {
     esac
 }
 
+prod_known_hosts() { printf '%s/.ssh/known_hosts.anj-prod' "$(p "$USER_HOME")"; }
+prod_ssh_config() { printf '%s/.local/share/anj-cloud/prod-vm/ssh_config' "$(p "$USER_HOME")"; }
 qual_known_hosts() { printf '%s/.ssh/known_hosts.anj-qual' "$(p "$USER_HOME")"; }
 qual_tag_file() { printf '%s/.local/state/anj-cloud-qual/run-id' "$(p "$USER_HOME")"; }
-qual_ssh_config() { printf '%s/.local/share/anj-cloud/prod-vm/ssh_config' "$(p "$USER_HOME")"; }
+qual_ssh_config() { prod_ssh_config; }
+
+prod_ssh_cleanup() {
+    if [[ -n "$PROD_SSH_WORK" ]]; then
+        rm -rf -- "$PROD_SSH_WORK" || true
+        PROD_SSH_WORK=""
+    fi
+}
+
+write_prod_ssh_config() {
+    local phase="$1" file key block address known_hosts candidate effective temporary mode line
+    local -a expected
+    file="$(prod_ssh_config)"
+    if [[ "$phase" == plan ]]; then log "    would write ssh alias: ssh -F $file anj-prod"; return 0; fi
+    key="${KEYS[0]%.pub}"
+    address="$(profile_get "$PROD" subnet).10"
+    known_hosts="$(prod_known_hosts)"
+    block="$(printf '# >>> anj-prod (halo-vm.sh --apply) >>>\nHost anj-prod\n  HostName %s\n  User anj\n  IdentityFile %s\n  IdentitiesOnly yes\n  UserKnownHostsFile %s\n  StrictHostKeyChecking accept-new\n  ConnectTimeout 5\n  BatchMode yes\n# <<< anj-prod <<<' "$address" "$key" "$known_hosts")"
+    as_user mkdir -p "$(dirname "$file")" || abort "cannot create the SSH config directory"
+    PROD_SSH_WORK="$(as_user mktemp -d "$(dirname "$file")/.anj-prod-ssh.XXXXXX")" \
+        || { PROD_SSH_WORK=""; abort "cannot create a user-owned SSH work directory"; }
+    candidate="$PROD_SSH_WORK/candidate"
+    effective="$PROD_SSH_WORK/effective"
+    temporary="$PROD_SSH_WORK/install"
+    as_user python3 -I - "$file" "$block" "$candidate" <<'PY' || abort "unsafe SSH config; $file was not changed"
+import re
+import sys
+
+path, managed, output = sys.argv[1:]
+try:
+    with open(path) as stream:
+        lines = stream.read().splitlines()
+except FileNotFoundError:
+    lines = []
+prefix, body = [], []
+marked = legacy = section_seen = False
+
+
+def fail(number, message):
+    raise SystemExit(f"halo-vm: unsafe SSH config line {number}: {message}; original left unchanged")
+
+
+def emit(line):
+    (body if section_seen else prefix).append(line)
+
+
+for number, line in enumerate(lines, 1):
+    stripped = line.lstrip()
+    if re.match(r"^# >>> anj-prod(?: |$)", stripped):
+        if marked:
+            fail(number, "nested anj-prod marker")
+        marked = section_seen = True
+        continue
+    if re.match(r"^# <<< anj-prod(?: |$)", stripped):
+        if not marked:
+            fail(number, "closing anj-prod marker without an opening marker")
+        marked = False
+        continue
+    if marked:
+        continue
+    directive = re.match(r"(?i)^([a-z]+)(?:[ \t]*=[ \t]*|[ \t]+|$)", stripped)
+    keyword = directive.group(1).lower() if directive else ""
+    arguments = stripped[directive.end():] if directive else ""
+    if keyword == "include":
+        fail(number, "Include is not safe to migrate automatically")
+    if keyword == "match":
+        fail(number, "Match blocks are not safe to migrate automatically")
+    if keyword == "host":
+        section_seen = True
+        comment = re.search(r"\s+#", arguments)
+        aliases_text = arguments[:comment.start()] if comment else arguments
+        if any(character in aliases_text for character in "'\"\\") and "anj-prod" in aliases_text.lower():
+            fail(number, "quoted or escaped anj-prod alias is ambiguous")
+        aliases = aliases_text.split()
+        matches = [alias for alias in aliases if alias.lower() == "anj-prod"]
+        if matches and len(aliases) != 1:
+            fail(number, "mixed-alias Host anj-prod block is not safe to migrate")
+        legacy = bool(matches)
+        if legacy:
+            if comment:
+                emit(arguments[comment.start():])
+        else:
+            emit(line)
+        continue
+    if not section_seen and stripped and not stripped.startswith("#"):
+        fail(number, "global directive before the first Host is not safe to reposition")
+    if legacy and stripped and not stripped.startswith("#"):
+        continue
+    emit(line)
+if marked:
+    fail(len(lines), "unterminated anj-prod marker")
+with open(output, "w") as stream:
+    stream.write("\n".join(prefix + [managed] + body) + "\n")
+PY
+    as_user ssh -G -F "$candidate" anj-prod 2>/dev/null | as_user tee "$effective" >/dev/null \
+        || abort "invalid SSH config; $file was not changed"
+    expected=("hostname $address" "user anj" "identitiesonly yes" "stricthostkeychecking accept-new"
+              "connecttimeout 5" "batchmode yes" "identityfile $key" "userknownhostsfile $known_hosts")
+    for line in "${expected[@]}"; do
+        grep -qxF "$line" "$effective" || abort "wrong effective SSH config for anj-prod; $file was not changed"
+    done
+    [[ "$(grep -c '^identityfile ' "$effective")" == 1 && "$(grep -c '^userknownhostsfile ' "$effective")" == 1 ]] \
+        || abort "ambiguous effective SSH identity configuration; $file was not changed"
+    if [[ -f "$file" ]] && cmp -s "$candidate" "$file"; then
+        prod_ssh_cleanup
+        log "    ssh alias unchanged: ssh -F $file anj-prod"
+        return 0
+    fi
+    if [[ -f "$file" ]]; then
+        mode="$(stat -c '%a' "$file")" || abort "cannot read the mode of $file"
+    else
+        mode=600
+    fi
+    if ! as_user cp "$candidate" "$temporary"; then
+        abort "cannot write $file; original left unchanged"
+    fi
+    if ! as_user chmod "$mode" "$temporary"; then
+        abort "cannot set the mode of $file; original left unchanged"
+    fi
+    if ! as_user mv -f "$temporary" "$file"; then
+        abort "cannot install $file atomically; original left unchanged"
+    fi
+    prod_ssh_cleanup
+    log "    ssh alias: ssh -F $file anj-prod"
+}
 
 # qual_lock FLOCK-ARGS...: the user-owned lock that serialises --qual and --qual-destroy. --qual
 # holds it from the busy check through the tag write and define (to its exit), so of two runs

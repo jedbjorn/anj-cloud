@@ -31,8 +31,8 @@ disk and the backups. See [self-hosting/README.md](self-hosting/README.md).
 
 ## Trust model
 
-- A household has its own certificate authority. A pairing code carries the first 16 bytes of that CA's
-  SHA-256, so a new device can check it is talking to your server before it trusts anything.
+- A household has its own certificate authority. A pairing code carries the first 10 bytes (80 bits) of that
+  CA's SHA-256, so a new device can check it is talking to your server before it trusts anything.
 - Each device generates its own key. The gateway issues a certificate for it and records the device against an
   account. Revoking the device stops it at the next request.
 - Admin is a role of an account, never of a device, and is re-checked on every admin request.

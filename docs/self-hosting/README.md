@@ -1,36 +1,48 @@
 # Self-hosting AnJ Cloud
 
-AnJ Cloud is built on Nextcloud: Nextcloud stores the household's files and provides sharing, while the AnJ Cloud
-gateway adds device pairing, per-device access control and client updates. This guide takes you from an empty Linux
-machine to a working household server and a first paired device. Read it in order the first time; each page ends
-with what to do next.
+AnJ Cloud uses Nextcloud for household file storage and sharing, and adds device pairing, per-device access
+control, and client updates. The guided installer puts those services on one Debian 13 machine with a
+separate data disk.
 
-1. [Requirements](requirements.md): what you need before you start.
-2. [The VM host and the gateway VM](host-and-vm.md): your deployment profile, the host side, the VM, the guided install.
-3. [DNS, TLS and port forwarding](dns-tls-forwarding.md): making the server reachable, and checking it.
-4. [Accounts and your first device](accounts-and-pairing.md)
-5. [Backups and restore](backups.md)
-6. [Upgrades](upgrades.md)
-7. [Your release keys, and publishing client releases](keys-and-releases.md)
-8. [Troubleshooting](troubleshooting.md)
+**Start with the [quick start](quickstart.md).** It is the canonical stranger-to-working-server path: prepare
+the machine, create DNS and forwarding, run the installer, check health, and pair the first admin device.
+It needs neither Subfloor nor client build/signing tools.
 
-Everything specific to your household (domain, addresses, account names, release key) lives in one file, your
-**deployment profile**, never in the code. The reference documentation for every command is
-[`deploy/README.md`](../../deploy/README.md) and [`services/access/README.md`](../../services/access/README.md);
-these pages are the guided path through it.
+> Unattended Debian VM installs, synthetic-device access, and local upgrades have passed lab checks.
+> The complete interactive public walkthrough and real-network setup remain unverified. Read the
+> quick start's exact validation scope and follow its stop conditions.
 
-Placeholders used throughout: `gateway.example.com` (your public host name), `192.168.0.10` (the VM host's address
-on your LAN), `sam` and `alex` (household accounts).
+## Read alongside the quick start
 
-## How the pieces fit
+- [Requirements](requirements.md): hardware, blank-disk rules, users, network destinations, and secrets.
+- [DNS, TLS and port forwarding](dns-tls-forwarding.md): domain versus hostname, Cloudflare DNS and DDNS,
+  public IPv4/CGNAT, the single TCP 443 forward, household certificates, and hairpin/split DNS.
+- [Accounts and pairing](accounts-and-pairing.md): the first admin, one-time codes, more devices, and
+  recovery commands.
 
-```text
-internet -> your router :443 -> VM host (192.168.0.10) -> gateway VM (HAProxy -> access service -> Nextcloud)
-                                    |                         |
-                                    |                         +-- data disk (files, registry, secrets)
-                                    +-- backup drive (encrypted restic repository, shared into the VM)
-```
+These references explain the same installation path; they are not alternative installers.
 
-The VM host is any Linux machine with KVM. It runs one VM, forwards port 443 to it, and holds the backup drive.
-Everything else, including Docker and the services, is inside the VM, so the host stays clean and the VM can be
-rebuilt from its data disk or from a backup.
+## Deployment routes
+
+The default is a **generic Debian 13 amd64 VM**, recommended when the physical host has other uses, or a
+**dedicated Debian 13 amd64 machine**. Run the quick start inside that VM or machine. It talks directly to
+the guided installer and needs no VM-host profile or staging tool.
+
+An existing **advanced libvirt VM-host route** is documented in [The VM host and gateway VM](host-and-vm.md).
+It uses a separate deployment profile and host staging commands. With that route, the router's TCP 443
+forward targets the VM host, which forwards to the VM. Do not mix its host commands into the generic quick
+start.
+
+The generic quick start covers installation and first pairing, not a completed backup design. Its
+[backup and alert limitations](quickstart.md#6-what-is-configured-and-what-is-not) are explicit: one data
+disk is not a backup, and local ntfy alerts are not independent external monitoring.
+
+## Operate the server
+
+- [Upgrades](upgrades.md): the generic `local_upgrade.py` route first, with `stage.py anj-prod` kept for the
+  advanced libvirt route. Local upgrades and explicit rollback passed in the lab; automatic failure
+  fallback and the live advanced staging route were not exercised.
+- [Troubleshooting](troubleshooting.md): generic-first status, health, pairing, DDNS, upgrade, and emergency
+  checks, with host-only commands labelled separately.
+- [Backups and restore](backups.md): the existing encrypted virtiofs workflow, explicitly scoped to the
+  advanced VM-host route. It is not a generic quick-start backup procedure.

@@ -8,6 +8,8 @@ zone_id = "00000000000000000000000000000000"
 # secrets/cloudflare-dns-token yet; with --adopt-data it is looked for after the disk is mounted:
 # token_file = "/root/cloudflare-dns-token"
 accounts = ["sam", "alex"]
+# Permit a fresh scripted install to format its one blank data disk. Interactive setup still asks separately.
+data_disk_init = true
 household_lan = "192.168.0.0/24"
 bind_address = "10.77.10.10"
 admin_ssh_source = "10.77.10.1"

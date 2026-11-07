@@ -72,9 +72,21 @@ TLS_SOURCES = {"issuer_crt": "issuer.crt", "server_crt": "server.crt", "server_k
 # (SC-028 up-front 413, GET /v1/files/added).
 REQUIRED_COMMITS = {"4c3bb82": "spec #19 permanent credentials (PR #25)",
                     "f554e13": "SC-028 up-front 413 and /v1/files/added"}
+# The squashed public history carries those fixes from its exact, known root onwards.
+PUBLIC_HISTORY_COMMIT = "cf8994f416bdc9d1f8c8bcc6710932f80221d608"
 HOST = re.compile(r"(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]")
 COMMIT = re.compile(r"[0-9a-f]{7,40}")
 FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
+
+
+def missing_required_commit(commit, has_commit, is_ancestor):
+    """The first missing legacy fix, or None for either supported release history."""
+    if has_commit(PUBLIC_HISTORY_COMMIT) and is_ancestor(PUBLIC_HISTORY_COMMIT, commit):
+        return None
+    for required, purpose in REQUIRED_COMMITS.items():
+        if not is_ancestor(required, commit):
+            return required, purpose
+    return None
 
 
 class Interrupted(Exception):
@@ -273,6 +285,13 @@ class ProdStack(Stack):
     def git(self, *args):
         return self.run(["git", "-C", str(self.checkout), *args]).strip()
 
+    def has_commit(self, commit):
+        try:
+            self.git("rev-parse", "--verify", "--quiet", commit + "^{commit}")
+        except RuntimeError:
+            return False
+        return True
+
     def is_ancestor(self, ancestor, commit):
         result = subprocess.run(["git", "-C", str(self.checkout), "merge-base", "--is-ancestor", ancestor, commit],
                                 capture_output=True, timeout=60, check=False)
@@ -293,9 +312,10 @@ class ProdStack(Stack):
                 raise RuntimeError("Unknown commit in this checkout; fetch origin first") from None
         if require_merged and not self.is_ancestor(full, "origin/main"):
             raise RuntimeError("Commit is not merged into origin/main")
-        for required, purpose in REQUIRED_COMMITS.items():
-            if not self.is_ancestor(required, full):
-                raise RuntimeError(f"Commit does not contain {required} ({purpose})")
+        missing = missing_required_commit(full, self.has_commit, self.is_ancestor)
+        if missing:
+            required, purpose = missing
+            raise RuntimeError(f"Commit does not contain {required} ({purpose})")
         return full
 
     def run_bytes(self, argv, data=None, timeout=1800):
