@@ -11,7 +11,9 @@ release's source remains available for a release rollback.
 ## Generic VM or dedicated machine
 
 Use this route on the same generic Debian machine where you ran the [quick start](quickstart.md). It uses
-the clean public clone as `anj`; it does not use `stage.py`, a VM host, or a deployment profile.
+the clean public clone as `anj`; it does not use SSH staging, the VM-host `stage.py` route, or a deployment
+profile. `local_upgrade.py` reuses `stage.py`'s local validation helpers, but archives the source and invokes
+the installed setup command locally.
 
 ### 1. Fast-forward the clean public clone
 

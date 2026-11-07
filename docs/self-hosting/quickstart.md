@@ -102,13 +102,16 @@ change it on an existing data disk later.
    NAT (CGNAT) prevents this inbound path. If the router's WAN address is private/shared or does not match
    the public address seen by outside services, stop and ask the ISP for a publicly routed IPv4 address.
 
-Only TCP 443 is used. Standard HTTPS therefore needs no port in the client URL, and the current tooling
-assumes port 443. Do not substitute a random external port as a security measure.
+The supported and qualified server/router deployment forwards **external TCP 443 to internal TCP 443**.
+Standard HTTPS therefore needs no port in the client URL. Alternate external ports are not documented,
+supported, or qualified for this deployment; do not substitute a random external port as a security measure.
 
 Cloudflare's orange-cloud proxy and ordinary Cloudflare Tunnel are **not supported** by this installation.
 A future tunnel option for CGNAT requires a separately qualified design because current clients pin the
 household CA and connect with direct per-device mutual TLS. See [the networking reference](dns-tls-forwarding.md)
 for the details and official Cloudflare documentation.
+
+![Generic network diagram: DNS only for cloud.example.com, then TCP 443 through the router to a Debian VM; documentation-only addresses](../images/server-network.png)
 
 ## 3. Run the guided installer
 
@@ -230,6 +233,8 @@ connect a laptop through a phone hotspot so it reaches `cloud.example.com` from 
 5. The app fetches the household CA but accepts it only when its fingerprint matches the pin carried by the
    code. It then creates the device's own key and receives a per-device certificate. Do not disable TLS
    verification or install an unrelated CA to make pairing work.
+
+![The public Android pairing form: server address, pairing code, and Scan QR code](../images/android-pairing.png)
 
 Expected server output is `Paired: <account>'s device …`. The app's **Admin** section appears for the first
 admin. Follow the app's remaining folder and sync choices. Pairing successfully from mobile data or a

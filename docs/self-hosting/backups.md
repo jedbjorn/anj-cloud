@@ -56,17 +56,21 @@ cd /srv/anj-cloud/release/current
 python3 deploy/backup.py init --show-escrow
 ```
 
-Optionally run a first full backup immediately, choosing the maintenance cap in minutes:
+### Complete the mandatory first full backup
+
+**Run the first full backup now and verify it succeeds before relying on scheduled protection.** Choose the
+maintenance cap in minutes:
 
 ```bash
 cd /srv/anj-cloud/release/current
 python3 deploy/backup.py seed --cap <minutes>
 ```
 
-The guided installer installs the nightly and stale-backup timers, but a timer is useful only after the
-repository is initialized successfully. The stale check alerts after 36 hours without a successful backup.
+Repository initialization alone does not activate scheduled protection. Nightly runs refuse with reason
+`not-seeded` until this seed succeeds. The 36-hour stale-backup alert is also unarmed until `seeded_at`
+exists; after a successful seed, it alerts when no successful backup has occurred for 36 hours.
 
-Check status or run restic's repository check as `anj`:
+Verify both the recorded success and the repository as `anj`:
 
 ```bash
 cd /srv/anj-cloud/release/current
@@ -74,8 +78,10 @@ python3 deploy/backup.py status
 python3 deploy/backup.py check
 ```
 
-`status` prints JSON with repository, last-success, and housekeeping information. These commands do not
-replace a restore drill.
+Before relying on the timers, `status` must show a `repository_id`, a non-null `seeded_at`, and a
+`last_success` for the seed with `"kind": "seed"` and `"result": "success"`. The repository check must exit
+zero and print `"check": "ok"`. If either check fails, fix the reported problem now; do not assume the
+nightly timer or the 36-hour alert will protect you. These checks still do not replace a restore drill.
 
 ## Restore in the advanced route
 
