@@ -223,25 +223,26 @@ class System:
         return ["runuser", "-u", user, "--", "env", f"HOME={entry.pw_dir}", f"PM2_HOME={entry.pw_dir}/.pm2",
                 "PATH=/usr/local/bin:/usr/bin:/bin", "LC_ALL=C.UTF-8", *quiet, *argv]
 
-    def read(self, argv, *, user=None, timeout=120, data=None, cwd=None):
+    def read(self, argv, *, user=None, timeout=120, data=None, cwd=None, umask=-1):
         """A read-only command: always runs (dry run too). Returns (code, stdout, stderr). In a dry
         run (and doctor) a Python child writes no bytecode cache either (review R3)."""
         environment = dict(os.environ, LC_ALL="C.UTF-8", **({"PYTHONDONTWRITEBYTECODE": "1"} if self.dry else {}))
         try:
             result = subprocess.run(self.user_argv(argv, user), input=data, capture_output=True, text=True,
-                                    timeout=timeout, check=False, cwd=cwd, env=environment)
+                                    timeout=timeout, check=False, cwd=cwd, env=environment, umask=umask)
         except FileNotFoundError:
             return 127, "", f"{argv[0]}: not found"
         except subprocess.TimeoutExpired:
             return 124, "", f"{argv[0]}: timed out"
         return result.returncode, result.stdout, result.stderr
 
-    def change(self, argv, *, user=None, timeout=1800, data=None, cwd=None, show_errors=False, check=True):
+    def change(self, argv, *, user=None, timeout=1800, data=None, cwd=None, show_errors=False, check=True, umask=-1):
         """A changing command: skipped in a dry run. stdin (`data`) is never recorded."""
         self.commands.append({"argv": [str(a) for a in argv], **({"user": user} if user else {})})
         if self.dry:
             return 0, "", ""
-        code, out, err = self.read(argv, user=user, timeout=timeout, data=data, cwd=cwd)
+        options = {"umask": umask} if umask != -1 else {}
+        code, out, err = self.read(argv, user=user, timeout=timeout, data=data, cwd=cwd, **options)
         if check and code:
             detail = (" " + err.strip().splitlines()[-1][:300]) if show_errors and err.strip() else ""
             raise SetupError(f"`{argv[0]} {argv[1] if len(argv) > 1 else ''}` failed (exit {code}).{detail}",
@@ -2375,6 +2376,22 @@ class Pm2(Step):
             return False, f"PM2 {installed or 'absent'} (pin {self.pin()})"
         if not PM2_LINK.is_symlink() or os.readlink(PM2_LINK) != str(PM2_DIR / "node_modules" / "pm2" / "bin" / "pm2"):
             return False, f"PM2 {installed}, {PM2_LINK} missing"
+        # Root can read an installation that the service user cannot. Check the package
+        # tree as anj without invoking PM2 (even --version can start its daemon).
+        probe = ("import os,sys\n"
+                 "def fail(*args): sys.exit(1)\n"
+                 "root,binary=sys.argv[1:]\n"
+                 "if not os.path.isdir(root) or not os.access(binary,os.R_OK|os.X_OK): fail()\n"
+                 "for path,dirs,files in os.walk(root,onerror=fail):\n"
+                 " if not os.access(path,os.R_OK|os.X_OK): fail()\n"
+                 " for name in dirs:\n"
+                 "  if not os.access(os.path.join(path,name),os.R_OK|os.X_OK): fail()\n"
+                 " for name in files:\n"
+                 "  if not os.access(os.path.join(path,name),os.R_OK): fail()\n")
+        code, _, _ = self.system.read(["python3", "-I", "-c", probe, str(PM2_DIR / "node_modules"), str(PM2_LINK)],
+                                     user=self.setup.user)
+        if code:
+            return False, f"PM2 {installed}, installed files are not accessible to {self.setup.user}"
         return True, f"PM2 {installed}"
 
     def plan(self):
@@ -2386,8 +2403,10 @@ class Pm2(Step):
         self.system.mkdir(PM2_DIR, mode=0o755)
         for name in ("package.json", "package-lock.json"):
             self.system.write(PM2_DIR / name, (SOURCE_DIR / "pm2" / name).read_bytes())
+        # Only npm's public package tree needs this mask; preserve the installer's
+        # inherited mask for all other work, including secret material.
         self.system.change(["npm", "ci", "--omit=optional", "--ignore-scripts", "--no-audit", "--no-fund"],
-                           cwd=str(PM2_DIR), show_errors=True)
+                           cwd=str(PM2_DIR), show_errors=True, umask=0o022)
         self.system.symlink(PM2_DIR / "node_modules" / "pm2" / "bin" / "pm2", PM2_LINK)
 
     def verify(self):
