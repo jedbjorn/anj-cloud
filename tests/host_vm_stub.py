@@ -388,6 +388,8 @@ def main():
         target = args[args.index("-o") + 1]
         Path(target).write_bytes(b"seed")
         out()
+    if name == "ssh" and args[:1] == ["-G"]:
+        os.execv("/usr/bin/ssh", ["ssh", *args])
     if name == "ssh":
         out("status: done\nDebian GNU/Linux 13 (trixie)\n6.12.0-cloud\n4\n3900\nsudo-ok\nuefi", state.get("ssh_rc", 0))
     if name == "tailscale":

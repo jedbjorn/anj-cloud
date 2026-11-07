@@ -158,8 +158,8 @@ Code-only pairing (decision #151, spec #35): the pair dialog asks for the
 server, prefilled with the household origin the app was built with
 (`--dart-define=ANJ_HOUSEHOLD_ORIGIN=https://…`, default
 `https://gateway.example.com`), and the pairing code (case-insensitive,
-optional spaces/hyphens). The code carries the first 16 bytes of the household
-CA's SHA-256: the app fetches `GET /v1/ca` without trust, accepts the CA only if
+optional spaces/hyphens). The code carries the first 10 bytes (80 bits) of the
+household CA's SHA-256: the app fetches `GET /v1/ca` without trust, accepts the CA only if
 it matches ("This code is not for this server" otherwise, with nothing stored),
 stores it in the profile as `household-ca.crt` once the device is paired, and
 uses it as the trust anchor from then on. A profile that is already paired

@@ -23,7 +23,7 @@ import unittest
 from unittest import mock
 
 from deploy import prod
-from deploy.vm import bootstrap, paths, stage
+from deploy.vm import bootstrap, local_upgrade, paths, stage
 from tests.vm_bootstrap_fakes import FakeFacts, FakeSystem
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -767,15 +767,21 @@ class OperationsRestartTests(unittest.TestCase):
 # deploy/vm/stage.py --upgrade ----------------------------------------------------------------------
 
 class StageUpgradeTests(unittest.TestCase):
-    def git_run(self, dirty="", merged=True, fixes=True):
+    def git_run(self, dirty="", merged=True, fixes=True, public=False, public_known=False):
         calls = []
 
         def run(argv, **_options):
             calls.append(argv[3:])
             if argv[3] == "status":
                 return subprocess.CompletedProcess(argv, 0, dirty, "")
+            if argv[3] == "rev-parse":
+                return subprocess.CompletedProcess(argv, 0 if public_known else 1,
+                                                   prod.PUBLIC_HISTORY_COMMIT if public_known else "", "")
             ancestor, descendant = argv[5], argv[6]
-            ok = merged if descendant == "origin/main" else fixes
+            if ancestor == prod.PUBLIC_HISTORY_COMMIT:
+                ok = public
+            else:
+                ok = merged if descendant == "origin/main" else fixes
             return subprocess.CompletedProcess(argv, 0 if ok else 1, "", "")
         return run, calls
 
@@ -797,6 +803,21 @@ class StageUpgradeTests(unittest.TestCase):
         stage.check_upgrade("anj-qual", full, "/c", run=run)        # qualification takes a PR head
         self.assertNotIn("origin/main", [c[-1] for c in calls])
 
+    def test_check_upgrade_accepts_only_descendants_of_the_public_root(self):
+        full = "b" * 40
+        run, calls = self.git_run(fixes=False, public=True, public_known=True)
+        stage.check_upgrade("anj-prod", full, "/c", run=run)
+        self.assertIn(["merge-base", "--is-ancestor", full, "origin/main"], calls)
+        self.assertIn(["merge-base", "--is-ancestor", prod.PUBLIC_HISTORY_COMMIT, full], calls)
+        self.assertFalse([c for c in calls if c[:1] == ["merge-base"] and c[2] in prod.REQUIRED_COMMITS])
+        run, _calls = self.git_run(fixes=False, public=False, public_known=True)
+        with self.assertRaisesRegex(RuntimeError, "does not contain 4c3bb82"):
+            stage.check_upgrade("anj-prod", full, "/c", run=run)
+        run, calls = self.git_run(merged=False, fixes=False, public=True, public_known=True)
+        with self.assertRaisesRegex(RuntimeError, "not merged into origin/main"):
+            stage.check_upgrade("anj-prod", full, "/c", run=run)
+        self.assertNotIn(["merge-base", "--is-ancestor", prod.PUBLIC_HISTORY_COMMIT, full], calls)
+
     def test_upgrade_argv_runs_the_staged_copy_over_ssh(self):
         full = "b" * 40
         self.assertEqual(["ssh", "-F", "/cfg", "-t", "anj-prod",
@@ -816,7 +837,7 @@ class StageUpgradeTests(unittest.TestCase):
                                   order.append(("upgrade", target, commit, no_backup)) or 7), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(7, stage.main(["anj-prod", "--commit", "bbbb", "--upgrade"]))
-        self.assertEqual([("check", "anj-prod", "b" * 40), ("stage", "anj-prod", "bbbb"),
+        self.assertEqual([("check", "anj-prod", "b" * 40), ("stage", "anj-prod", "b" * 40),
                           ("upgrade", "anj-prod", "b" * 40, False)], order)
         with mock.patch.object(stage, "resolve", return_value="b" * 40), \
                 mock.patch.object(stage, "check_upgrade", side_effect=RuntimeError("x is not merged")), \
@@ -826,6 +847,135 @@ class StageUpgradeTests(unittest.TestCase):
         self.assertIn("stage: x is not merged", err.getvalue())
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             stage.main(["anj-prod", "--upgrade", "--with-secrets"])
+
+    def test_main_stages_the_exact_checked_commit_if_head_moves(self):
+        order = []
+        resolutions = iter(("a" * 40, "b" * 40))
+
+        def resolve(commit, _checkout):
+            order.append(("resolve", commit))
+            return next(resolutions)
+
+        def staged(_runner, _target, commit, checkout):
+            order.append(("stage", commit))
+            return {"commit": resolve(commit, checkout) if commit == "HEAD" else commit}
+
+        with mock.patch.object(stage, "resolve", side_effect=resolve), \
+                mock.patch.object(stage, "check_upgrade",
+                                  side_effect=lambda _target, commit, _checkout: order.append(("check", commit))), \
+                mock.patch.object(stage, "stage", side_effect=staged), \
+                mock.patch.object(stage, "run_upgrade", side_effect=lambda _target, commit, no_backup=False:
+                                  order.append(("upgrade", commit)) or 0), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(stage.main(["anj-prod", "--upgrade"]), 0)
+        self.assertEqual(order, [("resolve", "HEAD"), ("check", "a" * 40), ("stage", "a" * 40),
+                                 ("upgrade", "a" * 40)])
+
+
+class LocalUpgradeTests(unittest.TestCase):
+    full = "c" * 40
+    checkout = Path("/checkout")
+
+    def invoke(self, argv=(), *, resolved=None, resolve_error=None, fetch_code=0, check_error=None,
+               archive_code=0, setup_code=0):
+        events, sources = [], []
+
+        def resolve(commit, checkout):
+            events.append(("resolve", commit, checkout))
+            if resolve_error:
+                raise resolve_error
+            return self.full if resolved is None else resolved
+
+        def check(target, commit, checkout, run):
+            events.append(("check", target, commit, checkout))
+            if check_error:
+                raise check_error
+
+        def run(command, **kwargs):
+            if command[:4] == ["git", "-C", str(self.checkout), "fetch"]:
+                kind, code = "fetch", fetch_code
+            elif command[:4] == ["git", "-C", str(self.checkout), "archive"]:
+                kind, code = "archive", archive_code
+                sources.append(Path(kwargs["stdout"].name))
+                kwargs["stdout"].write(b"tar")
+            elif command[:1] == ["sudo"]:
+                kind, code = "setup", setup_code
+                source = Path(command[command.index("--source") + 1])
+                self.assertTrue(source.is_file())
+            else:
+                raise AssertionError(command)
+            events.append((kind, command, kwargs))
+            return subprocess.CompletedProcess(command, code)
+
+        error = io.StringIO()
+        with mock.patch.object(local_upgrade, "CHECKOUT", self.checkout), \
+                mock.patch.object(local_upgrade.Path, "cwd", return_value=self.checkout), \
+                mock.patch.object(local_upgrade.stage, "resolve", side_effect=resolve), \
+                mock.patch.object(local_upgrade.stage, "check_upgrade", side_effect=check), \
+                mock.patch.object(local_upgrade.subprocess, "run", side_effect=run), \
+                contextlib.redirect_stderr(error):
+            code = local_upgrade.main(list(argv))
+        return code, events, sources, error.getvalue()
+
+    def test_successful_call_order_exact_arguments_and_cleanup(self):
+        code, events, sources, error = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual(error, "")
+        self.assertEqual([event[0] for event in events], ["resolve", "fetch", "check", "archive", "setup"])
+        self.assertEqual(events[0], ("resolve", "HEAD", self.checkout))
+        self.assertEqual(events[1][1], ["git", "-C", str(self.checkout), "fetch", "origin", "main"])
+        self.assertEqual(events[2], ("check", "anj-prod", self.full, self.checkout))
+        self.assertEqual(events[3][1], ["git", "-C", str(self.checkout), "archive", "--format=tar", self.full])
+        [source] = sources
+        self.assertEqual(events[4][1], ["sudo", "/usr/local/bin/anj-cloud-setup", "upgrade", "--source", str(source),
+                                       "--expect", self.full])
+        self.assertEqual(events[4][2], {"check": False})
+        self.assertNotIn("--no-backup", events[4][1])
+        self.assertFalse(source.exists())
+        self.assertFalse(source.parent.exists())
+
+    def test_no_backup_is_forwarded_only_when_requested(self):
+        code, events, sources, _error = self.invoke(["--no-backup"])
+        self.assertEqual(code, 0)
+        self.assertEqual(events[-1][1][-1], "--no-backup")
+        self.assertEqual(events[-1][1][-3:-1], ["--expect", self.full])
+        self.assertFalse(sources[0].exists())
+
+    def test_failed_prerequisites_never_call_setup_and_clean_any_archive(self):
+        cases = (
+            ("resolve", dict(resolve_error=RuntimeError("resolve failed")), ["resolve"]),
+            ("short commit", dict(resolved="c" * 7), ["resolve"]),
+            ("fetch", dict(fetch_code=1), ["resolve", "fetch"]),
+            ("check", dict(check_error=RuntimeError("not merged")), ["resolve", "fetch", "check"]),
+            ("archive", dict(archive_code=1), ["resolve", "fetch", "check", "archive"]),
+        )
+        for name, options, expected in cases:
+            with self.subTest(name):
+                code, events, sources, error = self.invoke(**options)
+                self.assertEqual(code, 1)
+                self.assertEqual([event[0] for event in events], expected)
+                self.assertNotIn("setup", [event[0] for event in events])
+                self.assertIn("local-upgrade:", error)
+                for source in sources:
+                    self.assertFalse(source.exists())
+                    self.assertFalse(source.parent.exists())
+
+    def test_setup_failure_propagates_and_cleans_the_archive(self):
+        code, events, sources, error = self.invoke(setup_code=23)
+        self.assertEqual(code, 23)
+        self.assertEqual([event[0] for event in events], ["resolve", "fetch", "check", "archive", "setup"])
+        self.assertEqual(error, "")
+        self.assertFalse(sources[0].exists())
+        self.assertFalse(sources[0].parent.exists())
+
+    def test_wrong_cwd_fails_before_resolving_or_running_git(self):
+        with mock.patch.object(local_upgrade, "CHECKOUT", self.checkout), \
+                mock.patch.object(local_upgrade.Path, "cwd", return_value=Path("/elsewhere")), \
+                mock.patch.object(local_upgrade.stage, "resolve") as resolve, \
+                contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(local_upgrade.main([]), 1)
+        resolve.assert_not_called()
+        self.assertIn("root of the anj-cloud checkout", error.getvalue())
 
 
 if __name__ == "__main__":

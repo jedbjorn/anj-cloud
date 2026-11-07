@@ -26,8 +26,19 @@ Fill in:
 `~/.local/share/anj-cloud/profile.toml`, then `deploy/.local/profile.toml`. Back the file up next to your keys.
 `halo-vm.sh` also reads it as the user who runs `sudo`.
 
-Install the pinned Python dependencies once: `python3 deploy/checks.py --deps` (it also checks the client build
-tools; you can ignore client complaints if you only host).
+The staging tools use Python's standard library. Neither Flutter nor Subfloor is needed to host the server.
+
+Before the host preflight can pass, supply these files yourself:
+
+- `~/.local/share/anj-cloud/prod-vm/image/debian-13-genericcloud-amd64.qcow2`, exactly matching the reviewed digest
+  in `deploy/host/libvirt/debian-13-genericcloud-amd64.sha512`.
+- An adjacent `SHA512SUMS` whose line for that filename has the same digest. The host script does not download these
+  artifacts; do not substitute a newer Debian image whose digest differs. Use `--image FILE` to choose another location.
+- `~/.ssh/anj-prod-admin.pub` and its corresponding private key. Use repeatable `--key FILE` options to supply different
+  public keys. Keep the private key on the host; it is not copied into the repository or documentation.
+
+The dry run below lists missing host tools and artifacts. Install the host packages it names yourself. If you do not
+already have the exact pinned image, use the [generic quick start](quickstart.md) instead of this advanced automation.
 
 ## 2. Prepare the VM host
 
@@ -54,6 +65,13 @@ sudo deploy/host/halo-vm.sh --forward on
 
 ## 3. Install the gateway in the VM
 
+After the first host apply, wait until cloud-init has finished and SSH is ready. Retry this read-only command until it
+succeeds; host apply creates the alias but does not wait for the guest's first boot:
+
+```bash
+ssh -F ~/.local/share/anj-cloud/prod-vm/ssh_config anj-prod true
+```
+
 Stage the sources into the VM, then run the guided installer there (it needs a terminal because it asks questions).
 
 ```bash
@@ -67,10 +85,11 @@ ssh -t -F ~/.local/share/anj-cloud/prod-vm/ssh_config anj-prod sudo /var/lib/anj
 ```
 
 The installer asks only what it cannot work out: the public host name, whether to keep DNS updated (DDNS), your
-router's network range, the first accounts, where alerts go, and for the Cloudflare API token if DDNS is on. It
-then prepares the data disk, installs Docker and the pinned PM2, builds the images, creates your **household
-certificate authority**, the server certificate and the first accounts, starts the stack and verifies each step.
-A re-run repairs only what is missing.
+router's network range, the first accounts, where alerts go, and for the Cloudflare API token if DDNS is on. The host's
+external deployment profile is **not** copied into the VM, so confirm the prompted hostname and accounts instead of
+assuming the profile supplied them. The installer then prepares the data disk, installs Docker and the pinned PM2,
+builds the images, creates your **household certificate authority**, the server certificate and the first accounts,
+starts the stack and verifies each step. A re-run keeps completed steps and repairs missing or outdated ones.
 
 Other modes (inside the VM):
 
@@ -84,7 +103,8 @@ sudo anj-cloud-setup --answers FILE         # unattended; deploy/vm/answers/prod
 ## 4. Check the stack
 
 ```bash
-python3 deploy/prod.py check                # inside the VM: read-only verification
+cd /srv/anj-cloud/release/current
+python3 deploy/prod.py check                # read-only verification
 python3 deploy/prod.py status               # every app and its health, as JSON
 ```
 

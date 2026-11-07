@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import socket
@@ -50,6 +51,7 @@ class Answers(unittest.TestCase):
     def test_production_example_writes_ddns_on_explicitly(self):
         answers = bootstrap.load_answers(ROOT / "deploy" / "vm" / "answers" / "prod.example.toml")
         self.assertEqual(answers["ddns"], "on")
+        self.assertTrue(answers["data_disk_init"])
         bootstrap.validate_answers(answers)
 
     def test_inline_secrets_and_unknown_keys_are_refused_by_name(self):
@@ -220,6 +222,124 @@ class DryRun(unittest.TestCase):
         self.assertIn("refuse: /dev/vdb holds xfs", out)
         self.assertNotIn("mkfs", out)
         self.assertEqual(system.executed, [])
+
+
+class ReleaseApply(unittest.TestCase):
+    def test_local_source_install_records_release_as_the_setup_user(self):
+        temp = Path(tempfile.mkdtemp(prefix="anj-b2-release-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        system = FakeSystem(dry=False)
+        setup = mock.Mock()
+        setup.system = system
+        setup.facts = FakeFacts(system)
+        setup.user = setup.facts.user()
+        setup.release = "a" * 40
+        setup.release_tar = None
+        setup.checkout = None
+        with mock.patch.object(bootstrap, "install_release_source"), \
+                mock.patch.object(bootstrap.paths, "STACK_CONFIG", temp / "stack.json"), \
+                mock.patch.object(system, "write", wraps=system.write) as write:
+            bootstrap.Release(setup).apply()
+        write.assert_called_once()
+        self.assertIs(write.call_args.kwargs["owner"], setup.user)
+        self.assertEqual(json.loads((temp / "stack.json").read_text()), {"release": setup.release})
+
+
+class Pm2Permissions(unittest.TestCase):
+    """Real subprocess/file permissions with an offline npm fixture; no PM2 daemon."""
+
+    def setUp(self):
+        self.temp = Path(tempfile.mkdtemp(prefix="anj-pm2-permissions-"))
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.directory = self.temp / "opt" / "pm2"
+        self.bin = self.temp / "bin"
+        self.bin.mkdir()
+        self.link = self.bin / "pm2"
+        npm = self.bin / "npm"
+        npm.write_text("#!/usr/bin/python3\n"
+                       "import json,os,pathlib,shutil\n"
+                       "p=pathlib.Path\n"
+                       "count=p('install-count')\n"
+                       "count.write_text(str(int(count.read_text())+1) if count.exists() else '1')\n"
+                       # Simulate root npm replacing its private dependency tree in this unprivileged test.
+                       "dep=p('node_modules/dependency')\n"
+                       "if dep.exists(): dep.chmod(0o755)\n"
+                       # npm ci removes installed packages but retains node_modules and its mode.
+                       "p('node_modules').mkdir(exist_ok=True)\n"
+                       "for child in p('node_modules').iterdir():\n"
+                       " if child.is_dir(): shutil.rmtree(child)\n"
+                       " else: child.unlink()\n"
+                       "p('node_modules/pm2/bin').mkdir(parents=True)\n"
+                       "p('node_modules/dependency').mkdir()\n"
+                       "p('node_modules/dependency/index.js').write_text('module.exports = {};')\n"
+                       "pin=json.loads(p('package.json').read_text())['dependencies']['pm2']\n"
+                       "p('node_modules/pm2/package.json').write_text(json.dumps({'version':pin}))\n"
+                       "binary=p('node_modules/pm2/bin/pm2')\n"
+                       "binary.write_text('#!/bin/sh\\ntouch '+str(p('daemon-started').absolute())+'\\n')\n"
+                       "binary.chmod(0o755)\n")
+        npm.chmod(0o755)
+        self.enterContext(mock.patch.dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"]))
+        self.enterContext(mock.patch.object(bootstrap, "PM2_DIR", self.directory))
+        self.enterContext(mock.patch.object(bootstrap, "PM2_LINK", self.link))
+        self.system = bootstrap.System(out=io.StringIO())
+        self.setup = mock.Mock(system=self.system, facts=mock.Mock(), user=pwd.getpwuid(os.getuid()).pw_name, steps=[])
+        self.step = bootstrap.Pm2(self.setup)
+
+    def test_restrictive_parent_umask_does_not_make_pm2_private_or_change_parent(self):
+        previous = os.umask(0o077)
+        try:
+            self.step.apply()
+            with mock.patch.object(self.system, "read", wraps=self.system.read) as read:
+                self.assertTrue(self.step.verify()[0])
+                self.assertTrue(any(call.kwargs.get("user") == self.setup.user for call in read.call_args_list))
+            parent_file = self.temp / "still-private"
+            parent_file.write_text("private fixture")
+            self.assertEqual(parent_file.stat().st_mode & 0o777, 0o600)
+        finally:
+            os.umask(previous)
+        self.assertEqual((self.directory / "node_modules").stat().st_mode & 0o777, 0o755)
+        self.assertEqual((self.directory / "node_modules/dependency/index.js").stat().st_mode & 0o777, 0o644)
+        self.assertFalse((self.directory / "daemon-started").exists())
+
+    def test_reinstall_repairs_existing_private_node_modules_directory(self):
+        self.step.apply()
+        modules = self.directory / "node_modules"
+        modules.chmod(0o700)
+        previous = os.umask(0o077)
+        try:
+            self.step.apply()
+            private_file = self.temp / "still-private-after-repair"
+            private_file.write_text("private fixture")
+        finally:
+            os.umask(previous)
+        self.assertEqual(modules.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((modules / "dependency/index.js").stat().st_mode & 0o777, 0o644)
+        self.assertEqual(private_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.directory / "install-count").read_text(), "2")
+        self.assertTrue(self.step.verify()[0])
+        self.assertFalse((self.directory / "daemon-started").exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "permission denial fixture requires an unprivileged test runner")
+    def test_rerun_repairs_inaccessible_dependencies_then_is_idempotent(self):
+        self.step.apply()
+        dependency = self.directory / "node_modules/dependency"
+        dependency.chmod(0o000)
+        self.addCleanup(dependency.chmod, 0o755)
+        self.assertFalse(self.step.state()[0])
+        self.assertFalse(self.step.verify()[0])
+        bootstrap.Setup.execute(self.setup, self.step, 2, 12)
+        self.assertEqual(self.setup.steps[-1]["result"], "changed")
+        self.assertTrue(self.step.verify()[0])
+        bootstrap.Setup.execute(self.setup, self.step, 2, 12)
+        self.assertEqual(self.setup.steps[-1]["result"], "already done")
+        self.assertEqual((self.directory / "install-count").read_text(), "2")
+        self.assertFalse((self.directory / "daemon-started").exists())
+
+    def test_dry_run_never_installs_pm2(self):
+        self.system.dry = True
+        self.step.apply()
+        self.assertFalse(self.directory.exists())
+        self.assertFalse(self.link.exists())
 
 
 class DiskRule(unittest.TestCase):

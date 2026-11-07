@@ -732,9 +732,17 @@ class BackupPassword(Base):
         self.assertEqual(setup.backup_done, "confirmed")
         self.assertIn({"argv": ["python3", "-I", f"{paths.RELEASE_CURRENT}/deploy/backup.py", "init", "--show-escrow"],
                        "user": "anj"}, self.system.commands)
-        self.assertIn("First full backup: tonight at 03:30", self.text())
+        self.assertIn("Run the first full backup before relying on the timers", self.text())
+        self.assertIn("Nightly runs refuse, and the 36-hour stale alert stays unarmed", self.text())
         self.make("").offer_backup()                                         # no share: no offer
         self.assertNotIn("Set up encrypted backups now?", self.text())
+
+    def test_summary_requires_seed_after_repository_init(self):
+        status = {"apps": {}, "healthcheck": "ready", "firewall": "loaded", "backup": "not seeded",
+                  "data_disk_used": "1%"}
+        text = bootstrap.render_summary_status(status, {"ddns": "off"}, "set up")
+        self.assertIn("⚠ repository initialized — mandatory first backup required", text)
+        self.assertNotIn("set up — first backup tonight", text)
 
 
 # M8: hidden input -------------------------------------------------------------------------------------
