@@ -36,7 +36,7 @@ AnJ Cloud is young software built for one household first.
 
 | Platform | State |
 |---|---|
-| Gateway (a Linux host running a VM) | In use. **[Server setup guide](docs/self-hosting/README.md)** |
+| Gateway (Debian 13 amd64 VM or dedicated machine) | Guided installer. **[Server quick start](docs/self-hosting/quickstart.md)** (clean-path validation pending) |
 | Linux client (x86_64) | Usable: installer, tray, start at login, in-app update |
 | Android client (arm64) | Usable: signed APK, in-app update |
 | macOS client (Apple silicon) | Usable: installer, menu-bar item, in-app update |
@@ -47,14 +47,24 @@ repository yet.
 
 ## Set up your server first
 
-Every client needs a gateway to pair with, so start there. The **[server setup guide](docs/self-hosting/README.md)**
-walks through it end to end: [requirements](docs/self-hosting/requirements.md) (a Linux host with KVM, a domain,
-Cloudflare DNS), [the VM host and gateway VM](docs/self-hosting/host-and-vm.md),
-[DNS, TLS and port forwarding](docs/self-hosting/dns-tls-forwarding.md),
-[accounts and the first device](docs/self-hosting/accounts-and-pairing.md),
-[backups and restore](docs/self-hosting/backups.md), [upgrades](docs/self-hosting/upgrades.md),
-[your release keys and publishing client releases](docs/self-hosting/keys-and-releases.md), and
-[troubleshooting](docs/self-hosting/troubleshooting.md).
+Every client needs a gateway to pair with, so start there. The canonical
+**[self-hosting quick start](docs/self-hosting/quickstart.md)** takes a generic Debian 13 amd64 VM or
+dedicated machine through DNS, the guided installer, health checks, and first pairing. A VM is recommended
+when the physical host has other uses.
+
+You need 2 or more CPUs, 4 GiB RAM, 8 GiB free on the OS disk (20 GiB is the practical recommendation),
+exactly one blank data disk, a public DNS hostname, and a router that can forward TCP 443. The installer
+explains its detected defaults and asks for confirmation before formatting the data disk. No Subfloor,
+Flutter, deployment profile, or client build/signing keys are needed.
+
+The exact generic clean-install path has not yet completed end-to-end validation. Follow its stop conditions
+rather than treating an unfinished run as successful.
+
+Read [requirements](docs/self-hosting/requirements.md),
+[DNS, TLS and forwarding](docs/self-hosting/dns-tls-forwarding.md), and
+[accounts and pairing](docs/self-hosting/accounts-and-pairing.md) alongside the quick start. The
+[self-hosting index](docs/self-hosting/README.md) also identifies the separate advanced libvirt VM-host
+route. The generic quick start does not configure backups; its limitations and next steps are explicit.
 
 ## Install a client
 
