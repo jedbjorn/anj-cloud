@@ -865,6 +865,7 @@ class _ClientHomeState extends State<ClientHome>
                         builder: (_) => AdminPage(
                           call: controller.admin,
                           onNotAdmin: controller.adminRoleRemoved,
+                          server: controller.serverOrigin!,
                         ),
                       ),
                     ),

@@ -136,6 +136,14 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   String? certificateWarning;
   String? root;
   String? server;
+
+  /// This device's paired server as a canonical origin, never the build's
+  /// household default. Null before pairing.
+  String? get serverOrigin {
+    final current = server;
+    return current == null ? null : normalizeServerOrigin(current);
+  }
+
   String? ca;
   String? fingerprint;
   String pairingState = 'unpaired';
@@ -1299,8 +1307,8 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     final store = Manifest(profile);
     PairingClient? client;
     try {
-      final origin = Uri.parse(address);
-      final requestedOrigin = origin.origin;
+      final requestedOrigin = normalizeServerOrigin(address);
+      final origin = Uri.parse(requestedOrigin);
       final boundOrigin = store.setting('accountOrigin');
       if (boundOrigin != null && requestedOrigin != boundOrigin) {
         throw const FormatException(
@@ -1362,9 +1370,9 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
           ? p.absolute((caPath != null && caPath.isNotEmpty) ? caPath : ca!)
           : null;
       if (legacyAnchor != null) {
-        server = address;
+        server = requestedOrigin;
         ca = legacyAnchor;
-        store.setSetting('server', address);
+        store.setSetting('server', requestedOrigin);
         store.setSetting('ca', legacyAnchor);
       }
       if (pin != null) {
@@ -1407,7 +1415,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
           result['fingerprint'] as String,
         );
         final trustPath = legacyAnchor ?? _storePinnedCa(pinnedCa!);
-        server = address;
+        server = requestedOrigin;
         ca = trustPath;
         // A device's first pairing shows the folder screen before any sync
         // (decision #118); once confirmed, a re-pair never does. "First"
@@ -1429,7 +1437,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
           store.setSetting('accountRights', rights.toString());
           accountRights = rights.toString();
           store.setSetting('deviceId', deviceId);
-          store.setSetting('server', address);
+          store.setSetting('server', requestedOrigin);
           store.setSetting('ca', trustPath);
         });
         if (firstSync) firstSyncPending = true;
@@ -1629,6 +1637,82 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     unawaited(stop());
     super.dispose();
   }
+}
+
+/// The canonical HTTPS origin for a pairing [address]. Surrounding whitespace
+/// is ignored and a missing scheme defaults to HTTPS. Raw authority validation
+/// happens before [Uri] can canonicalize it: encoded/backslash forms, credentials,
+/// malformed ports, non-root paths, queries and fragments are rejected. IPv6
+/// literals must be bracketed so they cannot be misread as a host and port.
+String normalizeServerOrigin(String address) {
+  final input = address.trim();
+  Never invalid() => throw const FormatException(
+    'Use an HTTPS server origin without a path, credentials, query or fragment.',
+  );
+
+  if (input.isEmpty ||
+      input.contains(RegExp(r'\s')) ||
+      input.contains('%') ||
+      input.contains('\\')) {
+    invalid();
+  }
+  final explicitScheme = RegExp(r'^[A-Za-z][A-Za-z0-9+.-]*://')
+      .firstMatch(input);
+  if (explicitScheme != null &&
+      explicitScheme.group(0)!.toLowerCase() != 'https://') {
+    invalid();
+  }
+  final remainder = input.substring(explicitScheme?.end ?? 0);
+  final delimiter = remainder.indexOf(RegExp(r'[/?#]'));
+  final authority = delimiter < 0
+      ? remainder
+      : remainder.substring(0, delimiter);
+  final suffix = delimiter < 0 ? '' : remainder.substring(delimiter);
+  if (authority.isEmpty ||
+      authority.contains('@') ||
+      (suffix.isNotEmpty && suffix != '/')) {
+    invalid();
+  }
+
+  String? rawPort;
+  if (authority.startsWith('[')) {
+    final closing = authority.indexOf(']');
+    if (closing < 0) invalid();
+    final literal = InternetAddress.tryParse(authority.substring(1, closing));
+    if (literal == null || literal.type != InternetAddressType.IPv6) invalid();
+    final after = authority.substring(closing + 1);
+    if (after.isNotEmpty) {
+      if (!after.startsWith(':')) invalid();
+      rawPort = after.substring(1);
+    }
+  } else {
+    if (authority.contains('[') || authority.contains(']')) invalid();
+    final separator = authority.indexOf(':');
+    if (separator >= 0 && authority.indexOf(':', separator + 1) >= 0) {
+      invalid();
+    }
+    final host = separator < 0 ? authority : authority.substring(0, separator);
+    if (host.isEmpty) invalid();
+    if (separator >= 0) rawPort = authority.substring(separator + 1);
+  }
+  final port = rawPort == null ? null : int.tryParse(rawPort);
+  if (rawPort != null &&
+      (!RegExp(r'^[0-9]+$').hasMatch(rawPort) ||
+          port == null ||
+          port > 65535)) {
+    invalid();
+  }
+
+  final origin = Uri.parse('https://$authority$suffix');
+  if (origin.scheme != 'https' ||
+      origin.host.isEmpty ||
+      origin.userInfo.isNotEmpty ||
+      origin.hasQuery ||
+      origin.hasFragment ||
+      (origin.path.isNotEmpty && origin.path != '/')) {
+    invalid();
+  }
+  return origin.origin;
 }
 
 /// The pairing label the gateway accepts: control characters removed and at
