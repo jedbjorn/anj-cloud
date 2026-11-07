@@ -22,7 +22,7 @@ class FakeSystem(bootstrap.System):
         self.executed = []
         self.events = []            # writes and changes, in order
 
-    def read(self, argv, *, user=None, timeout=120, data=None, cwd=None):
+    def read(self, argv, *, user=None, timeout=120, data=None, cwd=None, umask=-1):
         argv = [str(a) for a in argv]
         self.reads.append(argv)
         if argv[0] == "python3" and any(part.endswith(("deploy/ddns.py", "deploy/backup.py")) for part in argv) \
