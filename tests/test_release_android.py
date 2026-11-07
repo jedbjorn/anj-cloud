@@ -72,10 +72,12 @@ class AndroidPublishTests(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         git(self.repo, "init", "-q", "-b", "main")
+        (self.repo / "apps/client").mkdir(parents=True)
         self.commits = []
         for index in range(3):
             (self.repo / "file").write_text(str(index))
-            git(self.repo, "add", "file")
+            (self.repo / "apps/client/release-version.json").write_text(json.dumps({"version_code": index + 1}))
+            git(self.repo, "add", ".")
             git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=f@example.invalid", "commit", "-qm", f"c{index}")
             self.commits.append(git(self.repo, "rev-parse", "HEAD"))
         git(self.repo, "update-ref", "refs/remotes/origin/main", self.commits[1])
@@ -202,7 +204,7 @@ class AndroidPublishTests(unittest.TestCase):
         plan = self.github(runner=lambda argv, **kw: calls.append(argv))
         self.assertEqual([], calls)
         self.assertIn("dry-run", plan["state"])
-        self.assertEqual(("android-2026.11.06.2", self.commits[1]), (plan["tag"], plan["target_commit"]))
+        self.assertEqual(("android-2", self.commits[1]), (plan["tag"], plan["target_commit"]))
         self.assertEqual(["anj-cloud-2026.11.06.2.apk", "anj-cloud-2026.11.06.2.apk.sha256"], plan["assets"])
 
     def test_github_release_create_tags_the_commit_with_the_apk_and_its_sha256(self):
@@ -211,8 +213,8 @@ class AndroidPublishTests(unittest.TestCase):
 
         def runner(argv, **kwargs):
             calls.append(argv)
-            if argv[:3] == ["gh", "release", "view"]:
-                return subprocess.CompletedProcess(argv, 1, "", "release not found")
+            if argv[:2] == ["gh", "api"]:
+                return subprocess.CompletedProcess(argv, 0, "[[]]", "")
             assets = [Path(a) for a in argv[4:6]]
             self.assertEqual(self.apk.read_bytes(), assets[0].read_bytes())
             self.assertEqual(f"{ORIGINAL_FACTS(self.apk, self.runner, ('aapt2', 'apksigner', {}))['sha256']}  "
@@ -222,11 +224,12 @@ class AndroidPublishTests(unittest.TestCase):
         plan = self.github(create=True, runner=runner)
         self.assertEqual("created", plan["state"])
         create = calls[1]
-        self.assertEqual(["gh", "release", "create", "android-2026.11.06.2"], create[:4])
+        self.assertEqual(["gh", "release", "create", "android-2"], create[:4])
         self.assertEqual(self.commits[1], create[create.index("--target") + 1])
         calls.clear()
-        with self.assertRaisesRegex(release.Refused, "already exists"):
-            self.github(create=True, runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+        with self.assertRaisesRegex(release.Refused, "not above GitHub"):
+            self.github(create=True, runner=lambda argv, **kw: subprocess.CompletedProcess(
+                argv, 0, json.dumps([[{"tag_name": "android-2026.11.05.2", "assets": []}]]), ""))
 
     def test_github_release_rehearses_a_branch_only_as_a_dry_run(self):
         self.describe(commit=self.commits[2])

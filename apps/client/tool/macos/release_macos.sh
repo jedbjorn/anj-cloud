@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A publishable macOS release (spec #40 R2), driven from the VM host: the commit is
 # checked out alone, its version code and version computed as
-# tool/package_linux.py does (`git rev-list --count`, the commit's UTC date),
+# tool/package_linux.py does (committed release-version.json, the commit's UTC date),
 # the source sent to mac-test, built and stamped there by
 # tool/macos/package_release.sh --version-code --version, and the archive
 # and receipts fetched back. Publish the archive with
@@ -33,9 +33,8 @@ git -C "$repo" fetch --quiet origin main
 commit=$(git -C "$repo" rev-parse --verify "$commit^{commit}")
 [[ $(git -C "$repo" rev-parse --is-shallow-repository) == false ]] || { echo "release_macos.sh: use a full clone" >&2; exit 1; }
 git -C "$repo" merge-base --is-ancestor "$commit" "$ref" || { echo "release_macos.sh: ${commit:0:12} is not in $ref" >&2; exit 1; }
-code=$(git -C "$repo" rev-list --count "$commit")
-date=$(TZ=UTC git -C "$repo" show -s --format=%cd --date=format-local:%Y.%m.%d "$commit")
-version="$date.$code"
+read -r code version < <(python3 "$repo/deploy/client_version.py" "$commit")
+[[ -n $code && -n $version ]] || exit 1
 mkdir -p "$out"
 tree=$(mktemp -d "${TMPDIR:-/tmp}/anj-macrel.XXXXXX")
 cleanup() {
