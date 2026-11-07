@@ -17,7 +17,7 @@ library plus the `openssl` command (3.0+); never builds anything.
                        | --local-project NAME [--port N] [--source-ref REF]
         Takes an artifact apps/client/tool/package_linux.py built and publishes it signed:
           - its receipt's source commit must be in origin/main (fetched first) and its
-            version_code must be that commit's `git rev-list --count`;
+            version_code must be that commit's apps/client/release-version.json;
           - its built-in release key must be the key that signs it (a release that trusts another
             key could never update itself again);
           - its version_code must be above the release the target serves now;
@@ -38,7 +38,7 @@ library plus the `openssl` command (3.0+); never builds anything.
         APK must be cloud.anj.anj_cloud signed by exactly one certificate, the one pinned in
         apps/client/android/release-signer.sha256 (a rotated key is a reviewed change there); its
         cloud.anj.source_head commit must be in origin/main and its versionCode that commit's
-        `git rev-list --count`, above the served release's. The manifest {version, version_code,
+        committed release number, above the served release's. The manifest {version, version_code,
         size, sha256, signer_sha256} is not signed: Android trusts the APK's certificate.
         --signer-sha256 (local stacks only) pins another certificate, for test keys.
 """
@@ -60,7 +60,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
-from deploy import deployment_profile  # noqa: E402
+from deploy import deployment_profile, client_version  # noqa: E402
 from services.access.release_manifest import SIGNED, ManifestError, manifest_from, signed_message  # noqa: E402
 
 # The Linux manager's standard-library Ed25519 (one implementation of the curve checks).
@@ -274,16 +274,16 @@ ARTIFACT_FACTS = {"linux-x86_64": artifact_facts, "macos-arm64": macos_artifact_
 
 # The files whose code decides what is signed and how (review L5): a local edit could sign bytes
 # no client accepts.
-SIGNING_PATHS = ("deploy/release.py", "services/access/release_manifest.py", "apps/client/tool/linux_install.py")
+SIGNING_PATHS = ("deploy/release.py", "deploy/client_version.py", "apps/client/release-version.json", "services/access/release_manifest.py", "apps/client/tool/linux_install.py")
 
 
 def check_checkout(runner=subprocess.run):
-    """A full clone (the version code counts history) with the signing code as committed."""
+    """A full clone for ancestry verification, with the signing code as committed."""
     git = ["git", "-C", str(REPO)]
     shallow = run([*git, "rev-parse", "--is-shallow-repository"], runner)
     if shallow.returncode or shallow.stdout.decode().strip() != "false":
-        raise Refused("Publish from a full clone: this checkout is shallow (or not a git checkout), so version codes "
-                      "cannot be recomputed. Run `git fetch --unshallow` or use the main checkout.")
+        raise Refused("Publish from a full clone: this checkout is shallow (or not a git checkout), so source ancestry "
+                      "cannot be verified. Run `git fetch --unshallow` or use the main checkout.")
     dirty = run([*git, "status", "--porcelain", "--", *SIGNING_PATHS], runner)
     if dirty.returncode or dirty.stdout.strip():
         raise Refused("The signing code has local changes (" + ", ".join(SIGNING_PATHS) + "); commit or discard them "
@@ -291,7 +291,7 @@ def check_checkout(runner=subprocess.run):
 
 
 def check_source(receipt, ref=SOURCE_REF, *, fetch=True, runner=subprocess.run):
-    """The receipt's commit is in `ref` and its version_code is that commit's rev-list count."""
+    """The receipt's commit is in `ref` and carries the allocated release number."""
     check_checkout(runner)
     git = ["git", "-C", str(REPO)]
     if fetch:
@@ -303,10 +303,14 @@ def check_source(receipt, ref=SOURCE_REF, *, fetch=True, runner=subprocess.run):
         raise Refused(f"Commit {source[:12]} is not known to this checkout")
     if run([*git, "merge-base", "--is-ancestor", source, ref], runner).returncode:
         raise Refused(f"Commit {source[:12]} is not in {ref}; only merged commits are published")
-    count = run([*git, "rev-list", "--count", source], runner)
-    if count.returncode or int(count.stdout.decode().strip()) != receipt["version_code"]:
+    try:
+        expected = client_version.version_code(REPO, source, runner)
+    except ValueError as error:
+        raise Refused(str(error)) from error
+    if expected != receipt["version_code"]:
         raise Refused(f"The artifact's version_code {receipt['version_code']} is not its commit's "
-                      f"(git rev-list --count {source[:12]})")
+                      f"allocated release number ({expected})")
+
 
 
 # Targets ---------------------------------------------------------------------------------------

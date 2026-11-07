@@ -13,13 +13,13 @@
         A reproducible signed release APK (cloud.anj.anj_cloud, R8) of a committed source: `git
         archive` of the commit (default HEAD; nothing uncommitted or ignored can enter) extracted
         to a fixed path, built with the pinned Flutter and Android toolchains for arm64 phones and
-        the x86_64 emulator. versionCode is the commit's `git rev-list --count` and versionName
-        its UTC date and that count, as for Linux; the commit is stamped into the manifest
+        the x86_64 emulator. versionCode is the commit's apps/client/release-version.json and versionName
+        its UTC date and that code, as for Linux; the commit is stamped into the manifest
         (cloud.anj.source_head). OUT (absolute, absent) receives anj-cloud-<version>.apk, its
         .sha256 and build-receipt.json. The signer must be the pinned certificate.
 
     release_android.py github-release --apk APK [--create | --source-ref REF]
-        The first-install path (#131): a GitHub release tagged android-<version> on the APK's
+        The first-install path (#131): a GitHub release tagged android-<version_code> on the APK's
         commit, with the APK and its .sha256 as assets. The APK passes the publish checks first
         (pinned signer, commit on origin/main, versionCode). Without --create it only prints
         what it would run; --create needs the operator's go-ahead.
@@ -39,7 +39,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO))
-from deploy import deployment_profile, release  # noqa: E402
+from deploy import deployment_profile, release, client_version  # noqa: E402
 
 SIGNING_DIR = Path.home() / ".local/share/anj-cloud/signing/android"
 KEYSTORE = "anj-cloud-release.p12"
@@ -113,13 +113,10 @@ def keygen(directory=SIGNING_DIR):
 
 
 def release_version(commit):
-    """(versionCode, versionName): as package_linux.py, the commit's rev-list count and date."""
-    if git("rev-parse", "--is-shallow-repository") == "true":
-        raise Refused("Build from a full (not shallow) clone: the version code counts the commit's history.")
-    code = int(git("rev-list", "--count", commit))
-    date = subprocess.run(["git", "-C", str(REPO), "show", "-s", "--format=%cd", "--date=format-local:%Y.%m.%d", commit],
-                          capture_output=True, text=True, check=True, env={**os.environ, "TZ": "UTC"}).stdout.strip()
-    return code, f"{date}.{code}"
+    try:
+        return client_version.release_version(REPO, commit)
+    except ValueError as error:
+        raise Refused(str(error)) from error
 
 
 def digest(path):
@@ -188,7 +185,7 @@ def github_release(apk, *, create=False, runner=subprocess.run, fetch=True, sour
     release.check_android(facts, release.android_pin())
     release.check_source(facts, source_ref or release.SOURCE_REF, fetch=fetch)
     version, head = facts["version"], facts["source_head"]
-    tag, name = f"android-{version}", f"anj-cloud-{version}.apk"
+    tag, name = f"android-{facts['version_code']}", f"anj-cloud-{version}.apk"
     notes = (f"AnJ Cloud for Android {version} (versionCode {facts['version_code']}), built from {head}.\n\n"
              f"First install only (decision #131): download {name} on the phone, check its SHA-256 against "
              f"{name}.sha256, then install it. Later updates come from the household server in the app.\n\n"
@@ -206,9 +203,10 @@ def github_release(apk, *, create=False, runner=subprocess.run, fetch=True, sour
                             "--target", head, "--title", f"AnJ Cloud for Android {version}", "--notes", "…"]}
         if not create:
             return {**plan, "state": "dry-run: no GitHub release created"}
-        exists = runner(["gh", "release", "view", tag, "--repo", REPOSITORY], capture_output=True)
-        if exists.returncode == 0:
-            raise Refused(f"GitHub release {tag} already exists; releases are never replaced")
+        try:
+            client_version.check_github_version(REPOSITORY, facts["version_code"], runner)
+        except ValueError as error:
+            raise Refused(str(error)) from error
         done = runner(argv, capture_output=True, text=True)
         if done.returncode:
             raise Refused("gh release create failed: " + (done.stderr or "")[-300:])

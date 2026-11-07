@@ -77,17 +77,9 @@ def main():
 
 
 def release_version(head):
-    """(version_code, version) of a commit (spec #37 U-publish). The version code is the number
-    of commits reachable from it (`git rev-list --count`): every commit on main is an ancestor of
-    every later one, so along main it only grows, and deploy/release.py recomputes it from git
-    before publishing. The version shown to people is the commit's UTC date and that code,
-    e.g. 2026.11.05.612. A shallow clone would count wrong: package from a full checkout."""
-    if run("git", "rev-parse", "--is-shallow-repository", capture=True).stdout.strip() == "true":
-        sys.exit("Package from a full (not shallow) clone: the version code counts the commit's history.")
-    code = int(run("git", "rev-list", "--count", head, capture=True).stdout.strip())
-    date = subprocess.run(["git", "show", "-s", "--format=%cd", "--date=format-local:%Y.%m.%d", head], cwd=REPO,
-                          check=True, text=True, capture_output=True, env={**os.environ, "TZ": "UTC"}).stdout.strip()
-    return code, f"{date}.{code}"
+    sys.path.insert(0, str(REPO))
+    from deploy.client_version import release_version as committed_version
+    return committed_version(REPO, head)
 
 
 def _package(destination, head, output, audit, image_id, version_code=None, version=None):
