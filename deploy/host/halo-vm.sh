@@ -1035,6 +1035,7 @@ step_3() {
                 record 3 "$([[ "$phase" == plan ]] && echo planned || echo changed)" "" "defined" "4 GiB memfd, pinned 14,30,15,31, UEFI"
             fi
             has 'Autostart:.*disable' V dominfo "$PROD" || change V autostart --disable "$PROD"
+            write_prod_ssh_config "$phase"
             ;;
         verify)
             uuid="$(domain_uuid)"
@@ -1694,9 +1695,48 @@ mode_forward() {
     esac
 }
 
+prod_known_hosts() { printf '%s/.ssh/known_hosts.anj-prod' "$(p "$USER_HOME")"; }
+prod_ssh_config() { printf '%s/.local/share/anj-cloud/prod-vm/ssh_config' "$(p "$USER_HOME")"; }
 qual_known_hosts() { printf '%s/.ssh/known_hosts.anj-qual' "$(p "$USER_HOME")"; }
 qual_tag_file() { printf '%s/.local/state/anj-cloud-qual/run-id' "$(p "$USER_HOME")"; }
-qual_ssh_config() { printf '%s/.local/share/anj-cloud/prod-vm/ssh_config' "$(p "$USER_HOME")"; }
+qual_ssh_config() { prod_ssh_config; }
+
+write_prod_ssh_config() {
+    local phase="$1" file key block address
+    file="$(prod_ssh_config)"
+    if [[ "$phase" == plan ]]; then log "    would write ssh alias: ssh -F $file anj-prod"; return 0; fi
+    key="${KEYS[0]%.pub}"
+    address="$(profile_get "$PROD" subnet).10"
+    block="$(printf '# >>> anj-prod (halo-vm.sh --apply) >>>\nHost anj-prod\n  HostName %s\n  User anj\n  IdentityFile %s\n  IdentitiesOnly yes\n  UserKnownHostsFile %s\n  StrictHostKeyChecking accept-new\n  ConnectTimeout 5\n  BatchMode yes\n# <<< anj-prod <<<' "$address" "$key" "$(prod_known_hosts)")"
+    if [[ -f "$file" ]]; then
+        awk '
+            /^# >>> anj-prod / { marked=1; next }
+            marked {
+                if ($0 ~ /^# <<< anj-prod /) marked=0
+                next
+            }
+            { directive=tolower($0) }
+            directive ~ /^[[:space:]]*host[[:space:]]+/ {
+                stale = directive ~ /^[[:space:]]*host[[:space:]]+anj-prod[[:space:]]*$/
+                if (!stale) print
+                next
+            }
+            directive ~ /^[[:space:]]*match[[:space:]]+/ { stale=0; print; next }
+            stale && $0 !~ /^[[:space:]]*(#|$)/ { next }
+            { print }
+        ' "$file" > "$WORK/prod_ssh_config" || abort "cannot read $file"
+    else
+        : > "$WORK/prod_ssh_config" || abort "cannot prepare $file"
+    fi
+    printf '%s\n' "$block" >> "$WORK/prod_ssh_config" || abort "cannot prepare $file"
+    if [[ -f "$file" ]] && cmp -s "$WORK/prod_ssh_config" "$file"; then
+        log "    ssh alias unchanged: ssh -F $file anj-prod"
+        return 0
+    fi
+    as_user mkdir -p "$(dirname "$file")" || abort "cannot create the SSH config directory"
+    as_user cp "$WORK/prod_ssh_config" "$file" || abort "cannot write $file"
+    log "    ssh alias: ssh -F $file anj-prod"
+}
 
 # qual_lock FLOCK-ARGS...: the user-owned lock that serialises --qual and --qual-destroy. --qual
 # holds it from the busy check through the tag write and define (to its exit), so of two runs

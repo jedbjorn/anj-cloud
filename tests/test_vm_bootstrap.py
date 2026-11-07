@@ -50,6 +50,7 @@ class Answers(unittest.TestCase):
     def test_production_example_writes_ddns_on_explicitly(self):
         answers = bootstrap.load_answers(ROOT / "deploy" / "vm" / "answers" / "prod.example.toml")
         self.assertEqual(answers["ddns"], "on")
+        self.assertTrue(answers["data_disk_init"])
         bootstrap.validate_answers(answers)
 
     def test_inline_secrets_and_unknown_keys_are_refused_by_name(self):
@@ -220,6 +221,27 @@ class DryRun(unittest.TestCase):
         self.assertIn("refuse: /dev/vdb holds xfs", out)
         self.assertNotIn("mkfs", out)
         self.assertEqual(system.executed, [])
+
+
+class ReleaseApply(unittest.TestCase):
+    def test_local_source_install_records_release_as_the_setup_user(self):
+        temp = Path(tempfile.mkdtemp(prefix="anj-b2-release-"))
+        self.addCleanup(shutil.rmtree, temp, True)
+        system = FakeSystem(dry=False)
+        setup = mock.Mock()
+        setup.system = system
+        setup.facts = FakeFacts(system)
+        setup.user = setup.facts.user()
+        setup.release = "a" * 40
+        setup.release_tar = None
+        setup.checkout = None
+        with mock.patch.object(bootstrap, "install_release_source"), \
+                mock.patch.object(bootstrap.paths, "STACK_CONFIG", temp / "stack.json"), \
+                mock.patch.object(system, "write", wraps=system.write) as write:
+            bootstrap.Release(setup).apply()
+        write.assert_called_once()
+        self.assertIs(write.call_args.kwargs["owner"], setup.user)
+        self.assertEqual(json.loads((temp / "stack.json").read_text()), {"release": setup.release})
 
 
 class DiskRule(unittest.TestCase):
