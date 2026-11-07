@@ -506,6 +506,38 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     };
   }
 
+  /// Stable document ids from the requested tree's parent (or the root) to
+  /// [id], including both ends. Android's Files app uses this to navigate
+  /// directly to a document. Tree callers never learn ancestors above their
+  /// granted parent, and a single-document grant reveals no ancestry.
+  List<String> findPath(String? parent, String id, DocumentsCaller caller) {
+    if (caller.kind == CallerKind.document ||
+        (parent == null &&
+            caller.kind != CallerKind.own &&
+            caller.kind != CallerKind.system)) {
+      throw const DocumentsFailure('denied', 'No access to this path.');
+    }
+    final start = resolve(parent ?? rootId).path;
+    final target = resolve(id).path;
+    if (start == null ||
+        target == null ||
+        !covers(start, target) ||
+        (start.isNotEmpty && _byPath[start]!['kind'] != 'directory')) {
+      throw const DocumentsFailure('notFound', 'Not inside this folder.');
+    }
+    _read(caller, start);
+    final paths = <String>[target];
+    var path = target;
+    while (path != start) {
+      path = _parent(path);
+      if (path.isNotEmpty && _byPath[path]?['kind'] != 'directory') {
+        throw const DocumentsFailure('notFound', 'A parent folder is missing.');
+      }
+      paths.add(path);
+    }
+    return paths.reversed.map(idOf).toList();
+  }
+
   /// Whether [id] is [parent] or beneath it (tree grants; working copies are
   /// never part of a tree).
   bool isChild(String parent, String id) {

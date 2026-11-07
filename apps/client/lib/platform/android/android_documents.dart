@@ -68,6 +68,12 @@ class AndroidDocuments implements GrantRevoker, PlatformApps {
             args['parent'] as String,
             args['id'] as String,
           );
+        case 'findPath':
+          return service.findPath(
+            args['parent'] as String?,
+            args['id'] as String,
+            caller(),
+          );
         case 'open':
           return await service.open(
             args['id'] as String,
