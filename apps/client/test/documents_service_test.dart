@@ -173,6 +173,90 @@ void main() {
     expect(cloud['cloudOnly'], isTrue);
   });
 
+  test('Files app navigation resolves root, folder and file ancestry', () {
+    expect(service.findPath(null, 'root', system), ['root']);
+    expect(service.findPath(null, id('Music/Album'), system), [
+      'root',
+      id('Music'),
+      id('Music/Album'),
+    ]);
+    expect(service.findPath(null, id('Music/Album/track.mp3'), system), [
+      'root',
+      id('Music'),
+      id('Music/Album'),
+      id('Music/Album/track.mp3'),
+    ]);
+    expect(service.findPath(null, id('cloud.txt'), system), [
+      'root',
+      id('cloud.txt'),
+    ]);
+    expect(
+      host.commands,
+      isEmpty,
+      reason: 'Navigation needs no network or file bytes.',
+    );
+  });
+
+  test(
+    'tree navigation exposes only the approved parent and descendants',
+    () async {
+      final parent = id('Music/Album');
+      final child = id('Music/Album/track.mp3');
+      expect(() => service.findPath(parent, child, g1), denied());
+      await service.approve(g1.package!, 'Music/Album', AccessMode.read);
+      expect(service.findPath(parent, child, g1), [parent, child]);
+      expect(service.findPath(parent, parent, g1), [parent]);
+      expect(() => service.findPath(null, child, g1), denied());
+      expect(() => service.findPath(id('Music'), child, g1), denied());
+      await service.revoke(g1.package!, 'Music/Album');
+      expect(() => service.findPath(parent, child, g1), denied());
+    },
+  );
+
+  test(
+    'navigation refuses unrelated, missing, deleted and non-tree documents',
+    () {
+      final notFound = throwsA(
+        isA<DocumentsFailure>().having((e) => e.code, 'code', 'notFound'),
+      );
+      expect(
+        () => service.findPath(id('Private'), id('Music/Album'), system),
+        notFound,
+      );
+      expect(
+        () => service.findPath(id('cloud.txt'), id('cloud.txt'), system),
+        notFound,
+      );
+      expect(() => service.findPath(null, 'n:999999', system), notFound);
+      expect(() => service.findPath(null, id('gone.txt'), system), notFound);
+      host.set([
+        ...library(),
+        {
+          ...file('Docs.txt'),
+          'workingCopies': [
+            {'path': '/staging/working-1-Docs.txt'},
+          ],
+        },
+      ]);
+      expect(
+        () => service.findPath(null, 'w:working-1-Docs.txt', system),
+        notFound,
+      );
+      expect(
+        () => service.findPath('w:working-1-Docs.txt', id('Music'), system),
+        notFound,
+      );
+      const viewer = DocumentsCaller(CallerKind.document, documentRead: true);
+      expect(() => service.findPath(null, id('Music/Album'), viewer), denied());
+      expect(
+        () => service.findPath(id('Music/Album'), id('Music/Album'), viewer),
+        denied(),
+      );
+      host.set([dir('Music/Album')]);
+      expect(() => service.findPath(null, id('Music/Album'), system), notFound);
+    },
+  );
+
   test('default: no app has access, even to a folder it picked', () async {
     expect(() => service.children(id('Music'), g1), denied());
     expect(() => service.document(id('Music/loose.flac'), g1), denied());
@@ -461,6 +545,12 @@ void main() {
     expect(await service.rename(album, 'Record', system), album);
     expect(service.resolve(album).path, 'Music/Record');
     expect(service.resolve(track).path, 'Music/Record/track.mp3');
+    expect(service.findPath(null, track, system), [
+      'root',
+      id('Music'),
+      album,
+      track,
+    ]);
     // The approval follows its folder.
     expect(service.approvals.single.folder, 'Music/Record');
     expect(names(service.children(album, g1)), ['track.mp3']);
@@ -468,6 +558,13 @@ void main() {
     expect(service.resolve(track).path, 'Private/Record/track.mp3');
     expect(service.isChild(id('Private'), track), isTrue);
     expect(service.isChild(id('Music'), track), isFalse);
+    expect(service.findPath(null, track, system), [
+      'root',
+      id('Private'),
+      album,
+      track,
+    ]);
+    expect(service.findPath(album, track, g1), [album, track]);
   });
 
   test(
