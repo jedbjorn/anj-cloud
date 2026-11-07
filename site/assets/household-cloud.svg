@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="650" viewBox="0 0 680 650" fill="none">
+  <title>A cloud with a home</title>
+  <desc>A home server connects a laptop and phone with individual accounts and a shared folder. An illustrative diagram of a household cloud, not an application screenshot.</desc>
+  <defs>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1" fill="#baccc1"/></pattern>
+    <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><path d="M0 0V8" stroke="#bdcdc0" stroke-width="2"/></pattern>
+  </defs>
+  <circle cx="359" cy="320" r="262" fill="#e9ede3"/>
+  <circle cx="359" cy="320" r="262" fill="url(#grid)"/>
+  <path d="M110 524H602" stroke="#b1c3b7" stroke-width="1.5"/>
+  <path d="M119 317V262Q119 246 135 246H238M475 247H542Q558 247 558 263V328M280 477V550H462V486" stroke="#66938b" stroke-width="2" stroke-dasharray="5 7"/>
+  <circle cx="119" cy="285" r="5" fill="#f8f6ef" stroke="#66938b" stroke-width="2"/>
+  <circle cx="558" cy="298" r="5" fill="#f8f6ef" stroke="#66938b" stroke-width="2"/>
+  <g transform="translate(202 90)">
+    <path d="M21 126L154 23L287 126V346H21Z" fill="url(#hatch)" transform="translate(9 10)"/>
+    <path d="M21 126L154 23L287 126V346H21Z" fill="#f8f6ef" stroke="#173f4a" stroke-width="2" stroke-linejoin="round"/>
+    <path d="M2 138L154 19L306 138" stroke="#173f4a" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M233 78V41H260V99" fill="#f8f6ef" stroke="#173f4a" stroke-width="2"/>
+    <rect x="93" y="146" width="124" height="155" rx="8" fill="#d5e2d8" stroke="#173f4a" stroke-width="2"/>
+    <rect x="103" y="158" width="104" height="58" rx="4" fill="#173f4a"/>
+    <path d="M118 184H168M118 191H152" stroke="#dce8de" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="191" cy="187" r="4" fill="#d5bb66"/>
+    <rect x="103" y="226" width="104" height="58" rx="4" fill="#173f4a"/>
+    <path d="M118 251H168M118 258H152" stroke="#dce8de" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="191" cy="255" r="4" fill="#c6dfbc"/>
+    <path d="M106 308V315M204 308V315" stroke="#173f4a" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="155" cy="101" r="18" stroke="#7f9d8c" stroke-width="1.5"/>
+    <path d="M148 102L153 107L163 96" stroke="#2d7480" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="154" y="332" text-anchor="middle" font-family="Arial,sans-serif" font-size="10" letter-spacing="2" fill="#173f4a">YOUR SERVER</text>
+  </g>
+  <g transform="translate(44 324) rotate(-6 125 80)">
+    <rect x="10" y="2" width="220" height="144" rx="8" fill="#173f4a"/>
+    <rect x="18" y="10" width="204" height="127" rx="3" fill="#f8f6ef"/>
+    <rect x="18" y="10" width="204" height="22" rx="3" fill="#d6e4da"/>
+    <circle cx="29" cy="21" r="2.5" fill="#688d80"/>
+    <text x="40" y="24" font-family="Arial,sans-serif" font-size="8" fill="#173f4a">Your library</text>
+    <g stroke="#2d7480" stroke-width="1.5" fill="#e4ece1"><path d="M36 49H48L52 54H72V75H36Z"/><path d="M36 87H48L52 92H72V113H36Z"/></g>
+    <text x="84" y="62" font-family="Arial,sans-serif" font-size="9" fill="#173f4a">Documents</text>
+    <rect x="84" y="68" width="28" height="9" rx="3" fill="#d6e9d8"/>
+    <text x="89" y="75" font-family="Arial,sans-serif" font-size="6" fill="#245537">Local</text>
+    <text x="84" y="100" font-family="Arial,sans-serif" font-size="9" fill="#173f4a">Family album</text>
+    <rect x="84" y="106" width="35" height="9" rx="3" fill="#d3e5ec"/>
+    <text x="89" y="113" font-family="Arial,sans-serif" font-size="6" fill="#175360">Shared</text>
+    <path d="M0 146H240L253 159Q253 165 246 165H-7Q-13 165-13 159Z" fill="#c7d7cc" stroke="#173f4a" stroke-width="2" stroke-linejoin="round"/>
+    <path d="M92 146L98 152H146L152 146" stroke="#173f4a" stroke-width="1.5"/>
+  </g>
+  <g transform="translate(510 333) rotate(9 55 86)">
+    <rect x="4" y="8" width="105" height="190" rx="17" fill="#c4d4c8"/>
+    <rect width="105" height="190" rx="17" fill="#173f4a"/>
+    <rect x="6" y="7" width="93" height="176" rx="12" fill="#f8f6ef"/>
+    <path d="M35 9H70" stroke="#173f4a" stroke-width="5" stroke-linecap="round"/>
+    <text x="16" y="36" font-family="Arial,sans-serif" font-size="9" font-weight="bold" fill="#173f4a">AnJ Cloud</text>
+    <g fill="#e7eee5" stroke="#c1d3c6"><rect x="13" y="49" width="79" height="32" rx="5"/><rect x="13" y="87" width="79" height="32" rx="5"/><rect x="13" y="125" width="79" height="32" rx="5"/></g>
+    <g stroke="#2d7480" stroke-width="1.2"><path d="M22 59H29L32 62H39V71H22Z"/><path d="M22 97H29L32 100H39V109H22Z"/><path d="M22 135H29L32 138H39V147H22Z"/></g>
+    <g fill="#173f4a" font-family="Arial,sans-serif" font-size="6"><text x="45" y="68">Documents</text><text x="45" y="106">Photos</text><text x="45" y="144">Music</text></g>
+    <path d="M39 173H65" stroke="#173f4a" stroke-width="2.5" stroke-linecap="round"/>
+  </g>
+  <g transform="translate(275 464)">
+    <rect width="170" height="50" rx="25" fill="#f8f6ef" stroke="#a4bdae"/>
+    <circle cx="27" cy="25" r="13" fill="#d9e7d6"/>
+    <path d="M21 25L25 29L33 21" stroke="#2d7480" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="49" y="22" font-family="Arial,sans-serif" font-size="10" fill="#173f4a">A space for everyone.</text>
+    <text x="49" y="35" font-family="Arial,sans-serif" font-size="9" fill="#53676b">A server of your own.</text>
+  </g>
+  <g transform="translate(82 172) rotate(-9)">
+    <path d="M0 0H105V55H0Z" fill="#e7c9a2"/>
+    <path d="M8 8H97V47H8Z" stroke="#c59e72" stroke-dasharray="2 3"/>
+    <text x="52" y="26" text-anchor="middle" font-family="Georgia,serif" font-size="15" font-style="italic" fill="#6d432e">Home,</text>
+    <text x="52" y="42" text-anchor="middle" font-family="Georgia,serif" font-size="15" font-style="italic" fill="#6d432e">connected.</text>
+  </g>
+  <path d="M558 160V182M547 171H569M173 555V569M166 562H180" stroke="#b6532c" stroke-width="1.5" stroke-linecap="round"/>
+  <circle cx="537" cy="574" r="5" stroke="#b6532c" stroke-width="1.5"/>
+  <text x="361" y="591" text-anchor="middle" font-family="Arial,sans-serif" font-size="9" letter-spacing="2" fill="#53676b">YOUR FILES. YOUR PEOPLE. YOUR CLOUD.</text>
+</svg>
