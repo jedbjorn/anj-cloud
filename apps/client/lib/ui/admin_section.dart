@@ -17,12 +17,16 @@ class AdminPage extends StatefulWidget {
     super.key,
     required this.call,
     required this.onNotAdmin,
+    required this.server,
     this.initial = AdminView.users,
   });
   final AdminCall call;
 
   /// A 403 `not-admin` from any call: the app hides Admin with a notice.
   final VoidCallback onNotAdmin;
+
+  /// The canonical origin this admin device is currently paired with.
+  final String server;
   final AdminView initial;
 
   @override
@@ -68,8 +72,11 @@ class _AdminPageState extends State<AdminPage> {
   Widget get _section => KeyedSubtree(
     key: ValueKey(_view),
     child: switch (_view) {
-      AdminView.users => UsersView(client: _client),
-      AdminView.invitations => InvitationsView(client: _client),
+      AdminView.users => UsersView(client: _client, server: widget.server),
+      AdminView.invitations => InvitationsView(
+        client: _client,
+        server: widget.server,
+      ),
       AdminView.settings => SettingsView(client: _client),
       AdminView.health => HealthView(client: _client),
       AdminView.activity => ActivityView(client: _client),
@@ -450,8 +457,9 @@ String _when(Object? iso) {
 // Users ---------------------------------------------------------------------
 
 class UsersView extends StatefulWidget {
-  const UsersView({super.key, required this.client});
+  const UsersView({super.key, required this.client, required this.server});
   final AdminClient client;
+  final String server;
   @override
   State<UsersView> createState() => _UsersViewState();
 }
@@ -679,7 +687,13 @@ class _UsersViewState extends _LoadingState<UsersView> {
           done: grant ? '$uid is now an admin.' : '$uid is no longer an admin.',
         );
       case 'invite':
-        await _createInvitation(context, this, users, preset: uid);
+        await _createInvitation(
+          context,
+          this,
+          users,
+          server: widget.server,
+          preset: uid,
+        );
     }
   }
 }
@@ -813,11 +827,13 @@ Widget _deviceTile(_LoadingState state, Map<String, dynamic> device) {
 
 // Invitations ---------------------------------------------------------------
 
-/// Create an invitation (user, grant, label) and show its code once.
+/// Create an invitation (user, grant, label) and show its code once with the
+/// current admin device's [server], which manual pairing also needs.
 Future<void> _createInvitation(
   BuildContext context,
   _LoadingState state,
   List<Map<String, dynamic>> users, {
+  required String server,
   String? preset,
 }) async {
   final request = await showDialog<Map<String, Object?>>(
@@ -829,7 +845,7 @@ Future<void> _createInvitation(
   if (created == null || !context.mounted) return;
   await showDialog<void>(
     context: context,
-    builder: (context) => _CodeDialog(created: created),
+    builder: (context) => _CodeDialog(created: created, server: server),
   );
 }
 
@@ -914,8 +930,9 @@ class _InviteDialogState extends State<_InviteDialog> {
 }
 
 class _CodeDialog extends StatelessWidget {
-  const _CodeDialog({required this.created});
+  const _CodeDialog({required this.created, required this.server});
   final Map<String, dynamic> created;
+  final String server;
 
   String get _code {
     final code = created['code'] as String? ?? '';
@@ -933,6 +950,27 @@ class _CodeDialog extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
+        Text('Server address', style: Theme.of(context).textTheme.titleSmall),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: SelectableText(
+                server,
+                key: const ValueKey('admin-invite-server'),
+                style: const TextStyle(fontFamily: 'monospace'),
+              ),
+            ),
+            IconButton(
+              key: const ValueKey('admin-invite-copy-server'),
+              tooltip: 'Copy server address',
+              onPressed: () => Clipboard.setData(ClipboardData(text: server)),
+              icon: const Icon(Icons.copy),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        Text('Pairing code', style: Theme.of(context).textTheme.titleSmall),
         SelectableText(
           _code,
           key: const ValueKey('admin-invite-code'),
@@ -940,7 +978,7 @@ class _CodeDialog extends StatelessWidget {
               ?.copyWith(fontFamily: 'monospace'),
         ),
         const SizedBox(height: 12),
-        // The same code as a QR code, for the app's Scan QR code (#108 Q12).
+        // Only the same code as a QR code, for the app's Scan QR code (#108 Q12).
         Center(
           child: PairingCodeQr(
             key: const ValueKey('admin-invite-qr'),
@@ -948,7 +986,10 @@ class _CodeDialog extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 8),
-        const Text('Type the code on the new device, or scan the QR code.'),
+        const Text(
+          'For manual pairing, enter the server address and pairing code on '
+          'the new device. Scanning the QR code supplies only the pairing code.',
+        ),
         const SizedBox(height: 8),
         Text('Valid until ${_when(created['expires_at'])}. Shown only now.'),
         const SizedBox(height: 8),
@@ -960,9 +1001,10 @@ class _CodeDialog extends StatelessWidget {
     ),
     actions: [
       TextButton.icon(
+        key: const ValueKey('admin-invite-copy-code'),
         onPressed: () => Clipboard.setData(ClipboardData(text: _code)),
         icon: const Icon(Icons.copy),
-        label: const Text('Copy'),
+        label: const Text('Copy code'),
       ),
       FilledButton(
         onPressed: () => Navigator.pop(context),
@@ -973,8 +1015,13 @@ class _CodeDialog extends StatelessWidget {
 }
 
 class InvitationsView extends StatefulWidget {
-  const InvitationsView({super.key, required this.client});
+  const InvitationsView({
+    super.key,
+    required this.client,
+    required this.server,
+  });
   final AdminClient client;
+  final String server;
   @override
   State<InvitationsView> createState() => _InvitationsViewState();
 }
@@ -1017,7 +1064,14 @@ class _InvitationsViewState extends _LoadingState<InvitationsView> {
     actions: [
       FilledButton.icon(
         key: const ValueKey('admin-create-invitation'),
-        onPressed: busy ? null : () => _createInvitation(context, this, _users),
+        onPressed: busy
+            ? null
+            : () => _createInvitation(
+                context,
+                this,
+                _users,
+                server: widget.server,
+              ),
         icon: const Icon(Icons.add),
         label: const Text('Create'),
       ),

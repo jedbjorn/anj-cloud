@@ -11,6 +11,7 @@ import 'package:anj_cloud/ui/pairing_code_qr.dart';
 import 'package:anj_cloud/ui/app.dart';
 
 import 'fakes.dart';
+import 'layout_fixtures.dart';
 import 'test_platform.dart';
 
 const ownDevice = '11111111-1111-4111-8111-111111111111';
@@ -69,7 +70,9 @@ class FakeAdmin {
       return AdminResponse(428, {
         'error': 'confirmation-required',
         'message': 'Confirm',
-        'title': path.endsWith('/revoke') ? 'Revoke the VM host (sam)?' : 'Confirm?',
+        'title': path.endsWith('/revoke')
+            ? 'Revoke the VM host (sam)?'
+            : 'Confirm?',
         'effect': path.endsWith('/revoke')
             ? 'This device stops syncing at once and must be paired again to return.'
             : 'Server effect text.',
@@ -270,6 +273,7 @@ Future<void> openAdmin(
   ThemeData? theme,
   AdminView view = AdminView.users,
   VoidCallback? onNotAdmin,
+  String server = 'https://gateway.example.com',
 }) async {
   tester.view.physicalSize = const Size(1400, 1000);
   tester.view.devicePixelRatio = 1;
@@ -286,6 +290,7 @@ Future<void> openAdmin(
                   builder: (_) => AdminPage(
                     call: api.call,
                     onNotAdmin: onNotAdmin ?? () {},
+                    server: server,
                     initial: view,
                   ),
                 ),
@@ -489,7 +494,10 @@ void main() {
     await showDevices(tester, 'sam');
     final sam = find.byKey(const ValueKey('admin-user-devices:sam'));
     expect(
-      find.descendant(of: sam, matching: find.text('the VM host · This device')),
+      find.descendant(
+        of: sam,
+        matching: find.text('the VM host · This device'),
+      ),
       findsOneWidget,
     );
     expect(
@@ -629,11 +637,24 @@ void main() {
     expect(find.text('Revoked the VM host.'), findsOneWidget);
   });
 
-  testWidgets('an invitation code is shown once with the warning', (
-    tester,
-  ) async {
+  testWidgets('an invitation shows the paired server and copies it separately '
+      'from the one-time code', (tester) async {
+    const server = 'https://gateway.example.com';
+    const code = 'ABCD-1234-EFGH-5678-JKMN-9012-PQRS-3456';
     final api = FakeAdmin();
-    await openAdmin(tester, api, view: AdminView.invitations);
+    String? clipboard;
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        clipboard = (call.arguments as Map)['text'] as String?;
+      }
+      return null;
+    });
+    addTearDown(
+      () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+    );
+    await openAdmin(tester, api, view: AdminView.invitations, server: server);
     expect(find.textContaining('ABCD'), findsNothing);
     await tester.tap(find.byKey(const ValueKey('admin-create-invitation')));
     await tester.pumpAndSettle();
@@ -647,24 +668,123 @@ void main() {
     );
     await tester.tap(find.byKey(const ValueKey('admin-invite-create')));
     await tester.pumpAndSettle();
-    expect(find.text('ABCD-1234-EFGH-5678-JKMN-9012-PQRS-3456'), findsOne);
-    // The same code as a QR code for the app's scan (#97 review M3).
+    expect(find.text(code), findsOne);
+    expect(find.text('Server address'), findsOneWidget);
+    expect(
+      tester
+          .widget<SelectableText>(
+            find.byKey(const ValueKey('admin-invite-server')),
+          )
+          .data,
+      server,
+    );
+    expect(
+      find.textContaining('server address and pairing code'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('QR code supplies only the pairing code'),
+      findsOne,
+    );
+    // The QR payload remains only the code for the app's scan (#97 review M3).
     expect(
       tester
           .widget<PairingCodeQr>(find.byKey(const ValueKey('admin-invite-qr')))
           .code,
       'ABCD1234EFGH5678JKMN9012PQRS3456',
     );
+    await tester.tap(find.byKey(const ValueKey('admin-invite-copy-server')));
+    await tester.pump();
+    expect(clipboard, server);
+    await tester.tap(find.byKey(const ValueKey('admin-invite-copy-code')));
+    await tester.pump();
+    expect(clipboard, code);
     expect(find.textContaining('it works once'), findsOneWidget);
     expect(api.mutations().single.$3, {
       'uid': 'alex',
       'grant': 'write',
       'label': 'Alex phone',
     });
+    tester.view.physicalSize = const Size(390, 844);
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull, reason: 'phone dialog must fit');
     await tester.tap(find.text('Done'));
     await tester.pumpAndSettle();
     expect(find.textContaining('ABCD'), findsNothing);
   });
+
+  testWidgets(
+    'CloudApp invitations use the active paired origin, not the build '
+    'default',
+    (tester) async {
+      const activeOrigin = 'https://paired-family.anj-cloud.test';
+      expect(activeOrigin, isNot(ClientController.householdOrigin));
+      final api = FakeAdmin();
+      final controller = layoutController()
+        ..server = activeOrigin
+        ..adminCall = api.call;
+      addTearDown(controller.dispose);
+      String? clipboard;
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+        if (call.method == 'Clipboard.setData') {
+          clipboard = (call.arguments as Map)['text'] as String?;
+        }
+        return null;
+      });
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+      );
+      tester.view.physicalSize = const Size(1400, 1000);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(CloudApp(controller: controller));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const ValueKey('open-admin')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(AdminView.invitations.label).first);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('admin-create-invitation')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('admin-invite-user')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Alex (alex)').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('admin-invite-create')));
+      await tester.pumpAndSettle();
+
+      expect(api.mutations().single.$2, '/v1/admin/invitations');
+      expect(
+        tester
+            .widget<SelectableText>(
+              find.byKey(const ValueKey('admin-invite-server')),
+            )
+            .data,
+        activeOrigin,
+      );
+      expect(
+        find.text(ClientController.householdOrigin),
+        findsNothing,
+        reason: 'the build default must not replace the active paired origin',
+      );
+      await tester.tap(find.byKey(const ValueKey('admin-invite-copy-server')));
+      await tester.pump();
+      expect(clipboard, activeOrigin);
+      expect(
+        tester
+            .widget<PairingCodeQr>(
+              find.byKey(const ValueKey('admin-invite-qr')),
+            )
+            .code,
+        'ABCD1234EFGH5678JKMN9012PQRS3456',
+        reason: 'the QR still carries only the pairing code',
+      );
+      await tester.tap(find.text('Done'));
+      await tester.pumpAndSettle();
+    },
+  );
 
   testWidgets('approve: the fingerprint field starts empty and refuses '
       'short input', (tester) async {
