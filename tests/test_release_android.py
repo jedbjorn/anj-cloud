@@ -72,10 +72,12 @@ class AndroidPublishTests(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         git(self.repo, "init", "-q", "-b", "main")
+        (self.repo / "apps/client").mkdir(parents=True)
         self.commits = []
         for index in range(3):
             (self.repo / "file").write_text(str(index))
-            git(self.repo, "add", "file")
+            (self.repo / "apps/client/release-version.json").write_text(json.dumps({"version_code": index + 1}))
+            git(self.repo, "add", ".")
             git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=f@example.invalid", "commit", "-qm", f"c{index}")
             self.commits.append(git(self.repo, "rev-parse", "HEAD"))
         git(self.repo, "update-ref", "refs/remotes/origin/main", self.commits[1])

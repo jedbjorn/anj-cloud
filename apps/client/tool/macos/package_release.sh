@@ -7,7 +7,7 @@
 #   package_release.sh <out dir> [--skip-build] [--version-code <n> --version <v>]
 #
 # With --version-code and --version (spec #40 R2; tool/macos/release_macos.sh
-# computes them on the VM host as package_linux.py does: `git rev-list --count` and
+# computes them on the VM host as package_linux.py does: committed release-version.json and
 # the commit's UTC date), the build is an in-app-updatable release: its
 # CFBundleVersion is the version code, and Contents/Resources/
 # bundle-receipt.json {platform, target, version, version_code,
