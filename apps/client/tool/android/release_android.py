@@ -13,8 +13,8 @@
         A reproducible signed release APK (cloud.anj.anj_cloud, R8) of a committed source: `git
         archive` of the commit (default HEAD; nothing uncommitted or ignored can enter) extracted
         to a fixed path, built with the pinned Flutter and Android toolchains for arm64 phones and
-        the x86_64 emulator. versionCode is the commit's `git rev-list --count` and versionName
-        its UTC date and that count, as for Linux; the commit is stamped into the manifest
+        the x86_64 emulator. versionCode is the commit's apps/client/release-version.json and versionName
+        its UTC date and that code, as for Linux; the commit is stamped into the manifest
         (cloud.anj.source_head). OUT (absolute, absent) receives anj-cloud-<version>.apk, its
         .sha256 and build-receipt.json. The signer must be the pinned certificate.
 
@@ -39,7 +39,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO))
-from deploy import deployment_profile, release  # noqa: E402
+from deploy import deployment_profile, release, client_version  # noqa: E402
 
 SIGNING_DIR = Path.home() / ".local/share/anj-cloud/signing/android"
 KEYSTORE = "anj-cloud-release.p12"
@@ -113,13 +113,10 @@ def keygen(directory=SIGNING_DIR):
 
 
 def release_version(commit):
-    """(versionCode, versionName): as package_linux.py, the commit's rev-list count and date."""
-    if git("rev-parse", "--is-shallow-repository") == "true":
-        raise Refused("Build from a full (not shallow) clone: the version code counts the commit's history.")
-    code = int(git("rev-list", "--count", commit))
-    date = subprocess.run(["git", "-C", str(REPO), "show", "-s", "--format=%cd", "--date=format-local:%Y.%m.%d", commit],
-                          capture_output=True, text=True, check=True, env={**os.environ, "TZ": "UTC"}).stdout.strip()
-    return code, f"{date}.{code}"
+    try:
+        return client_version.release_version(REPO, commit)
+    except ValueError as error:
+        raise Refused(str(error)) from error
 
 
 def digest(path):

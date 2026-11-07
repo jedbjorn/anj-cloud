@@ -54,3 +54,11 @@ No command rotates a key and there is no remote revocation: every installed app 
 built or installed with. Rotate only when a key is lost or may be known to someone else; the steps for the
 desktop key and the Android certificate, and what each device must do, are in `services/access/README.md`
 ("Rotating a release key"). Until you finish them, publish nothing.
+
+## Release numbering
+
+`apps/client/release-version.json` is the committed release number for every platform. Increment it
+before each release; all packagers and publishing checks read the exact source commit. Version 167
+is the first allocation after the public repository export, so devices already running 166 can update.
+Numbers must stay at or below 2100000000 for Android. Rewriting or squashing Git history never changes
+a release number. A new build cannot reuse a number already served to clients.

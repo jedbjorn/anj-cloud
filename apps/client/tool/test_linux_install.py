@@ -318,6 +318,7 @@ class PackageProvenance(unittest.TestCase):
             source.parent.mkdir(parents=True)
             committed = b"print('committed manager A')\n"
             source.write_bytes(committed)
+            (repo / 'apps/client/release-version.json').write_text('{"version_code":167}\n')
             icon = repo / 'apps/client/assets/branding/harbor/icon-512.png'
             icon.parent.mkdir(parents=True)
             committed_icon = (ROOT / 'assets/branding/harbor/icon-512.png').read_bytes()
@@ -343,8 +344,8 @@ class PackageProvenance(unittest.TestCase):
             self.assertEqual((bundle / 'linux_install.py').read_bytes(), committed)
             receipt = json.loads((bundle / 'bundle-receipt.json').read_text())
             self.assertEqual(receipt['source_head'], head)
-            # Spec #37 U-publish: the version code is the commit's rev-list count (one commit here).
-            self.assertEqual((receipt['version_code'], receipt['version'][-2:]), (1, '.1'))
+            # Public history may have only one commit; the allocated release is still 167.
+            self.assertEqual((receipt['version_code'], receipt['version'][-4:]), (167, '.167'))
             self.assertEqual(receipt['files_sha256']['linux_install.py'], manager.digest(bundle / 'linux_install.py'))
             self.assertEqual((bundle / manager.ICON_PAYLOAD).read_bytes(), committed_icon)
             self.assertEqual(receipt['files_sha256'][manager.ICON_PAYLOAD], manager.digest(bundle / manager.ICON_PAYLOAD))
