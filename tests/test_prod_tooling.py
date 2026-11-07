@@ -276,8 +276,12 @@ class ReleaseTests(unittest.TestCase):
             self.git("update-ref", "refs/remotes/origin/main", merged)
             self.git("checkout", "-q", "-b", "side")
             unmerged = self.commit("unmerged")
+            self.git("checkout", "-q", "--orphan", "wrong")
+            self.git("rm", "-q", "-rf", "--ignore-unmatch", ".")
+            wrong = self.commit("wrong-history")
             stack = prod.ProdStack("anj-cloud-test-prod", Path(directory) / "state", checkout=self.repository)
             with patch.object(prod, "REQUIRED_COMMITS", {spec19[:7]: "spec 19", fixes[:7]: "fixes"}):
+                self.assertEqual(merged, stack.resolve_commit(merged))
                 self.assertEqual(merged, stack.resolve_commit(merged[:12]))
                 self.assertEqual(merged, stack.resolve_commit("origin/main"))
                 with self.assertRaisesRegex(RuntimeError, "not merged"):
@@ -285,12 +289,47 @@ class ReleaseTests(unittest.TestCase):
                 self.assertEqual(unmerged, stack.resolve_commit(unmerged[:12], require_merged=False))
                 with self.assertRaisesRegex(RuntimeError, "does not contain"):
                     stack.resolve_commit(before[:12])
-                for bad in ("main", "HEAD~1", "zzzzzzz", "abc"):
+                with self.assertRaisesRegex(RuntimeError, "does not contain"):
+                    stack.resolve_commit(wrong, require_merged=False)
+                for bad in ("main", "HEAD~1", "zzzzzzz", "abc", "d" * 40):
                     with self.subTest(bad), self.assertRaises(RuntimeError):
                         stack.resolve_commit(bad)
 
+    def test_public_history_is_an_alternative_to_the_legacy_required_commits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.repository = Path(directory) / "repo"
+            self.repository.mkdir()
+            self.git("init", "-q", "-b", "main")
+            spec19 = self.commit("legacy-spec19")
+            fixes = self.commit("legacy-fixes")
+            self.git("checkout", "-q", "--orphan", "public")
+            self.git("rm", "-q", "-rf", "--ignore-unmatch", ".")
+            public = self.commit("initial-public-release")
+            merged = self.commit("public-release")
+            self.git("update-ref", "refs/remotes/origin/main", merged)
+            self.git("checkout", "-q", "-b", "side")
+            unmerged = self.commit("unmerged-public-release")
+            self.git("checkout", "-q", "--orphan", "wrong")
+            self.git("rm", "-q", "-rf", "--ignore-unmatch", ".")
+            wrong = self.commit("wrong-history")
+            stack = prod.ProdStack("anj-cloud-test-prod", Path(directory) / "state", checkout=self.repository)
+            with patch.object(prod, "PUBLIC_HISTORY_COMMIT", public), \
+                    patch.object(prod, "REQUIRED_COMMITS", {spec19[:7]: "spec 19", fixes[:7]: "fixes"}):
+                self.assertEqual(public, stack.resolve_commit(public[:7]))
+                self.assertEqual(merged, stack.resolve_commit(merged))
+                self.assertEqual(merged, stack.resolve_commit(merged[:12]))
+                self.assertEqual(merged, stack.resolve_commit("origin/main"))
+                with self.assertRaisesRegex(RuntimeError, "not merged"):
+                    stack.resolve_commit(unmerged[:12])
+                self.assertEqual(unmerged, stack.resolve_commit(unmerged, require_merged=False))
+                with self.assertRaisesRegex(RuntimeError, "does not contain"):
+                    stack.resolve_commit(wrong, require_merged=False)
+                with self.assertRaisesRegex(RuntimeError, "Unknown commit"):
+                    stack.resolve_commit("d" * 40)
+
     def test_required_commits_are_the_spec_19_and_dev_fix_merges(self):
         self.assertEqual({"4c3bb82", "f554e13"}, set(prod.REQUIRED_COMMITS))
+        self.assertEqual("cf8994f416bdc9d1f8c8bcc6710932f80221d608", prod.PUBLIC_HISTORY_COMMIT)
 
     def test_vm_defaults_and_root_refusal(self):
         self.assertEqual(Path("/srv/anj-cloud/state"), prod.DEFAULT_STATE_ROOT)

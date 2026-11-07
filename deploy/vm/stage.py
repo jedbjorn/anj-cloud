@@ -110,7 +110,7 @@ def check_upgrade(target, full, checkout=CHECKOUT, run=subprocess.run):
     the commit, and nothing local may be mistaken for it), a commit lacking prod.py's required
     fixes, and on any target but anj-qual a commit not merged into origin/main (the VM cannot check
     either: it has no git)."""
-    from deploy.prod import REQUIRED_COMMITS
+    from deploy.prod import missing_required_commit
     status = git_ok(checkout, "status", "--porcelain", run=run)
     if status.returncode:
         raise RuntimeError(f"cannot read the state of {checkout}")
@@ -121,9 +121,17 @@ def check_upgrade(target, full, checkout=CHECKOUT, run=subprocess.run):
         if merged:
             raise RuntimeError(f"{full[:12]} is not merged into origin/main (as fetched here); {target} takes only a "
                                "reviewed, merged release (git fetch origin main, then retry)")
-    for required, purpose in REQUIRED_COMMITS.items():
-        if git_ok(checkout, "merge-base", "--is-ancestor", required, full, run=run).returncode:
-            raise RuntimeError(f"{full[:12]} does not contain {required} ({purpose})")
+
+    def has_commit(commit):
+        return git_ok(checkout, "rev-parse", "--verify", "--quiet", commit + "^{commit}", run=run).returncode == 0
+
+    def is_ancestor(ancestor, descendant):
+        return git_ok(checkout, "merge-base", "--is-ancestor", ancestor, descendant, run=run).returncode == 0
+
+    missing = missing_required_commit(full, has_commit, is_ancestor)
+    if missing:
+        required, purpose = missing
+        raise RuntimeError(f"{full[:12]} does not contain {required} ({purpose})")
 
 
 def upgrade_argv(target, commit, ssh_config=SSH_CONFIG, terminal=None, no_backup=False):

@@ -404,6 +404,43 @@ class HaloVmTests(unittest.TestCase):
         statuses = {s["step"]: s["status"] for s in summary["steps"]}
         self.assertTrue(all(v == "pass" for v in statuses.values()), (statuses, self.h.output))
 
+    def test_apply_writes_prod_ssh_alias_and_preserves_other_blocks(self):
+        config = self.h.root / HOME.lstrip("/") / ".local/share/anj-cloud/prod-vm/ssh_config"
+        config.parent.mkdir(parents=True)
+        unmarked = ("Host anj-prod\n  HostName 192.0.2.99\n  IdentityFile /stale/key\n"
+                    "  # retain this operator comment\n\n")
+        unrelated = ("Host elsewhere\n  HostName 192.0.2.1\nMatch host elsewhere\n  User preserved\n"
+                     "Host anj-prod.example\n  HostName 192.0.2.2\n")
+        marked = ("# >>> anj-prod (halo-vm.sh --apply) >>>\nHost anj-prod\n  HostName 192.0.2.100\n"
+                  "# <<< anj-prod <<<\n")
+        qual = ("# >>> anj-qual (halo-vm.sh --qual) >>>\nHost anj-qual\n  HostName 10.77.11.10\n"
+                "# <<< anj-qual <<<\n")
+        config.write_text(unmarked + unrelated + qual + marked)
+        key = self.h.tmp / "configured.pub"
+        key.write_text(KEY + "\n")
+        result = self.h.run("--apply", "--key", str(key), "--net-mode", "open")
+        self.assertEqual(result.returncode, 0, self.h.output)
+        text = config.read_text()
+        self.assertIn(unrelated, text)
+        self.assertIn(qual, text)
+        self.assertIn("# retain this operator comment", text)
+        self.assertNotIn("192.0.2.99", text)
+        self.assertNotIn("192.0.2.100", text)
+        self.assertNotIn("/stale/key", text)
+        self.assertEqual(text.count("Host anj-prod\n"), 1)
+        self.assertIn("HostName 10.77.10.10", text)
+        self.assertIn(f"IdentityFile {str(key)[:-4]}\n", text)
+        known_hosts = self.h.root / HOME.lstrip("/") / ".ssh/known_hosts.anj-prod"
+        self.assertIn(f"UserKnownHostsFile {known_hosts}\n", text)
+        self.assertIn("StrictHostKeyChecking accept-new\n", text)
+        self.assertIn("BatchMode yes\n", text)
+        host_config = json.loads((self.h.root / "etc/anj-cloud-host/anj-cloud-host.json").read_text())
+        self.assertEqual(host_config["net_mode"], "open")
+        self.assertEqual(self.h.run("--apply", "--key", str(key), "--net-mode", "open").returncode, 0, self.h.output)
+        self.assertEqual(config.read_text(), text)
+        self.assertEqual(config.read_text().count("Host anj-prod\n"), 1)
+        self.assertIn("ssh alias unchanged", self.h.output)
+
     def fail_on(self, command, word):
         self.h.load_state()
         self.h.state.setdefault("fail", []).append([command, word])

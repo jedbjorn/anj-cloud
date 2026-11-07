@@ -2754,7 +2754,8 @@ class Release(Step):
         install_release_source(self.setup, commit, self.setup.release_tar, self.setup.checkout)
         if not paths.STACK_CONFIG.exists():
             # prod.py setup takes the release recorded here (the VM has no git checkout).
-            self.system.write(paths.STACK_CONFIG, json.dumps({"release": commit}, indent=2) + "\n", mode=0o600, owner=anj)
+            self.system.write(paths.STACK_CONFIG, json.dumps({"release": commit}, indent=2) + "\n", mode=0o600,
+                              owner=self.setup.user)
 
 
 EXTRACT_SCRIPT = ("import sys,tarfile,os,shutil\n"
