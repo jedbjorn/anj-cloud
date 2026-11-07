@@ -16,6 +16,10 @@ manifest/operation journal, descriptor-relative filesystem boundary, device
 identity/pairing code and a DAV adapter. Fixture, local TLS and real VM host gateway integration tests cover the behavior described below.
 The laptop and other platforms require separate acceptance.
 
+The client connects to an AnJ Cloud gateway built on Nextcloud. Nextcloud provides server-side file storage and
+sharing; the gateway adds pairing, per-device access control and client updates. Clients do not connect directly
+to Nextcloud.
+
 Cloud space release uses journaled artifact ownership, a conditional remote hash
 proof and a supported sole-open Linux write lease through quarantine and final
 unlink. Busy files, unknown hardlinks, working copies and legacy/uncertain staging
