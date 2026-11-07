@@ -15,7 +15,7 @@ import emu_updater as u
 def main():
     u.OUT.mkdir(parents=True, exist_ok=True)
     try:
-        u.adb("install", "-r", "-t", str(u.APKS / "app-debug.apk"), timeout=300)
+        u.adb("install", "-r", "-t", "-g", str(u.APKS / "app-debug.apk"), timeout=300)
         u.adb("logcat", "-c")
         u.launch()
         for button, marker, absent in (
