@@ -5,6 +5,8 @@ Household file sync and private inference access, from a gateway you host yourse
 and client updates. One small server at home, matching apps on Linux, macOS, Windows and Android, and one place to
 say who and which devices may connect.
 
+**[Project website →](https://jedbjorn.github.io/anj-cloud/)**
+
 ![The library on an Android phone: filter chips, search, sync and share badges](docs/images/android-library.png)
 
 ## What it does
