@@ -55,7 +55,12 @@ Step 'vs-components' {
 Step 'pub-get' { flutter pub get --enforce-lockfile }
 Step 'analyze' { flutter analyze }
 Step 'test' { flutter test --concurrency=1 @Tests }
-Step 'build' { flutter build windows --release }
+Step 'build' {
+  # anj-defines.env (the deployment profile's origin) is sent by
+  # `windows_seat.sh push --profile` when the profile is real.
+  if (Test-Path 'anj-defines.env') { flutter build windows --release --dart-define-from-file=anj-defines.env }
+  else { flutter build windows --release }
+}
 Step 'bundle' {
   $release = Join-Path $Source 'build\windows\x64\runner\Release'
   Get-ChildItem $release -Recurse -File | ForEach-Object {

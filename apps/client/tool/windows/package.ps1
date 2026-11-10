@@ -7,8 +7,17 @@
 # SDK, and bundle-receipt.json with every file's SHA-256. The archive's own
 # SHA-256 is printed and written beside it: the trusted handoff for install
 # and update. Run after `flutter build windows --release`.
+#
+# -VersionCode and -Version stamp the release version into the receipt.
+# Take both from the build host, as the other packagers do:
+# `python3 deploy/client_version.py <commit>` prints them (the committed
+# apps/client/release-version.json and the commit's UTC date). Only a release stamped with them updates itself in the app and
+# can be published with deploy/release.py; without them the package installs
+# and updates by hand only.
 param(
   [Parameter(Mandatory)][string]$SourceHead,
+  [int]$VersionCode = 0,
+  [string]$Version = '',
   [string]$Source = 'C:\anj\work\client',
   [string]$Out = 'C:\anj\work\w5-dist',
   [string]$Vs = 'C:\anj\toolchains\vs2022-buildtools',
@@ -17,6 +26,11 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 if ($SourceHead -notmatch '^[0-9a-f]{40}$') { throw 'SourceHead must be a 40-hex commit id' }
+if ($VersionCode -or $Version) {
+  if ($VersionCode -lt 1 -or $VersionCode -gt 2100000000 -or $Version -cnotmatch '^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$') {
+    throw '-VersionCode and -Version must both be given and valid'
+  }
+}
 $short = $SourceHead.Substring(0, 12)
 $top = "anj-cloud-windows-x86_64-$short"
 $bundle = Join-Path $Source 'build\windows\x64\runner\Release'
@@ -50,6 +64,10 @@ $receipt = [ordered]@{
   toolchain = 'Flutter 3.47.9, MSVC ' + (Split-Path (Split-Path (Split-Path $crt.FullName)) -Leaf)
   files_sha256 = $files
 }
+if ($VersionCode) {
+  $receipt.version_code = $VersionCode
+  $receipt.version = $Version
+}
 [IO.File]::WriteAllText((Join-Path $stage 'bundle-receipt.json'), ($receipt | ConvertTo-Json -Depth 4))
 
 $zip = Join-Path $Out "anj-cloud-$short-windows-x86_64$(if ($Stored) { '-stored' }).zip"
@@ -67,3 +85,4 @@ Set-Content "$zip.sha256" "$sha  $(Split-Path $zip -Leaf)"
 "archive $zip"
 "sha256 $sha"
 "files $($files.Count)"
+if ($VersionCode) { "version $Version (version_code $VersionCode)" } else { 'version none: no in-app update, not publishable' }

@@ -111,6 +111,22 @@ for c in "${guest_cmds[@]}"; do
 done
 [ "$(leftovers)" = 0 ] && [ "$(servers)" = 0 ] && ok "success paths leave no temp file or server" || bad "leftovers after success: $(leftovers) files, $(servers) servers"
 
+# In-app update builds: push --profile adds the deployment profile's untracked
+# outputs (the release key asset a self-updating build needs); plain push
+# sends tracked files only.
+cp "$fake/scp" "$fake/scp.plain"
+printf '#!/usr/bin/env bash\nfor a; do case "$a" in /*client.tar) tar -tf "$a" >"$FAKE/tar.list" ;; esac; done\n' >"$fake/scp"
+run push --profile
+[ "$code" = 0 ] && grep -qx 'assets/release/household-release-key.pub' "$FAKE/tar.list" && grep -qx 'pubspec.yaml' "$FAKE/tar.list" &&
+  ok "push --profile sends the release key asset with the tracked sources" || bad "push --profile: $code $out"
+run push
+[ "$code" = 0 ] && ! grep -qx 'assets/release/household-release-key.pub' "$FAKE/tar.list" && grep -qx 'pubspec.yaml' "$FAKE/tar.list" &&
+  ok "push sends tracked files only" || bad "plain push: $code $out"
+run push --other
+[ "$code" != 0 ] && ok "push refuses an unknown option" || bad "push --other: $code $out"
+mv "$fake/scp.plain" "$fake/scp"
+[ "$(leftovers)" = 0 ] && ok "push leaves no temp file" || bad "leftovers after push: $(leftovers) files"
+
 # M1: forward-check cleans up on failure and signals.
 touch "$FAKE/ssh_fail"; run forward-check; rm -f "$FAKE/ssh_fail"
 [ "$code" != 0 ] && [ "$(leftovers)" = 0 ] && [ "$(servers)" = 0 ] && ok "forward-check failure ($code) cleans up" || bad "forward-check failure: $code, $(leftovers) files, $(servers) servers"

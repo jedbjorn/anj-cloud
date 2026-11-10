@@ -103,6 +103,27 @@ class ReleaseToolTests(unittest.TestCase):
                 archive.writestr(member, b"x")
         return path
 
+    def windows_artifact(self, commit=None, *, code=None, key_text=None, top=None, platform="Windows x86_64",
+                         stamped=True, extra=()):
+        """A zip as tool/windows/package.ps1 writes it: one release directory with its receipt."""
+        import zipfile
+        commit = commit or self.commits[1]
+        code = int(git(self.repo, "rev-list", "--count", commit)) if code is None else code
+        receipt = {"platform": platform, "source_head": commit, "files_sha256": {}}
+        if stamped:
+            receipt.update(version=f"2026.11.11.{code}", version_code=code)
+        top = top or f"anj-cloud-windows-x86_64-{commit[:12]}"
+        self.made = getattr(self, "made", 0) + 1
+        path = self.root / f"{self.made}" / f"anj-cloud-{commit[:12]}-windows-x86_64.zip"
+        path.parent.mkdir()
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(f"{top}/bundle-receipt.json", json.dumps(receipt))
+            archive.writestr(f"{top}/{release.KEY_PAYLOAD}", self.public.read_text() if key_text is None else key_text)
+            archive.writestr(f"{top}/anj_cloud.exe", b"client")
+            for member in extra:
+                archive.writestr(member, b"x")
+        return path
+
     def publish(self, artifact, destination=None, **kwargs):
         return release.publish("linux-x86_64", artifact, destination or FakeDestination(), key_dir=self.keys, fetch=False, **kwargs)
 
@@ -179,9 +200,10 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertIn(reason, str(caught.exception))
                 self.assertEqual([], destination.published)
         # android-arm64 has its own branch (tests/test_release_android.py).
-        for target, reason in (("ios", "Not a desktop target"), ("windows-x64", "Only linux-x86_64, macos-arm64")):
-            with self.subTest(target=target), self.assertRaisesRegex(release.Refused, reason):
-                release.publish(target, self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+        with self.assertRaisesRegex(release.Refused, "Not a desktop target"):
+            release.publish("ios", self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+        # Every signed target has a reader: none falls through to "cannot be published yet".
+        self.assertEqual(set(release.SIGNED), set(release.ARTIFACT_FACTS))
 
     def test_publish_macos_signs_a_manifest_for_macos_arm64(self):
         artifact = self.macos_artifact()
@@ -217,6 +239,47 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertEqual([], destination.published)
         with self.assertRaisesRegex(release.Refused, "not a readable macOS release archive"):
             release.publish("macos-arm64", self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+
+    def test_publish_windows_signs_a_manifest_for_windows_x64(self):
+        artifact = self.windows_artifact()
+        destination = FakeDestination()
+        result = release.publish("windows-x64", artifact, destination, key_dir=self.keys, fetch=False)
+        (target, data, manifest), = destination.published
+        self.assertEqual(("windows-x64", artifact.read_bytes()), (target, data))
+        self.assertEqual(manifest, manifest_from(manifest, "windows-x64"))
+        self.assertEqual(("windows-x64", 2, "2026.11.11.2", self.generated["key_id"], artifact.stat().st_size),
+                         (manifest["target"], manifest["version_code"], manifest["version"], manifest["key_id"],
+                          manifest["size"]))
+        raw = release.parse_public(self.public.read_text())
+        self.assertTrue(manager.ed25519_verify(raw, signed_message(manifest), base64.b64decode(manifest["signature"])))
+        self.assertEqual(self.commits[1], result["source_head"])
+
+    def test_publish_windows_refuses_what_could_not_update_itself(self):
+        other = self.root / "other.pub"
+        release.keygen(self.root / "other-keys", other)
+        cases = {
+            "not in origin/main": self.windows_artifact(self.commits[2]),
+            "is not its commit's": self.windows_artifact(code=7),
+            "(it has none)": self.windows_artifact(key_text="# none\n"),
+            "it trusts": self.windows_artifact(key_text=other.read_text()),
+            "does not match its source commit": self.windows_artifact(top="anj-cloud-windows-x86_64-000000000000"),
+            # A package made without -VersionCode and -Version installs by hand only.
+            "has no source commit, version or version_code": self.windows_artifact(stamped=False),
+            "has no source commit, version or version_code ": self.windows_artifact(platform="Linux x86_64"),
+            "has no release receipt": self.windows_artifact(extra=("other/x",)),
+        }
+        for reason, artifact in cases.items():
+            with self.subTest(reason=reason):
+                destination = FakeDestination()
+                with self.assertRaises(release.Refused) as caught:
+                    release.publish("windows-x64", artifact, destination, key_dir=self.keys, fetch=False)
+                self.assertIn(reason.strip(), str(caught.exception))
+                self.assertEqual([], destination.published)
+        with self.assertRaisesRegex(release.Refused, "not a readable Windows release archive"):
+            release.publish("windows-x64", self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+        # A macOS zip is not a Windows release.
+        with self.assertRaisesRegex(release.Refused, "has no release receipt"):
+            release.publish("windows-x64", self.macos_artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
 
     def test_production_goes_through_the_vm_operator_over_ssh(self):
         config = self.root / "ssh_config"

@@ -8,9 +8,13 @@
 #   windows_seat.sh start                start the shut-off VM, take the lease, wait for SSH
 #   windows_seat.sh ssh <command...>     run a command on the guest
 #   windows_seat.sh ps <script> [args]   copy a .ps1 into C:\anj\tools and run it
-#   windows_seat.sh push                 send this checkout's apps/client (HEAD plus
+#   windows_seat.sh push [--profile]     send this checkout's apps/client (HEAD plus
 #                                        the working tree's tracked changes) to
-#                                        C:\anj\work\client
+#                                        C:\anj\work\client; --profile adds the
+#                                        deployment profile's untracked outputs
+#                                        (tool/apply_profile.py: the release key
+#                                        asset and anj-defines.env), which a build
+#                                        that updates itself needs
 #   windows_seat.sh pull <guest-dir> <halo-dir>
 #   windows_seat.sh screenshot <file.png>
 #   windows_seat.sh forward-check        prove the reverse forward to a the VM host
@@ -213,6 +217,13 @@ push() {
   local dir; dir="$(mktemp -d)"; temp_paths+=("$dir")
   # Tracked files only, as they are in the working tree.
   (cd "$client" && git ls-files -z --cached -- . | tar --null -T - -cf "$dir/client.tar")
+  if [ "${1:-}" = --profile ]; then
+    # Untracked by design (docs/development.md): rendered here, never committed.
+    (cd "$client" && python3 tool/apply_profile.py >/dev/null &&
+      tar -rf "$dir/client.tar" assets/release/household-release-key.pub $([ ! -f anj-defines.env ] || echo anj-defines.env))
+  elif [ -n "${1:-}" ]; then
+    die "usage: push [--profile]"
+  fi
   guest 'if not exist C:\anj\downloads mkdir C:\anj\downloads' >/dev/null
   scp -q "${ssh_opts[@]}" "$dir/client.tar" "$user@$host:C:/anj/downloads/client.tar"
   ps_run "$here/windows/unpack.ps1"
@@ -322,12 +333,12 @@ case "$cmd" in
   start) start ;;
   ssh) require_lease; guest "$@" ;;
   ps) require_lease; ps_run "$@" ;;
-  push) require_lease; push ;;
+  push) require_lease; push "$@" ;;
   pull) require_lease; pull "$@" ;;
   screenshot) require_lease; screenshot "$@" ;;
   forward-check) require_lease; forward_check "$@" ;;
   stop) stop "$@" ;;
   state) state ;;
   lease) if [ -f "$lease" ]; then cat "$lease"; else echo "no lease ($lease)"; fi ;;
-  *) sed -n '2,47p' "$0"; exit 2 ;;
+  *) sed -n '2,51p' "$0"; exit 2 ;;
 esac

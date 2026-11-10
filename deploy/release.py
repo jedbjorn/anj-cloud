@@ -12,10 +12,12 @@ library plus the `openssl` command (3.0+); never builds anything.
 
     release.py publish --target linux-x86_64 --artifact <anj-cloud-linux-x86_64-*.tar.gz>
     release.py publish --target macos-arm64 --artifact <anj-cloud-macos-arm64-*.zip>
+    release.py publish --target windows-x64 --artifact <anj-cloud-*-windows-x86_64.zip>
                        [--min-client-version-code N] [--dry-run]
                        [--ssh-host anj-prod] [--ssh-config FILE]
                        | --local-project NAME [--port N] [--source-ref REF]
-        Takes an artifact apps/client/tool/package_linux.py built and publishes it signed:
+        Takes an artifact apps/client/tool/package_linux.py built (macOS: tool/macos/release_macos.sh;
+        Windows: tool/windows/package.ps1 with -VersionCode and -Version) and publishes it signed:
           - its receipt's source commit must be in origin/main (fetched first) and its
             version_code must be that commit's apps/client/release-version.json;
           - its built-in release key must be the key that signs it (a release that trusts another
@@ -268,8 +270,44 @@ def macos_artifact_facts(path):
     return receipt, key, size, checksum.hexdigest()
 
 
+def windows_artifact_facts(path):
+    """(receipt, built-in public key or None, size, sha256) of a Windows release archive:
+    the zip apps/client/tool/windows/package.ps1 writes, holding one
+    anj-cloud-windows-x86_64-<source12> directory whose bundle-receipt.json carries the version
+    (-VersionCode, -Version)."""
+    import zipfile
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise Refused("The artifact must be a regular file")
+    checksum, size = hashlib.sha256(), 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            checksum.update(chunk)
+            size += len(chunk)
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            tops = {PurePosixPath(name).parts[0] for name in names if PurePosixPath(name).parts}
+            top = next(iter(tops)) if len(tops) == 1 else ""
+            receipt = json.loads(archive.read(f"{top}/bundle-receipt.json")) if f"{top}/bundle-receipt.json" in names else None
+            key = parse_public(archive.read(f"{top}/{KEY_PAYLOAD}").decode()) if f"{top}/{KEY_PAYLOAD}" in names else None
+    except (zipfile.BadZipFile, OSError, ValueError, UnicodeError, KeyError) as error:
+        raise Refused(f"The artifact is not a readable Windows release archive ({error})") from None
+    if not isinstance(receipt, dict):
+        raise Refused("The artifact has no release receipt (build it with apps/client/tool/windows/package.ps1)")
+    source, code = receipt.get("source_head"), receipt.get("version_code")
+    if (receipt.get("platform") != "Windows x86_64" or not isinstance(source, str) or len(source) != 40
+            or type(code) is not int or code < 1 or not isinstance(receipt.get("version"), str)):
+        raise Refused("The artifact's receipt has no source commit, version or version_code "
+                      "(package it with tool/windows/package.ps1 -VersionCode <n> -Version <v>)")
+    if top != f"anj-cloud-windows-x86_64-{source[:12]}":
+        raise Refused("The artifact's directory does not match its source commit")
+    return receipt, key, size, checksum.hexdigest()
+
+
 # Desktop targets this tool publishes, and how each artifact is read.
-ARTIFACT_FACTS = {"linux-x86_64": artifact_facts, "macos-arm64": macos_artifact_facts}
+ARTIFACT_FACTS = {"linux-x86_64": artifact_facts, "macos-arm64": macos_artifact_facts,
+                  "windows-x64": windows_artifact_facts}
 
 
 # The files whose code decides what is signed and how (review L5): a local edit could sign bytes
