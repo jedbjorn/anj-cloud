@@ -21,7 +21,7 @@ installer script.
 | Linux x86_64 | `.tar.gz` | `linux_install.py` |
 | macOS (Apple silicon) | `.zip` | `anj-cloud-macos-install.sh` |
 | Android (arm64) | Signed `.apk` | Open APK on phone, or `adb install` |
-| Windows (x86_64) | None yet | Build your own; no in-app updates yet |
+| Windows (x86_64) | None yet | Build your own; `anj-cloud-manager.exe` |
 
 ## Linux
 
@@ -94,8 +94,10 @@ Keep your signing keys safe; publish your signed updates through your gateway as
 
 ## Windows
 
-There is **no official Windows build yet**. An installer and update manager exist; in-app updates are not
-available yet, so you update by running the manager with a new archive. Treat the Windows client as early.
+There is **no official Windows build yet**. An installer and update manager exist, and a build you package
+with your own release key can update itself in the app. That in-app update is new and has not been verified on
+a Windows machine yet; updating by running the manager with a new archive always works. Treat the Windows
+client as early.
 
 Building needs Windows x86_64 with Visual Studio Build Tools 2022 (C++ workload and C++ ATL) and the pinned
 Flutter SDK (`apps/client/tool/windows/install.ps1` installs them on a build seat).
@@ -103,6 +105,7 @@ Flutter SDK (`apps/client/tool/windows/install.ps1` installs them on a build sea
 ```powershell
 # in apps\client, after `flutter build windows --release`:
 powershell -File tool\windows\package.ps1 -SourceHead <40-hex commit>   # writes the zip and prints its SHA-256
+#   add -VersionCode <n> -Version <v> for a build that updates itself in the app (see below)
 # install or update (the manager runs from the unpacked release; get its checksum separately):
 anj-cloud-manager.exe install <zip> --sha256 <hex>
 anj-cloud-manager.exe run
@@ -112,6 +115,18 @@ anj-cloud-manager.exe uninstall             # removes exactly what install added
 
 `update <zip> --sha256 <hex>` refuses while the app runs. The app keeps its secrets in Windows DPAPI and shows a
 notification-area icon. Pairing is as on the other desktops.
+
+**In-app updates.** An installed build offers **Update available** when all of these hold: it was built with
+your release key in the tree (`apps/client/tool/apply_profile.py` writes it before `flutter build`), it was
+packaged with `-VersionCode` and `-Version` (`python3 deploy/client_version.py <commit>` prints both for a
+commit), and your gateway serves a newer `windows-x64` release signed with that key
+(`python3 deploy/release.py publish --target windows-x64 --artifact <zip>`, see
+[updates and signing](updates-and-signing.md)). On **Update now** the app quits and hands the download to the
+installed manager (`apply-update`), which verifies the signature, size and SHA-256 again by the key inside the
+installed release, installs the new release beside the old one and starts the app. Your profile, secrets and
+synced folder are not touched. If anything fails, the release you were running stays active and is started
+again, and the app shows **Update could not be installed**. A build without a release key or version shows no
+update notices and is updated with `update <zip> --sha256 <hex>`.
 
 ## First launch on any platform
 

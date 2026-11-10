@@ -10,7 +10,7 @@ certificate that you control.
 
 | Platform | What it checks |
 |---|---|
-| Linux, macOS (desktop) | An Ed25519 signature over the release manifest, by the key built into the running app (`key_id` is the first 16 hex characters of that key's SHA-256); the manifest's target, version code (must be higher), size and SHA-256 against the downloaded archive |
+| Linux, macOS, Windows (desktop) | An Ed25519 signature over the release manifest, by the key built into the running app (`key_id` is the first 16 hex characters of that key's SHA-256); the manifest's target, version code (must be higher), size and SHA-256 against the downloaded archive |
 | Android | The APK must be signed with the same certificate as the installed app (Android enforces this); the app also checks the package's size and SHA-256 and the manifest's signer against the one it carries |
 
 A device whose app was built without your key shows no update notices at all. Updates wait for pending uploads
@@ -39,6 +39,9 @@ default server address into the build tree. Those files are generated and untrac
 python3 apps/client/tool/package_linux.py /absolute/absent/dir
 python3 deploy/release.py publish --target linux-x86_64 --artifact /absolute/absent/dir/anj-cloud-linux-x86_64-<commit>.tar.gz --dry-run
 # macOS: tool/macos/release_macos.sh <commit> <out>   then   release.py publish --target macos-arm64 --artifact <zip>
+# Windows (on a Windows build machine; not yet verified end to end, see clients.md#windows):
+#   tool\windows\package.ps1 -SourceHead <commit> -VersionCode <n> -Version <v>
+#   then   release.py publish --target windows-x64 --artifact <zip>
 # Android
 python3 apps/client/tool/android/release_android.py build /absolute/absent/dir
 python3 deploy/release.py publish --target android-arm64 --artifact /absolute/absent/dir/anj-cloud-<version>.apk
