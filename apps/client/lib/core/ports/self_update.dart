@@ -6,7 +6,9 @@
 /// reads the running bundle's receipt and runs the installed manager's
 /// `apply-update` (tool/linux_install.py), which verifies the download again
 /// against the release key built into the installed release, waits for this
-/// process to exit, installs it and relaunches the app.
+/// process to exit, installs it and relaunches the app. macOS:
+/// `MacosManagerSelfUpdate`; Windows: `WindowsManagerSelfUpdate`
+/// (anj-cloud-manager.exe `apply-update`).
 library;
 
 import 'dart:io';

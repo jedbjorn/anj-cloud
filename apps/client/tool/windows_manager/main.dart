@@ -6,6 +6,11 @@
 ///   update `<zip>` --sha256 `<hex>`     refuses while AnJ Cloud runs
 ///   run [--background]              start the active release
 ///   status
+///   apply-update `<archive>` --manifest `<file>` [--check | --result `<file>`]
+///                                   the app's in-app update: verify the
+///                                   signed download,
+///                                   wait for the app to quit, install, start
+///                                   it again
 ///   autostart enable|disable|status
 ///   uninstall                       exactly what install added
 ///
@@ -26,7 +31,8 @@ Future<void> main(List<String> arguments) async {
   try {
     final result = await _dispatch(arguments);
     stdout.writeln(const JsonEncoder.withIndent('  ').convert(result));
-    exitCode = 0;
+    // apply-update answers a refused hand-over as an outcome, not an error.
+    exitCode = result is Map && result['ok'] == false ? 1 : 0;
   } on Refused catch (error) {
     stderr.writeln('anj-cloud-manager: $error');
     exitCode = 1;
@@ -56,6 +62,20 @@ Future<Object?> _dispatch(List<String> arguments) async {
       return manager.run(background: arguments.contains('--background'));
     case 'status':
       return manager.status();
+    case 'apply-update':
+      final manifest = option('--manifest');
+      if (arguments.length < 2 || manifest == null) {
+        throw Refused(
+          'Usage: apply-update <archive> --manifest <file> '
+          '[--check | --result <file>]',
+        );
+      }
+      return manager.applyUpdate(
+        arguments[1],
+        manifest,
+        result: option('--result'),
+        check: arguments.contains('--check'),
+      );
     case 'autostart':
       final action = arguments.length > 1 ? arguments[1] : '';
       if (!const {'enable', 'disable', 'status'}.contains(action)) {
@@ -67,6 +87,7 @@ Future<Object?> _dispatch(List<String> arguments) async {
   }
   throw Refused(
     'Commands: install|update <zip> --sha256 <hex>, run [--background], status, '
+    'apply-update <archive> --manifest <file> [--check | --result <file>], '
     'autostart enable|disable|status, uninstall',
   );
 }
