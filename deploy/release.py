@@ -55,6 +55,7 @@ import re
 from pathlib import Path, PurePosixPath
 import shlex
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -275,6 +276,11 @@ def macos_artifact_facts(path):
 # refused by each of them, on every check.
 WINDOWS_MAX_MEMBERS = 10000
 WINDOWS_MAX_UNPACKED = 2 * 1024 * 1024 * 1024
+# manager.dart `requiredFiles`: what every Windows release must carry (tests/test_release_tool.py
+# reads the Dart list and compares).
+WINDOWS_REQUIRED = frozenset({
+    "anj_cloud.exe", "flutter_windows.dll", "anj_rootfs.dll", "anj-cloud-manager.exe", "data/app.so",
+    "data/icudtl.dat", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"})
 WINDOWS_RESERVED = re.compile(r"(CON|PRN|AUX|NUL|COM[0-9¹²³]|LPT[0-9¹²³]|CONIN\$|CONOUT\$)")
 
 
@@ -288,6 +294,12 @@ def windows_member_refusal(info):
         return "uses a compression other than stored or deflate"
     if info.file_size >= 0xFFFFFFFF or info.compress_size >= 0xFFFFFFFF or info.header_offset >= 0xFFFFFFFF:
         return "needs ZIP64"
+    extra = info.extra
+    while len(extra) >= 4:   # the manager reads sizes from the fixed fields only
+        kind, length = struct.unpack("<HH", extra[:4])
+        if kind == 0x0001:
+            return "carries a ZIP64 extra field"
+        extra = extra[4 + length:]
     kind = stat_module.S_IFMT(info.external_attr >> 16)
     if info.create_system == 3 and kind not in (0, stat_module.S_IFREG, stat_module.S_IFDIR):
         return "is a link or special file"
@@ -305,6 +317,24 @@ def windows_member_refusal(info):
                 or any(ord(c) < 0x20 or c in '<>:"|?*' for c in part)
                 or WINDOWS_RESERVED.fullmatch(part.split(".")[0].rstrip().upper())):
             return "has a name Windows cannot hold"
+    return None
+
+
+def windows_payload_refusal(archive, members, top, receipt):
+    """Why the manager's release check (manager.dart `_validate`) would refuse this payload; None when it
+    would not: the files are exactly those the receipt lists, each with its hash, and the required ones
+    are there. Reading every member also checks its CRC-32, as the manager's extraction does."""
+    hashes = receipt.get("files_sha256")
+    if not isinstance(hashes, dict) or not WINDOWS_REQUIRED <= hashes.keys():
+        return "its receipt does not list every file a release must carry"
+    files = {info.orig_filename[len(top) + 1:]: info for info in members if not info.orig_filename.endswith("/")}
+    if files.keys() != hashes.keys() | {"bundle-receipt.json"}:
+        return "its files are not exactly those its receipt lists"
+    for name, expected in hashes.items():
+        if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+            return "its receipt has an invalid hash"
+        if hashlib.sha256(archive.read(files[name])).hexdigest() != expected:
+            return f"{name} does not match its receipt hash"
     return None
 
 
@@ -328,6 +358,9 @@ def windows_artifact_facts(path):
             names = archive.namelist()
             if len(members) > WINDOWS_MAX_MEMBERS or sum(info.file_size for info in members) > WINDOWS_MAX_UNPACKED:
                 raise Refused("The artifact has more members or bytes than the Windows manager accepts")
+            # Python tolerates bytes in front of an archive and adjusts every offset; the manager does not.
+            if members and min(info.header_offset for info in members) != 0:
+                raise Refused("The Windows manager would refuse this artifact: bytes precede the archive")
             seen = set()
             for info in members:
                 refusal = windows_member_refusal(info)
@@ -341,10 +374,13 @@ def windows_artifact_facts(path):
             top = next(iter(tops)) if len(tops) == 1 else ""
             receipt = json.loads(archive.read(f"{top}/bundle-receipt.json")) if f"{top}/bundle-receipt.json" in names else None
             key = parse_public(archive.read(f"{top}/{KEY_PAYLOAD}").decode()) if f"{top}/{KEY_PAYLOAD}" in names else None
+            payload = windows_payload_refusal(archive, members, top, receipt) if isinstance(receipt, dict) else None
     except (zipfile.BadZipFile, OSError, ValueError, UnicodeError, KeyError) as error:
         raise Refused(f"The artifact is not a readable Windows release archive ({error})") from None
     if not isinstance(receipt, dict):
         raise Refused("The artifact has no release receipt (build it with apps/client/tool/windows/package.ps1)")
+    if payload:
+        raise Refused(f"The Windows manager would refuse this artifact: {payload}")
     source, code = receipt.get("source_head"), receipt.get("version_code")
     if (receipt.get("platform") != "Windows x86_64" or not isinstance(source, str) or len(source) != 40
             or type(code) is not int or code < 1 or not isinstance(receipt.get("version"), str)):
