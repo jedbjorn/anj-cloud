@@ -22,6 +22,7 @@ anj_info_fd
 anj_install
 anj_install_directory
 anj_install_owned
+anj_locate_identity
 anj_lock
 anj_mkdir
 anj_mkdir_exclusive

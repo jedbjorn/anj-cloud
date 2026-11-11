@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/attr.h>
+#include <sys/fsgetpath.h>
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/stat.h>

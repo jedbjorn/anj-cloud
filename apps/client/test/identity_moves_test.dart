@@ -13,6 +13,7 @@ import 'dart:io';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/ports/change_watcher.dart';
 import 'package:anj_cloud/core/ports/commit_durability.dart';
+import 'package:anj_cloud/core/ports/root_filesystem.dart';
 import 'package:anj_cloud/core/state/identity_index.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
@@ -110,11 +111,7 @@ class _Fs extends NativeRootFs {
 
   Map<String, dynamic> _seen(Map<String, dynamic> item) {
     final inode = inodes[item['path']], count = links[item['path']];
-    return {
-      ...item,
-      'inode': ?inode,
-      'links': ?count,
-    };
+    return {...item, 'inode': ?inode, 'links': ?count};
   }
 
   /// Whole-directory listings of each descriptor ([scan], or a watch scan
@@ -139,16 +136,16 @@ class _Fs extends NativeRootFs {
   }
 
   bool lookup = false;
-  String? Function(String identity)? answer;
+  IdentityLocation Function(String identity)? answer;
   final lookups = <String>[];
 
   @override
   bool get locatesIdentity => lookup;
 
   @override
-  String? locateIdentity(int fd, String identity) {
+  IdentityLocation locateIdentity(int fd, int stageFd, String identity) {
     lookups.add(identity);
-    return answer?.call(identity);
+    return answer?.call(identity) ?? identityNotFound;
   }
 }
 
@@ -911,7 +908,9 @@ void main() {
       final w = watcher();
       w.debugNow = () => 0;
       fs.lookup = true;
-      fs.answer = (_) => 'Other/b.txt';
+      engine.identityLookup = true;
+      fs.answer = (_) =>
+          (place: IdentityPlace.inside, path: 'Other/b.txt', links: 1);
       rename('Docs/a.txt', 'Other/b.txt');
       engine.markDirty('Docs/a.txt');
       await engine.tick();
@@ -925,6 +924,7 @@ void main() {
       w.debugNow = () => 0;
       w.enqueue('Other/unrelated.txt');
       fs.lookup = true;
+      engine.identityLookup = true;
       File(root('Docs/a.txt')).deleteSync();
       engine.markDirty('Docs/a.txt');
       await engine.tick();
@@ -932,8 +932,412 @@ void main() {
       expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
       expect(now, Duration.zero);
     });
-  });
 
+    // The kill switch: the lookup ships disabled
+    // (SyncEngine.identityLookupByDefault), and switched off a platform that
+    // answers it behaves exactly as one that does not: never asked, the
+    // removal held for the quiet period (here the maximum delay, the watcher
+    // busy), then decided on a partial pass as on Linux, no full scan asked.
+    test('the identity lookup ships switched off', () {
+      expect(SyncEngine.identityLookupByDefault, isFalse);
+      expect(engine.identityLookup, isFalse);
+    });
+    for (final supported in [false, true]) {
+      test(
+        supported
+            ? 'switched off, a platform that answers the lookup behaves as '
+                  'one that does not'
+            : 'a platform without the lookup: held, then decided on a '
+                  'partial pass',
+        () async {
+          final w = watcher();
+          w.debugNow = () => 0;
+          w.enqueue('Other/unrelated.txt');
+          fs.lookup = supported;
+          // An answer that, switched on, would decide at once.
+          fs.answer = (_) => identityNotFound;
+          final scans = engine.fullScans;
+          File(root('Docs/a.txt')).deleteSync();
+          engine.markDirty('Docs/a.txt');
+          await engine.tick();
+          expect(engine.lastPass!.localScan, 'partial');
+          expect(store.entries['Docs/a.txt']!.expectedPresent, isTrue);
+          expect(cloud.calls, isEmpty);
+          expect(engine.nextLocalDeadline()!, greaterThan(Duration.zero));
+          now += settings.maxDelay - const Duration(milliseconds: 1);
+          engine.markDirty('Docs/a.txt');
+          await engine.tick();
+          expect(store.entries['Docs/a.txt']!.expectedPresent, isTrue);
+          now += const Duration(milliseconds: 1);
+          engine.markDirty('Docs/a.txt');
+          await engine.tick();
+          expect(engine.lastPass!.localScan, 'partial');
+          expect(
+            store.entries['Docs/a.txt']?.expectedPresent ?? false,
+            isFalse,
+          );
+          await engine.tick();
+          expect(cloud.calls, ['DELETE Docs/a.txt']);
+          expect(fs.lookups, isEmpty, reason: 'never asked');
+          expect(engine.uncertainAudits, 0);
+          expect(engine.fullScans, scans);
+        },
+      );
+    }
+
+    // Spec #33 I3 on Linux, with a fake locator standing in for the macOS
+    // and Windows export: only the old side of each change is rescanned,
+    // and the watcher stays busy (its clock is frozen), so a hold lasts
+    // until the maximum delay. A certain answer decides with the fake clock
+    // still at zero; an uncertain one (decision #143) is held, then decided
+    // by one full scan ([heldThenFullScan]).
+    group('I3 lookup (fake locator)', () {
+      setUp(() {
+        watcher().debugNow = () => 0;
+        watcher().enqueue('Other/unrelated.txt');
+        fs.lookup = true;
+        engine.identityLookup = true;
+      });
+
+      IdentityLocation inside(String path, [int links = 1]) =>
+          (place: IdentityPlace.inside, path: path, links: links);
+
+      Future<void> onePass(String vanished) async {
+        engine.markDirty(vanished);
+        await engine.tick();
+        expect(engine.lastPass!.localScan, 'partial');
+      }
+
+      test('found inside: a folder renamed is one MOVE in one pass', () async {
+        write('Docs/deep/b.txt', 'b');
+        for (var i = 0; i < 30 && remote('Docs/deep/b.txt') == null; i++) {
+          watcher().debugNow = null;
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await engine.tick();
+        }
+        watcher().debugNow = () => 0;
+        watcher().enqueue('Other/unrelated.txt');
+        cloud.calls.clear();
+        final ids = fileIds();
+        final docs = store.entries['Docs']!.localIdentity!;
+        fs.answer = (id) =>
+            id == docs ? inside('Other/Docs 2026') : identityNotFound;
+        rename('Docs', 'Other/Docs 2026');
+        await onePass('Docs');
+        expect(fs.lookups, [docs], reason: 'one lookup for the top item');
+        expect(cloud.calls, ['MOVE Docs -> Other/Docs 2026']);
+        expect(
+          cloud.fileIds['Other/Docs 2026/deep/b.txt'],
+          ids['Docs/deep/b.txt'],
+        );
+        expect(now, Duration.zero);
+      });
+
+      test('found outside the root (moved to the Trash): a delete in the same '
+          'pass', () async {
+        File(root('Docs/a.txt')).renameSync('${fixture.path}/Trash-a.txt');
+        fs.answer = (_) => (place: IdentityPlace.outside, path: null, links: 0);
+        await onePass('Docs/a.txt');
+        expect(fs.lookups, hasLength(1));
+        expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
+        await engine.tick();
+        expect(cloud.calls, ['DELETE Docs/a.txt']);
+        expect(now, Duration.zero);
+      });
+
+      test('not found (deleted): a delete in the same pass', () async {
+        File(root('Docs/a.txt')).deleteSync();
+        fs.answer = (_) => identityNotFound;
+        await onePass('Docs/a.txt');
+        expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
+        await engine.tick();
+        expect(cloud.calls, ['DELETE Docs/a.txt']);
+        expect(engine.uncertainAudits, 0);
+        expect(now, Duration.zero);
+      });
+
+      /// [path] (and the folders above it) synchronized, folders listed back
+      /// with their versions; the watcher busy again afterwards.
+      Future<void> synced(String path, String text) async {
+        write(path, text);
+        watcher().debugNow = null;
+        for (var i = 0; i < 30 && remote(path) == null; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await engine.tick();
+        }
+        for (var i = 0; i < 4; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          await engine.tick();
+        }
+        watcher().debugNow = () => 0;
+        watcher().enqueue('Other/unrelated.txt');
+        cloud.calls.clear();
+      }
+
+      const outside = (place: IdentityPlace.outside, path: null, links: 0);
+
+      // A certain answer for a folder says nothing about what was beneath
+      // it: a file moved out of the folder before the folder went to the
+      // Trash is looked up on its own, and is one MOVE, never a delete plus
+      // a new upload (which would lose its file ID, history and shares).
+      test('a folder trashed after a file in it moved out: the file is looked '
+          'up on its own and is one MOVE, never a delete', () async {
+        await synced('Docs/Sub/deep/b.txt', 'b');
+        final ids = fileIds();
+        final subEntry = store.entries['Docs/Sub']!;
+        expect(
+          subEntry.etag,
+          isNotNull,
+          reason: 'the folder itself is looked up',
+        );
+        final sub = subEntry.localIdentity!;
+        final b = store.entries['Docs/Sub/deep/b.txt']!.localIdentity!;
+        rename('Docs/Sub/deep/b.txt', 'Other/b.txt');
+        Directory(root('Docs/Sub')).renameSync('${fixture.path}/Trash-Sub');
+        fs.answer = (id) => id == b
+            ? inside('Other/b.txt')
+            : id == sub
+            ? outside
+            : identityNotFound;
+        await onePass('Docs/Sub');
+        // The pass that sees the folder go: one MOVE and no DELETE at all,
+        // neither of the file nor of the folder above it (whose deletion
+        // would take the file with it).
+        expect(cloud.calls, ['MOVE Docs/Sub/deep/b.txt -> Other/b.txt']);
+        // The new side arrives one pass later; the folder, empty in the
+        // cloud now, may then go.
+        engine.markDirty('Other/b.txt');
+        await engine.tick();
+        await engine.tick();
+        expect(cloud.calls.first, 'MOVE Docs/Sub/deep/b.txt -> Other/b.txt');
+        expect(
+          cloud.calls.where((c) => c.startsWith('DELETE Docs/Sub/deep')),
+          isEmpty,
+        );
+        expect(cloud.calls.where((c) => c.startsWith('PUT')), isEmpty);
+        expect(remote('Other/b.txt'), 'b');
+        expect(cloud.fileIds['Other/b.txt'], ids['Docs/Sub/deep/b.txt']);
+        expect(fs.lookups, containsAll([sub, b]));
+      });
+
+      test('a folder trashed with everything in it: each item beneath is '
+          'certain too, so nothing is held', () async {
+        await synced('Docs/Sub/deep/b.txt', 'b');
+        expect(store.entries['Docs/Sub']!.etag, isNotNull);
+        Directory(root('Docs/Sub')).renameSync('${fixture.path}/Trash-Sub');
+        fs.answer = (_) => outside;
+        await onePass('Docs/Sub');
+        await engine.tick();
+        expect(
+          store.entries['Docs/Sub/deep/b.txt']?.expectedPresent ?? false,
+          isFalse,
+        );
+        expect(store.entries['Docs/Sub']?.expectedPresent ?? false, isFalse);
+        expect(cloud.calls.where((c) => c.startsWith('MOVE')), isEmpty);
+        expect(engine.uncertainAudits, 0);
+        expect(now, Duration.zero);
+      });
+
+      // Decision #143: every other answer is uncertain. The removal is held
+      // exactly as on Linux (the watcher stays busy here, so until the
+      // maximum delay), it is never deleted on a partial pass, and when the
+      // hold ends one full scan is asked for, which decides at once. Neither
+      // the hold nor the request keeps the worker due at once.
+      Future<void> heldThenFullScan(String vanished) async {
+        final scans = engine.fullScans;
+        // A new item the rescan found may go up; nothing is removed or moved.
+        Iterable<String> removals() => cloud.calls.where(
+          (c) => c.startsWith('DELETE') || c.startsWith('MOVE'),
+        );
+        await onePass(vanished);
+        expect(fs.lookups, isNotEmpty);
+        expect(
+          store.entries[vanished]!.expectedPresent,
+          isTrue,
+          reason: 'an uncertain answer holds the removal',
+        );
+        expect(removals(), isEmpty);
+        expect(engine.nextLocalDeadline()!, greaterThan(Duration.zero));
+        now += settings.maxDelay - const Duration(milliseconds: 1);
+        await onePass(vanished);
+        expect(store.entries[vanished]!.expectedPresent, isTrue);
+        expect(engine.uncertainAudits, 0, reason: 'held until maxDelay');
+        expect(engine.nextLocalDeadline()!, greaterThan(Duration.zero));
+        now += const Duration(milliseconds: 1);
+        await onePass(vanished);
+        expect(
+          store.entries[vanished]!.expectedPresent,
+          isTrue,
+          reason: 'never deleted on a partial pass',
+        );
+        expect(removals(), isEmpty);
+        expect(engine.uncertainAudits, 1, reason: 'one full scan asked for');
+        expect(engine.nextLocalDeadline(), Duration.zero);
+        expect(engine.fullScans, scans);
+        await engine.tick();
+        expect(engine.lastPass!.localScan, 'full');
+        expect(engine.fullScans, scans + 1);
+        // Settled: no second request and no wake loop (fake clock).
+        for (var i = 0; i < 5; i++) {
+          now += settings.maxDelay;
+          await engine.tick();
+        }
+        expect(engine.uncertainAudits, 1);
+        expect(engine.fullScans, scans + 1);
+        expect(engine.nextLocalDeadline(), isNot(Duration.zero));
+      }
+
+      test('a lookup that throws: held, then a full scan deletes, never a '
+          'crash', () async {
+        File(root('Docs/a.txt')).deleteSync();
+        fs.answer = (_) => throw const FileSystemException('injected');
+        await heldThenFullScan('Docs/a.txt');
+        expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
+        expect(cloud.calls, ['DELETE Docs/a.txt']);
+        expect(engine.message, isNot(contains('injected')));
+      });
+
+      test('an uncertain answer (a native error or race) for an item that '
+          'moved: held, then the full scan makes it one MOVE', () async {
+        rename('Docs/a.txt', 'Other/b.txt');
+        fs.answer = (_) => identityUncertain;
+        await heldThenFullScan('Docs/a.txt');
+        expect(cloud.calls, ['MOVE Docs/a.txt -> Other/b.txt']);
+        expect(remote('Other/b.txt'), 'a');
+      });
+
+      test('an uncertain answer for an item that is gone: held, then the '
+          'full scan deletes', () async {
+        File(root('Docs/a.txt')).deleteSync();
+        fs.answer = (_) => identityUncertain;
+        await heldThenFullScan('Docs/a.txt');
+        expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
+        expect(cloud.calls, ['DELETE Docs/a.txt']);
+      });
+
+      test('found inside at a path that is not there (a stale answer): held, '
+          'then the full scan deletes; nothing invented', () async {
+        File(root('Docs/a.txt')).deleteSync();
+        fs.answer = (_) => inside('Other/ghost.txt');
+        await heldThenFullScan('Docs/a.txt');
+        expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
+        expect(store.entries['Other/ghost.txt'], isNull);
+        expect(cloud.calls, ['DELETE Docs/a.txt']);
+      });
+
+      test('found inside at a path that now holds a different item: held, '
+          'then the full scan deletes; never paired', () async {
+        // The other item is created while Docs/a.txt still holds its inode,
+        // so it is a different item on every filesystem. Created after the
+        // delete, ext4 may give it the freed inode: the same identity, which
+        // the engine treats as the same file (not what this test is about).
+        write('Other/b.txt', 'another file');
+        File(root('Docs/a.txt')).deleteSync();
+        expect(
+          fs.fileIdentity(tree.fd, 'Other/b.txt'),
+          isNot(store.entries['Docs/a.txt']!.localIdentity),
+        );
+        fs.answer = (_) => inside('Other/b.txt');
+        await heldThenFullScan('Docs/a.txt');
+        expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
+        expect(cloud.calls.where((c) => c.startsWith('MOVE')), isEmpty);
+        expect(cloud.calls, contains('DELETE Docs/a.txt'));
+        expect(remote('Other/b.txt'), 'another file');
+      });
+
+      test('found inside but hard-linked by the user (effective link count '
+          '2): held, then the full scan never pairs it', () async {
+        rename('Docs/a.txt', 'Other/b.txt');
+        Process.runSync('ln', [root('Other/b.txt'), root('Other/c.txt')]);
+        fs.answer = (_) => inside('Other/b.txt', 2);
+        await heldThenFullScan('Docs/a.txt');
+        expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
+        expect(cloud.calls.where((c) => c.startsWith('MOVE')), isEmpty);
+        expect(cloud.calls, contains('DELETE Docs/a.txt'));
+      });
+
+      test('found only in staging with another link left: held, then a MOVE '
+          'when the other side arrives', () async {
+        rename('Docs/a.txt', 'Other/b.txt');
+        fs.answer = (_) => (place: IdentityPlace.staging, path: null, links: 2);
+        await onePass('Docs/a.txt');
+        expect(
+          store.entries['Docs/a.txt']!.expectedPresent,
+          isTrue,
+          reason: 'where the other link is cannot be known: held',
+        );
+        expect(cloud.calls, isEmpty);
+        fs.answer = (_) => inside('Other/b.txt');
+        await onePass('Docs/a.txt');
+        expect(cloud.calls, ['MOVE Docs/a.txt -> Other/b.txt']);
+        expect(engine.uncertainAudits, 0);
+      });
+
+      test('found only in staging until the hold ends: the full scan makes '
+          'it one MOVE', () async {
+        rename('Docs/a.txt', 'Other/b.txt');
+        fs.answer = (_) => (place: IdentityPlace.staging, path: null, links: 2);
+        await heldThenFullScan('Docs/a.txt');
+        expect(cloud.calls, ['MOVE Docs/a.txt -> Other/b.txt']);
+      });
+
+      test('found only in staging, no link left but the engine\'s own: held, '
+          'then the full scan deletes', () async {
+        cloud.put('Docs/down.txt', 'from another device');
+        watcher().debugNow = null;
+        for (
+          var i = 0;
+          i < 30 && !File(root('Docs/down.txt')).existsSync();
+          i++
+        ) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await engine.tick();
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        await engine.tick();
+        watcher().debugNow = () => 0;
+        watcher().enqueue('Other/unrelated.txt');
+        expect(store.entries['Docs/down.txt']!.localIdentity, isNotNull);
+        cloud.calls.clear();
+        // The user's link goes; only the staging copy holds the inode.
+        File(root('Docs/down.txt')).deleteSync();
+        fs.answer = (_) => (place: IdentityPlace.staging, path: null, links: 1);
+        await heldThenFullScan('Docs/down.txt');
+        expect(
+          store.entries['Docs/down.txt']?.expectedPresent ?? false,
+          isFalse,
+        );
+        expect(cloud.calls, ['DELETE Docs/down.txt']);
+      });
+
+      test('several uncertain removals ask for one full scan', () async {
+        File(root('Docs/a.txt')).deleteSync();
+        File(root('Other/keep.txt')).deleteSync();
+        fs.answer = (_) => identityUncertain;
+        engine.markDirty('Other/keep.txt');
+        await heldThenFullScan('Docs/a.txt');
+        expect(fs.lookups.toSet(), hasLength(2));
+        expect(cloud.calls.toSet(), {
+          'DELETE Docs/a.txt',
+          'DELETE Other/keep.txt',
+        });
+      });
+
+      test('a folder found outside with an item beneath it uncertain: the '
+          'folder is held with it, then the full scan decides', () async {
+        await synced('Docs/Sub/b.txt', 'b');
+        final sub = store.entries['Docs/Sub']!.localIdentity!;
+        Directory(root('Docs/Sub')).renameSync('${fixture.path}/Trash-Sub');
+        fs.answer = (id) => id == sub ? outside : identityUncertain;
+        await heldThenFullScan('Docs/Sub');
+        expect(store.entries['Docs/Sub']?.expectedPresent ?? false, isFalse);
+        expect(
+          store.entries['Docs/Sub/b.txt']?.expectedPresent ?? false,
+          isFalse,
+        );
+      });
+    });
+  });
   group('commit point (decisions #136, #137)', () {
     void renameThree() {
       rename('Docs/report.txt', 'Archive/r.txt');

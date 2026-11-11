@@ -447,4 +447,5 @@ int anj_chmod_private(const char* path) { int n = chmod(path, 0700); error_numbe
 #include "watch_fsevents.inc"
 #endif
 #include "watch_walk.inc"
+#include "locate.inc"
 #include "lifecycle.inc"

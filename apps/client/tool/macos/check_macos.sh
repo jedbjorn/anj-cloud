@@ -75,7 +75,7 @@ mkdir -p build/tmp
 export TMPDIR=${PWD:A}/build/tmp
 export ANJ_MACOS_ROOTFS_LIBRARY=$lib ANJ_ROOTFS_LIBRARY=$lib
 step "mac-side tests (test_macos/)" test-macos.log \
-  flutter --suppress-analytics test --reporter expanded --concurrency=1 test_macos test/macos_platform_adapters_test.dart test/macos_desktop_session_test.dart test/secrets_unavailable_test.dart test/platform_selectors_test.dart test/native_portability_test.dart test/local_watch_test.dart test/local_watch_adversarial_test.dart test/top_folders_test.dart test/top_folder_hold_deferral_test.dart
+  flutter --suppress-analytics test --reporter expanded --concurrency=1 test_macos test/macos_platform_adapters_test.dart test/macos_desktop_session_test.dart test/secrets_unavailable_test.dart test/platform_selectors_test.dart test/native_portability_test.dart test/identity_lookup_native_test.dart test/local_watch_test.dart test/local_watch_adversarial_test.dart test/top_folders_test.dart test/top_folder_hold_deferral_test.dart
 unset ANJ_MACOS_ROOTFS_LIBRARY ANJ_ROOTFS_LIBRARY
 
 for mode in $modes; do

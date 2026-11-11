@@ -98,19 +98,19 @@ abstract interface class RootFilesystem implements RootIdentitySource {
   /// a local delete. Installs, restores and folder creation only add.
   void Function()? beforeDestructiveChange;
 
-  /// Whether [locateIdentity] answers on this platform: the seam of spec
-  /// #33 I3 (macOS by file ID, Windows by `OpenFileById`). Where it does, a
-  /// synchronized item missing from a partial pass is looked up instead of
-  /// held: found inside the root it is a move, otherwise a delete at once.
-  /// False until I3 lands, and on Linux and Android, which hold the removal
-  /// for the quiet period instead (decision #140).
+  /// Whether [locateIdentity] answers on this platform (spec #33 I3): macOS
+  /// (fsgetpath on the root's volume) and Windows (`OpenFileById`). Where it
+  /// does, a synchronized item missing from a partial pass is looked up
+  /// instead of held: found inside the root it is a move, otherwise a delete
+  /// at once. False on Linux and Android, which hold the removal for the
+  /// quiet period instead (decision #140).
   bool get locatesIdentity;
 
-  /// The root-relative path of the item whose local identity
-  /// (`volume:inode`, the NTFS file ID) is [identity], when it is beneath the
-  /// root [fd] and has exactly one link; null when not found, outside the
-  /// root, hard-linked or on any error. Bounded; never throws.
-  String? locateIdentity(int fd, String identity);
+  /// Where the item whose local identity (`volume:inode`, the NTFS file ID)
+  /// is [identity] is now, relative to the root [fd]; [stageFd] is the
+  /// private staging directory, whose links are the engine's own. Bounded;
+  /// never throws: any error is [IdentityPlace.uncertain].
+  IdentityLocation locateIdentity(int fd, int stageFd, String identity);
 
   /// Whether the volume holding [rootPath] treats names that differ only by
   /// case (or Unicode normalization) as one name: NTFS on Windows, APFS and
@@ -148,3 +148,51 @@ abstract interface class RootFilesystem implements RootIdentitySource {
   /// The guard for owned-file release bound to this same boundary.
   ReleaseGuard releaseGuard();
 }
+
+/// Where [RootFilesystem.locateIdentity] found an item (spec #33 I3). The
+/// certain answers are [inside], [outside] and [notFound]; [staging] and
+/// [uncertain] prove nothing, so the engine holds the removal (as Linux
+/// does) and lets a full scan decide.
+enum IdentityPlace {
+  /// Beneath the root, at [IdentityLocation.path], re-opened through the
+  /// boundary as the same item.
+  inside,
+
+  /// Elsewhere on the root's volume (the Trash, another folder), under a
+  /// name that is the item's only link: the item left the root.
+  outside,
+
+  /// The one name the platform reported is a link in the private staging
+  /// directory (macOS names a single link of a hard-linked file, and a
+  /// download's staging copy is one): where any other link is, is unknown.
+  staging,
+
+  /// No such item on the root's volume.
+  notFound,
+
+  /// Anything that proves nothing, failing safe: an error (an unexpected
+  /// failure, the item or the root changed while it was being looked up), a
+  /// malformed identity, a volume key other than the root's, an outside
+  /// name of a file with more than one link.
+  uncertain,
+}
+
+/// A [RootFilesystem.locateIdentity] answer. [links] is the item's link
+/// count (1 for a folder) for [IdentityPlace.inside] and
+/// [IdentityPlace.staging], before the engine discounts its own staging
+/// links; 0 otherwise.
+typedef IdentityLocation = ({IdentityPlace place, String? path, int links});
+
+/// The [IdentityPlace.uncertain] answer.
+const IdentityLocation identityUncertain = (
+  place: IdentityPlace.uncertain,
+  path: null,
+  links: 0,
+);
+
+/// The [IdentityPlace.notFound] answer.
+const IdentityLocation identityNotFound = (
+  place: IdentityPlace.notFound,
+  path: null,
+  links: 0,
+);
