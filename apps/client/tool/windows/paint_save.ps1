@@ -1,4 +1,4 @@
-# Saves -Path once in Paint, as a user would (spec #32 W4, #73 review 6):
+# Saves -Path once in Paint, as a user would:
 # open it, select all, clear, Ctrl+S, close. Paint saves by deleting the
 # file and creating a new one under the name (editor_patterns.ps1). Runs in
 # the console session, unelevated (the W4 E2E calls it from its task).

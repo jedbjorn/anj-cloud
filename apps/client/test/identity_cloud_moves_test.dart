@@ -19,6 +19,7 @@ import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
 import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -139,6 +140,46 @@ class _Fs extends NativeRootFs {
   final renames = <String>[];
   void Function()? afterRename;
 
+  /// When set, every name this binding creates or renames to resolves the
+  /// way a case- and normalization-insensitive volume (NTFS, default APFS)
+  /// does: an existing sibling whose name differs only by case or
+  /// normalization is that same item. [redirected] lists such writes.
+  String? foldingRoot;
+  final redirected = <String>[];
+
+  String _resolve(String path) {
+    final rootPath = foldingRoot;
+    if (rootPath == null) return path;
+    var at = '';
+    for (final part in path.split('/')) {
+      final dir = Directory(at.isEmpty ? rootPath : '$rootPath/$at');
+      String? hit;
+      if (dir.existsSync()) {
+        final key = NamePolicy.foldKey(part);
+        for (final e in dir.listSync(followLinks: false)) {
+          final name = e.uri.pathSegments.where((s) => s.isNotEmpty).last;
+          if (name == part) {
+            hit = part;
+            break;
+          }
+          if (NamePolicy.foldKey(name) == key) hit ??= name;
+        }
+      }
+      at = at.isEmpty ? (hit ?? part) : '$at/${hit ?? part}';
+    }
+    if (at != path) redirected.add(path);
+    return at;
+  }
+
+  @override
+  void makeDir(int fd, String path) => super.makeDir(fd, _resolve(path));
+  @override
+  void makeDirExclusive(int fd, String path) =>
+      super.makeDirExclusive(fd, _resolve(path));
+  @override
+  void install(int fd, String relative, String stage) =>
+      super.install(fd, _resolve(relative), stage);
+
   /// Called once before the next single-path stat of [statPath] (the
   /// engine's re-check just before a rename).
   String? statPath;
@@ -157,7 +198,9 @@ class _Fs extends NativeRootFs {
 
   @override
   void renameExclusive(int fd, String from, String to, String identity) {
-    super.renameExclusive(fd, from, to, identity);
+    // Renaming an item to another spelling of its own name is allowed.
+    final target = _resolve(to);
+    super.renameExclusive(fd, from, target == from ? to : target, identity);
     renames.add('$from -> $to');
     afterRename?.call();
   }
@@ -270,37 +313,40 @@ void main() {
       expect(store.entries.containsKey('Docs/report.txt'), isFalse);
     });
 
-    test('a folder with 1,000 children renamed: one local rename, no GET',
-        () async {
-      for (var i = 0; i < 1000; i++) {
-        write('Big/${i ~/ 100}/f$i.txt', 'f$i');
-      }
-      await ticks(3);
-      expect(remote('Big/9/f999.txt'), 'f999');
-      cloud.calls.clear();
-      fs.renames.clear();
-      final before = identity('Big');
-      final child = identity('Big/3/f345.txt');
-      await cloud.moveElsewhere('Big', 'Archive/Big 2026');
-      await ticks();
-      expect(fs.renames, ['Big -> Archive/Big 2026']);
-      expect(cloud.calls, isEmpty);
-      expect(identity('Archive/Big 2026'), before);
-      expect(identity('Archive/Big 2026/3/f345.txt'), child);
-      expect(
-        store.entries.keys.where((k) => k == 'Big' || k.startsWith('Big/')),
-        isEmpty,
-      );
-      final moved = store.entries.values
-          .where((e) => e.path.startsWith('Archive/Big 2026/'))
-          .toList();
-      expect(moved.where((e) => e.kind == ItemKind.file), hasLength(1000));
-      expect(
-        moved.where((e) => e.status != 'current local'),
-        isEmpty,
-        reason: 'every row synchronized at its new path',
-      );
-    }, timeout: const Timeout(Duration(minutes: 5)));
+    test(
+      'a folder with 1,000 children renamed: one local rename, no GET',
+      () async {
+        for (var i = 0; i < 1000; i++) {
+          write('Big/${i ~/ 100}/f$i.txt', 'f$i');
+        }
+        await ticks(3);
+        expect(remote('Big/9/f999.txt'), 'f999');
+        cloud.calls.clear();
+        fs.renames.clear();
+        final before = identity('Big');
+        final child = identity('Big/3/f345.txt');
+        await cloud.moveElsewhere('Big', 'Archive/Big 2026');
+        await ticks();
+        expect(fs.renames, ['Big -> Archive/Big 2026']);
+        expect(cloud.calls, isEmpty);
+        expect(identity('Archive/Big 2026'), before);
+        expect(identity('Archive/Big 2026/3/f345.txt'), child);
+        expect(
+          store.entries.keys.where((k) => k == 'Big' || k.startsWith('Big/')),
+          isEmpty,
+        );
+        final moved = store.entries.values
+            .where((e) => e.path.startsWith('Archive/Big 2026/'))
+            .toList();
+        expect(moved.where((e) => e.kind == ItemKind.file), hasLength(1000));
+        expect(
+          moved.where((e) => e.status != 'current local'),
+          isEmpty,
+          reason: 'every row synchronized at its new path',
+        );
+      },
+      timeout: const Timeout(Duration(minutes: 5)),
+    );
 
     test('a file written between the scan and the rename waits a pass, '
         'then moves and its edit uploads', () async {
@@ -369,22 +415,24 @@ void main() {
       expect(exists('Archive/kept.txt'), isFalse);
     });
 
-    test('rows without a file ID fall back to the #71 same-version rule',
-        () async {
-      await library();
-      for (final path in ['Docs/report.txt', 'Archive/keep.txt']) {
-        store.entries[path]!.fileId = null;
-        cloud.fileIds.remove(path);
-      }
-      // A case-only rename of the same version still moves.
-      await cloud.moveElsewhere('Docs/report.txt', 'Docs/Report.txt');
-      // Any other rename without a file ID is a delete plus a download.
-      await cloud.moveElsewhere('Archive/keep.txt', 'Archive/kept.txt');
-      await ticks();
-      expect(fs.renames, ['Docs/report.txt -> Docs/Report.txt']);
-      expect(cloud.calls, ['GET Archive/kept.txt']);
-      expect(disk('Archive/kept.txt'), 'keep');
-    });
+    test(
+      'rows without a file ID fall back to the #71 same-version rule',
+      () async {
+        await library();
+        for (final path in ['Docs/report.txt', 'Archive/keep.txt']) {
+          store.entries[path]!.fileId = null;
+          cloud.fileIds.remove(path);
+        }
+        // A case-only rename of the same version still moves.
+        await cloud.moveElsewhere('Docs/report.txt', 'Docs/Report.txt');
+        // Any other rename without a file ID is a delete plus a download.
+        await cloud.moveElsewhere('Archive/keep.txt', 'Archive/kept.txt');
+        await ticks();
+        expect(fs.renames, ['Docs/report.txt -> Docs/Report.txt']);
+        expect(cloud.calls, ['GET Archive/kept.txt']);
+        expect(disk('Archive/kept.txt'), 'keep');
+      },
+    );
 
     test('one commit point for every rename of the pass', () async {
       engine.close();
@@ -478,48 +526,55 @@ void main() {
     });
   });
 
-  group('row 2: a crash under a top folder (the delete held by the settle)',
-      () {
-    setUp(start);
+  group(
+    'row 2: a crash under a top folder (the delete held by the settle)',
+    () {
+      setUp(start);
 
-    test('a hard-linked file renamed by a cloud move, then a crash before its '
+      test(
+        'a hard-linked file renamed by a cloud move, then a crash before its '
         'rows: adopted by its bytes, never deleted and uploaded again (#80 '
-        'delta review L1)', () async {
-      var now = Duration.zero;
-      engine.debugElapsed = () => now;
-      write('Documents/Docs/report.txt', 'report');
-      await ticks(3);
-      final outside = '${fixture.path}/report-link.txt';
-      expect(
-        Process.runSync('ln', [root('Documents/Docs/report.txt'), outside])
-            .exitCode,
-        0,
+        'delta review L1)',
+        () async {
+          var now = Duration.zero;
+          engine.debugElapsed = () => now;
+          write('Documents/Docs/report.txt', 'report');
+          await ticks(3);
+          final outside = '${fixture.path}/report-link.txt';
+          expect(
+            Process.runSync('ln', [
+              root('Documents/Docs/report.txt'),
+              outside,
+            ]).exitCode,
+            0,
+          );
+          await ticks(1);
+          cloud.calls.clear();
+          await cloud.moveElsewhere(
+            'Documents/Docs/report.txt',
+            'Documents/Archive/r.txt',
+          );
+          fs.afterRename = () => throw _Crash();
+          await expectLater(engine.tick(), throwsA(isA<_Crash>()));
+          fs.afterRename = null;
+          store.close();
+          store = Manifest(Directory('${fixture.path}/profile'));
+          // A file with a second link may carry no recorded identity (no
+          // staging claim proves it): only its bytes can say it is the item.
+          store.entries['Documents/Docs/report.txt']!.localIdentity = null;
+          store.save();
+          engine = SyncEngine(store, tree, cloud)..debugElapsed = () => now;
+          await ticks();
+          now += engine.topDeleteSettle + const Duration(seconds: 1);
+          await ticks();
+          expect(cloud.calls.where((c) => c.startsWith('DELETE')), isEmpty);
+          expect(cloud.calls.where((c) => c.startsWith('PUT')), isEmpty);
+          expect(disk('Documents/Archive/r.txt'), 'report');
+          expect(remote('Documents/Archive/r.txt'), 'report');
+        },
       );
-      await ticks(1);
-      cloud.calls.clear();
-      await cloud.moveElsewhere(
-        'Documents/Docs/report.txt',
-        'Documents/Archive/r.txt',
-      );
-      fs.afterRename = () => throw _Crash();
-      await expectLater(engine.tick(), throwsA(isA<_Crash>()));
-      fs.afterRename = null;
-      store.close();
-      store = Manifest(Directory('${fixture.path}/profile'));
-      // A file with a second link may carry no recorded identity (no
-      // staging claim proves it): only its bytes can say it is the item.
-      store.entries['Documents/Docs/report.txt']!.localIdentity = null;
-      store.save();
-      engine = SyncEngine(store, tree, cloud)..debugElapsed = () => now;
-      await ticks();
-      now += engine.topDeleteSettle + const Duration(seconds: 1);
-      await ticks();
-      expect(cloud.calls.where((c) => c.startsWith('DELETE')), isEmpty);
-      expect(cloud.calls.where((c) => c.startsWith('PUT')), isEmpty);
-      expect(disk('Documents/Archive/r.txt'), 'report');
-      expect(remote('Documents/Archive/r.txt'), 'report');
-    });
-  });
+    },
+  );
 
   group('row 3: both sides change (cloud rows)', () {
     setUp(start);
@@ -597,10 +652,9 @@ void main() {
       expect(row.status, 'current local');
       expect(row.movedNote, 'Renamed on another device to B.txt');
       expect(store.entries.containsKey('Docs/A.txt'), isFalse);
-      expect(
-        (await projectEntry(engine, row))['presentationNotes'],
-        ['Renamed on another device to B.txt'],
-      );
+      expect((await projectEntry(engine, row))['presentationNotes'], [
+        'Renamed on another device to B.txt',
+      ]);
       // Shown once: a later move of the row replaces it.
       await cloud.moveElsewhere('Docs/B.txt', 'Docs/C.txt');
       await ticks();
@@ -668,17 +722,19 @@ void main() {
       expect(store.entries['Docs/B.txt']!.status, 'current local');
     });
 
-    test('deleted here, renamed in the cloud: the delete follows the item',
-        () async {
-      await library();
-      File(root('Docs/report.txt')).deleteSync();
-      await cloud.moveElsewhere('Docs/report.txt', 'Archive/r.txt');
-      await ticks();
-      expect(cloud.calls, ['DELETE Archive/r.txt']);
-      expect(remote('Archive/r.txt'), isNull);
-      expect(exists('Archive/r.txt'), isFalse);
-      expect(store.operations, isEmpty);
-    });
+    test(
+      'deleted here, renamed in the cloud: the delete follows the item',
+      () async {
+        await library();
+        File(root('Docs/report.txt')).deleteSync();
+        await cloud.moveElsewhere('Docs/report.txt', 'Archive/r.txt');
+        await ticks();
+        expect(cloud.calls, ['DELETE Archive/r.txt']);
+        expect(remote('Archive/r.txt'), isNull);
+        expect(exists('Archive/r.txt'), isFalse);
+        expect(store.operations, isEmpty);
+      },
+    );
 
     test('a folder deleted here, renamed in the cloud: the delete follows '
         'it', () async {
@@ -769,8 +825,8 @@ void main() {
   group('row 7: a new name another item here holds keeps the item', () {
     setUp(start);
 
-    // A name this device cannot hold (Win32 names, case folds) is #73's
-    // NameHolds; its tests come with it.
+    // A name this device cannot hold (Win32 names, case folds): the group
+    // after this one.
 
     test('deleted here while the cloud moved it onto a name another local '
         'item holds: the delete follows the item, nothing is downloaded, the '
@@ -803,12 +859,162 @@ void main() {
       expect(disk('Archive/r.txt'), 'mine');
       expect(remote('Archive/r.txt'), 'report');
       expect(store.entries['Docs/report.txt']!.status, serverNameClashStatus);
+      // On every platform such a row is amber with its reason and the app
+      // needs attention, until the clash is gone.
+      SyncStatus overall() => deriveStatus(
+        paused: false,
+        offline: false,
+        unpaired: false,
+        message: engine.message,
+        entries: store.entries.values,
+        operations: store.operations.values,
+      );
+      expect(overall(), SyncStatus.attention);
+      expect(
+        (await projectEntry(
+          engine,
+          store.entries['Docs/report.txt']!,
+        ))['presentationErrors'],
+        [serverNameClashStatus],
+      );
       // The other item goes: the move follows.
       File(root('Archive/r.txt')).deleteSync();
       await ticks();
       expect(fs.renames, ['Docs/report.txt -> Archive/r.txt']);
       expect(cloud.calls, isEmpty);
       expect(disk('Archive/r.txt'), 'report');
+      expect(overall(), isNot(SyncStatus.attention));
+    });
+  });
+
+  // A cloud move's target gets the same decision as a create or a download
+  // (NameHolds): on a device that cannot hold the new name, the item stays
+  // where it is with the reason, and nothing is renamed, created, deleted,
+  // moved or uploaded for it. The filesystem here folds case as NTFS does,
+  // so a wrong rename or folder creation lands inside the folded sibling.
+  group('a new name this device cannot hold keeps the item', () {
+    setUp(() {
+      start();
+      fs.foldingRoot = tree.root.path;
+      engine
+        ..holdsAnyName = false
+        ..foldsCase = true;
+    });
+
+    List<String> listing(String folder) => [
+      for (final e in Directory(root(folder)).listSync(followLinks: false))
+        e.uri.pathSegments.where((s) => s.isNotEmpty).last,
+    ]..sort();
+
+    test(
+      'a cloud rename to a name the platform refuses: not renamed, held '
+      'with the reason, nothing sent; a later good name is followed',
+      () async {
+        await library();
+        await cloud.moveElsewhere('Docs/report.txt', 'Docs/x.');
+        await ticks(4);
+        expect(fs.renames, isEmpty);
+        expect(cloud.calls, isEmpty);
+        expect(listing('Docs'), ['report.txt']);
+        expect(disk('Docs/report.txt'), 'report');
+        expect(remote('Docs/x.'), 'report');
+        expect(
+          store.entries['Docs/report.txt']!.status,
+          serverNameNotAllowedStatus,
+        );
+        expect(store.entries['Docs/report.txt']!.conflict, isNull);
+        expect(store.operations, isEmpty);
+        // An edit here meanwhile stays here: nothing is uploaded over the
+        // cloud item under either name.
+        write('Docs/report.txt', 'edited while held');
+        await ticks(3);
+        expect(cloud.calls, isEmpty);
+        expect(remote('Docs/x.'), 'report');
+        // Renamed again in the cloud to a name this device can hold: followed
+        // by one rename, and the edit then uploads as an edit of that item.
+        await cloud.moveElsewhere('Docs/x.', 'Docs/fine.txt');
+        await ticks(4);
+        expect(fs.renames, ['Docs/report.txt -> Docs/fine.txt']);
+        expect(listing('Docs'), ['fine.txt']);
+        expect(cloud.calls, ['PUT Docs/fine.txt']);
+        expect(remote('Docs/fine.txt'), 'edited while held');
+        expect(store.entries['Docs/fine.txt']!.status, 'current local');
+        expect(store.entries.containsKey('Docs/report.txt'), isFalse);
+      },
+    );
+
+    test('a cloud rename onto a sibling that differs only by case: not '
+        'renamed, held as a clash, both files untouched', () async {
+      await library();
+      write('Docs/x.txt', 'other');
+      await ticks(3);
+      cloud.calls.clear();
+      await cloud.moveElsewhere('Docs/x.txt', 'Docs/Report.txt');
+      await ticks(4);
+      expect(fs.renames, isEmpty);
+      expect(fs.redirected, isEmpty);
+      expect(cloud.calls, isEmpty);
+      expect(listing('Docs'), ['report.txt', 'x.txt']);
+      expect(disk('Docs/report.txt'), 'report');
+      expect(disk('Docs/x.txt'), 'other');
+      expect(remote('Docs/report.txt'), 'report');
+      expect(remote('Docs/Report.txt'), 'other');
+      expect(store.entries['Docs/x.txt']!.status, serverNameClashStatus);
+      expect(store.entries['Docs/report.txt']!.status, 'current local');
+      expect(store.operations, isEmpty);
+    });
+
+    test('a cloud move into a folder held as a clash loser: not moved, no '
+        'folder made, nothing lands in the kept sibling, and the following '
+        'scans send nothing', () async {
+      await library();
+      await cloud.made('Archive/Docs');
+      await cloud.made('Archive/docs');
+      cloud.put('Archive/Docs/x.txt', 'kept folder');
+      cloud.put('Archive/docs/y.txt', 'held folder');
+      await ticks(3);
+      expect(listing('Archive'), ['Docs', 'keep.txt']);
+      expect(listing('Archive/Docs'), ['x.txt']);
+      expect(store.entries['Archive/docs']!.status, serverNameClashStatus);
+      cloud.calls.clear();
+      fs.renames.clear();
+      fs.redirected.clear();
+
+      await cloud.moveElsewhere('Archive/keep.txt', 'Archive/docs/keep.txt');
+      await ticks(5);
+      expect(fs.renames, isEmpty);
+      expect(fs.redirected, isEmpty, reason: 'nothing written through Docs');
+      expect(cloud.calls, isEmpty);
+      expect(listing('Archive'), ['Docs', 'keep.txt']);
+      expect(listing('Archive/Docs'), ['x.txt']);
+      expect(disk('Archive/keep.txt'), 'keep');
+      expect(store.entries['Archive/keep.txt']!.status, serverFolderNameStatus);
+      expect(store.entries['Archive/docs']!.status, serverNameClashStatus);
+      expect(
+        store.entries['Archive/docs/y.txt']!.status,
+        serverFolderNameStatus,
+      );
+      // Only the record of the kept folder's download remains.
+      expect([
+        for (final o in store.operations.values)
+          if (o.kind != 'artifact') '${o.kind} ${o.path}',
+      ], isEmpty);
+      // The cloud is as the other device left it.
+      expect(remote('Archive/docs/keep.txt'), 'keep');
+      expect(remote('Archive/docs/y.txt'), 'held folder');
+      expect(remote('Archive/Docs/x.txt'), 'kept folder');
+      expect(cloud.files.containsKey('Archive/keep.txt'), isFalse);
+    });
+
+    test('a cloud rename of the item itself in case only is still followed '
+        '(the item is not its own sibling)', () async {
+      await library();
+      await cloud.moveElsewhere('Docs/report.txt', 'Docs/Report.txt');
+      await ticks(3);
+      expect(fs.renames, ['Docs/report.txt -> Docs/Report.txt']);
+      expect(cloud.calls, isEmpty);
+      expect(listing('Docs'), ['Report.txt']);
+      expect(store.entries['Docs/Report.txt']!.status, 'current local');
     });
   });
 
@@ -909,8 +1115,7 @@ void main() {
       expect(exists('Docs/report.txt'), isFalse);
     });
 
-    test('a file ID seen in another storage never crosses into it',
-        () async {
+    test('a file ID seen in another storage never crosses into it', () async {
       await library();
       await share();
       final id = cloud.fileIds['Docs/report.txt']!;
@@ -930,10 +1135,10 @@ void main() {
       cloud.fileIds['Archive/two.txt'] = id;
       await ticks();
       expect(fs.renames, isEmpty);
-      expect(
-        cloud.calls.toSet(),
-        {'GET Archive/one.txt', 'GET Archive/two.txt'},
-      );
+      expect(cloud.calls.toSet(), {
+        'GET Archive/one.txt',
+        'GET Archive/two.txt',
+      });
     });
 
     test('a file ID two rows claim pairs nothing', () async {

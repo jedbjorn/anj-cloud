@@ -438,6 +438,15 @@ class SyncEngine {
       );
     }
     if (eventDriven && _verifyWanted) consider(Duration.zero);
+    if (tree.busy.isNotEmpty) {
+      // A busy file is read again without waiting for an event.
+      final last = _busyRetriedAt;
+      consider(
+        last == null
+            ? busyRetryInterval
+            : last + busyRetryInterval - _clock.elapsed,
+      );
+    }
     final audit = _lastStatAudit;
     if (audit != null) consider(audit + statAuditInterval - _clock.elapsed);
     final held = _nextHeldRemoval(w);
@@ -450,6 +459,26 @@ class SyncEngine {
       );
     }
     return best;
+  }
+
+  /// How often a partial pass reads the busy files again
+  /// ([RootTree.busy]). Test seam.
+  Duration busyRetryInterval = const Duration(seconds: 10);
+
+  /// When a partial pass last read the busy files again, or first found
+  /// one waiting.
+  Duration? _busyRetriedAt;
+
+  bool _busyRetryDue(Duration elapsed) {
+    final last = _busyRetriedAt;
+    if (last == null) {
+      // First seen waiting: the interval starts now.
+      _busyRetriedAt = elapsed;
+      return busyRetryInterval == Duration.zero;
+    }
+    if (elapsed - last < busyRetryInterval) return false;
+    _busyRetriedAt = elapsed;
+    return true;
   }
 
   /// The local view for this pass: the full scan without a watcher, else
@@ -470,6 +499,7 @@ class SyncEngine {
     tree.refreshWriteback();
     final work = w.take();
     final elapsed = _clock.elapsed;
+    if (tree.busy.isEmpty) _busyRetriedAt = null;
     final wasEventDriven = _eventDrivenPass;
     _eventDrivenPass = eventDriven;
     // Without periodic writeback no stamp is trusted: every pass reads every
@@ -533,9 +563,15 @@ class SyncEngine {
     }
     _localScan = 'partial';
     final due = _dueConfirmations();
+    // A file left out because another program held it open: releasing it
+    // need not raise an event, so it is read again here, at most once per
+    // [busyRetryInterval] (a full scan tries every file anyway).
+    final retry = tree.busy.isNotEmpty && _busyRetryDue(elapsed)
+        ? tree.busy.toSet()
+        : const <String>{};
     // Paths the engine or a command acted on since the last scan are
     // re-stat-ed too, so the view never lags its own changes.
-    final paths = {...work.paths, ...due, ..._unstamped, ..._touched};
+    final paths = {...work.paths, ...due, ..._unstamped, ..._touched, ...retry};
     _touched.clear();
     try {
       _rescan(paths, work.subtrees);
@@ -3276,6 +3312,21 @@ class SyncEngine {
   /// them; every pass pairs them again.
   final Set<String> _cloudHeld = {};
 
+  /// The names this device cannot hold, for the cloud moves of one pass:
+  /// built on first use and again after each move applied, since a move
+  /// changes which names are on this device.
+  NameHolds? _moveHoldsCache;
+  NameHolds _moveHolds(
+    Map<String, LocalItem> rawLocal,
+    Map<String, RemoteItem> remote,
+  ) => _moveHoldsCache ??= NameHolds(
+    win32Names: !holdsAnyName,
+    foldsCase: foldsCase,
+    remote: remote.keys,
+    local: rawLocal,
+    entries: manifest.entries,
+  );
+
   bool _cloudHolds(String path) {
     if (_cloudHeld.isEmpty) return false;
     for (var at = path; ; at = p.posix.dirname(at)) {
@@ -3367,6 +3418,7 @@ class SyncEngine {
     Map<String, RemoteItem> remote,
   ) {
     _dropMovedTombstones(remote);
+    _moveHoldsCache = null;
     final settled = <String>{};
     try {
       // Each round applies the top pairs; a row moved out of a folder that
@@ -3378,6 +3430,7 @@ class SyncEngine {
         for (final MapEntry(key: from, value: to) in pairs.entries) {
           if (_applyCloudMove(from, to, local, rawLocal, remote)) {
             moved = true;
+            _moveHoldsCache = null;
           } else {
             settled.add(from);
           }
@@ -3388,6 +3441,7 @@ class SyncEngine {
       // A local move the cloud's rename did not settle and did not hold:
       // reconciled the ordinary way (the new local name is uploaded).
       _renamedBothSides.clear();
+      _moveHoldsCache = null;
     }
   }
 
@@ -3581,6 +3635,16 @@ class SyncEngine {
     // Another local item already holds the new name.
     if (rawLocal.containsKey(to) && !withinOrAt(at, to)) {
       return hold(serverNameClashStatus);
+    }
+    if (here != null) {
+      // A new name this device cannot hold (decision #120 Q2): a name the
+      // platform refuses, a sibling that folds onto it, or a folder on the
+      // way that is itself held. The item stays where it is with the
+      // reason; it is never renamed and no folder is made for it, so on a
+      // case-blind volume it cannot land inside the sibling its new folder
+      // folds onto. Nothing is deleted, moved or uploaded for it meanwhile.
+      final refused = _moveHolds(rawLocal, remote).status(to, moving: at);
+      if (refused != null) return hold(refused);
     }
     if (here == null) {
       // Not removal-inferred yet (expected here, no delete): next pass. An
@@ -3809,7 +3873,7 @@ class SyncEngine {
       if (!withinOrAt(to, row.path)) continue;
       row.movedNote = null;
       // Held at its old path for this move: planned afresh at the new one.
-      if (row.status == serverNameClashStatus ||
+      if (isServerNameHold(row.status) ||
           row.status.startsWith('rename pending')) {
         row.status = 'queued';
       }
@@ -4597,6 +4661,17 @@ class SyncEngine {
         }
         entry.status = restore;
         _dirty.add(op.path);
+        continue;
+      }
+      // The item may be at a new name that another program holds open: it
+      // is among the busy files, which a scan leaves out, so its old path
+      // looks removed. The removal waits; once the file can be read, the
+      // scan pairs the two paths as a move.
+      if (op.data['inferred'] == true &&
+          entry.localIdentity != null &&
+          tree.busyIdentities.containsValue(entry.localIdentity)) {
+        _dirty.add(op.path);
+        _localWork = true;
         continue;
       }
       if (_holdTopDeletion(op, entry)) continue;

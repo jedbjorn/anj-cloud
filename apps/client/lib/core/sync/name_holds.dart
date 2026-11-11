@@ -3,8 +3,8 @@ import 'package:path/path.dart' as p;
 import '../state/model.dart';
 import 'name_policy.dart';
 
-/// Which server items this device cannot create under their names (decision
-/// #120 Q2, spec #32 W4), for one pass. Such an item stays Cloud-only with
+/// Which server items this device cannot create under their names, for one
+/// pass. Such an item stays Cloud-only with
 /// the reason as its row status ([serverNameNotAllowedStatus],
 /// [serverNameClashStatus], [serverFolderNameStatus]) and is never created
 /// here, so a case-blind filesystem never writes it inside the sibling it
@@ -47,8 +47,10 @@ class NameHolds {
   final _groups = <String, Map<String, List<String>>>{};
 
   /// The hold status of [path], absent from this device, or null when it
-  /// can be created here.
-  String? status(String path) {
+  /// can be created here. [moving] is where the same item is on this device
+  /// now, when the question is whether it can be renamed to [path] (a move
+  /// made in the cloud): the item is not its own sibling.
+  String? status(String path, {String? moving}) {
     if (!active) return null;
     final parts = path.split('/');
     if (win32Names) {
@@ -61,7 +63,7 @@ class NameHolds {
       var prefix = '';
       for (var i = 0; i < parts.length; i++) {
         prefix = i == 0 ? parts[0] : '$prefix/${parts[i]}';
-        if (_loses(prefix)) {
+        if (_loses(prefix, moving)) {
           return i == parts.length - 1
               ? serverNameClashStatus
               : serverFolderNameStatus;
@@ -72,20 +74,26 @@ class NameHolds {
   }
 
   /// The portable rules plus NTFS's component limit of 255 UTF-16 units
-  /// (spec #32 File Names, `componentTooLong`). Uploads keep the portable
+  /// (`componentTooLong`). Uploads keep the portable
   /// rules alone.
   static bool _win32Refuses(String name) =>
       NamePolicy.check(name) != null || name.length > win32ComponentUnits;
 
   static const win32ComponentUnits = 255;
 
-  bool _loses(String path) {
-    if (local.containsKey(path)) return false;
+  bool _loses(String path, [String? moving]) {
+    if (local.containsKey(path) && path != moving) return false;
     final folder = p.posix.dirname(path);
     final name = p.posix.basename(path);
-    final members = _group(folder, name);
-    if (members.length < 2) return false;
     String child(String n) => folder == '.' ? n : '$folder/$n';
+    var members = _group(folder, name);
+    if (moving != null && members.any((n) => child(n) == moving)) {
+      members = [
+        for (final n in members)
+          if (child(n) != moving) n,
+      ];
+    }
+    if (members.length < 2) return false;
     if (members.any((n) => n != name && local.containsKey(child(n)))) {
       return true;
     }

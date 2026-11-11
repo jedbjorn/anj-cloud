@@ -1,5 +1,5 @@
 # Runs test/windows_sync_e2e_test.dart unelevated in the console session for
-# deploy/windows_sync_fixture.py (spec #32 W4): an Interactive RunLevel
+# deploy/windows_sync_fixture.py: an Interactive RunLevel
 # Limited task of the same user, against the anj_rootfs.dll that
 # native_test.ps1 built. Prints the test log.
 param(

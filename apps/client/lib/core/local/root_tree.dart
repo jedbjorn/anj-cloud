@@ -233,8 +233,15 @@ class RootTree {
   /// Files a pass could not read because another program holds them open
   /// without read sharing (EBUSY from the boundary). The engine neither
   /// uploads, downloads over, nor infers a deletion for them, and shows them
-  /// as busy; each later pass tries them again. A full scan starts afresh.
+  /// as busy. A full scan tries every file again; between full scans the
+  /// engine reads the busy ones again at an interval, since a release need
+  /// not raise a watcher event.
   final Set<String> busy = {};
+
+  /// The local identity (`volume:inode`) of each busy file, from the stat
+  /// that listed it: a synchronized item whose identity is among them was
+  /// renamed to that path, not removed.
+  final Map<String, String> busyIdentities = {};
 
   /// Stored index for a path (set by the engine): the stamp, the hash read
   /// with it, when that read began (wall-clock microseconds) and whether that
@@ -337,6 +344,7 @@ class RootTree {
     native.checkRoot(fd, root.path);
     _readWriteback();
     busy.clear();
+    busyIdentities.clear();
     final decide = _decider();
     final result = <String, LocalItem>{};
     for (final item in native.scan(fd)) {
@@ -378,6 +386,7 @@ class RootTree {
               ? p.posix.isWithin(path, held)
               : p.posix.dirname(held) == (path.isEmpty ? '.' : path)),
     );
+    busyIdentities.removeWhere((held, _) => !busy.contains(held));
     final listed = _exact(path, native.watchScan(watch, fd, path, recursive));
     final decide = _decider(reuse: reuse);
     final items = <String, LocalItem>{};
@@ -641,9 +650,11 @@ class RootTree {
             // engine changes nothing for it; a later pass reads it again.
             if (error.osError?.errorCode != fileBusyErrno) rethrow;
             busy.add(path);
+            busyIdentities[path] = "${item['volume']}:${item['inode']}";
             return null;
           }
           busy.remove(path);
+          busyIdentities.remove(path);
           hash = read.hash;
           // Record the stamp only when the read proves it matches the scan.
           if (trusted0 && read.stamp == scanStamp) {

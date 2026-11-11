@@ -1,25 +1,28 @@
 import 'dart:io';
 
 import 'package:anj_cloud/core/local/root_tree.dart';
+import 'package:anj_cloud/core/ports/change_watcher.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/name_holds.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
+import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
 
-/// Spec #32 W4, decision #120 Q2: on a device that cannot hold every name
+/// On a device that cannot hold every name
 /// the server can, a server item that cannot be created here stays
 /// Cloud-only with its reason, and the kept clash sibling never flips. Two
 /// gates: Win32 names (Windows) and a case-folding root volume (Windows,
 /// default macOS). Runs anywhere through the test seams.
 void main() {
-  // The deletion under Documents here is not about the settle time of spec
-  // #34 P7 (H1); top_folders_test.dart covers it.
+  // The deletions under Documents here are not about their settle time;
+  // top_folders_test.dart covers it.
   setUpAll(() => SyncEngine.debugTopDeleteSettleAll = Duration.zero);
   tearDownAll(() => SyncEngine.debugTopDeleteSettleAll = null);
   late Directory fixture;
@@ -28,15 +31,21 @@ void main() {
   late SyncEngine engine;
 
   /// Windows: Win32 names and case folding. macOS: case folding only.
-  void device({required bool windows}) {
+  void device({required bool windows, bool watch = false}) {
     final parent = Directory('${fixture.path}/a')..createSync();
     final tree = RootTree.setup(parent.path, 'a', NativeRootFs());
     store = Manifest(Directory('${fixture.path}/profile-a'));
     store.setSetting('retention', 'local');
     cloud = FakeCloud();
-    engine = SyncEngine(store, tree, cloud)
-      ..holdsAnyName = !windows
-      ..foldsCase = true;
+    engine =
+        SyncEngine(
+            store,
+            tree,
+            cloud,
+            watchers: watch ? const LinuxChangeWatchers() : null,
+          )
+          ..holdsAnyName = !windows
+          ..foldsCase = true;
   }
 
   setUp(() {
@@ -69,7 +78,7 @@ void main() {
     expect(status('Documents/bad.'), serverNameNotAllowedStatus);
     expect(status('Documents/bad./inside.txt'), serverFolderNameStatus);
     // Amber with its reason, but no Rename: this device has no copy to
-    // rename (Rename is for local names, decision #120).
+    // rename (Rename is for local names).
     final row = await projectEntry(
       engine,
       store.entries['Documents/names/CON']!,
@@ -170,6 +179,72 @@ void main() {
     );
   });
 
+  test('watcher-driven passes: a held row is looked at again every pass, so '
+      'the clash loser comes down once its sibling is gone', () async {
+    // Passes that visit only changed paths: nothing changes at the held
+    // row's own path, so only its unsettled state brings it back.
+    engine.close();
+    fixture.deleteSync(recursive: true);
+    fixture = Directory.systemTemp.createTempSync('anj-names-test-');
+    device(windows: true, watch: true);
+    engine.watcherSettings = const WatcherSettings(
+      quiet: Duration(milliseconds: 150),
+      maxDelay: Duration(seconds: 2),
+    );
+    await engine.startWatching();
+    Future<void> passesUntil(bool Function() done) async {
+      for (var i = 0; i < 80 && !done(); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await engine.tick();
+      }
+    }
+
+    cloud.put('Documents/A.txt', 'upper');
+    cloud.put('Documents/a.txt', 'lower');
+    await passesUntil(() => onDisk('Documents/A.txt'));
+    for (var i = 0; i < 4; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await engine.tick();
+    }
+    expect(status('Documents/a.txt'), serverNameClashStatus);
+    expect(engine.lastPass!.full, isFalse, reason: 'ordinary passes now');
+    final fullScans = engine.fullScans;
+    File('${engine.tree.root.path}/Documents/A.txt').deleteSync();
+    await passesUntil(() => onDisk('Documents/a.txt'));
+    expect(cloud.files.containsKey('Documents/A.txt'), isFalse);
+    expect(
+      File('${engine.tree.root.path}/Documents/a.txt').readAsStringSync(),
+      'lower',
+    );
+    expect(engine.fullScans, fullScans, reason: 'no full scan did it');
+  });
+
+  test('a held server name needs attention app-wide and is amber on its row; '
+      'removing the hold clears both', () async {
+    SyncStatus overall() => deriveStatus(
+      paused: false,
+      offline: false,
+      unpaired: false,
+      message: engine.message,
+      entries: store.entries.values,
+      operations: store.operations.values,
+    );
+    cloud.put('Documents/ok.txt', 'fine');
+    await engine.tick();
+    expect(overall(), isNot(SyncStatus.attention));
+    cloud.put('Documents/CON', 'held');
+    await engine.tick();
+    expect(status('Documents/CON'), serverNameNotAllowedStatus);
+    expect(overall(), SyncStatus.attention);
+    final row = await projectEntry(engine, store.entries['Documents/CON']!);
+    expect(row['presentationErrors'], [serverNameNotAllowedStatus]);
+    expect(row['nameRefused'], isFalse, reason: 'no Rename is offered');
+    cloud.files.remove('Documents/CON');
+    await engine.tick();
+    await engine.tick();
+    expect(overall(), isNot(SyncStatus.attention));
+  });
+
   test('files under the losing folder of a clash stay Cloud-only', () async {
     // Real listings name the folders too.
     await cloud.mkdir('Documents/Docs');
@@ -254,7 +329,7 @@ void main() {
     }
     watch.stop();
     expect(held, 5000);
-    // Quadratic grouping took seconds for 3,000 names (#73 review).
+    // Quadratic grouping took seconds for 3,000 names.
     expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
   });
 

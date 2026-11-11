@@ -1,10 +1,11 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:anj_cloud/ui/qr_image.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// A QR image decodes whatever its PNG format (spec #32 W4 finding: a 1-bit
+import 'qr_image.dart';
+
+/// A QR image decodes whatever its PNG format (a 1-bit
 /// palette PNG, qrencode's default, failed to decode).
 void main() {
   test('a 1-bit palette PNG decodes', () {
