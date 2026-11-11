@@ -139,7 +139,7 @@ def main():
         # A server whose CA is not the one the codes pin. Invitation A is tried there first: the
         # stack would accept that code, so only the device's check of the pin can refuse it.
         other, other_seen = other_server(work, other_port)
-        # Names Windows cannot hold, straight into Nextcloud (the gateway refuses them, #120).
+        # Names Windows cannot hold, straight into Nextcloud (the gateway refuses them).
         for parent in (BACKEND, BACKEND + "Documents"):  # A fresh stack has neither yet.
             stack.dav("MKCOL", UID, parent, expected=(201, 405))
         stack.dav("MKCOL", UID, BACKEND + names_folder, expected=(201,))

@@ -1,4 +1,4 @@
-# Records how the seat's editors save (spec #32 W4, Files in Other Apps):
+# Records how the seat's editors save:
 # Notepad (.txt), WordPad (.rtf) and Paint (.png) each open a file, change
 # it through the keyboard and save; a FileSystemWatcher logs every create,
 # change, rename and delete in the folder meanwhile, and the file's NTFS id

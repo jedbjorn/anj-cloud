@@ -15,7 +15,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'fakes.dart';
 
 /// A boundary whose reads of [busy] paths fail as Windows' do while another
-/// program holds the file without read sharing (EBUSY, SC-048 F5).
+/// program holds the file without read sharing (EBUSY).
 class _BusyFs extends NativeRootFs {
   /// [verification] set: the platform hashes only what its watcher reports
   /// between full verifications, as Windows, macOS and Android do.
@@ -65,7 +65,7 @@ class _HookCloud extends FakeCloud {
   }
 }
 
-/// Spec #32 W4, SC-048 F5: a file another program holds open is skipped,
+/// A file another program holds open is skipped,
 /// shown as busy and retried; the pass goes on for everything else.
 void main() {
   late Directory fixture;
@@ -196,6 +196,46 @@ void main() {
     expect(isBusyStatus(store.entries[held]!.status), isFalse);
     expect(engine.fullScans, fullScans, reason: 'no full scan did it');
   });
+
+  test(
+    'a file renamed and then held busy at its new name is not deleted '
+    'on the server; once released it is the same server file, moved',
+    () async {
+      // The settle time of deletions under Documents is not the subject.
+      SyncEngine.debugTopDeleteSettleAll = Duration.zero;
+      addTearDown(() => SyncEngine.debugTopDeleteSettleAll = null);
+      local('Documents/a.txt').writeAsStringSync('v1');
+      local('Documents/gone.txt').writeAsStringSync('g1');
+      await engine.tick();
+      final id = cloud.fileIds['Documents/a.txt'];
+      expect(id, isNotNull);
+      local('Documents/a.txt').renameSync(local('Documents/b.txt').path);
+      // A real removal in the same passes is still sent.
+      local('Documents/gone.txt').deleteSync();
+      fs.busy.add('Documents/b.txt');
+      for (var i = 0; i < 4; i++) {
+        await engine.tick();
+        expect(remote('Documents/a.txt'), 'v1', reason: 'pass $i');
+        expect(cloud.fileIds['Documents/a.txt'], id);
+      }
+      expect(cloud.files.containsKey('Documents/gone.txt'), isFalse);
+      expect(store.entries['Documents/b.txt']!.status, fileBusyStatus);
+      fs.busy.clear();
+      for (var i = 0; i < 4; i++) {
+        await engine.tick();
+      }
+      expect(cloud.files.containsKey('Documents/a.txt'), isFalse);
+      expect(remote('Documents/b.txt'), 'v1');
+      expect(
+        cloud.fileIds['Documents/b.txt'],
+        id,
+        reason: 'moved, not re-made',
+      );
+      expect(store.entries.containsKey('Documents/a.txt'), isFalse);
+      expect(store.entries['Documents/b.txt']!.status, 'current local');
+      expect(tree.busyIdentities, isEmpty);
+    },
+  );
 
   test('a busy file is never taken for deleted', () async {
     local('Documents/held.txt').writeAsStringSync('v1');

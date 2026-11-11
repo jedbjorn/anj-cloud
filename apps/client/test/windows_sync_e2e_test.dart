@@ -1,8 +1,7 @@
 @TestOn('windows')
 library;
 
-// Opt-in, against a disposable review stack only (spec #32 W4, Acceptance
-// rows 8 and 12): run by deploy/windows_sync_fixture.py, which owns the stack
+// Opt-in, against a disposable review stack only: run by deploy/windows_sync_fixture.py, which owns the stack
 // (anj-cloud-review-<tag>), the reverse forward that makes the stack's
 // https://127.0.0.1:<port> reachable from this guest, the invitations and
 // the operator approvals. Skipped unless ANJ_W4_CONFIG names its JSON:
@@ -153,7 +152,7 @@ void main() {
 
       Future<_Device> pair(String label, String code) async {
         final controller = await controllerFor(label);
-        // The code carries the CA pin (spec #35); this stack has no console
+        // The code carries the CA pin; this stack has no console
         // backend, so the operator approves by fingerprint.
         await controller.pair(origin, code);
         await controller.stop();
@@ -233,7 +232,7 @@ void main() {
         probe.dispose();
 
         // Device A: the typed invitation. Device B: the invitation read
-        // from a QR image file (the spec #35 dialog has no image entry; the
+        // from a QR image file (the pairing dialog has no image entry; the
         // decoder is kept for this run and its 1-bit PNG case).
         final a = await pair('a', config['code_a'] as String);
         devices.add(a);
@@ -357,7 +356,7 @@ void main() {
         expect(File(conflict.remoteCopy!).readAsStringSync(), 'alpha edit');
         record('conflict preserves both versions');
 
-        // ---- exclusions (#21) ------------------------------------------
+        // ---- exclusions ------------------------------------------------
         a.file('$prefix/Thumbs.db').writeAsStringSync('cache');
         a.file('$prefix/desktop.ini').writeAsStringSync('[.ShellClassInfo]');
         // A file written with them does arrive, so the passes saw the folder.
@@ -384,7 +383,7 @@ void main() {
           'allocated_released': released,
         });
 
-        // ---- a file another app holds open (SC-048 F5) ------------------
+        // ---- a file another app holds open -----------------------------
         final held = '$prefix/held.txt';
         a.file(held).writeAsStringSync('v1');
         await until('v1 on B', () async => b.file(held).existsSync());
@@ -421,7 +420,7 @@ void main() {
           'a file held without read sharing is skipped, shown busy, then synced',
         );
 
-        // ---- a Paint save: delete and recreate is an edit (#73 review 6) --
+        // ---- a Paint save: delete and recreate is an edit ----------------
         final picture = '$prefix/paint/pic.png';
         a.engine.tree.ensureDirectory(p.posix.dirname(picture));
         a
@@ -505,10 +504,10 @@ void main() {
         });
         a.file(big).deleteSync();
 
-        // ---- names Windows cannot hold (#120), created on the server ----
+        // ---- names Windows cannot hold, created on the server -----------
         final names = config['names_folder'] as String;
         // It existed on the server before this device paired, so it starts
-        // Cloud-only (#29); choose Local to materialize what can be.
+        // Cloud-only; choose Local to materialize what can be.
         await a.engine.tick();
         final listed = (await a.cloud.snapshot())
             .map((e) => e.path)

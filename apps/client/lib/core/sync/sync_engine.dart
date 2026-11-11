@@ -4663,6 +4663,17 @@ class SyncEngine {
         _dirty.add(op.path);
         continue;
       }
+      // The item may be at a new name that another program holds open: it
+      // is among the busy files, which a scan leaves out, so its old path
+      // looks removed. The removal waits; once the file can be read, the
+      // scan pairs the two paths as a move.
+      if (op.data['inferred'] == true &&
+          entry.localIdentity != null &&
+          tree.busyIdentities.containsValue(entry.localIdentity)) {
+        _dirty.add(op.path);
+        _localWork = true;
+        continue;
+      }
       if (_holdTopDeletion(op, entry)) continue;
       if (current == null) {
         // Already gone before this client's delete ran: whichever version

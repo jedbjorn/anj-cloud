@@ -3,8 +3,8 @@ import 'package:path/path.dart' as p;
 import '../state/model.dart';
 import 'name_policy.dart';
 
-/// Which server items this device cannot create under their names (decision
-/// #120 Q2, spec #32 W4), for one pass. Such an item stays Cloud-only with
+/// Which server items this device cannot create under their names, for one
+/// pass. Such an item stays Cloud-only with
 /// the reason as its row status ([serverNameNotAllowedStatus],
 /// [serverNameClashStatus], [serverFolderNameStatus]) and is never created
 /// here, so a case-blind filesystem never writes it inside the sibling it
@@ -74,7 +74,7 @@ class NameHolds {
   }
 
   /// The portable rules plus NTFS's component limit of 255 UTF-16 units
-  /// (spec #32 File Names, `componentTooLong`). Uploads keep the portable
+  /// (`componentTooLong`). Uploads keep the portable
   /// rules alone.
   static bool _win32Refuses(String name) =>
       NamePolicy.check(name) != null || name.length > win32ComponentUnits;

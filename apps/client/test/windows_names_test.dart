@@ -15,14 +15,14 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
 
-/// Spec #32 W4, decision #120 Q2: on a device that cannot hold every name
+/// On a device that cannot hold every name
 /// the server can, a server item that cannot be created here stays
 /// Cloud-only with its reason, and the kept clash sibling never flips. Two
 /// gates: Win32 names (Windows) and a case-folding root volume (Windows,
 /// default macOS). Runs anywhere through the test seams.
 void main() {
-  // The deletion under Documents here is not about the settle time of spec
-  // #34 P7 (H1); top_folders_test.dart covers it.
+  // The deletions under Documents here are not about their settle time;
+  // top_folders_test.dart covers it.
   setUpAll(() => SyncEngine.debugTopDeleteSettleAll = Duration.zero);
   tearDownAll(() => SyncEngine.debugTopDeleteSettleAll = null);
   late Directory fixture;
@@ -78,7 +78,7 @@ void main() {
     expect(status('Documents/bad.'), serverNameNotAllowedStatus);
     expect(status('Documents/bad./inside.txt'), serverFolderNameStatus);
     // Amber with its reason, but no Rename: this device has no copy to
-    // rename (Rename is for local names, decision #120).
+    // rename (Rename is for local names).
     final row = await projectEntry(
       engine,
       store.entries['Documents/names/CON']!,
@@ -329,7 +329,7 @@ void main() {
     }
     watch.stop();
     expect(held, 5000);
-    // Quadratic grouping took seconds for 3,000 names (#73 review).
+    // Quadratic grouping took seconds for 3,000 names.
     expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
   });
 
