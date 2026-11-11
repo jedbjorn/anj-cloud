@@ -237,6 +237,49 @@ void main() {
     },
   );
 
+  test('a file edited and held busy while another device renames it: no '
+      'second copy and no conflict; after release the rename is followed '
+      'once and the edit uploads under the new name', () async {
+    local('Documents/a.txt').writeAsStringSync('v1');
+    // The second pass records the file's cloud ID from the listing: a
+    // rename in the cloud is recognized by it.
+    await engine.tick();
+    await engine.tick();
+    final id = cloud.fileIds['Documents/a.txt'];
+    expect(store.entries['Documents/a.txt']!.fileId, id);
+    local('Documents/a.txt').writeAsStringSync('v2 edited here');
+    fs.busy.add('Documents/a.txt');
+    await cloud.move(
+      'Documents/a.txt',
+      'Documents/c.txt',
+      etag: cloud.versions['Documents/a.txt']!,
+    );
+    for (var i = 0; i < 4; i++) {
+      await engine.tick();
+      expect(
+        local('Documents/c.txt').existsSync(),
+        isFalse,
+        reason: 'pass $i: not downloaded again under the new name',
+      );
+      expect(store.entries['Documents/a.txt']!.conflict, isNull);
+      expect(store.entries['Documents/a.txt']!.status, fileBusyStatus);
+      expect(remote('Documents/c.txt'), 'v1');
+    }
+    fs.busy.clear();
+    for (var i = 0; i < 4; i++) {
+      await engine.tick();
+    }
+    expect(local('Documents/a.txt').existsSync(), isFalse);
+    expect(local('Documents/c.txt').readAsStringSync(), 'v2 edited here');
+    expect(remote('Documents/c.txt'), 'v2 edited here');
+    expect(cloud.fileIds['Documents/c.txt'], id, reason: 'the same file');
+    expect(cloud.files.containsKey('Documents/a.txt'), isFalse);
+    expect(store.entries.containsKey('Documents/a.txt'), isFalse);
+    expect(store.entries['Documents/c.txt']!.conflict, isNull);
+    expect(store.entries['Documents/c.txt']!.status, 'current local');
+    expect(store.entries.values.where((e) => e.conflict != null), isEmpty);
+  });
+
   test('a busy file is never taken for deleted', () async {
     local('Documents/held.txt').writeAsStringSync('v1');
     await engine.tick();

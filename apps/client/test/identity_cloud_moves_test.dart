@@ -858,7 +858,8 @@ void main() {
       expect(disk('Docs/report.txt'), 'report');
       expect(disk('Archive/r.txt'), 'mine');
       expect(remote('Archive/r.txt'), 'report');
-      expect(store.entries['Docs/report.txt']!.status, serverNameClashStatus);
+      // The file is here under its old name: the row says so, not Cloud-only.
+      expect(store.entries['Docs/report.txt']!.status, movedNameClashStatus);
       // On every platform such a row is amber with its reason and the app
       // needs attention, until the clash is gone.
       SyncStatus overall() => deriveStatus(
@@ -875,7 +876,7 @@ void main() {
           engine,
           store.entries['Docs/report.txt']!,
         ))['presentationErrors'],
-        [serverNameClashStatus],
+        [movedNameClashStatus],
       );
       // The other item goes: the move follows.
       File(root('Archive/r.txt')).deleteSync();
@@ -920,7 +921,7 @@ void main() {
         expect(remote('Docs/x.'), 'report');
         expect(
           store.entries['Docs/report.txt']!.status,
-          serverNameNotAllowedStatus,
+          movedNameNotAllowedStatus,
         );
         expect(store.entries['Docs/report.txt']!.conflict, isNull);
         expect(store.operations, isEmpty);
@@ -959,7 +960,7 @@ void main() {
       expect(disk('Docs/x.txt'), 'other');
       expect(remote('Docs/report.txt'), 'report');
       expect(remote('Docs/Report.txt'), 'other');
-      expect(store.entries['Docs/x.txt']!.status, serverNameClashStatus);
+      expect(store.entries['Docs/x.txt']!.status, movedNameClashStatus);
       expect(store.entries['Docs/report.txt']!.status, 'current local');
       expect(store.operations, isEmpty);
     });
@@ -988,7 +989,9 @@ void main() {
       expect(listing('Archive'), ['Docs', 'keep.txt']);
       expect(listing('Archive/Docs'), ['x.txt']);
       expect(disk('Archive/keep.txt'), 'keep');
-      expect(store.entries['Archive/keep.txt']!.status, serverFolderNameStatus);
+      // The moved file is here, at its old path; the folder and its own
+      // file are Cloud-only.
+      expect(store.entries['Archive/keep.txt']!.status, movedFolderNameStatus);
       expect(store.entries['Archive/docs']!.status, serverNameClashStatus);
       expect(
         store.entries['Archive/docs/y.txt']!.status,
@@ -1004,6 +1007,84 @@ void main() {
       expect(remote('Archive/docs/y.txt'), 'held folder');
       expect(remote('Archive/Docs/x.txt'), 'kept folder');
       expect(cloud.files.containsKey('Archive/keep.txt'), isFalse);
+    });
+
+    test('once the cloud gives a name this device can hold, the row is '
+        'planned afresh: no hold reason is left on it', () async {
+      await library();
+      // Held for a refused name, and held for its new folder.
+      await cloud.made('Archive/Docs');
+      await cloud.made('Archive/docs');
+      cloud.put('Archive/Docs/x.txt', 'kept folder');
+      await cloud.moveElsewhere('Docs/report.txt', 'Docs/x.');
+      await cloud.moveElsewhere('Archive/keep.txt', 'Archive/docs/keep.txt');
+      await ticks(4);
+      expect(
+        store.entries['Docs/report.txt']!.status,
+        movedNameNotAllowedStatus,
+      );
+      expect(store.entries['Archive/keep.txt']!.status, movedFolderNameStatus);
+      cloud.calls.clear();
+      await cloud.moveElsewhere('Docs/x.', 'Docs/fine.txt');
+      await cloud.moveElsewhere('Archive/docs/keep.txt', 'Archive/kept.txt');
+      // One pass: the rows move and are queued, before any later pass could
+      // settle them by other means.
+      await engine.tick();
+      expect(fs.renames, [
+        'Docs/report.txt -> Docs/fine.txt',
+        'Archive/keep.txt -> Archive/kept.txt',
+      ]);
+      for (final path in ['Docs/fine.txt', 'Archive/kept.txt']) {
+        expect(
+          isServerNameHold(store.entries[path]!.status),
+          isFalse,
+          reason: '$path: ${store.entries[path]!.status}',
+        );
+      }
+      await ticks(2);
+      expect(cloud.calls, isEmpty);
+      expect(store.entries['Docs/fine.txt']!.status, 'current local');
+      expect(store.entries['Archive/kept.txt']!.status, 'current local');
+    });
+
+    test('a pass stopped right after the rename leaves no hold reason on the '
+        'moved rows', () async {
+      await library();
+      await cloud.made('Archive/Docs');
+      await cloud.made('Archive/docs');
+      await cloud.moveElsewhere('Docs/report.txt', 'Docs/x.');
+      await cloud.moveElsewhere('Archive/keep.txt', 'Archive/docs/keep.txt');
+      await ticks(4);
+      await cloud.moveElsewhere('Docs/x.', 'Docs/fine.txt');
+      await cloud.moveElsewhere('Archive/docs/keep.txt', 'Archive/kept.txt');
+      // The pass is asked to stop as soon as the renames are done: the rows
+      // have moved, and nothing has reconciled them yet.
+      fs.afterRename = () => engine.stopRequested = true;
+      await engine.tick();
+      fs.afterRename = null;
+      expect(fs.renames, hasLength(2));
+      for (final path in ['Docs/fine.txt', 'Archive/kept.txt']) {
+        expect(
+          isServerNameHold(store.entries[path]!.status),
+          isFalse,
+          reason: '$path: ${store.entries[path]!.status}',
+        );
+      }
+    });
+
+    test('a Cloud-only item renamed in the cloud onto a name a local item '
+        'holds is still labelled Cloud-only', () async {
+      await library();
+      engine.setRetention('Docs', Retention.cloud);
+      await ticks(3);
+      expect(exists('Docs/report.txt'), isFalse);
+      write('Archive/r.txt', 'mine');
+      cloud.calls.clear();
+      await cloud.moveElsewhere('Docs/report.txt', 'Archive/r.txt');
+      await engine.tick();
+      expect(store.entries['Docs/report.txt']!.status, serverNameClashStatus);
+      expect(disk('Archive/r.txt'), 'mine');
+      expect(cloud.calls.where((c) => !c.startsWith('PUT')), isEmpty);
     });
 
     test('a cloud rename of the item itself in case only is still followed '

@@ -59,10 +59,33 @@ const serverFolderNameStatus =
 const longPathNote = 'Long path: some Windows apps may not open this';
 const win32MaxPath = 259;
 
+/// The same three reasons for an item that is on this device under its old
+/// name while a rename or move made on another device cannot be followed
+/// here: it is not Cloud-only, it keeps its old name until the new one can
+/// be held.
+const movedNameNotAllowedStatus =
+    'Renamed on another device to a name not allowed on this device. It keeps its old name here; rename it again on another device';
+const movedNameClashStatus =
+    'Renamed on another device to a name another item here has on this device. It keeps its old name here; rename one on another device';
+const movedFolderNameStatus =
+    'Moved on another device into a folder this device cannot hold. It stays where it is here';
+
+/// The status of an item kept at its old path for [held], the reason its
+/// new cloud name cannot be held here.
+String movedHoldStatus(String held) => switch (held) {
+  serverNameNotAllowedStatus => movedNameNotAllowedStatus,
+  serverNameClashStatus => movedNameClashStatus,
+  serverFolderNameStatus => movedFolderNameStatus,
+  _ => held,
+};
+
 bool isServerNameHold(String status) =>
     status == serverNameNotAllowedStatus ||
     status == serverNameClashStatus ||
-    status == serverFolderNameStatus;
+    status == serverFolderNameStatus ||
+    status == movedNameNotAllowedStatus ||
+    status == movedNameClashStatus ||
+    status == movedFolderNameStatus;
 
 /// A file another program holds open without read sharing (Windows; SC-048
 /// F5): left as it is until a later pass can read it.

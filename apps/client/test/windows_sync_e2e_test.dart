@@ -687,9 +687,9 @@ void main() {
               a.engine.manifest.entries['$names/$source']?.status ?? 'none';
         }
         expect(moveStatus, {
-          'moved.': serverNameNotAllowedStatus,
-          'OK.txt': serverNameClashStatus,
-          'docs/move-into.txt': serverFolderNameStatus,
+          'moved.': movedNameNotAllowedStatus,
+          'OK.txt': movedNameClashStatus,
+          'docs/move-into.txt': movedFolderNameStatus,
         });
         expect([
           for (final o in a.engine.manifest.operations.values)
