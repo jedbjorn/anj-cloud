@@ -6,7 +6,8 @@ library;
 // https://127.0.0.1:<port> reachable from this guest, the invitations and
 // the operator approvals. Skipped unless ANJ_W4_CONFIG names its JSON:
 //   {"origin", "ca", "other_origin", "code_a", "qr_b", "denied_code",
-//    "names_folder", "work" (absent), "signal" (handshake directory)}
+//    "names_folder", "cloud_moves", "work" (absent), "signal" (handshake
+//    directory)}
 // Two Windows devices of one account pair through the real controller
 // (DPAPI secrets, anj_rootfs.dll, in-process device crypto) and reconcile
 // through the gateway; evidence carries digests, never codes or keys.
@@ -411,13 +412,25 @@ void main() {
         expect(await remoteHash(held), _digest(utf8.encode('v1')));
         holder.kill();
         await holder.exitCode;
-        await until(
+        // Released, and nothing writes to it again: only the engine's own
+        // reading of the busy files again brings it up (no full scan).
+        final fullScansAtRelease = a.engine.fullScans;
+        final releasedAt = DateTime.now();
+        final roundsToSync = await until(
           'v2 on B once the file is released',
           () async => b.file(held).readAsStringSync() == 'v2',
         );
         expect(await remoteHash(held), _digest(utf8.encode('v2')));
+        expect(a.engine.tree.busy, isEmpty);
         record(
           'a file held without read sharing is skipped, shown busy, then synced',
+          {
+            'released_with_no_new_write': true,
+            'seconds_to_sync': DateTime.now().difference(releasedAt).inSeconds,
+            'rounds': roundsToSync,
+            'full_scans_meanwhile': a.engine.fullScans - fullScansAtRelease,
+            'event_driven': a.engine.eventDriven,
+          },
         );
 
         // ---- a Paint save: delete and recreate is an edit ----------------
@@ -552,10 +565,16 @@ void main() {
         final deep = remoteNames
             .where((path) => path.endsWith('/deep.txt'))
             .firstOrNull;
+        final cloudMoves = [
+          for (final pair in config['cloud_moves'] as List)
+            ((pair as List)[0] as String, pair[1] as String),
+        ];
         expect(onDisk, {
           'A.txt',
           'ok.txt',
           'Docs',
+          // Synced now; moved in the cloud further down.
+          for (final (source, _) in cloudMoves) source,
           if (deep != null)
             p.posix.split(p.posix.relative(deep, from: names))[0],
         });
@@ -620,6 +639,80 @@ void main() {
         expect(winners[2], winners[0]);
         record('clash winners are stable over three passes', {
           'on_disk': winners[0].toList(),
+        });
+
+        // ---- moves made in the cloud to names this device cannot hold ----
+        // The driver makes them in Nextcloud, as another device's renames
+        // would arrive: to a name Windows refuses, onto a case sibling of a
+        // file here, and into the folder held back as the clash loser. Each
+        // item must stay where it is, with its reason; nothing may land in
+        // the kept sibling folder, and nothing may be sent to the server.
+        Set<String> namesOnDisk() =>
+            Directory(p.joinAll([a.root, ...names.split('/')]))
+                .listSync()
+                .map((e) => p.basename(e.path))
+                .toSet();
+        Set<String> keptFolder() =>
+            Directory(p.joinAll([a.root, ...names.split('/'), 'Docs']))
+                .listSync()
+                .map((e) => p.basename(e.path))
+                .toSet();
+        final beforeMoves = namesOnDisk();
+        for (final (source, _) in cloudMoves) {
+          expect(a.file('$names/$source').readAsStringSync(), 'server $source');
+        }
+        File(p.join(signal.path, 'moves-wanted.json'))
+            .writeAsStringSync(jsonEncode({'wanted': cloudMoves.length}));
+        final movesDone = File(p.join(signal.path, 'moves-done.json'));
+        for (var i = 0; i < 120 && !movesDone.existsSync(); i++) {
+          await Future<void>.delayed(const Duration(seconds: 1));
+        }
+        expect(movesDone.existsSync(), isTrue, reason: 'the driver moved them');
+        final listedAfterMoves = <Set<String>>[];
+        for (var pass = 0; pass < 6; pass++) {
+          await a.engine.tick();
+          await Future<void>.delayed(const Duration(seconds: 1));
+          listedAfterMoves.add(namesOnDisk());
+          expect(namesOnDisk(), beforeMoves, reason: 'pass $pass');
+          expect(keptFolder(), {'x.txt'}, reason: 'pass $pass');
+        }
+        final moveStatus = <String, String>{};
+        for (final (source, target) in cloudMoves) {
+          expect(
+            a.file('$names/$source').readAsStringSync(),
+            'server $source',
+            reason: 'still here, untouched',
+          );
+          moveStatus[target] =
+              a.engine.manifest.entries['$names/$source']?.status ?? 'none';
+        }
+        expect(moveStatus, {
+          'moved.': serverNameNotAllowedStatus,
+          'OK.txt': serverNameClashStatus,
+          'docs/move-into.txt': serverFolderNameStatus,
+        });
+        expect([
+          for (final o in a.engine.manifest.operations.values)
+            if (o.path.startsWith('$names/') &&
+                const {'delete', 'move', 'upload'}.contains(o.kind))
+              '${o.kind} ${o.path}',
+        ], isEmpty);
+        final afterMoves = (await a.cloud.snapshot())
+            .map((e) => e.path)
+            .where((path) => path.startsWith('$names/'))
+            .toSet();
+        for (final (source, target) in cloudMoves) {
+          expect(afterMoves, contains('$names/$target'));
+          expect(afterMoves, isNot(contains('$names/$source')));
+        }
+        expect(
+          afterMoves,
+          containsAll(['$names/Docs/x.txt', '$names/docs/y.txt']),
+        );
+        record('cloud moves to names this device cannot hold keep the items', {
+          'status': moveStatus,
+          'on_disk': namesOnDisk().toList(),
+          'in_kept_folder': keptFolder().toList(),
         });
 
         File(p.join(signal.path, 'expect.json')).writeAsStringSync(

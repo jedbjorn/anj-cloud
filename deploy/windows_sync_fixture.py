@@ -11,6 +11,11 @@ It owns, for this run only:
     a real, unused code tried there must be refused by the device because the code pins the
     stack's CA, and that server must see no other request;
   - remote names Windows cannot hold, written straight to Nextcloud (the gateway refuses them);
+  - three moves made straight in Nextcloud when the guest asks for them (signal/moves-wanted.json),
+    as another device's renames would arrive: to a name Windows refuses, onto a case sibling,
+    and into a folder the device holds back as a clash loser. The guest must keep each item
+    where it is; afterwards the driver checks the server still has every item where the moves
+    put it;
   - an SSH reverse forward so the guest reaches both at https://127.0.0.1:<port> and <port + 1>;
   - the operator approvals of the guest's two devices by fingerprint (a wrong fingerprint first,
     refused). The stack runs no console backend, so the server does not approve by itself;
@@ -32,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 
 from deploy.access_operator import Operator
 from deploy.dev import FIXTURE_USERS, Stack
@@ -43,6 +49,8 @@ UID = FIXTURE_USERS[0]
 # Devices see the account's files/<uid>/anj-cloud/ tree (access protocol backend_root).
 BACKEND = "anj-cloud/"
 LONG_NAME = "n" * 252 + ".txt"
+# Synced to the guest first, then moved in Nextcloud: (from, to), relative to the names folder.
+CLOUD_MOVES = (("move-refused.txt", "moved."), ("move-clash.txt", "OK.txt"), ("move-into.txt", "docs/move-into.txt"))
 SEGMENTS = [f"segment-{i}-" + "d" * 65 for i in range(3)]
 DEEP = [("MKCOL", "/".join(SEGMENTS[:i + 1])) for i in range(3)] + [("PUT", "/".join(SEGMENTS) + "/deep.txt")]
 HOST = os.environ.get("ANJ_WIN_HOST", "192.168.122.100")
@@ -152,7 +160,8 @@ def main():
                            ("PUT", "Docs/x.txt"), ("PUT", "docs/y.txt"), ("PUT", "bad./inside.txt"),
                            # Row 8: an invalid character, a 256-unit name, and a full path
                            # over 300 characters on the guest (synced, with the note).
-                           ("PUT", "a:b"), ("PUT", LONG_NAME), *DEEP):
+                           ("PUT", "a:b"), ("PUT", LONG_NAME), *DEEP,
+                           *(("PUT", source) for source, _ in CLOUD_MOVES)):
             try:
                 if kind == "MKCOL":
                     stack.dav("MKCOL", UID, f"{BACKEND}{names_folder}/{name}", expected=(201,))
@@ -168,6 +177,7 @@ def main():
                   "other_origin": f"https://127.0.0.1:{other_port}",
                   "code_a": invites["a"]["code"], "qr_b": GUEST + r"\invite-b.png",
                   "denied_code": invites["denied"]["code"], "names_folder": names_folder,
+                  "cloud_moves": [list(pair) for pair in CLOUD_MOVES],
                   "work": GUEST + r"\run", "signal": GUEST + r"\signal"}
         (work / "config.json").write_text(json.dumps(config))
         seat("ssh", f"if exist {GUEST} rmdir /s /q {GUEST}")
@@ -208,7 +218,22 @@ def main():
                 step(f"device {label} approved", fingerprint=fingerprint)
                 del pending[label]
             time.sleep(2)
-        code = runner.wait(timeout=900)
+        # The moves the guest asks for, made in Nextcloud as another device's would arrive.
+        moved = False
+        deadline = time.time() + 900
+        while runner.poll() is None and time.time() < deadline:
+            if not moved and guest_file("moves-wanted.json"):
+                for source, target in CLOUD_MOVES:
+                    destination = "/remote.php/dav/files/" + UID + "/" + urllib.parse.quote(
+                        f"{BACKEND}{names_folder}/{target}", safe="/")
+                    stack.dav("MOVE", UID, f"{BACKEND}{names_folder}/{source}",
+                              headers={"Destination": destination, "Overwrite": "F"}, expected=(201, 204))
+                (work / "moves-done.json").write_text(json.dumps({"moved": len(CLOUD_MOVES)}))
+                copy_to_guest(work / "moves-done.json", "signal/moves-done.json")
+                step("cloud moves made in Nextcloud", moves=[f"{s} -> {t}" for s, t in CLOUD_MOVES])
+                moved = True
+            time.sleep(2)
+        code = runner.wait(timeout=60)
         log = (args.evidence / "guest-run.txt").read_text()
         progress = guest_file("progress.json")
         (args.evidence / "progress.json").write_text(progress or "[]")
@@ -217,6 +242,17 @@ def main():
         # The other server was asked for its CA, and for nothing else: no enrolment, no code.
         step("the other server saw only the request for its CA",
              ok=bool(other_seen) and set(other_seen) == {"GET /v1/ca"}, requests=sorted(set(other_seen)))
+        # After the guest's passes the server is as the moves left it: nothing was deleted,
+        # moved back or uploaded over because the device could not follow.
+        step("the guest asked for the cloud moves", ok=moved)
+        for source, target in CLOUD_MOVES:
+            body = stack.dav("GET", UID, f"{BACKEND}{names_folder}/{target}")
+            step(f"server keeps the moved item: {target}", ok=body == f"server {source}".encode())
+            stack.dav("GET", UID, f"{BACKEND}{names_folder}/{source}", expected=(404,))
+        for kept, content in (("Docs/x.txt", b"server Docs/x.txt"), ("docs/y.txt", b"server docs/y.txt"),
+                              ("ok.txt", b"server ok.txt")):
+            step(f"server keeps the untouched item: {kept}",
+                 ok=stack.dav("GET", UID, f"{BACKEND}{names_folder}/{kept}") == content)
         expected = json.loads(guest_file("expect.json") or "{}")
         prefix = expected.get("prefix")
         for path, digest in expected.get("files", {}).items():
