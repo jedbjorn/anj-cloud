@@ -470,6 +470,16 @@ class WindowsHost implements Host {
     );
     return process.pid;
   }
+
+  @override
+  bool processAlive(int pid) {
+    // SYNCHRONIZE; a wait of 0 ms times out (0x102) while it runs.
+    final handle = _openProcess(0x00100000, 0, pid);
+    if (handle == nullptr) return false;
+    final state = _wait(handle, 0);
+    _closeHandle(handle);
+    return state == 0x102;
+  }
 }
 
 /// Waits (up to [timeout]) for process [pid] to end.

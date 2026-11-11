@@ -157,28 +157,32 @@ void main() {
     skip: shell,
   );
 
-  test('handOver starts the manager detached with --result', () async {
-    final updates = Directory(p.join(fixture.path, 'updates'))..createSync();
-    final archive = File(p.join(updates.path, '171.tar.gz'));
-    final manifest = File(p.join(updates.path, '171.json'));
-    final result = File(p.join(updates.path, 'result.json'));
-    await port().handOver(archive, manifest, result);
-    for (var i = 0; i < 100 && !calls.existsSync(); i++) {
-      await Future<void>.delayed(const Duration(milliseconds: 50));
-    }
-    expect(
-      calls.readAsLinesSync().last,
-      'apply-update ${archive.path} --manifest ${manifest.path} '
-      '--result ${result.path}',
-    );
-    await expectLater(
-      WindowsManagerSelfUpdate(
-        p.join(fixture.path, 'absent.exe'),
-        executable: executable,
-      ).handOver(archive, manifest, result),
-      throwsA(isA<SelfUpdateFailure>()),
-    );
-  }, skip: shell);
+  test(
+    'handOver starts the manager detached with --result and this pid',
+    () async {
+      final updates = Directory(p.join(fixture.path, 'updates'))..createSync();
+      final archive = File(p.join(updates.path, '171.tar.gz'));
+      final manifest = File(p.join(updates.path, '171.json'));
+      final result = File(p.join(updates.path, 'result.json'));
+      await port().handOver(archive, manifest, result);
+      for (var i = 0; i < 100 && !calls.existsSync(); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      expect(
+        calls.readAsLinesSync().last,
+        'apply-update ${archive.path} --manifest ${manifest.path} '
+        '--result ${result.path} --app-pid $pid',
+      );
+      await expectLater(
+        WindowsManagerSelfUpdate(
+          p.join(fixture.path, 'absent.exe'),
+          executable: executable,
+        ).handOver(archive, manifest, result),
+        throwsA(isA<SelfUpdateFailure>()),
+      );
+    },
+    skip: shell,
+  );
 
   test('the Windows adapters offer the in-app update through the manager', () {
     expect(

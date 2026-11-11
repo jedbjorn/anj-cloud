@@ -6,7 +6,8 @@
 ///   update `<zip>` --sha256 `<hex>`     refuses while AnJ Cloud runs
 ///   run [--background]              start the active release
 ///   status
-///   apply-update `<archive>` --manifest `<file>` [--check | --result `<file>`]
+///   apply-update `<archive>` --manifest `<file>` [--check | --result `<file>`
+///                [--app-pid `<process id>`]]
 ///                                   the app's in-app update: verify the
 ///                                   signed download,
 ///                                   wait for the app to quit, install, start
@@ -67,14 +68,19 @@ Future<Object?> _dispatch(List<String> arguments) async {
       if (arguments.length < 2 || manifest == null) {
         throw Refused(
           'Usage: apply-update <archive> --manifest <file> '
-          '[--check | --result <file>]',
+          '[--check | --result <file> [--app-pid <process id>]]',
         );
+      }
+      final appPid = option('--app-pid');
+      if (appPid != null && (int.tryParse(appPid) ?? 0) <= 0) {
+        throw Refused('--app-pid must be a process id.');
       }
       return manager.applyUpdate(
         arguments[1],
         manifest,
         result: option('--result'),
         check: arguments.contains('--check'),
+        appPid: appPid == null ? null : int.parse(appPid),
       );
     case 'autostart':
       final action = arguments.length > 1 ? arguments[1] : '';

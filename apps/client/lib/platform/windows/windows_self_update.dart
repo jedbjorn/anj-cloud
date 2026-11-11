@@ -132,6 +132,10 @@ class WindowsManagerSelfUpdate implements SelfUpdatePort {
         ..._arguments(archive, manifest),
         '--result',
         result.path,
+        // How the manager tells this process quitting slowly from the app
+        // having been started again.
+        '--app-pid',
+        '$pid',
       ], mode: ProcessStartMode.detached);
     } on Exception catch (error) {
       throw SelfUpdateFailure('The installed manager could not start: $error');

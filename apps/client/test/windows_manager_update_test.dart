@@ -22,19 +22,55 @@ class UpdateHost extends FakeHost {
   int busyAttempts = 0;
   final started = <String>[];
 
+  /// Thrown by every lock attempt (a lock that fails for another reason
+  /// than "held").
+  Object? lockError;
+
+  /// Thrown once, after the locked action ran (a failure past the commit).
+  Object? failAfterAction;
+  Object? startError;
+
   @override
   T withProfileLock<T>(String profile, String library, T Function() action) {
+    if (lockError != null) throw lockError!;
     if (busyAttempts > 0) {
       busyAttempts--;
       throw Busy();
     }
-    return super.withProfileLock(profile, library, action);
+    final value = super.withProfileLock(profile, library, action);
+    final late = failAfterAction;
+    if (late != null) {
+      failAfterAction = null;
+      throw late;
+    }
+    return value;
   }
 
   @override
   Future<int> start(String executable, List<String> arguments) async {
+    if (startError != null) throw startError!;
     started.add(executable);
     return 42;
+  }
+}
+
+/// A manager whose two cross-process locks can be held by "another
+/// process" (a second lock from this process would simply succeed).
+class ContendedManager extends Manager {
+  ContendedManager(super.host);
+  bool applying = false;
+  int transactionsHeld = 0;
+
+  @override
+  RandomAccessFile? applyLock() => applying ? null : super.applyLock();
+
+  @override
+  RandomAccessFile transactionLock() {
+    if (transactionsHeld > 0) {
+      transactionsHeld--;
+      throw TransactionBusy();
+    }
+    return super.transactionLock();
   }
 }
 
@@ -79,6 +115,7 @@ void main() {
   late File privateKey;
   late String keyText;
   late File otherPrivateKey;
+  late String otherKeyText;
 
   Future<String> generate(File key) async {
     final made = await Process.run(testOpenssl!, [
@@ -105,7 +142,7 @@ void main() {
     privateKey = File(p.join(keys.path, 'release.pem'));
     keyText = await generate(privateKey);
     otherPrivateKey = File(p.join(keys.path, 'other.pem'));
-    await generate(otherPrivateKey);
+    otherKeyText = await generate(otherPrivateKey);
   });
   tearDownAll(() => keys.deleteSync(recursive: true));
 
@@ -114,6 +151,7 @@ void main() {
     int code,
     List<int> bytes, {
     File? signer,
+    String? signerKeyText,
     String target = windowsReleaseTarget,
   }) async {
     final unsigned = ReleaseManifest(
@@ -122,7 +160,7 @@ void main() {
       versionCode: code,
       size: bytes.length,
       sha256: sha256.convert(bytes).toString(),
-      keyId: ReleaseKey.parse(keyText)!.id,
+      keyId: ReleaseKey.parse(signerKeyText ?? keyText)!.id,
       signature: '${'A' * 86}==',
     );
     final message = File(p.join(keys.path, 'message'))
@@ -148,7 +186,7 @@ void main() {
 
   late Directory temp;
   late UpdateHost host;
-  late Manager manager;
+  late ContendedManager manager;
   late Directory updates;
   late String firstRelease;
 
@@ -167,7 +205,7 @@ void main() {
   setUp(() {
     temp = Directory.systemTemp.createTempSync('anj-windows-update-');
     host = UpdateHost(temp.path);
-    manager = Manager(host);
+    manager = ContendedManager(host);
   });
   tearDown(() => temp.deleteSync(recursive: true));
 
@@ -395,15 +433,43 @@ void main() {
 
   test('the key in the download is never the one that is trusted', () async {
     await install();
-    // Signed by another key, and the package carries that key.
-    final otherText = '# other\ned25519 ${base64.encode(List.filled(32, 7))}\n';
-    final bytes = release(11, keyText: otherText);
-    final (archive, manifest, _) = download(
+    // The whole attack: an archive carrying the attacker's public key, a
+    // manifest signed by the attacker's private key and naming the
+    // attacker's key id. A manager that trusted the downloaded key would
+    // accept it.
+    final bytes = release(11, keyText: otherKeyText);
+    final forged = await signed(
+      11,
       bytes,
-      await signed(11, bytes, signer: otherPrivateKey),
+      signer: otherPrivateKey,
+      signerKeyText: otherKeyText,
     );
+    expect(
+      ReleaseKey.parse(otherKeyText)!
+          .verify(ReleaseManifest.fromJson(forged, windowsReleaseTarget)),
+      isTrue,
+      reason: 'the forgery is valid for the key it carries',
+    );
+    final (archive, manifest, result) = download(bytes, forged);
+    const message =
+        'The update is signed with a different key than this app trusts.';
     await expectLater(
       manager.applyUpdate(archive, manifest, check: true),
+      refused(message),
+    );
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: pause,
+    );
+    expect(outcome['message'], message);
+    expectUntouched();
+    // The same forgery under the installed key's id fails on the signature.
+    final renamed = {...forged, 'key_id': ReleaseKey.parse(keyText)!.id};
+    final (a, m, _) = download(bytes, renamed);
+    await expectLater(
+      manager.applyUpdate(a, m, check: true),
       refused("The update's signature does not verify."),
     );
     expectUntouched();
@@ -423,10 +489,25 @@ void main() {
     host.admin = true;
     final bytes = release(11, keyText: keyText);
     final (archive, manifest, _) = download(bytes, await signed(11, bytes));
+    const elevated =
+        'Run the manager as your normal Windows user, not as administrator: '
+        'AnJ Cloud is installed per user and runs unelevated.';
     await expectLater(
       manager.applyUpdate(archive, manifest, check: true),
-      throwsA(isA<Refused>()),
+      refused(elevated),
     );
+    // The hand-over refuses too: nothing installed, deleted, written or
+    // started by an elevated manager.
+    final refusedOutcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: p.join(updates.path, 'result.json'),
+      pause: pause,
+    );
+    expect(refusedOutcome, {'ok': false, 'message': elevated});
+    expect(File(archive).existsSync(), isTrue);
+    expect(File(p.join(updates.path, 'result.json')).existsSync(), isFalse);
+    expect(host.started, isEmpty);
     expectUntouched();
   });
 
@@ -570,6 +651,454 @@ void main() {
     expect(outcome['ok'], isTrue);
     expect(outcome.containsKey('relaunched'), isFalse);
     expect(host.started, isEmpty);
+  });
+
+  test(
+    'a release installed while the update waited is never replaced',
+    () async {
+      await install();
+      final bytes = release(11, keyText: keyText);
+      final (archive, manifest, result) = download(
+        bytes,
+        await signed(11, bytes),
+      );
+      // Verified against version 10. While the app is still quitting, a
+      // manual update to version 12 goes in.
+      final newer = release(12, keyText: keyText);
+      final newerFile = File(p.join(temp.path, 'newer.zip'))
+        ..writeAsBytesSync(newer);
+      host.busyAttempts = 1;
+      final outcome = await manager.applyUpdate(
+        archive,
+        manifest,
+        result: result,
+        pause: (_) async {
+          await manager.install(
+            newerFile.path,
+            sha256.convert(newer).toString(),
+            update: true,
+          );
+        },
+      );
+      expect(outcome['ok'], isFalse);
+      expect(outcome['message'], releaseChangedMessage);
+      final twelve = '${sourceOf(12)}-${sha256.convert(newer)}';
+      expect(manager.activeState()!['release'], twelve);
+      // Version 11 was never published, and the app comes back on version 12.
+      expect(
+        Directory(manager.layout.releases)
+            .listSync()
+            .map((e) => p.basename(e.path))
+            .toSet(),
+        {firstRelease, twelve},
+      );
+      expect(outcome['relaunched'], isTrue);
+      expect(host.started, [
+        p.join(manager.layout.release(twelve), 'anj_cloud.exe'),
+      ]);
+    },
+  );
+
+  test('a profile lock that fails still ends with the app started', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    // Not "held": the lock itself fails, for the wait and for the restart.
+    host.lockError = Refused('The profile lock cannot be taken.');
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: pause,
+    );
+    expect(outcome['ok'], isFalse);
+    expect(outcome['message'], 'The profile lock cannot be taken.');
+    expect(outcome['relaunched'], isTrue);
+    expect(host.started, [
+      p.join(manager.layout.release(firstRelease), 'anj_cloud.exe'),
+    ]);
+    host.lockError = null;
+    expectUntouched();
+    expect(jsonDecode(File(result).readAsStringSync())['ok'], isFalse);
+  });
+
+  test(
+    'nothing changes while the app runs, not even a release directory',
+    () async {
+      await install();
+      final bytes = release(11, keyText: keyText);
+      final (archive, manifest, result) = download(
+        bytes,
+        await signed(11, bytes),
+      );
+      host.busyAttempts = 4;
+      host.alive.add(4711);
+      final seen = <Set<String>>[];
+      final outcome = await manager.applyUpdate(
+        archive,
+        manifest,
+        result: result,
+        appPid: 4711,
+        pause: (_) async {
+          seen.add(
+            Directory(manager.layout.releases)
+                .listSync()
+                .map((e) => p.basename(e.path))
+                .where((name) => !name.startsWith('.'))
+                .toSet(),
+          );
+          expect(manager.activeState()!['release'], firstRelease);
+        },
+      );
+      // Four refused attempts, each leaving only the installed release.
+      expect(seen, List.filled(4, {firstRelease}));
+      expect(outcome['ok'], isTrue);
+      expect(outcome['relaunched'], isTrue);
+      expect(manager.activeState()!['release'], isNot(firstRelease));
+    },
+  );
+
+  test(
+    'an app started again abandons the update and owns its folder',
+    () async {
+      await install();
+      final bytes = release(11, keyText: keyText);
+      final (archive, manifest, result) = download(
+        bytes,
+        await signed(11, bytes),
+      );
+      // The process that handed over (4711) has exited, yet the profile is
+      // held: another instance runs.
+      host.busyAttempts = 1 << 30;
+      var pauses = 0;
+      final outcome = await manager.applyUpdate(
+        archive,
+        manifest,
+        result: result,
+        appPid: 4711,
+        pause: (_) async => pauses++,
+      );
+      expect(outcome, {
+        'ok': false,
+        'message': startedAgainMessage,
+        'started_again': true,
+      });
+      // Given up at once (the second look), not after two minutes.
+      expect(pauses, 1);
+      // That instance's folder is left alone and nothing is started.
+      expect(File(archive).existsSync(), isTrue);
+      expect(File(manifest).existsSync(), isTrue);
+      expect(File(result).existsSync(), isFalse);
+      expect(host.started, isEmpty);
+      host.busyAttempts = 0;
+      expectUntouched();
+    },
+  );
+
+  test('a slow app is told from a restarted one by its process', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    // Still quitting after two minutes; it exits during the grace.
+    host.busyAttempts = 1 << 30;
+    host.alive.add(4711);
+    var clock = DateTime.utc(2026, 11, 11);
+    final start = clock;
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      appPid: 4711,
+      now: () => clock,
+      pause: (_) async {
+        clock = clock.add(const Duration(seconds: 30));
+        if (clock.difference(start) >= const Duration(seconds: 200)) {
+          host.alive.remove(4711);
+          host.busyAttempts = 0;
+        }
+      },
+    );
+    expect(outcome['message'], notQuitMessage);
+    expect(outcome['relaunched'], isTrue);
+    expect(host.started, [
+      p.join(manager.layout.release(firstRelease), 'anj_cloud.exe'),
+    ]);
+    expectUntouched();
+    // It exited, and someone had already started it again: nothing more.
+    host.started.clear();
+    final again = release(11, keyText: keyText);
+    final (a, m, r) = download(again, await signed(11, again));
+    host.busyAttempts = 1 << 30;
+    host.alive.add(4712);
+    clock = DateTime.utc(2026, 11, 12);
+    final second = clock;
+    final later = await manager.applyUpdate(
+      a,
+      m,
+      result: r,
+      appPid: 4712,
+      now: () => clock,
+      pause: (_) async {
+        clock = clock.add(const Duration(seconds: 30));
+        if (clock.difference(second) >= const Duration(seconds: 200)) {
+          host.alive.remove(4712);
+        }
+      },
+    );
+    expect(later['message'], notQuitMessage);
+    expect(later['relaunched'], isFalse);
+    expect(host.started, isEmpty);
+    host.busyAttempts = 0;
+  });
+
+  test('a download replaced since the hand-over is not deleted', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    host.busyAttempts = 1 << 30;
+    var clock = DateTime.utc(2026, 11, 11);
+    var replaced = false;
+    await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      now: () => clock,
+      pause: (_) async {
+        clock = clock.add(const Duration(seconds: 30));
+        if (!replaced) {
+          // A newer app instance downloads again under the same name.
+          File(archive).writeAsBytesSync([...bytes, 1, 2, 3]);
+          replaced = true;
+        }
+      },
+    );
+    host.busyAttempts = 0;
+    expect(File(archive).existsSync(), isTrue);
+    expect(File(archive).lengthSync(), bytes.length + 3);
+    // The manifest is the file that was handed over: discarded.
+    expect(File(manifest).existsSync(), isFalse);
+    expectUntouched();
+  });
+
+  test('another manager command delays the update, or refuses it', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    // Held for two attempts, then free: installed.
+    manager.transactionsHeld = 2;
+    var pauses = 0;
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: (_) async => pauses++,
+    );
+    expect(pauses, 2);
+    expect(outcome['ok'], isTrue);
+    final second = manager.activeState()!['release'];
+    // Held past the deadline: refused with its own reason, app restarted.
+    final next = release(12, keyText: keyText);
+    final (a, m, r) = download(next, await signed(12, next));
+    manager.transactionsHeld = 1 << 30;
+    var clock = DateTime.utc(2026, 11, 11);
+    host.started.clear();
+    final refusedOutcome = await manager.applyUpdate(
+      a,
+      m,
+      result: r,
+      now: () => clock,
+      pause: (_) async => clock = clock.add(const Duration(seconds: 30)),
+    );
+    manager.transactionsHeld = 0;
+    expect(refusedOutcome['message'], otherCommandMessage);
+    expect(refusedOutcome['relaunched'], isTrue);
+    expect(manager.activeState()!['release'], second);
+    expect(host.started, [
+      p.join(manager.layout.release(second as String), 'anj_cloud.exe'),
+    ]);
+  });
+
+  test('a second hand-over while one runs changes nothing', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    manager.applying = true;
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: pause,
+    );
+    expect(outcome, {
+      'ok': false,
+      'message': 'Another update is already being applied.',
+      'concurrent': true,
+    });
+    // The first one owns the download, the result and the restart.
+    expect(File(archive).existsSync(), isTrue);
+    expect(File(manifest).existsSync(), isTrue);
+    expect(File(result).existsSync(), isFalse);
+    expect(host.started, isEmpty);
+    expectUntouched();
+  });
+
+  test('a result that cannot be written does not stop the restart', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    // Something sits where the result goes.
+    Directory(result).createSync();
+    File(p.join(result, 'in-the-way')).writeAsStringSync('x');
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: pause,
+    );
+    expect(outcome['ok'], isTrue);
+    expect(outcome['relaunched'], isTrue);
+    expect(host.started, hasLength(1));
+    expect(
+      File(manager.layout.log).readAsStringSync(),
+      contains('update_result_unwritten'),
+    );
+  });
+
+  test('a restart that fails is reported, the update stays', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    host.startError = const FileSystemException('cannot start');
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: pause,
+    );
+    expect(outcome['ok'], isTrue);
+    expect(outcome['relaunched'], isFalse);
+    expect(manager.activeState()!['release'], isNot(firstRelease));
+    expect(jsonDecode(File(result).readAsStringSync())['ok'], isTrue);
+    expect(
+      File(manager.layout.log).readAsStringSync(),
+      contains('update_relaunch_failed'),
+    );
+  });
+
+  test('a failure after the activation is reported as installed', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    // The activation record is written; releasing the lock then fails.
+    host.failAfterAction = const FileSystemException('lock release failed');
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: pause,
+    );
+    final id = '${sourceOf(11)}-${sha256.convert(bytes)}';
+    expect(manager.activeState()!['release'], id);
+    expect(outcome['ok'], isTrue);
+    expect(outcome['release'], id);
+    expect(outcome['problem'], contains('lock release failed'));
+    expect(jsonDecode(File(result).readAsStringSync())['ok'], isTrue);
+    expect(host.started, [p.join(manager.layout.release(id), 'anj_cloud.exe')]);
+  });
+
+  test('stages a killed manager left behind are swept', () async {
+    await install();
+    // Left by managers killed during a wait or an install (sign-out, power
+    // loss); a recent check stage may still be in use.
+    for (final name in ['.update-dead', '.stage-dead', '.check-recent']) {
+      Directory(p.join(manager.layout.releases, name, 'payload'))
+          .createSync(recursive: true);
+      File(p.join(manager.layout.releases, name, 'payload', 'big.bin'))
+          .writeAsBytesSync(List.filled(1024, 7));
+    }
+    Set<String> stages() =>
+        Directory(manager.layout.releases)
+            .listSync()
+            .map((e) => p.basename(e.path))
+            .where((name) => name.startsWith('.'))
+            .toSet();
+    // While another apply-update runs its stage is live: not swept by an
+    // install, which still sweeps its own kind.
+    manager.applying = true;
+    final again = release(10, keyText: keyText);
+    final file = File(p.join(temp.path, 'again.zip'))..writeAsBytesSync(again);
+    await manager.install(file.path, sha256.convert(again).toString());
+    expect(stages(), {'.update-dead', '.check-recent'});
+    manager.applying = false;
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    Directory(p.join(manager.layout.releases, '.stage-dead')).createSync();
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: pause,
+    );
+    expect(outcome['ok'], isTrue);
+    expect(stages(), {'.check-recent'});
+  });
+
+  test('an installed receipt that cannot be read refuses the update', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, _) = download(bytes, await signed(11, bytes));
+    final receipt = File(
+      p.join(manager.layout.release(firstRelease), 'bundle-receipt.json'),
+    );
+    final original = receipt.readAsStringSync();
+    for (final (text, message) in [
+      ('not json', "The installed release's receipt cannot be read."),
+      ('[]', "The installed release's receipt cannot be read."),
+      (
+        jsonEncode({...jsonDecode(original) as Map, 'version_code': 'ten'}),
+        "The installed release's receipt has an invalid version.",
+      ),
+    ]) {
+      receipt.writeAsStringSync(text);
+      await expectLater(
+        manager.applyUpdate(archive, manifest, check: true),
+        refused(message),
+      );
+    }
+    receipt.deleteSync();
+    await expectLater(
+      manager.applyUpdate(archive, manifest, check: true),
+      refused("The installed release's receipt cannot be read."),
+    );
+    receipt.writeAsStringSync(original);
+    expectUntouched();
   });
 
   test('a build packaged without a version counts as version 0', () async {
