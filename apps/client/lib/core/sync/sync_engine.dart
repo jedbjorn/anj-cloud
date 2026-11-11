@@ -3276,6 +3276,21 @@ class SyncEngine {
   /// them; every pass pairs them again.
   final Set<String> _cloudHeld = {};
 
+  /// The names this device cannot hold, for the cloud moves of one pass:
+  /// built on first use and again after each move applied, since a move
+  /// changes which names are on this device.
+  NameHolds? _moveHoldsCache;
+  NameHolds _moveHolds(
+    Map<String, LocalItem> rawLocal,
+    Map<String, RemoteItem> remote,
+  ) => _moveHoldsCache ??= NameHolds(
+    win32Names: !holdsAnyName,
+    foldsCase: foldsCase,
+    remote: remote.keys,
+    local: rawLocal,
+    entries: manifest.entries,
+  );
+
   bool _cloudHolds(String path) {
     if (_cloudHeld.isEmpty) return false;
     for (var at = path; ; at = p.posix.dirname(at)) {
@@ -3367,6 +3382,7 @@ class SyncEngine {
     Map<String, RemoteItem> remote,
   ) {
     _dropMovedTombstones(remote);
+    _moveHoldsCache = null;
     final settled = <String>{};
     try {
       // Each round applies the top pairs; a row moved out of a folder that
@@ -3378,6 +3394,7 @@ class SyncEngine {
         for (final MapEntry(key: from, value: to) in pairs.entries) {
           if (_applyCloudMove(from, to, local, rawLocal, remote)) {
             moved = true;
+            _moveHoldsCache = null;
           } else {
             settled.add(from);
           }
@@ -3388,6 +3405,7 @@ class SyncEngine {
       // A local move the cloud's rename did not settle and did not hold:
       // reconciled the ordinary way (the new local name is uploaded).
       _renamedBothSides.clear();
+      _moveHoldsCache = null;
     }
   }
 
@@ -3581,6 +3599,16 @@ class SyncEngine {
     // Another local item already holds the new name.
     if (rawLocal.containsKey(to) && !withinOrAt(at, to)) {
       return hold(serverNameClashStatus);
+    }
+    if (here != null) {
+      // A new name this device cannot hold (decision #120 Q2): a name the
+      // platform refuses, a sibling that folds onto it, or a folder on the
+      // way that is itself held. The item stays where it is with the
+      // reason; it is never renamed and no folder is made for it, so on a
+      // case-blind volume it cannot land inside the sibling its new folder
+      // folds onto. Nothing is deleted, moved or uploaded for it meanwhile.
+      final refused = _moveHolds(rawLocal, remote).status(to, moving: at);
+      if (refused != null) return hold(refused);
     }
     if (here == null) {
       // Not removal-inferred yet (expected here, no delete): next pass. An
@@ -3809,7 +3837,7 @@ class SyncEngine {
       if (!withinOrAt(to, row.path)) continue;
       row.movedNote = null;
       // Held at its old path for this move: planned afresh at the new one.
-      if (row.status == serverNameClashStatus ||
+      if (isServerNameHold(row.status) ||
           row.status.startsWith('rename pending')) {
         row.status = 'queued';
       }
