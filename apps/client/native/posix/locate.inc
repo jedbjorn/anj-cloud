@@ -7,13 +7,16 @@
 //
 // Returns one of the kLocate* values below and never fails otherwise.
 // Certain answers: kLocateInside (re-opened through the boundary as the same
-// dev:inode), kLocateOutside (the volume names it elsewhere) and
-// kLocateNotFound (no such inode on the root's volume, a stable key for
-// another volume, or a malformed identity). Every error is
-// kLocateUncertain, never folded into another answer: an fsgetpath failure
-// other than "no such inode", allocation, the st_dev volume-key fallback on
-// a mismatch, a path that changed between fsgetpath and the re-open, a
-// buffer too small. error_number then holds the errno. [out] receives the
+// dev:inode), kLocateOutside (the volume names it elsewhere, and that name
+// is the item's only link) and kLocateNotFound (no such inode on the root's
+// volume). Everything else is kLocateUncertain, failing safe, never folded
+// into another answer: a malformed identity, a volume key that differs from
+// the root's (stable or not: a volume mounted inside the root has its own
+// key), an fsgetpath failure other than "no such inode", allocation, a path
+// that changed between fsgetpath and the re-open, a root whose path changed
+// during the lookup, an outside name of a file with more than one link
+// (fsgetpath names one link only), a buffer too small. error_number then
+// holds the errno. [out] receives the
 // root-relative path (kLocateInside only; NUL-terminated, at most cap - 1
 // bytes) and [links] the item's link count (1 for a folder) for
 // kLocateInside and kLocateStaging. [stage] is the private staging
@@ -67,6 +70,26 @@ bool strip_prefix(const std::string& path, const std::string& prefix, std::strin
   rest = path.substr(with_slash.size());
   return true;
 }
+// The item named [path] outside the root is still [dev]:[ino] and that name
+// is its only link (a folder has one name): kLocateOutside. fsgetpath names
+// one link of a hard-linked file, so for a file with more links, or a name
+// that changed meanwhile, where the item is cannot be known: uncertain.
+int outside_answer(const std::string& path, dev_t dev, unsigned long long ino) {
+  struct stat st = {};
+  if (lstat(path.c_str(), &st) != 0) {
+    if (errno == 0) errno = ESTALE;
+    return kLocateUncertain;
+  }
+  if (st.st_dev != dev || static_cast<unsigned long long>(st.st_ino) != ino) {
+    errno = ESTALE;
+    return kLocateUncertain;
+  }
+  if (!S_ISDIR(st.st_mode) && st.st_nlink != 1) {
+    errno = EMLINK;
+    return kLocateUncertain;
+  }
+  return kLocateOutside;
+}
 // [relative] beneath [dir], opened without following any symlink, is still
 // the regular file or folder [dev]:[ino]. Its link count goes to [links].
 bool same_item(int dir, const std::string& relative, dev_t dev, unsigned long long ino,
@@ -84,34 +107,47 @@ bool same_item(int dir, const std::string& relative, dev_t dev, unsigned long lo
 int locate_identity(int root, int stage, const char* identity, char* out, int cap,
                     long long& links) {
   if (!out || cap <= 1) { errno = EINVAL; return kLocateUncertain; }
-  if (!identity) return kLocateNotFound;
+  // A malformed identity proves nothing about the item: uncertain.
+  if (!identity) { errno = EINVAL; return kLocateUncertain; }
   std::string id(identity);
   size_t colon = id.rfind(':');
-  if (colon == std::string::npos || colon == 0 || colon + 1 >= id.size()) return kLocateNotFound;
+  if (colon == std::string::npos || colon == 0 || colon + 1 >= id.size()) {
+    errno = EINVAL;
+    return kLocateUncertain;
+  }
   std::string digits = id.substr(colon + 1);
-  if (digits.find_first_not_of("0123456789") != std::string::npos) return kLocateNotFound;
+  if (digits.find_first_not_of("0123456789") != std::string::npos) {
+    errno = EINVAL;
+    return kLocateUncertain;
+  }
   errno = 0;
   unsigned long long ino = strtoull(digits.c_str(), nullptr, 10);
-  if (errno != 0 || ino == 0) return kLocateNotFound;
+  if (errno != 0 || ino == 0) { errno = EINVAL; return kLocateUncertain; }
   struct stat rs = {};
   if (fstat(root, &rs) != 0) return kLocateUncertain;
   if (!S_ISDIR(rs.st_mode)) { errno = ENOTDIR; return kLocateUncertain; }
-  // Another volume is never this root's item (a move across volumes is a
-  // delete), but only a stable key (the APFS volume UUID) proves it: the
-  // st_dev fallback is assigned at mount time, so a mismatch is uncertain.
-  bool stable = false;
-  if (volume_key(root, rs, &stable) != id.substr(0, colon)) {
-    if (stable) return kLocateNotFound;
+  // A volume key that differs from the root's proves nothing, stable or
+  // not: a volume mounted inside the root reports its own key for items
+  // beneath the root, and the st_dev fallback is assigned at mount time.
+  if (volume_key(root, rs) != id.substr(0, colon)) {
     errno = EXDEV;
     return kLocateUncertain;
   }
   struct statfs fs = {};
   if (fstatfs(root, &fs) != 0) return kLocateUncertain;
-  std::string found, root_path;
-  int item = path_by_id(fs.f_fsid, ino, found);
-  if (item != kLocateInside) return item;
+  // The root's path before and after the item's: a root renamed in between
+  // would make an item inside it read as outside.
+  std::string found, root_path, root_after;
   if (path_by_id(fs.f_fsid, static_cast<unsigned long long>(rs.st_ino), root_path) !=
       kLocateInside) {
+    if (errno == 0) errno = ESTALE;
+    return kLocateUncertain;
+  }
+  int item = path_by_id(fs.f_fsid, ino, found);
+  if (item != kLocateInside) return item;
+  if (path_by_id(fs.f_fsid, static_cast<unsigned long long>(rs.st_ino), root_after) !=
+          kLocateInside ||
+      root_after != root_path) {
     if (errno == 0) errno = ESTALE;
     return kLocateUncertain;
   }
@@ -128,17 +164,18 @@ int locate_identity(int root, int stage, const char* identity, char* out, int ca
     memcpy(out, relative.c_str(), relative.size() + 1);
     return kLocateInside;
   }
-  if (stage < 0) return kLocateOutside;
+  if (stage < 0) return outside_answer(found, rs.st_dev, ino);
   struct stat ss = {};
   if (fstat(stage, &ss) != 0) return kLocateUncertain;
-  if (ss.st_dev != rs.st_dev) return kLocateOutside;  // Staging is elsewhere.
+  // Staging is elsewhere.
+  if (ss.st_dev != rs.st_dev) return outside_answer(found, rs.st_dev, ino);
   std::string stage_path, staged;
   if (path_by_id(fs.f_fsid, static_cast<unsigned long long>(ss.st_ino), stage_path) !=
       kLocateInside) {
     if (errno == 0) errno = ESTALE;
     return kLocateUncertain;
   }
-  if (!strip_prefix(found, stage_path, staged)) return kLocateOutside;
+  if (!strip_prefix(found, stage_path, staged)) return outside_answer(found, rs.st_dev, ino);
   if (!valid(staged.c_str()) || !same_item(stage, staged, ss.st_dev, ino, links)) {
     if (errno == 0) errno = ESTALE;
     return kLocateUncertain;

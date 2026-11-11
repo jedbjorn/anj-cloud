@@ -630,10 +630,11 @@ static void stage_path_rows(int stage) {
 // Spec #33 I3: anj_locate_identity. Linux: unsupported (0) whatever is
 // asked. Darwin: a rename and a folder move are found at their new paths
 // (1), a move out of the root is outside (2), a file whose only remaining
-// link is in staging is staging (3), and a deleted file, another volume and
-// malformed identities are not found (4). Every error is uncertain (5,
-// decision #143), with anj_error set: a closed root, a short buffer, a
-// volume key that fell back to st_dev and does not match.
+// link is in staging is staging (3), and a deleted file is not found (4).
+// Everything else is uncertain (5, decision #143, failing safe), with
+// anj_error set: malformed identities, another volume key (stable or not),
+// an outside name of a file with more than one link, a closed root, a short
+// buffer.
 void locate_rows(int root, int stage) {
   auto identity = [&](const std::string& rel) {
     struct stat st = {};
@@ -680,19 +681,33 @@ void locate_rows(int root, int stage) {
   std::string bad;
   for (const char* id : {"", "x", ":5", "u:"}) bad += locate(id) + ";";
   bad += locate(volume + ":abc") + ";";
-  row("locate: malformed identities are not found", bad == std::string(
-      "4 links=0;4 links=0;4 links=0;4 links=0;4 links=0;"), "4 for each", bad);
-  // Another volume: proven only by a stable root key (the APFS volume UUID);
-  // against the st_dev fallback a mismatch is uncertain (decision #143).
-  struct stat root_st = {};
-  fstat(root, &root_st);
-  bool stable = false;
-  volume_key(root, root_st, &stable);
+  row("locate: malformed identities are uncertain", bad == std::string(
+      "5 links=0;5 links=0;5 links=0;5 links=0;5 links=0;") && anj_error() == EINVAL,
+      "5 for each, EINVAL", bad + " " + err(anj_error()));
+  // Another volume key proves nothing, stable or not (a volume mounted
+  // inside the root has its own key): uncertain.
   std::string other = locate("nonsense:12") + ";" +
     locate(volume + "x:" + file.substr(file.rfind(':') + 1)) + ";";
-  std::string want_other = stable ? "4 links=0;4 links=0;" : "5 links=0;5 links=0;";
-  row("locate: another volume", other == want_other, want_other, other,
-      stable ? "stable root key" : "st_dev fallback root key");
+  row("locate: another volume key is uncertain",
+      other == "5 links=0;5 links=0;" && anj_error() == EXDEV, "5 links=0;5 links=0; EXDEV",
+      other + " " + err(anj_error()));
+  {
+    // fsgetpath names one link only: a file whose links are all outside
+    // the root, two of them, is uncertain rather than outside.
+    write_file(at("root/loc/to/hl.txt"), "h");
+    std::string hl = identity("loc/to/hl.txt");
+    bool made = link(at("root/loc/to/hl.txt").c_str(), at("hl-out-1.txt").c_str()) == 0 &&
+      rename(at("root/loc/to/hl.txt").c_str(), at("hl-out-2.txt").c_str()) == 0;
+    std::string got = locate(hl);
+    int cause = anj_error();
+    row("locate: outside, a file with two links, is uncertain",
+        made && got == "5 links=0" && cause == EMLINK, "5 links=0 EMLINK",
+        got + " " + err(cause));
+    unlink(at("hl-out-2.txt").c_str());
+    row("locate: outside, its only link left, is outside", locate(hl) == "2 links=0",
+        "2 links=0", locate(hl));
+    unlink(at("hl-out-1.txt").c_str());
+  }
   char small[4];
   write_file(at("root/loc/to/long-name.txt"), "l");
   long long links = -1;
@@ -760,14 +775,17 @@ void locate_rows(int root, int stage) {
     unlink(at("root/loc/to/" + nfd).c_str());
   }
   {
-    // The volume key (anj_debug_volume): a stable key for another volume is
-    // not found; a key that fell back to st_dev proves nothing (uncertain).
+    // The volume key (anj_debug_volume): a key for another volume proves
+    // nothing, stable or fallen back to st_dev (uncertain).
     write_file(at("root/loc/to/vol.txt"), "v");
     anj_debug_volume(0, 1, 0x1234);
     std::string keyed = identity("loc/to/vol.txt");
     anj_debug_volume(0, 1, 0x5678);
-    row("locate: a stable key for another volume is not found", locate(keyed) == "4 links=0",
-        "4 links=0", locate(keyed));
+    std::string stable_other = locate(keyed);
+    int stable_cause = anj_error();
+    row("locate: a stable key for another volume is uncertain",
+        stable_other == "5 links=0" && stable_cause == EXDEV, "5 links=0 EXDEV",
+        stable_other + " " + err(stable_cause));
     anj_debug_volume(0, 0, 0);
     std::string real = identity("loc/to/vol.txt");
     // stable_volume fails now (an APFS attribute read failing, say): the

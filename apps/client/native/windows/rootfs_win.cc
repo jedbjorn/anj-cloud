@@ -1910,11 +1910,12 @@ ANJ_API char* anj_info_fd(int fd) {
 // [identity] (`w<volume serial>:<file id>`, as the scans report it). Same
 // ABI and results as native/posix/locate.inc. Certain: 1 inside the root
 // ([out], '/'-separated UTF-8, and [links]), 2 elsewhere on the root's
-// volume, 4 not found (no file with that ID, another volume, a malformed
-// identity). Every error is 5 (uncertain), with error_number set: an
-// unexpected OpenFileById failure, a name that no longer opens as the same
-// file beneath the root (it changed after it was listed), allocation, a
-// buffer too small. Never 3 (staging): every link name is enumerated
+// volume, 4 not found (no file with that ID). Every other answer is 5
+// (uncertain), with error_number set, failing safe: a malformed identity, a
+// volume key that differs from the root's, an unexpected OpenFileById
+// failure, a name that no longer opens as the same file beneath the root
+// (it changed after it was listed), a root whose path changed during the
+// lookup, allocation, a buffer too small. Never 3 (staging): every link name is enumerated
 // (FindFirstFileNameW), so a file whose only other link is a staging copy is
 // still found where it is.
 // The item is opened by its file ID relative to the root's volume with
@@ -1999,24 +2000,26 @@ int locate_identity(int fd, const char* identity, char* out, int cap, long long&
   HANDLE root = handle_of(fd);
   if (!root) return uncertain(cause, lx::BADF);
   if (!out || cap <= 1) return uncertain(cause, lx::INVAL);
-  if (!identity) return kLocateNotFound;
+  // A malformed identity proves nothing about the item: uncertain.
+  if (!identity) return uncertain(cause, lx::INVAL);
   std::string id(identity);
   size_t colon = id.rfind(':');
-  if (colon == std::string::npos || colon == 0 || colon + 1 >= id.size()) return kLocateNotFound;
+  if (colon == std::string::npos || colon == 0 || colon + 1 >= id.size())
+    return uncertain(cause, lx::INVAL);
   std::string digits = id.substr(colon + 1);
   size_t sign = digits[0] == '-' ? 1 : 0;
   if (digits.size() == sign || digits.find_first_not_of("0123456789", sign) != std::string::npos)
-    return kLocateNotFound;
+    return uncertain(cause, lx::INVAL);
   errno = 0;
   long long file_id = _strtoi64(digits.c_str(), nullptr, 10);
-  if (errno != 0) return kLocateNotFound;
+  if (errno != 0) return uncertain(cause, lx::INVAL);
   Stat rs;
   int e = stat_of(root, rs);
   if (e) return uncertain(cause, e);
   if (!rs.directory()) return uncertain(cause, lx::NOTDIR);
-  // The volume serial is the scans' own key and stable: another volume is
-  // never this root's item.
-  if (volume_key(rs) != id.substr(0, colon)) return kLocateNotFound;
+  // A volume key that differs from the root's proves nothing: a volume
+  // mounted inside the root reports its own key for items beneath the root.
+  if (volume_key(rs) != id.substr(0, colon)) return uncertain(cause, lx::XDEV);
   FILE_ID_DESCRIPTOR descriptor = {};
   descriptor.dwSize = sizeof(descriptor);
   descriptor.Type = FileIdType;
@@ -2049,6 +2052,13 @@ int locate_identity(int fd, const char* identity, char* out, int cap, long long&
     return uncertain(cause, from_win32(GetLastError()));
   }
   item.reset();  // Closed at once: nothing below needs it.
+  // The root's path again: renamed while the names were read, they would no
+  // longer compare against it (an item inside would read as outside).
+  std::wstring root_after;
+  if (!volume_relative(root, root_after)) return uncertain(cause, from_win32(GetLastError()));
+  if (CompareStringOrdinal(root_path.c_str(), static_cast<int>(root_path.size()),
+          root_after.c_str(), static_cast<int>(root_after.size()), FALSE) != CSTR_EQUAL)
+    return uncertain(cause, lx::STALE);
   int raced = 0;
   for (const auto& name : names) {
     std::string relative;

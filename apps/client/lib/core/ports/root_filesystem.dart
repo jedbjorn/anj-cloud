@@ -158,8 +158,8 @@ enum IdentityPlace {
   /// boundary as the same item.
   inside,
 
-  /// Elsewhere on the root's volume (the Trash, another folder): the item
-  /// left the root.
+  /// Elsewhere on the root's volume (the Trash, another folder), under a
+  /// name that is the item's only link: the item left the root.
   outside,
 
   /// The one name the platform reported is a link in the private staging
@@ -167,12 +167,13 @@ enum IdentityPlace {
   /// download's staging copy is one): where any other link is, is unknown.
   staging,
 
-  /// No such item on the root's volume, or a stable key for another volume.
+  /// No such item on the root's volume.
   notFound,
 
-  /// Any error: the platform could not answer (an unexpected failure, the
-  /// item changed while it was being looked up, a volume key that is not
-  /// stable).
+  /// Anything that proves nothing, failing safe: an error (an unexpected
+  /// failure, the item or the root changed while it was being looked up), a
+  /// malformed identity, a volume key other than the root's, an outside
+  /// name of a file with more than one link.
   uncertain,
 }
 

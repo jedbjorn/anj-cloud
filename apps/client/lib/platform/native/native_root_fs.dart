@@ -544,8 +544,9 @@ class NativeRootFs implements RootFilesystem, DocumentsFilesystem {
 
   @override
   IdentityLocation locateIdentity(int fd, int stageFd, String identity) {
-    if (!locatesIdentity) return identityUncertain;
-    if (identity.contains('\x00')) return identityNotFound;
+    // A NUL cannot reach the export intact: malformed, which proves nothing
+    // about the item (failing safe, as the export answers one).
+    if (!locatesIdentity || identity.contains('\x00')) return identityUncertain;
     final id = identity.toNativeUtf8();
     final out = malloc<Uint8>(_locateCapacity);
     final links = malloc<Int64>();

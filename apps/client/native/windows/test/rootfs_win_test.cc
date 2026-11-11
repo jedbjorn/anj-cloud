@@ -799,8 +799,10 @@ int run(const std::string& dir, const std::string& dll) {
              volume + ":", volume + ":abc", volume + "x:" + file.substr(file.rfind(':') + 1),
              volume + ":9223372036854775"})
       bad += locate(id) + ";";
-    check("locate: malformed identities, another volume, an unknown id",
-        bad == "4 links=0;4 links=0;4 links=0;4 links=0;4 links=0;4 links=0;4 links=0;", bad);
+    // Fail safe: a malformed identity and another volume key prove nothing
+    // (uncertain); only an unknown id on the root's volume is not found.
+    check("locate: malformed identities and another volume are uncertain, an unknown id is not found",
+        bad == "5 links=0;5 links=0;5 links=0;5 links=0;5 links=0;5 links=0;4 links=0;", bad);
     char small[4];
     long long links = -1;
     write_file(root + "\\loc\\to\\long-name.txt", "l");

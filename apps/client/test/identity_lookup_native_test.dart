@@ -49,6 +49,13 @@ void main() {
     expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
   }
 
+  test('an identity with a NUL in it: uncertain on every platform', () {
+    write('a.txt', 'a');
+    final id = native.fileIdentity(tree.fd, 'a.txt');
+    expect(locate('$id\x00'), identityUncertain);
+    expect(locate('\x00$id'), identityUncertain);
+  });
+
   if (!looksUp) {
     test('Linux and Android: no lookup; the export says unsupported', () {
       write('a.txt', 'a');
@@ -120,8 +127,8 @@ void main() {
     expect(locate(id), identityNotFound);
   });
 
-  test('a malformed identity, another volume, an unknown inode: not found, '
-      'never a crash', () {
+  test('a malformed identity or another volume key: uncertain (failing '
+      'safe); an unknown inode: not found; never a crash', () {
     write('a.txt', 'a');
     final id = native.fileIdentity(tree.fd, 'a.txt');
     final volume = id.split(':').first;
@@ -133,10 +140,10 @@ void main() {
       '$volume:abc',
       '$volume:12:34',
       '${volume}x:${id.split(':').last}',
-      '$volume:9223372036854775',
     ]) {
-      expect(locate(bad), identityNotFound, reason: bad);
+      expect(locate(bad), identityUncertain, reason: bad);
     }
+    expect(locate('$volume:9223372036854775'), identityNotFound);
   });
 
   test('a closed root: uncertain, never a crash', () {
