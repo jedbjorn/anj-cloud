@@ -46,6 +46,7 @@ struct Api {
   long long (*fs_magic)(int, const char*);
   int (*mkdir)(int, const char*);
   int (*mkdir_exclusive)(int, const char*);
+  int (*create_file)(int, const char*);
   int (*install_directory)(int, int, const char*, const char*, const char*, const char*);
   int (*rmdir_empty)(int, const char*, const char*);
   int (*install)(int, const char*, const char*);
@@ -101,6 +102,7 @@ bool load(const char* path) {
   get(api.rewind, "anj_rewind"); get(api.stamp, "anj_stamp");
   get(api.root_info, "anj_root_info"); get(api.fs_magic, "anj_fs_magic");
   get(api.mkdir, "anj_mkdir"); get(api.mkdir_exclusive, "anj_mkdir_exclusive");
+  get(api.create_file, "anj_create_file");
   get(api.install_directory, "anj_install_directory");
   get(api.rmdir_empty, "anj_rmdir_empty"); get(api.install, "anj_install");
   get(api.quarantine, "anj_quarantine");
@@ -863,6 +865,20 @@ int run(const std::string& dir, const std::string& dll) {
   check("mkdir of the same name succeeds", api.mkdir(rootfd, "Docs") == 0, got(-1));
   check("mkdir of a case alias is a collision", refused(api.mkdir(rootfd, "docs"), 17), got(-1));
   check("mkdir_exclusive refuses existing", refused(api.mkdir_exclusive(rootfd, "Docs"), 17), got(-1));
+  {
+    // The shared ABI's exclusive create (the documents provider's, on Android).
+    int fd = api.create_file(rootfd, "Docs/created.txt");
+    check("create_file creates an empty file and returns it open", fd >= 0 && read_fd(fd).empty(), got(fd));
+    if (fd >= 0) api.close(fd);
+    check("create_file never replaces an existing file", refused(api.create_file(rootfd, "Docs/created.txt"), 17), got(-1));
+    check("create_file refuses a case alias of an existing file", refused(api.create_file(rootfd, "Docs/CREATED.TXT"), 17), got(-1));
+    check("create_file refuses an existing directory's name", refused(api.create_file(rootfd, "Docs"), 17), got(-1));
+    check("create_file needs its parent", refused(api.create_file(rootfd, "Absent/created.txt"), 2), got(-1));
+    fd = api.open_read(rootfd, "Docs/created.txt");
+    check("the created file opens by its exact name", fd >= 0, got(fd));
+    if (fd >= 0) api.close(fd);
+    DeleteFileW(longpath(root + "\\Docs\\created.txt").c_str());
+  }
   {
     write_file(root + "\\AutoShortNameExample.txt", "AUTO");
     wchar_t shortname[MAX_PATH * 4] = {};
