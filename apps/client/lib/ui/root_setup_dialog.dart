@@ -26,6 +26,10 @@ class _RootSetupDialogState extends State<RootSetupDialog> {
   final _known = TextEditingController();
   bool _confirmed = false;
   bool _busy = false;
+
+  /// The root was saved but sync did not start: nothing more to choose here,
+  /// and another attempt would only say the profile already owns a root.
+  bool _rootSaved = false;
   String? _error;
 
   @override
@@ -54,6 +58,7 @@ class _RootSetupDialogState extends State<RootSetupDialog> {
       _busy = true;
       _error = null;
     });
+    final before = widget.controller.root;
     try {
       await widget.controller.configureRoot(
         _parent.text.trim(),
@@ -65,10 +70,16 @@ class _RootSetupDialogState extends State<RootSetupDialog> {
       );
       if (mounted) Navigator.pop(context, true);
     } catch (error) {
+      final saved = before == null ? widget.controller.root : null;
       if (mounted) {
         setState(() {
           _busy = false;
-          _error = describeRootError(error);
+          _rootSaved = saved != null;
+          _error = saved == null
+              ? describeRootError(error)
+              : 'Your folder was set up at $saved, but syncing did not start: '
+                    '${describeRootError(error)}\nClose this dialog; syncing '
+                    'starts again the next time the app starts.';
         });
       }
     }
@@ -77,83 +88,97 @@ class _RootSetupDialogState extends State<RootSetupDialog> {
   @override
   Widget build(BuildContext context) {
     final automatic = widget.controller.automaticRoot;
-    return AlertDialog(
-      title: Text(
-        automatic ? 'Use another folder' : 'Choose your anj-cloud root',
-      ),
-      scrollable: true,
-      content: SizedBox(
-        width: 560,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'The app creates anj-cloud inside this parent folder. All regular files and nested folders there participate in synchronization.',
-            ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _parent,
-                    onChanged: (_) => setState(() => _error = null),
-                    decoration: const InputDecoration(
-                      labelText: 'Parent directory',
+    // Not dismissible while setting up (Escape, back, a click outside): the
+    // outcome, a refusal included, has to land in a dialog that is still here.
+    return PopScope(
+      canPop: !_busy,
+      child: AlertDialog(
+        title: Text(
+          automatic ? 'Use another folder' : 'Choose your anj-cloud root',
+        ),
+        scrollable: true,
+        content: SizedBox(
+          width: 560,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'The app creates anj-cloud inside this parent folder. All regular files and nested folders there participate in synchronization.',
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _parent,
+                      onChanged: (_) => setState(() => _error = null),
+                      decoration: const InputDecoration(
+                        labelText: 'Parent directory',
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Choose parent',
+                    icon: const Icon(Icons.folder_open),
+                    onPressed: _busy ? null : _choose,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'The root always uses Local and cloud. Choose Cloud-only for individual folders in the app to free local space on this device. New content synchronizes automatically; child choices are preserved.',
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _known,
+                maxLines: 2,
+                decoration: const InputDecoration(
+                  labelText: 'Known other sync roots (one per line)',
+                ),
+              ),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text(
+                  'This location is separate from my other synchronizers.',
+                ),
+                value: _confirmed,
+                onChanged: (v) => setState(() => _confirmed = v ?? false),
+              ),
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: SelectableText(
+                    _error!,
+                    key: const ValueKey('root-setup-error'),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
                     ),
                   ),
                 ),
-                IconButton(
-                  tooltip: 'Choose parent',
-                  icon: const Icon(Icons.folder_open),
-                  onPressed: _busy ? null : _choose,
-                ),
-              ],
+            ],
+          ),
+        ),
+        actions: [
+          if (_rootSaved)
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Close'),
+            )
+          else ...[
+            TextButton(
+              onPressed: _busy ? null : () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
             ),
-            const SizedBox(height: 12),
-            const Text(
-              'The root always uses Local and cloud. Choose Cloud-only for individual folders in the app to free local space on this device. New content synchronizes automatically; child choices are preserved.',
+            FilledButton(
+              onPressed: !_busy && _confirmed && _parent.text.trim().isNotEmpty
+                  ? _submit
+                  : null,
+              child: Text(_busy ? 'Setting up…' : 'Use this root'),
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _known,
-              maxLines: 2,
-              decoration: const InputDecoration(
-                labelText: 'Known other sync roots (one per line)',
-              ),
-            ),
-            CheckboxListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text(
-                'This location is separate from my other synchronizers.',
-              ),
-              value: _confirmed,
-              onChanged: (v) => setState(() => _confirmed = v ?? false),
-            ),
-            if (_error != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: SelectableText(
-                  _error!,
-                  key: const ValueKey('root-setup-error'),
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
-                ),
-              ),
           ],
-        ),
+        ],
       ),
-      actions: [
-        TextButton(
-          onPressed: _busy ? null : () => Navigator.pop(context, false),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: !_busy && _confirmed && _parent.text.trim().isNotEmpty
-              ? _submit
-              : null,
-          child: Text(_busy ? 'Setting up…' : 'Use this root'),
-        ),
-      ],
     );
   }
 }

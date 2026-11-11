@@ -1172,6 +1172,31 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     notifyListeners();
   }
 
+  /// Refuses a [parent] that is not an existing folder, with the real reason:
+  /// missing, not a folder (a file, or a path through one), or not readable.
+  static void _checkParent(String parent) {
+    final String resolved;
+    try {
+      resolved = Directory(parent).resolveSymbolicLinksSync();
+    } on FileSystemException catch (error) {
+      final os = error.osError;
+      final detail = os == null || os.message.isEmpty ? '' : ': ${os.message}';
+      final reason = switch (os?.errorCode) {
+        2 || 3 => 'The parent folder does not exist. Create it, or choose a folder that does.',
+        13 || 5 => 'The parent folder cannot be read: access is denied.',
+        20 => 'The parent folder is not a folder (part of its path is a file).',
+        _ => 'The parent folder cannot be used$detail.',
+      };
+      throw FileSystemException(reason, parent);
+    }
+    if (FileSystemEntity.typeSync(resolved) != FileSystemEntityType.directory) {
+      throw FileSystemException(
+        'The parent is a file, not a folder. Choose a folder.',
+        parent,
+      );
+    }
+  }
+
   /// Creates the root `<parent>/anj-cloud/` and starts sync. [automatic]
   /// (spec #34 P1) refuses an existing `anj-cloud/` instead of adopting it,
   /// except the one this profile began creating before an interruption.
@@ -1182,12 +1207,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   }) async {
     // Said before anything is stopped or opened, in words rather than the
     // platform's "cannot resolve symbolic links".
-    if (!Directory(parent).existsSync()) {
-      throw FileSystemException(
-        'The parent folder does not exist. Create it, or choose a folder that does.',
-        parent,
-      );
-    }
+    _checkParent(parent);
     await stop();
     final store = Manifest(profile);
     String? creating;
