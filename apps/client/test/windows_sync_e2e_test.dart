@@ -27,13 +27,13 @@ import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/platform/windows/dpapi_secrets.dart';
 import 'package:anj_cloud/platform/windows/windows_root_fs.dart';
-import 'package:anj_cloud/ui/qr_image.dart';
 import 'package:crypto/crypto.dart';
 import 'package:image/image.dart' as img;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
 import '../tool/eviction_fixture.dart' show ownedAllocated;
+import 'qr_image.dart';
 
 class _Device {
   _Device(this.label, this.profile, this.engine, this.cloud);
