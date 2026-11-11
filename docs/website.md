@@ -50,5 +50,5 @@ preview policy and stop any preview process you start.
 
 Keep platform availability, installer limits, and the trust model aligned with
 `README.md`, `docs/clients.md`, and `docs/self-hosting/quickstart.md`. In particular,
-do not imply end-to-end encrypted storage, an official Windows binary, implemented
+do not imply end-to-end encrypted storage, a Windows client tested beyond one Windows 10 machine, implemented
 inference access, or backup setup on the generic quick-start path.

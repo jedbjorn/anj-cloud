@@ -1,27 +1,28 @@
 # Installing the clients
 
-Official Linux x86_64, macOS arm64 and Android arm64 clients are available from
+Official Linux x86_64, macOS arm64, Windows x86_64 and Android arm64 clients are available from
 [GitHub Releases](https://github.com/jedbjorn/anj-cloud/releases). Download your artifact and its `.sha256`
 file; compare the digest with the release page, then run the checksum command below. `SHA256SUMS` lists all
 artifacts in the release. Replace the example filenames and `<hex>` with the downloaded filename and digest.
 
 Official builds carry the maintainer's keys: the Android APK is signed with the maintainer's APK signing key,
-and the desktop apps embed the maintainer's Ed25519 update key (macOS builds are ad-hoc code-signed). They pair with any AnJ Cloud server: type your server
+and the desktop apps embed the maintainer's Ed25519 update key (macOS builds are ad-hoc code-signed; Windows builds are not code-signed). They pair with any AnJ Cloud server: type your server
 address in the editable **Server** field at pairing. `https://gateway.example.com` is only the default text.
 In-app updates are downloaded from your paired gateway and only accept releases signed with those same
 keys (Ed25519 on desktop; the Android signing certificate on Android). A household that wants its own update
 feed builds and signs its own clients; see [keys and releases](self-hosting/keys-and-releases.md).
 
-Desktop commands below use the install managers from this repository's reviewed source, relative to the
-repository root. Obtain that source before installing; an archive checksum alone does not authenticate an
-installer script.
+Linux and macOS commands below use the install managers from this repository's reviewed source, relative to
+the repository root. Obtain that source before installing; an archive checksum alone does not authenticate an
+installer script. On Windows the manager is a program inside the zip, so there the zip itself must be checked
+against the release page before anything in it is run.
 
 | Platform | Official download | Install |
 |---|---|---|
 | Linux x86_64 | `.tar.gz` | `linux_install.py` |
 | macOS (Apple silicon) | `.zip` | `anj-cloud-macos-install.sh` |
 | Android (arm64) | Signed `.apk` | Open APK on phone, or `adb install` |
-| Windows (x86_64) | None yet | Build your own; `anj-cloud-manager.exe` |
+| Windows (x86_64) | `.zip` (early; tested on one Windows 10 machine) | `anj-cloud-manager.exe` from the zip |
 
 ## Linux
 
@@ -94,11 +95,48 @@ Keep your signing keys safe; publish your signed updates through your gateway as
 
 ## Windows
 
-There is **no official Windows build yet**. An installer and update manager exist, and a build you package
-with your own release key updates itself in the app. The in-app update has been run end to end on one
-Windows 10 test machine, with test builds, a throwaway key and a test gateway; it has not been tried on other
-Windows versions or machines. You can always update by hand instead: quit the app, then run the manager's
-`update` with a new archive. Treat the Windows client as early.
+Download the Windows x86_64 zip and its checksum from [Releases](https://github.com/jedbjorn/anj-cloud/releases).
+The installer, `anj-cloud-manager.exe`, is inside the zip. A checksum cannot vouch for the program that checks
+it, so first compare the zip's SHA-256 with the value shown on the release page yourself, in PowerShell:
+
+```powershell
+(Get-FileHash '<archive>.zip' -Algorithm SHA256).Hash.ToLower()    # must equal the release page's value
+mkdir unpacked; tar.exe -xf '<archive>.zip' -C unpacked
+$manager = (Get-Item unpacked\anj-cloud-windows-x86_64-*\anj-cloud-manager.exe).FullName
+& $manager install '<archive>.zip' --sha256 <hex>
+```
+
+Run the manager as your normal Windows user; it refuses to run as administrator. It installs under
+`%LOCALAPPDATA%\Programs\anj-cloud`, adds a Start menu entry and a Programs and Features entry, and starts the
+app at login (hidden in the notification area). The unpacked folder can be deleted afterwards. Later:
+
+```powershell
+# the installed manager is beside the app, under %LOCALAPPDATA%\Programs\anj-cloud\releases\<release>\
+anj-cloud-manager.exe status
+anj-cloud-manager.exe autostart disable      # also: enable, status
+anj-cloud-manager.exe update <zip> --sha256 <hex>   # by hand; quit the app first
+anj-cloud-manager.exe uninstall              # removes exactly what install added; keeps your profile and files
+```
+
+The app keeps its secrets in Windows DPAPI and shows a notification-area icon. Pairing is as on the other
+desktops. The official build updates itself in the app from your paired gateway, like the other desktops.
+
+**How far this has been tested.** The Windows client is early. Everything below was run on one Windows 10
+(19045) machine and nowhere else:
+
+- the official zip itself: installed with its manager, started from the Start menu, the pairing screen shown
+  with the default server address, quit, uninstalled;
+- with test builds of the same code, a test key and a test gateway: pairing, sync, and the in-app update
+  several times, including the refusal cases listed under "In-app updates" below, sign-out during an update,
+  and a profile path with a space and non-ASCII letters;
+- the project's Windows test scripts for the manager and the native library.
+
+Not tested: Windows 11 or other Windows versions and machines; a profile path that is a short (8.3) or
+redirected folder; the official zip paired with a real server and updated in the app (the first official
+update will be the first time that path runs with the maintainer's key). The programs are not code-signed,
+so Windows may warn about an unknown publisher when you run a downloaded file.
+
+### Building your own Windows client
 
 Building needs Windows x86_64 with Visual Studio Build Tools 2022 (C++ workload and C++ ATL) and the pinned
 Flutter SDK (`apps/client/tool/windows/install.ps1` installs them on a build seat).
@@ -107,15 +145,9 @@ Flutter SDK (`apps/client/tool/windows/install.ps1` installs them on a build sea
 # in apps\client, after `flutter build windows --release`:
 powershell -File tool\windows\package.ps1 -SourceHead <40-hex commit>   # writes the zip and prints its SHA-256
 #   add -VersionCode <n> -Version <v> for a build that updates itself in the app (see below)
-# install or update (the manager runs from the unpacked release; get its checksum separately):
-anj-cloud-manager.exe install <zip> --sha256 <hex>
-anj-cloud-manager.exe run
-anj-cloud-manager.exe autostart enable      # start at login; also: status, disable
-anj-cloud-manager.exe uninstall             # removes exactly what install added
 ```
 
-`update <zip> --sha256 <hex>` refuses while the app runs. The app keeps its secrets in Windows DPAPI and shows a
-notification-area icon. Pairing is as on the other desktops.
+Install it as above. `update <zip> --sha256 <hex>` refuses while the app runs.
 
 **In-app updates.** An installed build offers **Update available** when all of these hold: it was built with
 your release key in the tree (`apps/client/tool/apply_profile.py` writes it before `flutter build`), it was
