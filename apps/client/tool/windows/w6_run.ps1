@@ -1,6 +1,6 @@
 # Runs integration_test/windows_admin_test.dart in the real Windows app,
 # unelevated in the console session, for deploy/windows_admin_fixture.py
-# (spec #32 W6): an Interactive RunLevel Limited task of the same user. The
+# an Interactive RunLevel Limited task of the same user. The
 # app builds with the seat's toolchain (build.ps1) on first use. Prints the
 # test log, then "W6 TASK RESULT <n>" (the task's own exit code). The log is
 # removed first, so a task that never runs leaves no earlier run's PASS; the

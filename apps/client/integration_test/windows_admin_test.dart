@@ -13,7 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:path/path.dart' as p;
 
-/// Spec #32 W6 (acceptance row 14) in the real Windows app window, at the
+/// Admin and layout in the real Windows app window, at the
 /// console session's display scale, against a review stack through the
 /// reverse forward. Run by deploy/windows_admin_fixture.py through
 /// tool/windows/w6_run.ps1 (unelevated). ANJ_W6_CONFIG names its JSON:
@@ -21,7 +21,7 @@ import 'package:path/path.dart' as p;
 ///
 /// Alice's device is paired and granted admin by the driver. Through the
 /// Admin section she invites Bob; Bob's device pairs here with that code
-/// alone and the server approves it (code-only pairing, spec #35); she
+/// alone and the server approves it (code-only pairing); she
 /// changes his role both ways (Cancel first) and revokes his device; Bob,
 /// not an admin, sees no Admin section and gets 403. No overflow (the
 /// binding fails the test on one) and no control cut off at the sides, on
@@ -151,9 +151,16 @@ void main() {
           await controller.pair(origin, code, caPath: ca);
         } catch (error) {
           if (!'$error'.contains('(429)')) rethrow;
-          await Future<void>.delayed(const Duration(seconds: 7));
         }
         await controller.stop();
+        final state = controller.pairingState;
+        if (state == 'paired') break;
+        // Still waiting for the server, or asked to slow down: once more
+        // after a pause. Any other answer (denied, expired) ends the run.
+        if (state != 'pending') {
+          throw StateError('Pairing ended as "$state", not paired.');
+        }
+        await Future<void>.delayed(const Duration(seconds: 7));
       }
       if (controller.firstSyncPending) {
         final choice = await controller.firstSyncListing();
@@ -258,10 +265,20 @@ void main() {
       await paired(bob, code);
     });
     expect(bob.pairingState, 'paired');
-    // Nothing of this run waits for an approval any more.
+    // Nothing of this run waits for an approval any more: the list has
+    // loaded (its heading shows) and has no pending row at all for Bob.
     await tester.tap(find.byTooltip('Refresh'));
     await tester.pump(const Duration(seconds: 2));
-    expect(find.text('$bobLabel for anj-fixture-bob'), findsNothing);
+    expect(find.text('Waiting for approval'), findsOneWidget);
+    expect(find.textContaining(bobLabel), findsNothing);
+    expect(
+      find.byWidgetPredicate((w) {
+        final key = w.key;
+        return key is ValueKey<String> &&
+            key.value.startsWith('admin-approve:');
+      }),
+      findsNothing,
+    );
     clean('invitations after pairing');
     await screenshot('paired');
     record('Bob invited in the UI and his device paired by the code alone');

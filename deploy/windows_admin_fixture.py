@@ -1,15 +1,19 @@
-"""Admin and layout on Windows against a review stack (spec #32 W6, acceptance row 14).
+"""Admin and layout on Windows against a review stack.
 
     ANJ_WIN_OWNER=w6 deploy/.local/access-venv/bin/python -m deploy.windows_admin_fixture \\
         --project anj-cloud-review-w6 --port 18872 --evidence <dir> [--scales 100 150]
 
 Needs a started W10C-Testing lease of this lane with the client pushed, and an `up` review
-stack. It starts the stack's console backend (approve needs it) and checks that the gateway
-reaches it, and stops it afterwards. For each display scale it sets the console session's scaling (display_scale.ps1),
-invites Alice, approves her device and makes her admin (the recovery CLI over the console
-socket, as the Linux admin test does), then runs integration_test/windows_admin_test.dart
-in the real app window: Bob is invited, approved, refused Admin (403), given and denied the
-admin role, and revoked, all through the Admin section. A desktop screenshot is taken while
+stack. It starts the stack's console backend and checks that the gateway reaches it, and stops
+it afterwards: with it running, the server itself approves a device that redeems a pairing code
+(code-only pairing), so this driver never approves by fingerprint. For each display scale it
+sets the console session's scaling (display_scale.ps1) and issues a code for Alice. The guest
+pairs Alice's device with that code alone; the driver then reads the invitation back, requires
+that the server approved it for the fingerprint the device shows, and makes Alice admin (the
+recovery CLI over the console socket, as the Linux admin test does). The guest then runs
+integration_test/windows_admin_test.dart in the real app window: Bob is invited in the Admin
+section, his device pairs with the code alone, he is refused Admin (403), given and denied the
+admin role, and his device is revoked, all through the Admin section. A desktop screenshot is taken while
 the home screen shows. Each run first withdraws what an earlier run left of Bob (pending
 invitations, active devices, the admin role). A run passes only if the guest task ran with
 result 0, its log says "All tests passed" and progress.json ends with "done". If the run
@@ -130,6 +134,21 @@ def stop_console_backend(process, socket, timeout=15):
     print(f"console backend stopped (exit {process.returncode}), socket removed", flush=True)
 
 
+def paired_device(operator, invitation, fingerprint):
+    """The device the server approved for this invitation when its code was redeemed. Raises unless
+    the invitation is approved, for the fingerprint the device itself shows, with a device."""
+    row = next((row for row in operator.call("pending") if row.get("id") == invitation), None)
+    if row is None:
+        raise RuntimeError("the invitation is not listed")
+    if row.get("state") != "approved":
+        raise RuntimeError(f"the server has not approved the device (invitation {row.get('state')})")
+    if not fingerprint or row.get("fingerprint") != fingerprint:
+        raise RuntimeError("the approved device is not the one the guest shows")
+    if not row.get("device"):
+        raise RuntimeError("the approved invitation names no device")
+    return row["device"]
+
+
 def stop_guest_task():
     """End the guest test task and its app before the driver cleans up behind it."""
     out = seat("ssh", f'schtasks /End /TN "{TASK}" & taskkill /F /T /IM anj_cloud.exe', check=False)
@@ -214,17 +233,18 @@ def run_scale(stack, operator, scale, evidence, devices):
     runner = subprocess.Popen([str(SEAT), "ps", str(CLIENT / "tool/windows/w6_run.ps1"), "-Timeout", str(RUN_TIMEOUT)],
                               stdout=(out / "guest-run.txt").open("w"), stderr=subprocess.STDOUT)
     deadline = time.monotonic() + RUN_TIMEOUT + DRIVER_SLACK
-    approved = shot = False
+    paired = shot = False
     try:
         while runner.poll() is None and time.monotonic() < deadline:
-            if not approved and (shown := guest_file("fingerprint-alice.json")):
-                fingerprint = json.loads(shown)["fingerprint"]
-                devices.append(operator.approve(invite["id"], fingerprint)["device_id"])
+            if not paired and (shown := guest_file("fingerprint-alice.json")):
+                # The guest writes this once its device is paired by the code alone.
+                devices.append(paired_device(operator, invite["id"], json.loads(shown)["fingerprint"]))
+                step(f"{scale}%: the server approved Alice's device for the code")
                 granted = admin_cli(stack, "admin-grant", ALICE)
-                step(f"{scale}%: Alice approved and admin", ok=granted.returncode == 0 or "already" in granted.stderr,
+                step(f"{scale}%: Alice made admin", ok=granted.returncode == 0 or "already" in granted.stderr,
                      cli=granted.returncode)
-                approved = True
-            if approved and not shot and "home shown" in (guest_file("progress.json") or ""):
+                paired = True
+            if paired and not shot and "home shown" in (guest_file("progress.json") or ""):
                 # Evidence only: a failed desktop capture must not end the run.
                 taken = subprocess.run([str(SEAT), "screenshot", str(out / f"desktop-{scale}.png")],
                                        capture_output=True, text=True, timeout=120)

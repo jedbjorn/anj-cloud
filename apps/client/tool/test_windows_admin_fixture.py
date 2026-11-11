@@ -1,5 +1,5 @@
-"""Hermetic tests of deploy/windows_admin_fixture.py and tool/windows/w6_run.ps1 (spec #32 W6,
-review items 1 to 4). No VM, stack or SSH: the seat, the operator and the admin CLI are fakes.
+"""Hermetic tests of deploy/windows_admin_fixture.py and tool/windows/w6_run.ps1 (the
+driver and the guest runner). No VM, stack or SSH: the seat, the operator and the admin CLI are fakes.
 Run by tool/test_windows_seat.sh (check.sh) with the system python3, so the fixture must import
 without the access venv.
 """
@@ -23,7 +23,7 @@ PASSED_LOG = "00:42 +1: All tests passed!\nW6 TASK RESULT 0\n"
 
 
 class RunVerdict(unittest.TestCase):
-    """Review 1: a task that never ran cannot report an earlier run's PASS."""
+    """A task that never ran cannot report an earlier run's PASS."""
 
     def test_a_complete_run_passes(self):
         self.assertEqual(fixture.run_verdict(0, PASSED_LOG, DONE), [])
@@ -61,7 +61,7 @@ class RunVerdict(unittest.TestCase):
 
 
 class Cleanup(unittest.TestCase):
-    """Review 2: each cleanup step runs on its own; the restore is read back as 96 DPI."""
+    """Each cleanup step runs on its own; the restore is read back as 96 DPI."""
 
     def test_a_raising_step_never_skips_the_later_ones(self):
         ran = []
@@ -225,6 +225,9 @@ class FakeOperator:
             return {"state": "denied"}
         raise AssertionError(action)
 
+    def approve(self, identity, fingerprint):
+        raise AssertionError("the driver must not approve by fingerprint: pairing is by code alone")
+
     def revoke(self, identity):
         self.calls.append(("revoke", {"device_id": identity}))
         next(row for row in self.devices if row["id"] == identity)["state"] = "revoked"
@@ -269,8 +272,48 @@ def leftovers():
     return FakeOperator(pending, devices)
 
 
+class CodeOnlyPairing(unittest.TestCase):
+    """The driver reads back what the server approved for the code; it never approves itself."""
+
+    FINGERPRINT = "ab" * 32
+
+    def operator(self, **row):
+        return FakeOperator([{"id": "i-other", "uid": BOB, "state": "approved", "fingerprint": "cd" * 32,
+                              "device": "d-other"},
+                             {"id": "i-alice", "uid": ALICE, "state": "approved",
+                              "fingerprint": self.FINGERPRINT, "device": "d-alice", **row}], [])
+
+    def test_the_device_the_server_approved_for_the_code_is_returned(self):
+        operator = self.operator()
+        self.assertEqual(fixture.paired_device(operator, "i-alice", self.FINGERPRINT), "d-alice")
+        self.assertEqual([action for action, _ in operator.calls], ["pending"])
+
+    def test_an_invitation_the_server_has_not_approved_fails(self):
+        for state in ("issued", "reserved", "provisioning", "denied"):
+            with self.assertRaisesRegex(RuntimeError, "has not approved"):
+                fixture.paired_device(self.operator(state=state), "i-alice", self.FINGERPRINT)
+
+    def test_another_devices_fingerprint_fails(self):
+        with self.assertRaisesRegex(RuntimeError, "not the one the guest shows"):
+            fixture.paired_device(self.operator(), "i-alice", "cd" * 32)
+        with self.assertRaisesRegex(RuntimeError, "not the one the guest shows"):
+            fixture.paired_device(self.operator(fingerprint=None), "i-alice", self.FINGERPRINT)
+
+    def test_an_unlisted_invitation_or_a_missing_device_fails(self):
+        with self.assertRaisesRegex(RuntimeError, "not listed"):
+            fixture.paired_device(self.operator(), "i-none", self.FINGERPRINT)
+        with self.assertRaisesRegex(RuntimeError, "names no device"):
+            fixture.paired_device(self.operator(device=None), "i-alice", self.FINGERPRINT)
+
+    def test_the_run_takes_alices_device_from_the_server_and_never_approves(self):
+        source = (ROOT / "deploy/windows_admin_fixture.py").read_text()
+        self.assertIn('devices.append(paired_device(operator, invite["id"]', source)
+        self.assertNotIn("operator.approve(", source)
+        self.assertNotIn(".approve(", source)
+
+
 class ResetBob(unittest.TestCase):
-    """Review 3: a failed run's invitation, device and admin role of Bob are withdrawn first."""
+    """A failed run's invitation, device and admin role of Bob are withdrawn first."""
 
     def test_an_earlier_runs_bob_is_withdrawn_and_alice_is_untouched(self):
         operator, cli = leftovers(), FakeCli({ALICE, BOB})
@@ -308,7 +351,7 @@ class ResetBob(unittest.TestCase):
 
 
 class GuestTaskStop(unittest.TestCase):
-    """Review 4: past the deadline, the guest task is ended before the driver goes on."""
+    """Past the deadline, the guest task is ended before the driver goes on."""
 
     def test_an_overrunning_guest_run_is_ended_before_cleanup(self):
         events = []

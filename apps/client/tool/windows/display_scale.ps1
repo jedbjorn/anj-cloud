@@ -1,5 +1,5 @@
 # Sets the console session's display scaling and reports the effective DPI
-# (spec #32 W6), for the layout checks at 100, 125 and 150 %.
+# for the layout checks at 100, 125 and 150 %.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File display_scale.ps1 -Percent 150
 #
