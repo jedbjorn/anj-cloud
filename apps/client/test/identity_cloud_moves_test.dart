@@ -19,6 +19,7 @@ import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
 import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -858,12 +859,31 @@ void main() {
       expect(disk('Archive/r.txt'), 'mine');
       expect(remote('Archive/r.txt'), 'report');
       expect(store.entries['Docs/report.txt']!.status, serverNameClashStatus);
+      // On every platform such a row is amber with its reason and the app
+      // needs attention, until the clash is gone.
+      SyncStatus overall() => deriveStatus(
+        paused: false,
+        offline: false,
+        unpaired: false,
+        message: engine.message,
+        entries: store.entries.values,
+        operations: store.operations.values,
+      );
+      expect(overall(), SyncStatus.attention);
+      expect(
+        (await projectEntry(
+          engine,
+          store.entries['Docs/report.txt']!,
+        ))['presentationErrors'],
+        [serverNameClashStatus],
+      );
       // The other item goes: the move follows.
       File(root('Archive/r.txt')).deleteSync();
       await ticks();
       expect(fs.renames, ['Docs/report.txt -> Archive/r.txt']);
       expect(cloud.calls, isEmpty);
       expect(disk('Archive/r.txt'), 'report');
+      expect(overall(), isNot(SyncStatus.attention));
     });
   });
 

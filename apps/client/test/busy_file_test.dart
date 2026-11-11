@@ -5,6 +5,7 @@ import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/ports/change_watcher.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
+import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
@@ -107,6 +108,17 @@ void main() {
       expect(remote('Documents/held.txt'), 'v1');
       expect(store.entries['Documents/held.txt']!.status, fileBusyStatus);
       expect(tree.busy, {'Documents/held.txt'});
+      // The row says why, in amber, while the other row says nothing.
+      final row = await projectEntry(
+        engine,
+        store.entries['Documents/held.txt']!,
+      );
+      expect(row['presentationErrors'], [fileBusyStatus]);
+      final other = await projectEntry(
+        engine,
+        store.entries['Documents/other.txt']!,
+      );
+      expect(other['presentationErrors'], isEmpty);
       fs.busy.clear();
       await engine.tick();
       expect(remote('Documents/held.txt'), 'v2');

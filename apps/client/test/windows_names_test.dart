@@ -1,12 +1,15 @@
 import 'dart:io';
 
 import 'package:anj_cloud/core/local/root_tree.dart';
+import 'package:anj_cloud/core/ports/change_watcher.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/name_holds.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
+import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -28,15 +31,21 @@ void main() {
   late SyncEngine engine;
 
   /// Windows: Win32 names and case folding. macOS: case folding only.
-  void device({required bool windows}) {
+  void device({required bool windows, bool watch = false}) {
     final parent = Directory('${fixture.path}/a')..createSync();
     final tree = RootTree.setup(parent.path, 'a', NativeRootFs());
     store = Manifest(Directory('${fixture.path}/profile-a'));
     store.setSetting('retention', 'local');
     cloud = FakeCloud();
-    engine = SyncEngine(store, tree, cloud)
-      ..holdsAnyName = !windows
-      ..foldsCase = true;
+    engine =
+        SyncEngine(
+            store,
+            tree,
+            cloud,
+            watchers: watch ? const LinuxChangeWatchers() : null,
+          )
+          ..holdsAnyName = !windows
+          ..foldsCase = true;
   }
 
   setUp(() {
@@ -168,6 +177,72 @@ void main() {
       File('${engine.tree.root.path}/Documents/a.txt').readAsStringSync(),
       'lower',
     );
+  });
+
+  test('watcher-driven passes: a held row is looked at again every pass, so '
+      'the clash loser comes down once its sibling is gone', () async {
+    // Passes that visit only changed paths: nothing changes at the held
+    // row's own path, so only its unsettled state brings it back.
+    engine.close();
+    fixture.deleteSync(recursive: true);
+    fixture = Directory.systemTemp.createTempSync('anj-names-test-');
+    device(windows: true, watch: true);
+    engine.watcherSettings = const WatcherSettings(
+      quiet: Duration(milliseconds: 150),
+      maxDelay: Duration(seconds: 2),
+    );
+    await engine.startWatching();
+    Future<void> passesUntil(bool Function() done) async {
+      for (var i = 0; i < 80 && !done(); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await engine.tick();
+      }
+    }
+
+    cloud.put('Documents/A.txt', 'upper');
+    cloud.put('Documents/a.txt', 'lower');
+    await passesUntil(() => onDisk('Documents/A.txt'));
+    for (var i = 0; i < 4; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await engine.tick();
+    }
+    expect(status('Documents/a.txt'), serverNameClashStatus);
+    expect(engine.lastPass!.full, isFalse, reason: 'ordinary passes now');
+    final fullScans = engine.fullScans;
+    File('${engine.tree.root.path}/Documents/A.txt').deleteSync();
+    await passesUntil(() => onDisk('Documents/a.txt'));
+    expect(cloud.files.containsKey('Documents/A.txt'), isFalse);
+    expect(
+      File('${engine.tree.root.path}/Documents/a.txt').readAsStringSync(),
+      'lower',
+    );
+    expect(engine.fullScans, fullScans, reason: 'no full scan did it');
+  });
+
+  test('a held server name needs attention app-wide and is amber on its row; '
+      'removing the hold clears both', () async {
+    SyncStatus overall() => deriveStatus(
+      paused: false,
+      offline: false,
+      unpaired: false,
+      message: engine.message,
+      entries: store.entries.values,
+      operations: store.operations.values,
+    );
+    cloud.put('Documents/ok.txt', 'fine');
+    await engine.tick();
+    expect(overall(), isNot(SyncStatus.attention));
+    cloud.put('Documents/CON', 'held');
+    await engine.tick();
+    expect(status('Documents/CON'), serverNameNotAllowedStatus);
+    expect(overall(), SyncStatus.attention);
+    final row = await projectEntry(engine, store.entries['Documents/CON']!);
+    expect(row['presentationErrors'], [serverNameNotAllowedStatus]);
+    expect(row['nameRefused'], isFalse, reason: 'no Rename is offered');
+    cloud.files.remove('Documents/CON');
+    await engine.tick();
+    await engine.tick();
+    expect(overall(), isNot(SyncStatus.attention));
   });
 
   test('files under the losing folder of a clash stay Cloud-only', () async {
