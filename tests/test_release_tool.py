@@ -351,7 +351,26 @@ class ReleaseToolTests(unittest.TestCase):
             return (data[:cd_offset] + new_cd + data[end:end + 12] + struct.pack("<II", len(new_cd), cd_offset)
                     + data[end + 20:])
 
+        def miscounted(data):
+            end = data.rfind(b"PK\x05\x06")
+            count = struct.unpack("<H", data[end + 10:end + 12])[0] - 1
+            return data[:end + 8] + struct.pack("<HH", count, count) + data[end + 12:]
+
+        def utf16_receipt(data):
+            import io
+            import zipfile
+            out = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(data)) as old, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as new:
+                for info in old.infolist():
+                    body = old.read(info)
+                    if info.filename.endswith("/bundle-receipt.json"):
+                        body = body.decode().encode("utf-16")
+                    new.writestr(info.filename, body)
+            return out.getvalue()
+
         payloads = {
+            "its end record miscounts the members": rewritten(miscounted),
+            "not a readable Windows release archive ": rewritten(utf16_receipt),
             "its receipt does not list every file a release must carry": self.windows_artifact(hashes={}),
             "its receipt does not list every file a release must carry ": self.windows_artifact(drop=("flutter_windows.dll",)),
             "does not match its receipt hash": self.windows_artifact(

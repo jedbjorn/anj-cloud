@@ -358,6 +358,11 @@ def windows_artifact_facts(path):
             names = archive.namelist()
             if len(members) > WINDOWS_MAX_MEMBERS or sum(info.file_size for info in members) > WINDOWS_MAX_UNPACKED:
                 raise Refused("The artifact has more members or bytes than the Windows manager accepts")
+            # The manager believes the end record's entry count; Python reads the central directory to its end.
+            tail = path.read_bytes()[-(22 + 65535):]
+            end = tail.rfind(b"PK\x05\x06")
+            if end < 0 or struct.unpack("<H", tail[end + 10:end + 12])[0] != len(members):
+                raise Refused("The Windows manager would refuse this artifact: its end record miscounts the members")
             # Python tolerates bytes in front of an archive and adjusts every offset; the manager does not.
             if members and min(info.header_offset for info in members) != 0:
                 raise Refused("The Windows manager would refuse this artifact: bytes precede the archive")
@@ -372,7 +377,9 @@ def windows_artifact_facts(path):
                 seen.add(folded)
             tops = {PurePosixPath(name).parts[0] for name in names if PurePosixPath(name).parts}
             top = next(iter(tops)) if len(tops) == 1 else ""
-            receipt = json.loads(archive.read(f"{top}/bundle-receipt.json")) if f"{top}/bundle-receipt.json" in names else None
+            # As text in UTF-8, as the manager reads it (json.loads on bytes would also take UTF-16).
+            receipt = (json.loads(archive.read(f"{top}/bundle-receipt.json").decode("utf-8-sig"))
+                       if f"{top}/bundle-receipt.json" in names else None)
             key = parse_public(archive.read(f"{top}/{KEY_PAYLOAD}").decode()) if f"{top}/{KEY_PAYLOAD}" in names else None
             payload = windows_payload_refusal(archive, members, top, receipt) if isinstance(receipt, dict) else None
     except (zipfile.BadZipFile, OSError, ValueError, UnicodeError, KeyError) as error:
