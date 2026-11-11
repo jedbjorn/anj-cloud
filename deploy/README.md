@@ -766,7 +766,7 @@ python3 deploy/vm/stage.py anj-prod --commit <sha> --upgrade --no-backup   # ski
    - a backup, restore or release switch is running: the operations lock (`state/run/backup.lock`), `restore.lock`, or a backup or restore marker before its deadline.
 
    A plain setup re-run on an installed server refuses in the same cases.
-2. **No-op.** Upgrading to the release that is already live (`stack.json` and `release/current`) is a no-op: it says so and restarts nothing.
+2. **No switch.** Upgrading to the release that is already live (`stack.json` and `release/current`) switches, backs up and restarts nothing. It still runs step 8 (converge), so running the same upgrade again finishes a setup an earlier upgrade left incomplete.
 3. **Backup first.**
    - When backups are set up and the last successful backup is older than 24 hours, it runs `backup.py run`, detached like the switch (step 5): a dropped session does not kill a backup that has Nextcloud in maintenance mode. If that backup fails, nothing is updated. `backup.py` treats SIGHUP and SIGINT like SIGTERM: it unwinds and turns maintenance mode off.
    - `--no-backup` skips the backup, with a warning.
@@ -787,11 +787,21 @@ python3 deploy/vm/stage.py anj-prod --commit <sha> --upgrade --no-backup   # ski
    - it restarts and checks the stack;
    - it switches, then restarts `console`, `watchdog` and `watchers`.
 6. **Timeout.** After 1 hour, setup sends SIGTERM to every process of that session, which makes prod.py fall back (its first signal also ignores every further one, so a second cannot cut the fallback short). After 30 more minutes it sends SIGKILL. It then reports that the state is unknown (check `prod.py status`).
-7. **After the switch.** It refreshes `state/bin/anj-alert` from the new release and restarts `alerts`, only if the dispatcher changed. It records `release` and `last_upgrade` in `setup.json` and writes evidence to `state/setup-log/<UTC>.json`.
+7. **After the switch.** It refreshes `state/bin/anj-alert` from the new release and restarts `alerts`, only if the dispatcher changed. It records `release` and `last_upgrade` in `setup.json`.
+8. **Converge (flag SC-110).** A new release can change what a setup step wants (the PM2 ecosystem's `ddns` arguments, the firewall file, the PM2 lockfile, a timer). The switch alone does not apply that, so the upgrade then runs the **live release's own** `sudo anj-cloud-setup converge` (as root, with no terminal questions):
+   - It reads every step's state under the answers recorded in `setup.json` (with `stack.json`'s host and the live firewall's SSH source). A missing answer refuses rather than guesses; with DDNS on, a missing or placeholder `zone_id` refuses.
+   - It re-applies each step that is no longer "already done", through the same check → apply → verify as an install, **only** for the steps that restart no core service: 2 PM2 (`npm ci` beside the running daemon), 5 Firewall (`nft -c`, then one atomic reload), 6 Journald (restarts `systemd-journald` only), 10 Operations apps (only the missing or changed operations apps; not when the ntfy topic or DNS token is missing), 11 Timers, 12 Updates.
+   - When step 1 Packages, 3 Data disk, 4 Docker, 8 Release or 9 Stack is not done (apt may upgrade Docker; Docker, `prod.py setup` and `up` can restart the gateway, Nextcloud, the database or HAProxy; a step whose state cannot be read counts too), it applies **nothing** and names each step, its state and why. Run `sudo anj-cloud-setup` at a terminal: it shows and applies each step.
+   - It never prompts, issues a pairing code, offers or runs a backup, or writes a secret.
+   - It then runs doctor's checks (read-only). Any problem left fails it.
+
+   The upgrade prints what was re-applied ("Setup re-applied: step 10 Operations apps", or "every step was already done") and "Doctor: all checks pass". Only then does it say "live and healthy" and exit 0. Otherwise it says "Release <commit12> is live …, but this server is NOT fully set up for it", lists every step not applied and every doctor problem with the next command, and exits 1; the switch itself stands. Ctrl-C while converging exits 130: `sudo anj-cloud-setup converge` finishes it (finished steps are kept). The upgrade's evidence (`state/setup-log/<UTC>.json`) lists the re-applied steps under `steps` and converge's result under `converge`; converge writes its own evidence too.
 
 On a failure nothing switches. setup prints the reason and "The live release is still <commit12>; nothing switched", then exits 1. It also says "An alert was sent" only when prod.py reported one (build, verification, health check or interrupt). A refusal before the redeploy started sends none. The old release's tar, tree and image stay in place.
 
 **Rollback.** `sudo anj-cloud-setup upgrade --rollback` switches back to `stack.json`'s `previous_release` through the same path, including the backup first. If the last switch did not finish (`stack.json` names a release that is not live), it rolls back to the live release instead.
+
+After a rollback, step 8 runs the setup of the release that is now live, so the server converges to the **old** release's wants (the command that started the rollback belongs to the newer release; its steps are never applied). A release older than `converge` cannot re-apply anything by itself: the rollback then runs that release's own read-only `doctor` and exits 1 if it finds a problem. Then run `sudo anj-cloud-setup` at a terminal (the old release's setup re-applies what is missing, from the recorded answers) and `sudo anj-cloud-setup doctor`.
 
 The newest prod.py that has `--source` drives a rollback; a release older than #122 has no `--source`. After a rollback to such a release, its installed `anj-cloud-setup` has no `upgrade`. The way forward again is to re-stage from the VM host with `stage.py <vm> --commit <sha> --upgrade`, and setup prints that line. A rollback between two releases that both have `upgrade` can be reversed with another `--rollback`.
 

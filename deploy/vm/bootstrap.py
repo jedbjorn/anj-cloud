@@ -7,6 +7,7 @@
   sudo anj-cloud-setup doctor       find problems and print the fix for each (read-only)
   sudo …/anj-cloud-setup upgrade    switch to the release deploy/vm/stage.py --upgrade staged (decision #122)
   sudo anj-cloud-setup upgrade --rollback   switch back to the previous release (same health-checked path)
+  sudo anj-cloud-setup converge     re-apply the safe steps this release changed, then doctor (upgrade runs it)
   --dry-run                         show what would change; changes nothing, asks no secret
   --answers FILE                    unattended install from a TOML file (secrets by file path only)
   --adopt-data / --restore-from     rebuild onto the existing data disk / from the backup drive
@@ -248,6 +249,22 @@ class System:
             raise SetupError(f"`{argv[0]} {argv[1] if len(argv) > 1 else ''}` failed (exit {code}).{detail}",
                              "Fix the cause above, then run setup again; every finished step is kept.")
         return code, out, err
+
+    def streamed(self, argv, *, timeout=3600):
+        """A changing command run as root whose stderr goes straight to this terminal (its progress)
+        and whose stdout is returned (its result). Skipped in a dry run. Returns (code, stdout)."""
+        self.commands.append({"argv": [str(a) for a in argv]})
+        if self.dry:
+            return 0, ""
+        try:
+            result = subprocess.run([str(a) for a in argv], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=None,
+                                    text=True, timeout=timeout, check=False, cwd="/",
+                                    env=dict(os.environ, LC_ALL="C.UTF-8"))
+        except FileNotFoundError:
+            return 127, ""
+        except subprocess.TimeoutExpired:
+            return 124, ""
+        return result.returncode, result.stdout
 
     def attended(self, argv, *, user=None, timeout=3600):
         """A changing command that talks to the person at the terminal: stdin is inherited (it
@@ -932,6 +949,30 @@ def render_firewall(bind_address, admin_source):
     template = (SOURCE_DIR / "config" / "firewall.nft.tmpl").read_text()
     return template.replace("{{BIND_ADDRESS}}", str(ipaddress.IPv4Address(bind_address))).replace(
         "{{ADMIN_SOURCE}}", str(ipaddress.IPv4Address(admin_source)))
+
+
+def nft_rules(text):
+    """An nftables file without its whole-line comments: what `nft -f` loads (None stays None). A
+    release that only rewords the header comment leaves the firewall step done."""
+    if text is None:
+        return None
+    return [line.rstrip() for line in text.splitlines() if not line.lstrip().startswith("#")]
+
+
+def lock_pins(text):
+    """A package-lock.json without its `license` fields: what `npm ci` installs (every version,
+    resolved URL and integrity digest) is compared, a relicensed root package is not. None when
+    absent or unreadable."""
+    def strip(value):
+        if isinstance(value, dict):
+            return {key: strip(item) for key, item in value.items() if key != "license"}
+        if isinstance(value, list):
+            return [strip(item) for item in value]
+        return value
+    try:
+        return strip(json.loads(text)) if text is not None else None
+    except ValueError:
+        return None
 
 
 def render_template(text, home):
@@ -1708,14 +1749,15 @@ class Setup:
             self.farewell(evidence)
         return 0
 
-    def execute(self, step, position, total):
+    def execute(self, step, position, total, known=None):
         """C-20: [n/N] with a plain name, a purpose and the usual duration; a heartbeat on long
-        steps. The before/after detail goes to the evidence (and --dry-run)."""
+        steps. The before/after detail goes to the evidence (and --dry-run). `known`: the
+        (done, current) the caller just read (converge), so the state is not read twice."""
         label = f"[{position:>2}/{total}] {step.title}"
         self.say(label + (f" ({step.purpose})" if step.purpose else "") + f" — usually {step.expect}")
         entry = {"step": step.number, "name": step.name}
         with guide.Heartbeat(self.say) as beat:
-            done, current = step.state()
+            done, current = known if known is not None else step.state()
             entry["before"] = current
             if done:
                 ok, detail = step.verify()
@@ -2265,6 +2307,11 @@ class Step:
     name = ""
     title, purpose, expect = "", "", "under 1 min"     # the plain-language progress line (C-20)
     fix = "Run setup again; finished steps are kept."
+    # `converge` (after every upgrade or rollback) re-applies a step that is no longer done only
+    # when this is None: the step then never restarts the gateway, Nextcloud, the database or
+    # HAProxy, never prompts and needs no secret it does not already hold. Otherwise this says
+    # why converge stops instead (the operator runs setup at a terminal).
+    disruptive = "it is not safe to apply without the operator"
 
     def __init__(self, setup):
         self.setup = setup
@@ -2284,10 +2331,15 @@ class Step:
         done, current = self.state()
         return done, current
 
+    def reapply_refusal(self, current):
+        """None when converge may apply this step now, else why not (plain words)."""
+        return self.disruptive
+
 
 class Packages(Step):
     number, name = 1, "Packages"
     title, purpose, expect = "Installing system packages", "Docker, Node, firewall tools", "2–5 min"
+    disruptive = "apt may upgrade Docker, which restarts every container"
 
     def docker_choice(self):
         if self.facts.installed("docker-ce"):
@@ -2365,14 +2417,15 @@ class Packages(Step):
 class Pm2(Step):
     number, name = 2, "PM2"
     title, purpose, expect = "Installing PM2", "it keeps the services running", "about 1 min"
+    disruptive = None       # npm ci beside the running daemon, which keeps running (no app restarts)
 
     def pin(self):
         return json.loads((SOURCE_DIR / "pm2" / "package.json").read_text())["dependencies"]["pm2"]
 
     def state(self):
         installed = json.loads(System.text(PM2_DIR / "node_modules" / "pm2" / "package.json") or "{}").get("version")
-        lock = System.text(PM2_DIR / "package-lock.json")
-        if installed != self.pin() or lock != (SOURCE_DIR / "pm2" / "package-lock.json").read_text():
+        lock = lock_pins(System.text(PM2_DIR / "package-lock.json"))
+        if installed != self.pin() or lock is None or lock != lock_pins((SOURCE_DIR / "pm2" / "package-lock.json").read_text()):
             return False, f"PM2 {installed or 'absent'} (pin {self.pin()})"
         if not PM2_LINK.is_symlink() or os.readlink(PM2_LINK) != str(PM2_DIR / "node_modules" / "pm2" / "bin" / "pm2"):
             return False, f"PM2 {installed}, {PM2_LINK} missing"
@@ -2426,6 +2479,7 @@ class Pm2(Step):
 class DataDisk(Step):
     number, name = 3, "Data disk"
     title, purpose, expect = "Preparing the data disk", "", "seconds"
+    disruptive = "it mounts (or formats) the data disk"
     fix = "Check the data disk (`lsblk`), then run setup again."
 
     def device(self):
@@ -2544,6 +2598,7 @@ class DataDisk(Step):
 class Docker(Step):
     number, name = 4, "Docker"
     title, purpose, expect = "Configuring Docker", "its data goes on the data disk", "under 1 min"
+    disruptive = "it restarts the Docker daemon, and with it every container"
 
     def state(self):
         problems = []
@@ -2598,6 +2653,7 @@ class Docker(Step):
 class Firewall(Step):
     number, name = 5, "Firewall"
     title, purpose, expect = "Turning on the firewall", "only 443, and SSH from one address", "seconds"
+    disruptive = None       # checked with nft -c, then one atomic reload; no service restarts
 
     def text(self):
         return render_firewall(self.setup.answers["bind_address"], self.setup.answers["admin_ssh_source"])
@@ -2606,7 +2662,8 @@ class Firewall(Step):
         return (SOURCE_DIR / "systemd" / "anj-cloud-firewall.service").read_text()
 
     def state(self):
-        if System.text(FIREWALL_FILE) != self.text() or System.text(SYSTEMD_DIR / "anj-cloud-firewall.service") != self.unit():
+        if nft_rules(System.text(FIREWALL_FILE)) != nft_rules(self.text()) or \
+                System.text(SYSTEMD_DIR / "anj-cloud-firewall.service") != self.unit():
             return False, "not installed or different"
         code, _, _ = self.system.read(["nft", "list", "table", "inet", "anj_cloud"])
         enabled = self.system.read(["systemctl", "is-enabled", "anj-cloud-firewall.service"])[1].strip()
@@ -2649,6 +2706,7 @@ class Firewall(Step):
 class Journald(Step):
     number, name = 6, "Journald"
     title, purpose, expect = "Keeping system logs", "90 days, at most 1 GiB", "seconds"
+    disruptive = None       # restarts systemd-journald only
 
     def text(self):
         return (SOURCE_DIR / "config" / "zz-anj-cloud-journald.conf").read_text()
@@ -2738,6 +2796,7 @@ class Restore(Step):
 class Release(Step):
     number, name = 8, "Release"
     title, purpose, expect = "Unpacking the release", "", "under 1 min"
+    disruptive = "only a release switch (upgrade) places the live release"
 
     def resolve(self):
         if self.setup.release:
@@ -2836,6 +2895,7 @@ class Stack(Step):
     number, name = 9, "Stack"
     title, purpose, expect = "Starting anj-cloud", "builds the server, waits until healthy", "5–10 min"
     fix = "See `prod.py status`, fix the failing service, then run setup again (finished parts are kept)."
+    disruptive = "prod.py setup and up can restart the gateway, Nextcloud, the database or HAProxy"
 
     def prod(self, *args, change=True, timeout=3600):
         tree = paths.RELEASE_SOURCE_DIR / self.setup.release[:12]
@@ -3052,6 +3112,13 @@ class Stack(Step):
 class Operations(Step):
     number, name = 10, "Operations apps"
     title, purpose, expect = "Starting alerts and monitoring", "", "under 1 min"
+    disruptive = None       # (re)starts only the operations apps that are missing or changed
+
+    def reapply_refusal(self, current):
+        missing = [what for what in ("ntfy topic", "DNS token") if what in current]
+        if missing:
+            return "the " + " and the ".join(missing) + " is missing, and only setup at a terminal asks for it"
+        return None
 
     def apps(self):
         start = self.setup.answers.get("start_stack", True)
@@ -3199,6 +3266,7 @@ def pm2_list(setup):
 class Timers(Step):
     number, name = 11, "Timers"
     title, purpose, expect = "Scheduling backups, reboots and checks", "", "under 1 min"
+    disruptive = None       # unit files, enable, start the timers; no service restarts
 
     def backup(self):
         if not self.setup.backup_units:
@@ -3258,6 +3326,7 @@ class Timers(Step):
 class Updates(Step):
     number, name = 12, "Updates"
     title, purpose, expect = "Turning on security updates", "security fixes only, no automatic reboot", "1–2 min"
+    disruptive = None       # apt configuration files and the update timer
 
     def files(self):
         docker_repo = bool(self.facts.installed("docker-ce"))
@@ -3518,6 +3587,139 @@ def firewall_admin_source():
     return match.group(1) if match else None
 
 
+# converge: after every upgrade and rollback (flag SC-110) ----------------------------------------
+
+CONVERGE_TIMEOUT = 1800         # npm ci, unattended-upgrade --dry-run and doctor; usually under a minute
+PLACEHOLDER_ZONE = "0" * 32     # deploy/profile.example.toml's zone_id: never a real Cloudflare zone
+
+
+def converge_answers(setup):
+    """This install's recorded answers (setup.json, stack.json, the live firewall), for a run that
+    asks nothing. A missing one refuses: converge never guesses, and never uses a placeholder."""
+    stack = json.loads(System.text(paths.STACK_CONFIG) or "{}") if os.access(paths.STATE_ROOT, os.X_OK) else {}
+    if not stack.get("host"):
+        raise SetupError("anj-cloud is not installed on this machine yet.", f"Run the install first: sudo {setup_command()}")
+    record = setup.record
+    answers = {"start_stack": True, "household_lan": stack.get("household_lan"), "bind_address": stack.get("bind_address"),
+               "admin_ssh_source": firewall_admin_source(), "timezone": record.get("timezone")}
+    answers.update({key: value for key, value in (record.get("answers") or {}).items()
+                    if key in ANSWER_KEYS and value is not None})
+    answers["host"] = stack["host"]
+    if record.get("accounts"):
+        answers["accounts"] = list(record["accounts"])
+    missing = [key for key in ("ddns", "household_lan", "bind_address", "admin_ssh_source", "timezone")
+               if not answers.get(key)]
+    if answers.get("ddns") == "on" and answers.get("zone_id", PLACEHOLDER_ZONE) == PLACEHOLDER_ZONE:
+        missing.append("zone_id")
+    if missing:
+        raise SetupError(f"setup.json does not record {', '.join(missing)}, so no setup step was re-applied.",
+                         f"Run `sudo {setup_command()}` once at a terminal: it asks for what is missing and records it.")
+    return validate_answers(answers)
+
+
+def converge(setup):
+    """`anj-cloud-setup converge`: make this server what the live release's setup wants, asking
+    nothing. `upgrade` runs it with the live release's own code after every switch (and on an
+    upgrade to the live release), so a rollback converges to the old release's wants.
+
+    Every step's state is read under the recorded answers. A step that is not done is re-applied
+    through the same execute() (state -> apply -> verify) as an install, when it is safe
+    (Step.disruptive is None): PM2, firewall, journald, operations apps, timers, updates. When any
+    other step (packages, data disk, Docker, release, stack) is not done, nothing is applied and it
+    says which and why: those can restart the gateway, Nextcloud, the database or HAProxy. No
+    prompt, pairing code, backup or secret. Then doctor's checks; any problem left is a failure.
+
+    Returns (exit code, result); `upgrade` records the result in its evidence."""
+    result = {"result": None, "steps": setup.steps, "blocked": [], "problems": [], "evidence": None}
+    setup.answers = converge_answers(setup)
+    setup.mode = "converge"
+    stack = json.loads(System.text(paths.STACK_CONFIG) or "{}")
+    release, live = stack.get("release") or "", Upgrade.live()
+    if not release or live != release[:12]:
+        raise SetupError(f"release/current ({live or 'missing'}) is not the recorded release ({release[:12] or '-'}): a "
+                         "switch did not finish, so no setup step was re-applied.",
+                         f"`sudo {setup_command()} upgrade --rollback` returns to the live release; then run this again.")
+    if Path(ROOT).resolve() != Path(os.path.realpath(paths.RELEASE_CURRENT)):
+        raise SetupError(f"This copy of anj-cloud-setup ({ROOT}) is not the live release's; converge applies only the "
+                         "live release's setup.", f"Run the installed command: sudo {setup_command()} converge")
+    busy = ops_busy()
+    if busy:
+        raise SetupError(f"Not now: {busy}. Nothing was changed.",
+                         f"Run `sudo {setup_command()} converge` when it has finished.")
+    setup.release = release
+    setup.say(f"Checking every setup step against release {release[:12]} …")
+    pending, blocked = [], []
+    for step in setup.step_list():
+        if isinstance(step, (Ssh, Restore)):
+            continue
+        try:
+            done, current = step.state()
+        except SetupError as error:
+            done, current = False, f"unreadable ({error})"
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            done, current = False, f"unreadable ({guide.plain_error(error)})"
+        if done:
+            continue
+        why = "its state could not be read" if current.startswith("unreadable") else step.reapply_refusal(current)
+        (blocked if why else pending).append((step, current, why))
+    if blocked:
+        result["blocked"] = [{"step": step.number, "name": step.name, "state": current, "why": why}
+                             for step, current, why in blocked]
+        setup.say("\nThese setup steps are not done under this release, and are not applied without you:")
+        for step, current, why in blocked:
+            setup.say(f"  Step {step.number} {step.name}: {current}\n    not applied: {why}")
+        if pending:
+            setup.say("Nothing was applied; also waiting: " + ", ".join(f"step {s.number} {s.name}" for s, _c, _w in pending))
+        setup.say(f"Next, at a terminal: `sudo {setup_command()}` shows each step and applies it (it re-runs only what is "
+                  f"missing); `sudo {setup_command()} doctor` lists what is wrong.")
+        result["result"] = "blocked"
+        result["evidence"] = str(setup.write_evidence("blocked", quiet=True, command="converge", blocked=result["blocked"]))
+        return 1, result
+    if pending:
+        setup.say(f"Re-applying {len(pending)} setup step(s) that are not done for this release:")
+    for position, (step, current, _why) in enumerate(pending, 1):
+        setup.current = (position, len(pending), step)
+        try:
+            setup.execute(step, position, len(pending), known=(False, current))
+        except SetupError as error:
+            return converge_failed(setup, result, step, str(error), error.fix)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            return converge_failed(setup, result, step, guide.plain_error(error), None)
+    # Doctor's own checks, read-only by construction: what `sudo anj-cloud-setup doctor` reports.
+    setup.facts._cache.clear()
+    dry = setup.system.dry
+    setup.system.dry = setup.read_only = True
+    try:
+        problems, _status = doctor(setup)
+    finally:
+        setup.system.dry, setup.read_only = dry, False
+    result["problems"] = [problem for _name, problem, _fix in problems]
+    applied = ", ".join(f"step {entry['step']} {entry['name']}" for entry in setup.steps) or "none needed"
+    if problems:
+        setup.say(f"\nDoctor still finds {len(problems)} problem(s) (setup re-applied: {applied}):")
+        for _name, problem, fix in problems:
+            setup.say(f"PROBLEM {problem}\n  Fix: {fix}")
+        result["result"] = "problems remain"
+        result["evidence"] = str(setup.write_evidence("problems remain", quiet=True, command="converge",
+                                                      problems=result["problems"]))
+        return 1, result
+    setup.say(f"Setup re-applied: {applied}. Doctor: all checks pass.")
+    result["result"] = "converged"
+    result["evidence"] = str(setup.write_evidence("converged", quiet=True, command="converge"))
+    return 0, result
+
+
+def converge_failed(setup, result, step, what, fix):
+    setup.say(f"\nRe-applying step {step.number} ({step.name}) failed: {what}")
+    if fix:
+        setup.say(f"Fix: {fix}")
+    setup.say(f"Steps already re-applied are kept; `sudo {setup_command()} converge` continues.")
+    result["result"] = "failed"
+    result["problems"] = [f"Step {step.number} {step.name}: {what}"]
+    result["evidence"] = str(setup.write_evidence("failed", quiet=True, command="converge", error=what))
+    return 1, result
+
+
 # first-code --reissue ----------------------------------------------------------------------
 
 def reissue(setup):
@@ -3557,6 +3759,11 @@ def prod_takes_source(tree):
 def setup_has_upgrade(tree):
     """Whether a release tree's anj-cloud-setup knows `upgrade` (releases before #122 do not)."""
     return '"upgrade"' in (System.text(Path(tree) / "deploy" / "vm" / "bootstrap.py") or "")
+
+
+def setup_has_converge(tree):
+    """Whether a release tree's anj-cloud-setup knows `converge` (releases before SC-110 do not)."""
+    return '"converge"' in (System.text(Path(tree) / "deploy" / "vm" / "bootstrap.py") or "")
 
 
 def lock_held(path):
@@ -3610,9 +3817,15 @@ class Upgrade:
     First a backup when backups are set up and the last success is older than 24 hours (review
     H2 (1)); `--no-backup` skips it with a warning. prod.py runs in its own session without a
     terminal, so Ctrl-C or a dropped ssh never reaches it: it finishes, or falls back by itself
-    (review H1). Upgrading to the live release is a no-op. Secrets, accounts, the data disk and
-    every other step's work are never touched. The running command is maintenance to the watchdog
-    (`anj-cloud-setup` with a changing command, bounded at 15 minutes, decision #113)."""
+    (review H1). Upgrading to the live release switches nothing. Secrets, accounts and the data
+    disk are never touched. The running command is maintenance to the watchdog (`anj-cloud-setup`
+    with a changing command, bounded at 15 minutes, decision #113).
+
+    After the switch, and on an upgrade to the live release, the live release's own setup runs
+    `converge` (flag SC-110): it re-applies the safe setup steps whose wants changed with the
+    release, stops at a disruptive one, and runs doctor. Its exit code is the upgrade's: a server
+    that is not fully set up for the live release is never reported "live and healthy". A live
+    release older than `converge` (a rollback) is checked with its own read-only doctor instead."""
 
     def __init__(self, setup):
         self.setup = setup
@@ -3767,9 +3980,12 @@ class Upgrade:
         stack, live = self.stack(), self.live()
         before = live or (stack.get("release") or "-")[:12]
         if stack.get("release") == commit and live == commit[:12]:
-            setup.say(f"Release {commit[:12]} is already live on {setup.answers.get('host')}; nothing to do.")
-            setup.write_evidence("already current", quiet=True, command=command)
-            return 0
+            setup.say(f"Release {commit[:12]} is already live on {setup.answers.get('host')}; nothing to switch.")
+            converged = self.converge_live()
+            code = self.report_converge(converged)
+            setup.write_evidence("already current" + ("" if code == 0 else ", setup not converged"), quiet=True,
+                                 command=command, converge=self.converge_evidence(converged))
+            return code
         verb = "Rolling back" if rollback else "Updating"
         setup.say(f"{verb} {setup.answers.get('host')}: release {before} -> {commit[:12]}")
         backup = self.backup_first(no_backup)
@@ -3804,20 +4020,107 @@ class Upgrade:
             "from": previous, "to": commit[:12], "rollback": rollback,
             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")})
         operations = result.get("operations") or {}
-        setup.say(f"\nRelease {commit[:12]} is live and healthy (was {previous}; {guide.duration(elapsed)}).")
+        converged = self.converge_live()
+        if converged["code"] == 0:
+            setup.say(f"\nRelease {commit[:12]} is live and healthy (was {previous}; {guide.duration(elapsed)}).")
+        else:
+            setup.say(f"\nRelease {commit[:12]} is live (was {previous}; {guide.duration(elapsed)}), but this server is NOT "
+                      "fully set up for it.")
         if operations:
             setup.say("  Operations apps: " + ", ".join(f"{app} {state}" for app, state in sorted(operations.items())))
         if dispatcher != "unchanged":
             setup.say(f"  Alert dispatcher: {dispatcher}")
+        code = self.report_converge(converged)
         if setup_has_upgrade(paths.RELEASE_CURRENT):
             setup.say(f"  Release {previous} is kept: `sudo {setup_command()} upgrade --rollback` switches back.")
         else:
             # Review L1: this release predates `upgrade`; forward again only by re-staging.
             setup.say(f"  Release {previous} is kept. This release has no `upgrade` command: to go forward again, on the VM host "
                       f"run `deploy/vm/stage.py <vm> --commit {previous} --upgrade`.")
-        setup.write_evidence("rolled back" if rollback else "upgraded", quiet=False, command=command,
-                             previous=previous, operations=operations, dispatcher=dispatcher, backup=backup)
-        return 0
+        setup.write_evidence(("rolled back" if rollback else "upgraded") + ("" if code == 0 else ", setup not converged"),
+                             quiet=False, command=command, previous=previous, operations=operations,
+                             dispatcher=dispatcher, backup=backup, converge=self.converge_evidence(converged))
+        return code
+
+    # After the switch: the live release's setup converges (flag SC-110) --------------------------
+    def converge_live(self):
+        """`converge` of the live release's own anj-cloud-setup (as root; its progress goes straight to
+        the terminal, its result comes back as one JSON line), so the setup a rollback re-applies is
+        the old release's. A live release older than `converge` gets its own read-only `doctor`.
+        Returns {via, code, result, steps, blocked, problems, evidence}. The steps it re-applied
+        become this run's evidence steps."""
+        setup = self.setup
+        tree = Path(os.path.realpath(paths.RELEASE_CURRENT))
+        launcher = tree / "deploy" / "vm" / "anj-cloud-setup"
+        outcome = {"via": "converge", "code": 1, "result": None, "steps": [], "blocked": [], "problems": [],
+                   "evidence": None}
+        try:
+            if setup_has_converge(tree):
+                setup.say("  Setup: re-applying what this release changed (asks nothing; restarts no core service) …")
+                code, out = self.system.streamed(["python3", "-I", str(launcher), "converge", "--json"],
+                                                 timeout=CONVERGE_TIMEOUT)
+                try:
+                    result = json.loads((out.strip().splitlines() or ["{}"])[-1])
+                except ValueError:
+                    result = {}
+                result = result if isinstance(result, dict) else {}
+                outcome.update({key: result[key] for key in ("steps", "blocked", "problems", "evidence")
+                                if result.get(key)})
+                outcome["result"] = result.get("result") or f"converge exit {code}"
+                outcome["code"] = code if code != 0 or result.get("result") == "converged" else 1
+            else:
+                outcome["via"] = "doctor"
+                setup.say(f"  Setup: release {tree.name} predates `converge`; checking it with its own doctor …")
+                code, out = self.system.streamed(["python3", "-I", str(launcher), "doctor"], timeout=CONVERGE_TIMEOUT)
+                for line in out.splitlines():
+                    setup.say("    " + line)
+                outcome["problems"] = [line[len("PROBLEM "):] for line in out.splitlines() if line.startswith("PROBLEM ")]
+                outcome["result"] = "doctor passes" if code == 0 else "doctor found problems"
+                outcome["code"] = code
+        except KeyboardInterrupt:
+            outcome.update(code=130, result="interrupted")
+        setup.steps = list(outcome["steps"])
+        return outcome
+
+    def report_converge(self, converged):
+        """The setup lines of the final output; returns the upgrade's exit code."""
+        setup = self.setup
+        command = setup_command()
+        applied = ", ".join(f"step {entry.get('step')} {entry.get('name')}" for entry in converged["steps"])
+        if converged["code"] == 0:
+            if converged["via"] == "doctor":
+                setup.say("  Setup: this release cannot re-apply its setup by itself; its doctor finds nothing wrong.")
+            else:
+                setup.say(f"  Setup re-applied: {applied}" if applied else
+                          "  Setup: every step was already done for this release.")
+            setup.say("  Doctor: all checks pass.")
+            return 0
+        if converged["code"] == 130:
+            setup.say(f"  Setup: stopped while re-applying it. Finish it: sudo {command} converge")
+            return 130
+        if applied:
+            setup.say(f"  Setup re-applied: {applied}")
+        for item in converged["blocked"]:
+            setup.say(f"  NOT APPLIED step {item.get('step')} {item.get('name')}: {item.get('state')} — {item.get('why')}")
+        for problem in converged["problems"]:
+            setup.say(f"  PROBLEM {problem}")
+        if not converged["blocked"] and not converged["problems"]:
+            setup.say(f"  Setup: {converged['result']} (see the output above).")
+        if converged["via"] == "doctor":
+            setup.say(f"Next: this release cannot re-apply its setup by itself. At a terminal, `sudo {command}` re-applies "
+                      f"what is missing (its questions default to the recorded answers); then `sudo {command} doctor`.")
+        elif converged["blocked"]:
+            setup.say(f"Next: these steps can restart services or need you. At a terminal, `sudo {command}` shows and "
+                      f"applies each one; then `sudo {command} doctor`.")
+        else:
+            setup.say(f"Next: fix each problem, then `sudo {command} converge` (or `sudo {command} doctor` to check).")
+        if converged["evidence"]:
+            setup.say(f"Details (no secrets): {converged['evidence']}")
+        return converged["code"] if converged["code"] not in (0, None) else 1
+
+    @staticmethod
+    def converge_evidence(converged):
+        return {key: converged[key] for key in ("via", "code", "result", "blocked", "problems", "evidence")}
 
     def failed(self, command, verb, commit, before, code, err, elapsed, logs):
         setup = self.setup
@@ -3880,9 +4183,9 @@ def parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog="Answers file keys: " + ", ".join(sorted(ANSWER_KEYS)))
     p.add_argument("command", nargs="?", default="install",
-                   choices=("install", "pair", "backup", "status", "doctor", "first-code", "upgrade"),
-                   help="install (default), pair, backup, status, doctor, upgrade [--rollback]; first-code --reissue "
-                        "(= pair --new-code, no waiting)")
+                   choices=("install", "pair", "backup", "status", "doctor", "first-code", "upgrade", "converge"),
+                   help="install (default), pair, backup, status, doctor, upgrade [--rollback]; converge (what upgrade "
+                        "runs after a switch); first-code --reissue (= pair --new-code, no waiting)")
     p.add_argument("--dry-run", action="store_true", help="Plan only: change nothing, ask no secret")
     p.add_argument("--answers", help="Non-interactive: TOML answers file (secrets only by file path)")
     p.add_argument("--adopt-data", action="store_true", help="Rebuild onto an existing anj-cloud data disk")
@@ -3891,7 +4194,7 @@ def parser():
     p.add_argument("--host", help="Public hostname (overrides the answers file)")
     p.add_argument("--ddns", choices=("on", "off"), help="DDNS on or off (overrides the answers file)")
     p.add_argument("--data-disk", help="Data disk device (overrides the answers file)")
-    p.add_argument("--json", action="store_true", help="status: JSON")
+    p.add_argument("--json", action="store_true", help="status: JSON; converge: its result as one JSON line on stdout")
     p.add_argument("--new-code", action="store_true", help="pair: replace the first device's pairing code")
     p.add_argument("--show-password", action="store_true", help="backup: show the backup password again")
     p.add_argument("--reissue", action="store_true", help="first-code: replace the first admin pairing code")
@@ -3997,6 +4300,25 @@ def main(argv=None, *, system=None, facts=None, prompter=None, out=sys.stdout):
             setup.mode = "upgrade"
             return Upgrade(setup).run(rollback=args.rollback, source=args.source, expect=args.expect,
                                       no_backup=args.no_backup)
+        if args.command == "converge":
+            if args.dry_run or args.answers or args.adopt_data or args.restore_from or args.source or args.rollback \
+                    or args.no_backup or args.expect:
+                parser().error("converge takes only --json (it uses the recorded answers; doctor is its dry run)")
+            if args.json and out is sys.stdout:
+                setup.out = sys.stderr          # stdout carries only the result line (`upgrade` reads it)
+            try:
+                if os.geteuid() != 0:
+                    raise SetupError("converge needs root.", f"Run it with sudo: sudo {setup_command()} converge")
+                code, result = converge(setup)
+            except SetupError as error:
+                setup.say(f"anj-cloud-setup: {error}")
+                if error.fix:
+                    setup.say(f"Fix: {error.fix}")
+                code, result = 1, {"result": "refused", "steps": setup.steps, "blocked": [],
+                                   "problems": [str(error)], "evidence": None}
+            if args.json:
+                print(json.dumps(result, sort_keys=True), file=out, flush=True)
+            return code
         if args.rollback or args.no_backup or args.expect:
             parser().error("--rollback, --no-backup and --expect belong to upgrade")
         if args.dry_run:
