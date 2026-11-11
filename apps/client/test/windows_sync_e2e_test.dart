@@ -6,7 +6,7 @@ library;
 // (anj-cloud-review-<tag>), the reverse forward that makes the stack's
 // https://127.0.0.1:<port> reachable from this guest, the invitations and
 // the operator approvals. Skipped unless ANJ_W4_CONFIG names its JSON:
-//   {"origin", "ca", "other_server_code", "code_a", "qr_b", "denied_code",
+//   {"origin", "ca", "other_origin", "code_a", "qr_b", "denied_code",
 //    "names_folder", "work" (absent), "signal" (handshake directory)}
 // Two Windows devices of one account pair through the real controller
 // (DPAPI secrets, anj_rootfs.dll, in-process device crypto) and reconcile
@@ -188,15 +188,33 @@ void main() {
 
       final devices = <_Device>[];
       try {
-        // A code pinned to another server's CA, and a code the server never
-        // issued (or denied): refused before any file access.
+        // A code tried at a server with another CA, and a code the server
+        // never issued (or denied): refused before any file access.
         final probe = await controllerFor('refused');
-        await refusedPairing(
-          'a code for another server',
-          probe,
-          () => probe.pair(origin, config['other_server_code'] as String),
+        // Invitation A, which the stack would accept, tried at a server
+        // whose CA the code does not pin: only the device's check of the pin
+        // can refuse it, with that reason. The driver checks that server
+        // saw nothing but the request for its CA; the code pairs below.
+        final otherOrigin = config['other_origin'] as String;
+        Object? pinRefusal;
+        try {
+          await probe.pair(otherOrigin, config['code_a'] as String);
+        } catch (error) {
+          pinRefusal = error;
+        }
+        expect(
+          pinRefusal,
+          isA<PairingRefused>().having(
+            (e) => e.message,
+            'message',
+            notThisServer,
+          ),
         );
-        expect(probe.ca ?? '', isEmpty, reason: 'no trust anchor stored');
+        expect(probe.pairingState, isNot('paired'));
+        expect(probe.pairingState, isNot('pending'));
+        record('pairing refused: a real code at a server with another CA', {
+          'message': (pinRefusal as PairingRefused).message,
+        });
         await refusedPairing(
           'unknown invitation',
           probe,

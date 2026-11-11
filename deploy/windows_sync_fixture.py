@@ -1,4 +1,4 @@
-"""Windows pairing and sync on a review stack (spec #32 W4, Acceptance rows 8 and 12).
+"""Windows pairing and two-way sync on a review stack.
 
     ANJ_WIN_OWNER=w4 deploy/.local/access-venv/bin/python -m deploy.windows_sync_fixture \\
         --project anj-cloud-review-w4 --port 18871 --evidence <dir>
@@ -6,11 +6,14 @@
 Needs a started W10C-Testing lease of this lane (tool/windows_seat.sh start) with the client
 pushed and anj_rootfs.dll built (tool/windows/native_test.ps1 -Dart), and an `up` review stack.
 It owns, for this run only:
-  - three invitations for anj-fixture-alice (one denied), the QR image of one, and a
-    well-formed code pinned to another server's CA;
+  - three invitations for anj-fixture-alice (one denied) and the QR image of one;
+  - a second HTTPS server on <port + 1> with a CA of its own, which answers only `GET /v1/ca`:
+    a real, unused code tried there must be refused by the device because the code pins the
+    stack's CA, and that server must see no other request;
   - remote names Windows cannot hold, written straight to Nextcloud (the gateway refuses them);
-  - an SSH reverse forward so the guest reaches https://127.0.0.1:<port> (the dev certificate);
-  - the operator approvals of the guest's two devices (a wrong fingerprint first, refused);
+  - an SSH reverse forward so the guest reaches both at https://127.0.0.1:<port> and <port + 1>;
+  - the operator approvals of the guest's two devices by fingerprint (a wrong fingerprint first,
+    refused). The stack runs no console backend, so the server does not approve by itself;
 and runs test/windows_sync_e2e_test.dart in the console session, unelevated. Afterwards it
 checks the server bytes the guest expects, revokes both devices, deletes the fixture folders
 and removes its files from the guest. Codes and keys never enter the evidence.
@@ -18,18 +21,20 @@ and removes its files from the guest. Codes and keys never enter the evidence.
 
 import argparse
 import hashlib
+import http.server
 import json
 import os
 from pathlib import Path
 import secrets
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from deploy.access_operator import Operator
 from deploy.dev import FIXTURE_USERS, Stack
-from services.access.codes import CA_PIN_BYTES, PINNED_SECRET_BYTES, pinned_code
 
 CLIENT = Path(__file__).resolve().parent.parent / "apps/client"
 SEAT = CLIENT / "tool/windows_seat.sh"
@@ -68,6 +73,40 @@ def guest_file(name):
     return text.strip() or None
 
 
+def other_server(work, port):
+    """An HTTPS server with its own CA that serves that CA at /v1/ca and nothing else. Returns the
+    server and the list of request lines it received."""
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                    "-keyout", str(work / "other.key"), "-out", str(work / "other-ca.crt"), "-days", "2",
+                    "-subj", "/CN=Not this stack's issuer", "-addext", "subjectAltName=IP:127.0.0.1"],
+                   check=True, capture_output=True)
+    pem = (work / "other-ca.crt").read_bytes()
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def answer(self):
+            seen.append(f"{self.command} {self.path}")
+            found = self.command == "GET" and self.path == "/v1/ca"
+            body = pem if found else b""
+            self.send_response(200 if found else 404)
+            self.send_header("Content-Type", "application/x-pem-file")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = answer
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(work / "other-ca.crt", work / "other.key")
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
+
+
 def step(name, ok=True, **facts):
     print(("PASS " if ok else "FAIL ") + name + (f" {json.dumps(facts)}" if facts else ""), flush=True)
     if not ok:
@@ -89,16 +128,17 @@ def main():
     operator = Operator(stack)
     nonce = secrets.token_hex(4)
     names_folder = f"Documents/w4-names-{nonce}"
-    devices, forward, prefix = [], None, None
+    devices, forward, prefix, other = [], None, None, None
+    other_port = args.port + 1
     work = Path(tempfile.mkdtemp(prefix="anj-w4-"))
     try:
         # Invitations: typed (A), QR image (B), and one denied before use.
         invites = {label: operator.call("invite", uid=UID, rights="write") for label in ("a", "b", "denied")}
         operator.call("deny", pairing_id=invites["denied"]["id"])
         subprocess.run(["qrencode", "-o", str(work / "invite-b.png"), "-s", "8", invites["b"]["code"]], check=True)
-        # A code of the right shape whose CA pin is not this stack's: the client must refuse it
-        # before it stores or sends anything.
-        other_server = pinned_code(secrets.token_bytes(PINNED_SECRET_BYTES), secrets.token_bytes(CA_PIN_BYTES))
+        # A server whose CA is not the one the codes pin. Invitation A is tried there first: the
+        # stack would accept that code, so only the device's check of the pin can refuse it.
+        other, other_seen = other_server(work, other_port)
         # Names Windows cannot hold, straight into Nextcloud (the gateway refuses them, #120).
         for parent in (BACKEND, BACKEND + "Documents"):  # A fresh stack has neither yet.
             stack.dav("MKCOL", UID, parent, expected=(201, 405))
@@ -124,7 +164,8 @@ def main():
                 print(f"INFO Nextcloud refused {name!r}: {error}", flush=True)
         step("remote names written to Nextcloud", created=created)
 
-        config = {"origin": stack.origin, "ca": GUEST + r"\issuer.crt", "other_server_code": other_server,
+        config = {"origin": stack.origin, "ca": GUEST + r"\issuer.crt",
+                  "other_origin": f"https://127.0.0.1:{other_port}",
                   "code_a": invites["a"]["code"], "qr_b": GUEST + r"\invite-b.png",
                   "denied_code": invites["denied"]["code"], "names_folder": names_folder,
                   "work": GUEST + r"\run", "signal": GUEST + r"\signal"}
@@ -137,9 +178,11 @@ def main():
         for name in ("config.json", "invite-b.png"):
             (work / name).unlink()  # The codes stay off this host's disk too.
 
-        # The guest's 127.0.0.1:<port> is this stack, so the dev certificate's name verifies.
+        # The guest's 127.0.0.1:<port> is this stack, so the dev certificate's name verifies;
+        # <port + 1> is the other server.
         forward = subprocess.Popen(["ssh", *SSH, "-N", "-o", "ExitOnForwardFailure=yes",
-                                    "-R", f"127.0.0.1:{args.port}:127.0.0.1:{args.port}", f"{USER}@{HOST}"])
+                                    "-R", f"127.0.0.1:{args.port}:127.0.0.1:{args.port}",
+                                    "-R", f"127.0.0.1:{other_port}:127.0.0.1:{other_port}", f"{USER}@{HOST}"])
         time.sleep(3)
         if forward.poll() is not None:
             raise RuntimeError("reverse forward did not start")
@@ -171,6 +214,9 @@ def main():
         (args.evidence / "progress.json").write_text(progress or "[]")
         step("the Windows test ran", ok=code == 0 and "All tests passed" in log,
              tail=log.strip().splitlines()[-3:] if log.strip() else [])
+        # The other server was asked for its CA, and for nothing else: no enrolment, no code.
+        step("the other server saw only the request for its CA",
+             ok=bool(other_seen) and set(other_seen) == {"GET /v1/ca"}, requests=sorted(set(other_seen)))
         expected = json.loads(guest_file("expect.json") or "{}")
         prefix = expected.get("prefix")
         for path, digest in expected.get("files", {}).items():
@@ -180,6 +226,9 @@ def main():
         if forward is not None:
             forward.terminate()
             forward.wait(timeout=10)
+        if other is not None:
+            other.shutdown()
+            other.server_close()
         for device in devices:
             try:
                 operator.revoke(device)
