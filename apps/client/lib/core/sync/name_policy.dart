@@ -42,12 +42,32 @@ const nameFolderPendingStatus =
 
 bool isNameRefusal(String status) => status == nameNotAllowedStatus;
 
-/// A cloud item this device cannot hold under its name because another
-/// item here already has it (spec #33 I2 target check): the item stays at
-/// its own path, nothing is deleted or downloaded, and the row says where
+/// Statuses of a server item this device cannot hold under its name
+/// (decision #120 Q2; `NameHolds`): Cloud-only and never created here. This
+/// device has no copy to rename, so the row offers no Rename and says where
 /// the fix is.
+const serverNameNotAllowedStatus =
+    'Cloud only: name not allowed on this device. Rename it on another device to get it here';
 const serverNameClashStatus =
     'Cloud only: another item here has the same name on this device. Rename one on another device to get both here';
+const serverFolderNameStatus =
+    'Cloud only: its folder name is not allowed on this device';
+
+/// Information on a row whose full path on this device is over 259
+/// characters (Windows, spec #32 File Names): it syncs normally, but some
+/// other Windows apps cannot open it while long paths are off.
+const longPathNote = 'Long path: some Windows apps may not open this';
+const win32MaxPath = 259;
+
+bool isServerNameHold(String status) =>
+    status == serverNameNotAllowedStatus ||
+    status == serverNameClashStatus ||
+    status == serverFolderNameStatus;
+
+/// A file another program holds open without read sharing (Windows; SC-048
+/// F5): left as it is until a later pass can read it.
+const fileBusyStatus = 'Open in another app: syncs when it is closed';
+bool isBusyStatus(String status) => status == fileBusyStatus;
 
 /// The gateway refused a create or rename: 422 `name-not-portable`, for
 /// example a sibling clash that appeared after the last listing, or a

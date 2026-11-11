@@ -48,6 +48,17 @@ void main() {
         _row('Documents/readme.txt'),
         _row('Documents/.bashrc'),
         _row('Documents/old.txt', status: 'removed locally'),
+        // A server name this Windows device cannot hold (#120 Q2).
+        {
+          ..._row('Documents/a.txt', status: serverNameClashStatus),
+          'presentationErrors': [serverNameClashStatus],
+          'effectiveRetention': 'cloud',
+        },
+        // A full path over 259 characters on Windows: information only.
+        {
+          ..._row('Documents/deep.txt'),
+          'presentationNotes': [longPathNote],
+        },
       ];
   });
   tearDown(() {
@@ -97,6 +108,32 @@ void main() {
     );
     expect(
       find.byKey(const ValueKey('rename:Documents/.bashrc')),
+      findsNothing,
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('a held server name is amber with its reason and no Rename; '
+      'a long path shows its note without amber', (tester) async {
+    await open(tester);
+    expect(
+      inCard('Documents/a.txt', find.text(serverNameClashStatus)),
+      findsOneWidget,
+    );
+    expect(
+      inCard('Documents/a.txt', find.widgetWithText(Chip, 'Needs attention')),
+      findsOneWidget,
+    );
+    expect(find.byKey(const ValueKey('rename:Documents/a.txt')), findsNothing);
+    expect(
+      inCard('Documents/deep.txt', find.text(longPathNote)),
+      findsOneWidget,
+    );
+    expect(
+      inCard(
+        'Documents/deep.txt',
+        find.widgetWithText(Chip, 'Needs attention'),
+      ),
       findsNothing,
     );
     expect(tester.takeException(), isNull);

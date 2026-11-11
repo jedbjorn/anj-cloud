@@ -226,7 +226,8 @@ SyncStatus deriveStatus({
         (e) =>
             e.conflict != null ||
             isSizeRefusal(e.status) ||
-            isNameRefusal(e.status),
+            isNameRefusal(e.status) ||
+            isServerNameHold(e.status),
       )) {
     return SyncStatus.attention;
   }

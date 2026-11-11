@@ -24,6 +24,10 @@ String uniqueId() => List.generate(
   16,
   (_) => Random.secure().nextInt(256).toRadixString(16).padLeft(2, '0'),
 ).join();
+
+/// EBUSY in the boundary's errno numbering (the same on every platform).
+const fileBusyErrno = 16;
+
 void validateRelative(String path) {
   if (path.isEmpty ||
       path.startsWith('/') ||
@@ -226,6 +230,12 @@ class RootTree {
   /// EXDEV ("Invalid cross-device link") on Linux and macOS.
   static const _exdev = 18;
 
+  /// Files a pass could not read because another program holds them open
+  /// without read sharing (EBUSY from the boundary). The engine neither
+  /// uploads, downloads over, nor infers a deletion for them, and shows them
+  /// as busy; each later pass tries them again. A full scan starts afresh.
+  final Set<String> busy = {};
+
   /// Stored index for a path (set by the engine): the stamp, the hash read
   /// with it, when that read began (wall-clock microseconds) and whether that
   /// read was final (taken at least [confirmMicros] after the last ctime).
@@ -326,6 +336,7 @@ class RootTree {
   }) async {
     native.checkRoot(fd, root.path);
     _readWriteback();
+    busy.clear();
     final decide = _decider();
     final result = <String, LocalItem>{};
     for (final item in native.scan(fd)) {
@@ -358,6 +369,15 @@ class RootTree {
   }) {
     if (path.isNotEmpty) validateRelative(path);
     native.checkRoot(fd, root.path);
+    // What this listing reads is decided afresh, as in [snapshot].
+    busy.removeWhere(
+      (held) =>
+          path.isEmpty && recursive ||
+          held == path ||
+          (recursive
+              ? p.posix.isWithin(path, held)
+              : p.posix.dirname(held) == (path.isEmpty ? '.' : path)),
+    );
     final listed = _exact(path, native.watchScan(watch, fd, path, recursive));
     final decide = _decider(reuse: reuse);
     final items = <String, LocalItem>{};
@@ -612,12 +632,18 @@ class RootTree {
           hash = reuse[path]!.hash;
         } else {
           final began = wallMicros();
-          final read = native.copyAndHashStamped(
-            fd,
-            path,
-            null,
-            purpose: 'scan',
-          );
+          final ({String hash, String stamp}) read;
+          try {
+            read = native.copyAndHashStamped(fd, path, null, purpose: 'scan');
+          } on FileSystemException catch (error) {
+            // Another program holds the file without read sharing (Windows
+            // sharing modes; SC-048 F5): this pass leaves it out and the
+            // engine changes nothing for it; a later pass reads it again.
+            if (error.osError?.errorCode != fileBusyErrno) rethrow;
+            busy.add(path);
+            return null;
+          }
+          busy.remove(path);
           hash = read.hash;
           // Record the stamp only when the read proves it matches the scan.
           if (trusted0 && read.stamp == scanStamp) {
