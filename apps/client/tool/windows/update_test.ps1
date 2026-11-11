@@ -64,6 +64,21 @@ public static class W {
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
 }
+// A process as the app starts its manager for the hand-over: DETACHED_PROCESS
+// and no handle inheritance, so no console and no standard handles.
+public static class Detached {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct SI { public int cb; public string r, d, t; public int x, y, xs, ys, xc, yc, fa, flags; public short sw, cb2; public IntPtr r2, i, o, e; }
+  [StructLayout(LayoutKind.Sequential)] struct PI { public IntPtr p, t; public int pid, tid; }
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessW(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref SI si, out PI pi);
+  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr h, uint ms);
+  [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+  public static string Run(string commandLine, uint waitMs) {
+    var si = new SI(); si.cb = Marshal.SizeOf(typeof(SI)); PI pi;
+    if (!CreateProcessW(null, new System.Text.StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false, 0x8, IntPtr.Zero, null, ref si, out pi)) return "CreateProcess failed " + Marshal.GetLastWin32Error();
+    if (WaitForSingleObject(pi.p, waitMs) != 0) return "still running after " + waitMs + " ms";
+    uint code; GetExitCodeProcess(pi.p, out code); return "exit code " + code;
+  }
+}
 '@
 function Wait-Until([scriptblock]$condition, [int]$seconds) {
   $deadline = (Get-Date).AddSeconds($seconds)
@@ -127,6 +142,13 @@ try {
   $receipt = Get-Content (Join-Path $releaseA 'bundle-receipt.json') -Raw | ConvertFrom-Json
   Check 'the installed receipt carries its version' ($receipt.version_code -ge 1 -and $receipt.version_code -lt $code -and $receipt.version) "$($receipt.version) ($($receipt.version_code))"
   Check 'the installed release carries a release key' (Test-Path (Join-Path $releaseA 'data\flutter_assets\assets\release\household-release-key.pub'))
+
+  # Without anywhere to print, the exit code is still the command's.
+  $quote = [char]34
+  $silent = [Detached]::Run($quote + $managerA + $quote + ' status', 30000)
+  Check 'started detached without standard handles, a command that succeeds exits 0' ($silent -eq 'exit code 0') $silent
+  $silent = [Detached]::Run($quote + $managerA + $quote + ' no-such-command', 30000)
+  Check 'and a refused one exits 1' ($silent -eq 'exit code 1') $silent
 
   # The app's download: <profile>\updates\<code>.tar.gz and <code>.json.
   $archive = Join-Path $updates "$code.tar.gz"; $record = Join-Path $updates "$code.json"; $result = Join-Path $updates 'result.json'
