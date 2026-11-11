@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
@@ -11,6 +10,7 @@ import '../core/sync/bulk_targets.dart';
 import 'recovery_actions.dart';
 import 'create_folder_dialog.dart';
 import 'rename_dialog.dart';
+import 'root_setup_dialog.dart';
 import '../core/app/lifecycle.dart';
 import '../core/ports/autostart.dart';
 import '../core/update/desktop_updater.dart';
@@ -506,107 +506,10 @@ class _ClientHomeState extends State<ClientHome>
     super.dispose();
   }
 
-  Future<void> rootSetup(BuildContext context) async {
-    final parent = TextEditingController();
-    final known = TextEditingController();
-    var confirmed = false;
-    final choice = await showDialog<bool>(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setState) => AlertDialog(
-          title: Text(
-            controller.automaticRoot
-                ? 'Use another folder'
-                : 'Choose your anj-cloud root',
-          ),
-          scrollable: true,
-          content: SizedBox(
-            width: 560,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'The app creates anj-cloud inside this parent folder. All regular files and nested folders there participate in synchronization.',
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: parent,
-                        decoration: const InputDecoration(
-                          labelText: 'Parent directory',
-                        ),
-                      ),
-                    ),
-                    IconButton(
-                      tooltip: 'Choose parent',
-                      icon: const Icon(Icons.folder_open),
-                      onPressed: () async {
-                        final selected = await getDirectoryPath();
-                        if (selected != null) {
-                          setState(() => parent.text = selected);
-                        }
-                      },
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                const Text(
-                  'The root always uses Local and cloud. Choose Cloud-only for individual folders in the app to free local space on this device. New content synchronizes automatically; child choices are preserved.',
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: known,
-                  maxLines: 2,
-                  decoration: const InputDecoration(
-                    labelText: 'Known other sync roots (one per line)',
-                  ),
-                ),
-                CheckboxListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text(
-                    'This location is separate from my other synchronizers.',
-                  ),
-                  value: confirmed,
-                  onChanged: (v) => setState(() => confirmed = v ?? false),
-                ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: confirmed && parent.text.isNotEmpty
-                  ? () => Navigator.pop(context, true)
-                  : null,
-              child: const Text('Use this root'),
-            ),
-          ],
-        ),
-      ),
-    );
-    if (choice == true) {
-      try {
-        await controller.configureRoot(
-          parent.text,
-          knownRoots: known.text
-              .split('\n')
-              .where((s) => s.trim().isNotEmpty)
-              .map((s) => s.trim())
-              .toList(),
-        );
-      } catch (error) {
-        if (context.mounted) showError(context, error.toString());
-      }
-    }
-    parent.dispose();
-    known.dispose();
-  }
+  Future<void> rootSetup(BuildContext context) => showDialog<bool>(
+    context: context,
+    builder: (context) => RootSetupDialog(controller: controller),
+  );
 
   Future<void> finishEditing(
     BuildContext context,

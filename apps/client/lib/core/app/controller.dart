@@ -1180,6 +1180,14 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     List<String> knownRoots = const [],
     bool automatic = false,
   }) async {
+    // Said before anything is stopped or opened, in words rather than the
+    // platform's "cannot resolve symbolic links".
+    if (!Directory(parent).existsSync()) {
+      throw FileSystemException(
+        'The parent folder does not exist. Create it, or choose a folder that does.',
+        parent,
+      );
+    }
     await stop();
     final store = Manifest(profile);
     String? creating;
