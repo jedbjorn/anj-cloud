@@ -1091,12 +1091,18 @@ def main(argv=None):
     args = parser().parse_args(argv)
     try:
         refuse_root()
+        if args.command == "redeploy" and not args.commit and not args.source:
+            raise RuntimeError("redeploy needs a commit, or --source <git-archive tar>")
+        if args.command != "setup" and not DEFAULT_STATE_ROOT.is_dir():
+            # Only `setup` creates the state root. Anywhere else (the VM host's checkout) a read-only
+            # command must neither try to create /srv/anj-cloud nor fail with a bare PermissionError.
+            raise RuntimeError(f"No production state root at {DEFAULT_STATE_ROOT}: deploy/prod.py runs inside the "
+                               f"production VM as {paths.VM_USER} (python3 /srv/anj-cloud/release/current/deploy/prod.py "
+                               f"{args.command}). From the VM host, use `ssh <vm> anj-cloud-setup status`.")
         stack = ProdStack(PROJECT, DEFAULT_STATE_ROOT)
         if args.command == "setup":
             result = stack.setup(args.host, args.commit, bind_address=args.bind_address, household_lan=args.household_lan)
         elif args.command == "redeploy":
-            if not args.commit and not args.source:
-                raise RuntimeError("redeploy needs a commit, or --source <git-archive tar>")
             result = stack.redeploy(args.commit, source=args.source)
         elif args.command == "emergency-stop":
             result = stack.emergency_stop(args.reason)
@@ -1107,7 +1113,9 @@ def main(argv=None):
         if isinstance(error, (RuntimeError, ValueError)):
             print(f"ERROR: {error}", file=sys.stderr)
         else:
-            print(f"ERROR: {type(error).__name__}; diagnostic content withheld", file=sys.stderr)
+            hint = f" (deploy/prod.py runs inside the production VM as {paths.VM_USER})" \
+                if isinstance(error, PermissionError) else ""
+            print(f"ERROR: {type(error).__name__}; diagnostic content withheld{hint}", file=sys.stderr)
         return 1
     return 0
 

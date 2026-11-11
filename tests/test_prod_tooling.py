@@ -341,6 +341,19 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("not root", error.getvalue())
         self.assertEqual(paths.PROD_SUBCOMMANDS, tuple(prod.subcommands()))
 
+    def test_outside_the_vm_a_command_says_where_it_runs_and_creates_nothing(self):
+        """SC-110: `prod.py check` from the VM host's checkout tried to create /srv/anj-cloud and
+        ended in a bare "PermissionError; diagnostic content withheld"."""
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "srv" / "anj-cloud" / "state"
+            for command in ("check", "status"):
+                with patch.object(prod, "DEFAULT_STATE_ROOT", missing), patch.object(prod, "refuse_root"), \
+                        contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertEqual(1, prod.main([command]))
+                self.assertIn(f"No production state root at {missing}: deploy/prod.py runs inside the production VM",
+                              error.getvalue())
+            self.assertFalse((Path(directory) / "srv").exists())
+
 
 class CheckTests(unittest.TestCase):
     """`prod.py check`: PM2 online, restart policy no, limits, no ports, non-root, health, fresh TLS."""
