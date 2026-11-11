@@ -138,11 +138,21 @@ one. What you see depends on why:
   shows **Update could not be installed** with the reason.
 - The app has not quit two minutes after **Update now**: the same message appears the next time the app
   starts. The manager starts it again itself only if the app quits within about five more minutes.
-- You start the app again yourself before the manager has installed the update, or you sign out or shut down
-  while it waits: the manager gives up without a message, and the app offers the update again.
+- The files of the update are changed or removed on disk while the manager waits (a security product
+  quarantining one, for example): the manager checks them once more just before installing, refuses, starts
+  the app again, and the app shows **Update could not be installed**.
+- You start the app again yourself before the manager has installed the update: the manager gives up after a
+  few seconds and leaves that instance alone. The reason is shown the next time the app starts, and the
+  update is offered again.
+- You sign out or shut down while it waits: nothing is installed and there is no message; the app offers the
+  update again at its next start.
 
 A release served by your gateway but signed with another key is never downloaded: the app shows **Update
 could not be verified**.
+
+The manager only accepts a download that lies in the profile folder it derives from `LOCALAPPDATA`. A profile
+path with spaces or non-ASCII letters was tried; a short (8.3) or redirected `LOCALAPPDATA` was not. If the two
+ever disagree the update is refused, nothing is installed, and updating by hand still works.
 
 ## First launch on any platform
 
