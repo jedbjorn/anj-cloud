@@ -82,7 +82,7 @@ class NameHolds {
   static const win32ComponentUnits = 255;
 
   bool _loses(String path, [String? moving]) {
-    if (local.containsKey(path) && path != moving) return false;
+    if (local.containsKey(path)) return false;
     final folder = p.posix.dirname(path);
     final name = p.posix.basename(path);
     String child(String n) => folder == '.' ? n : '$folder/$n';

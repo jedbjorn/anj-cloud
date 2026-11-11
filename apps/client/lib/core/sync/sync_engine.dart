@@ -3585,6 +3585,12 @@ class SyncEngine {
       return false;
     }
 
+    // The item, or something beneath it, is open in another program: a scan
+    // leaves a busy file out, so the pair cannot be judged now. Left to the
+    // ordinary rules it would be downloaded again under the new name and
+    // its old row taken for a remote deletion. Held for the pass; once the
+    // file can be read the move is followed, with any edit made meanwhile.
+    if (tree.busy.any((path) => withinOrAt(at, path))) return hold();
     if (_held(from) ||
         _held(to) ||
         // The cloud renaming Documents, Music or Videos (even in case only)
@@ -3634,7 +3640,8 @@ class SyncEngine {
     }
     // Another local item already holds the new name.
     if (rawLocal.containsKey(to) && !withinOrAt(at, to)) {
-      return hold(serverNameClashStatus);
+      // On this device under its old name: not Cloud-only.
+      return hold(here != null ? movedNameClashStatus : serverNameClashStatus);
     }
     if (here != null) {
       // A new name this device cannot hold (decision #120 Q2): a name the
@@ -3644,7 +3651,7 @@ class SyncEngine {
       // case-blind volume it cannot land inside the sibling its new folder
       // folds onto. Nothing is deleted, moved or uploaded for it meanwhile.
       final refused = _moveHolds(rawLocal, remote).status(to, moving: at);
-      if (refused != null) return hold(refused);
+      if (refused != null) return hold(movedHoldStatus(refused));
     }
     if (here == null) {
       // Not removal-inferred yet (expected here, no delete): next pass. An
