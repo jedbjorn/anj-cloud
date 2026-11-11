@@ -87,13 +87,16 @@ $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\AnJ Cl
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AnJ Cloud'
 function RunValue { (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).'AnJ Cloud' }
-function Active { Get-Content (Join-Path $base 'active.json') -Raw | ConvertFrom-Json }
+function Active { Get-Content (Join-Path $base 'active.json') -Raw -Encoding UTF8 | ConvertFrom-Json }
 function Window { [W]::FindWindow('FLUTTER_RUNNER_WIN32_WINDOW', 'AnJ Cloud') }
 function Running { @(Get-Process anj_cloud -ErrorAction SilentlyContinue) }
 # The tray's Quit, as a person would choose it.
+# True once that very process has ended (a waiting manager may start the
+# app again at once).
 function Quit-Client {
+  $ids = @(Running | ForEach-Object Id)
   [W]::PostMessage((Window), 0x0111, [IntPtr]1003, [IntPtr]::Zero) | Out-Null
-  Wait-Until { -not (Running) } 30
+  Wait-Until { -not (Get-Process -Id $ids -ErrorAction SilentlyContinue) } 30
 }
 function Start-Client([string]$exe) {
   Start-Process $exe
