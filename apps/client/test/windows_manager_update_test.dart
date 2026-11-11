@@ -59,10 +59,19 @@ class UpdateHost extends FakeHost {
 class ContendedManager extends Manager {
   ContendedManager(super.host);
   bool applying = false;
+
+  /// Attempts for which a manual command still holds the apply lock.
+  int sweeping = 0;
   int transactionsHeld = 0;
 
   @override
-  RandomAccessFile? applyLock() => applying ? null : super.applyLock();
+  RandomAccessFile? applyLock() {
+    if (sweeping > 0) {
+      sweeping--;
+      return null;
+    }
+    return applying ? null : super.applyLock();
+  }
 
   @override
   RandomAccessFile transactionLock() {
@@ -770,33 +779,121 @@ void main() {
         bytes,
         await signed(11, bytes),
       );
-      // The process that handed over (4711) has exited, yet the profile is
-      // held: another instance runs.
+      // The process that handed over (4711) has exited, yet the profile
+      // stays held: another instance runs.
       host.busyAttempts = 1 << 30;
+      var clock = DateTime.utc(2026, 11, 11);
       var pauses = 0;
       final outcome = await manager.applyUpdate(
         archive,
         manifest,
         result: result,
         appPid: 4711,
-        pause: (_) async => pauses++,
+        now: () => clock,
+        pause: (step) async {
+          pauses++;
+          clock = clock.add(step);
+        },
       );
       expect(outcome, {
         'ok': false,
         'message': startedAgainMessage,
         'started_again': true,
       });
-      // Given up at once (the second look), not after two minutes.
-      expect(pauses, 1);
-      // That instance's folder is left alone and nothing is started.
+      // Concluded after three seconds of a held lock, not after two minutes
+      // and not at the first look.
+      expect(pauses, 12);
+      // That instance's download is left alone and nothing is started; the
+      // reason is there for the app's next start.
       expect(File(archive).existsSync(), isTrue);
       expect(File(manifest).existsSync(), isTrue);
-      expect(File(result).existsSync(), isFalse);
+      expect(jsonDecode(File(result).readAsStringSync()), outcome);
       expect(host.started, isEmpty);
       host.busyAttempts = 0;
       expectUntouched();
     },
   );
+
+  test(
+    'a lock released a moment after the app exits is not "started again"',
+    () async {
+      await install();
+      final bytes = release(11, keyText: keyText);
+      final (archive, manifest, result) = download(
+        bytes,
+        await signed(11, bytes),
+      );
+      // The process is gone; its lock file stays held for two more seconds
+      // (a handle released late, a scanner reading it).
+      host.busyAttempts = 8;
+      var clock = DateTime.utc(2026, 11, 11);
+      final outcome = await manager.applyUpdate(
+        archive,
+        manifest,
+        result: result,
+        appPid: 4711,
+        now: () => clock,
+        pause: (step) async => clock = clock.add(step),
+      );
+      expect(outcome['ok'], isTrue);
+      expect(outcome['relaunched'], isTrue);
+      expect(manager.activeState()!['release'], isNot(firstRelease));
+    },
+  );
+
+  test('a stage changed during the wait is never activated', () async {
+    await install();
+    for (final damage in ['changed', 'removed', 'added']) {
+      host.started.clear();
+      final bytes = release(11, keyText: keyText);
+      final (archive, manifest, result) = download(
+        bytes,
+        await signed(11, bytes),
+      );
+      // Verified, then waiting for the app to quit: meanwhile something
+      // touches the extracted release in its stage.
+      host.busyAttempts = 1;
+      final outcome = await manager.applyUpdate(
+        archive,
+        manifest,
+        result: result,
+        pause: (_) async {
+          final stage = Directory(manager.layout.releases)
+              .listSync()
+              .whereType<Directory>()
+              .singleWhere((d) => p.basename(d.path).startsWith('.update-'));
+          final top = stage.listSync().whereType<Directory>().single;
+          switch (damage) {
+            case 'changed':
+              File(p.join(top.path, 'anj_cloud.exe'))
+                  .writeAsStringSync('NOT THE SIGNED PROGRAM');
+            case 'removed':
+              File(p.join(top.path, 'flutter_windows.dll')).deleteSync();
+            case 'added':
+              File(p.join(top.path, 'extra.dll')).writeAsStringSync('x');
+          }
+        },
+      );
+      expect(outcome['ok'], isFalse, reason: damage);
+      expect(
+        outcome['message'],
+        startsWith(changedSinceMessage),
+        reason: damage,
+      );
+      // Nothing published, the old release still the active one, and
+      // started again.
+      expectUntouched();
+      expect(outcome['relaunched'], isTrue, reason: damage);
+      expect(host.started, [
+        p.join(manager.layout.release(firstRelease), 'anj_cloud.exe'),
+      ]);
+      expect(
+        jsonDecode(File(result).readAsStringSync())['message'],
+        startsWith(changedSinceMessage),
+      );
+      File(result).deleteSync();
+    }
+  });
 
   test('a slow app is told from a restarted one by its process', () async {
     await install();
@@ -938,23 +1035,54 @@ void main() {
       await signed(11, bytes),
     );
     manager.applying = true;
+    var clock = DateTime.utc(2026, 11, 11);
+    var pauses = 0;
     final outcome = await manager.applyUpdate(
       archive,
       manifest,
       result: result,
-      pause: pause,
+      now: () => clock,
+      pause: (step) async {
+        pauses++;
+        clock = clock.add(step);
+      },
     );
     expect(outcome, {
       'ok': false,
       'message': 'Another update is already being applied.',
       'concurrent': true,
     });
+    // Given up after five seconds of trying.
+    expect(pauses, 20);
     // The first one owns the download, the result and the restart.
     expect(File(archive).existsSync(), isTrue);
     expect(File(manifest).existsSync(), isTrue);
     expect(File(result).existsSync(), isFalse);
     expect(host.started, isEmpty);
     expectUntouched();
+  });
+
+  test('a manual command sweeping stages only delays the hand-over', () async {
+    await install();
+    final bytes = release(11, keyText: keyText);
+    final (archive, manifest, result) = download(
+      bytes,
+      await signed(11, bytes),
+    );
+    // An install or update holds the apply lock while it sweeps: nobody
+    // else would answer or restart the app for this hand-over.
+    manager.sweeping = 3;
+    var pauses = 0;
+    final outcome = await manager.applyUpdate(
+      archive,
+      manifest,
+      result: result,
+      pause: (_) async => pauses++,
+    );
+    expect(pauses, 3);
+    expect(outcome['ok'], isTrue);
+    expect(outcome['relaunched'], isTrue);
+    expect(jsonDecode(File(result).readAsStringSync())['ok'], isTrue);
   });
 
   test('a result that cannot be written does not stop the restart', () async {
@@ -1026,7 +1154,11 @@ void main() {
     expect(outcome['ok'], isTrue);
     expect(outcome['release'], id);
     expect(outcome['problem'], contains('lock release failed'));
-    expect(jsonDecode(File(result).readAsStringSync())['ok'], isTrue);
+    // What the app prints: "Updated to version …".
+    expect(outcome['version'], '2026.11.11.11');
+    expect(outcome['version_code'], 11);
+    final written = jsonDecode(File(result).readAsStringSync());
+    expect((written['ok'], written['version']), (true, '2026.11.11.11'));
     expect(host.started, [p.join(manager.layout.release(id), 'anj_cloud.exe')]);
   });
 
@@ -1059,13 +1191,19 @@ void main() {
       bytes,
       await signed(11, bytes),
     );
-    Directory(p.join(manager.layout.releases, '.stage-dead')).createSync();
+    Directory(p.join(manager.layout.releases, '.stage-live')).createSync();
+    // Another manager command holds the transaction, and this may be its
+    // live install stage: the hand-over's own sweep leaves it alone. It
+    // goes only inside the transaction that activates the update.
+    manager.transactionsHeld = 2;
+    final during = <bool>[];
     final outcome = await manager.applyUpdate(
       archive,
       manifest,
       result: result,
-      pause: pause,
+      pause: (_) async => during.add(stages().contains('.stage-live')),
     );
+    expect(during, [true, true]);
     expect(outcome['ok'], isTrue);
     expect(stages(), {'.check-recent'});
   });

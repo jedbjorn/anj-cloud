@@ -44,6 +44,8 @@ const startedAgainMessage =
 const releaseChangedMessage =
     'Another release was installed while this update waited; '
     'nothing was installed.';
+const changedSinceMessage =
+    'The update changed on disk after it was verified; nothing was installed.';
 const otherCommandMessage =
     'Another manager command was running; the update was not installed.';
 
@@ -364,6 +366,21 @@ class Manager {
           host.seal(destination, readOnly: true);
         }
       } else {
+        if (underLock) {
+          // The tree waited in its stage while the app quit. What is
+          // published must still be exactly what was verified: a file
+          // changed or removed meanwhile (by anything, a security product
+          // included) refuses the update instead of activating it.
+          final Map<String, dynamic> now;
+          try {
+            now = _validate(Directory(top));
+          } on Refused catch (error) {
+            throw Refused('$changedSinceMessage (${error.message})');
+          }
+          if (jsonEncode(now) != jsonEncode(receipt)) {
+            throw Refused(changedSinceMessage);
+          }
+        }
         Directory(top).renameSync(destination);
         host.seal(destination, readOnly: true);
       }
@@ -848,9 +865,12 @@ class Manager {
   /// Nothing the app says is trusted: the manifest's Ed25519 signature is
   /// verified against the release key built into the ACTIVE release (never
   /// one from the download), it must be a newer `windows-x64` release, and
-  /// the archive is copied to a private stage while hashed, so the bytes
-  /// checked (signed size and SHA-256, a complete release whose receipt
-  /// carries the signed version code) are the bytes installed.
+  /// the archive is copied to a private stage while hashed and extracted
+  /// there (signed size and SHA-256, a complete release whose receipt
+  /// carries the signed version code). The extracted files are hashed
+  /// against that receipt once more under the profile lock, immediately
+  /// before they are published, so what is activated is what was verified
+  /// even if something touched the stage during the wait.
   ///
   /// [check] raises on any refusal and changes nothing.
   ///
@@ -867,10 +887,11 @@ class Manager {
   /// app instance). The app, which quit for this, is started again: at once
   /// after an update; after a refusal once the handing-over process
   /// [appPid] has exited, within [wait] + [grace], unless another instance
-  /// is already running. When [appPid] has exited and the profile is held
-  /// all the same, the app was started again: the update is abandoned with
-  /// nothing written or deleted in that instance's folder and nothing
-  /// started. A failed update leaves the previous release active: the
+  /// is already running. When [appPid] has exited and the profile stays
+  /// held for [startedAgainAfter] all the same, another instance runs (or
+  /// something else holds its lock file): the update is abandoned, the
+  /// reason is written to [result] for the app's next start, and nothing
+  /// is deleted in that folder or started. A failed update leaves the previous release active: the
   /// activation record is the one commit point, and no release is ever
   /// changed in place.
   Future<Map<String, Object?>> applyUpdate(
@@ -882,6 +903,8 @@ class Manager {
     int? appPid,
     Duration wait = const Duration(seconds: 120),
     Duration grace = const Duration(seconds: 300),
+    Duration startedAgainAfter = const Duration(seconds: 3),
+    Duration applyLockWait = const Duration(seconds: 5),
     DateTime Function() now = DateTime.now,
     Future<void> Function(Duration)? pause,
   }) async {
@@ -910,6 +933,7 @@ class Manager {
     Map<String, dynamic>? state;
     _Download? download;
     String? installing;
+    ReleaseManifest? verifiedManifest;
     var installed = false;
     var startedAgain = false;
     RandomAccessFile? lock;
@@ -917,7 +941,13 @@ class Manager {
     try {
       _refuseElevated();
       state = _installed();
-      lock = applyLock();
+      // A manual install or update holds this lock for a moment while it
+      // sweeps stale stages: wait that out before concluding that another
+      // hand-over runs.
+      final lockDeadline = now().add(applyLockWait);
+      while ((lock = applyLock()) == null && now().isBefore(lockDeadline)) {
+        await pause(step);
+      }
       if (lock == null) {
         // Another apply-update owns this hand-over: it writes the result
         // and starts the app.
@@ -936,12 +966,13 @@ class Manager {
         manifest,
         stage,
       );
+      verifiedManifest = signed;
       installing = '${receipt['source_head']}-${signed.sha256}';
       _tryLog('update_waiting', {'version_code': signed.versionCode});
       final verified = state;
       final live = stage.path;
       Map<String, Object?> applied;
-      var exited = 0;
+      DateTime? heldSinceExit;
       while (true) {
         var other = false;
         try {
@@ -961,10 +992,17 @@ class Manager {
           });
           break;
         } on Busy {
-          // The app still holds its profile; or, when the process that
-          // handed over is gone (seen twice), another instance does.
-          if (appPid != null && !host.processAlive(appPid) && ++exited >= 2) {
-            throw const _StartedAgain();
+          // The app still holds its profile. Or the process that handed
+          // over is gone and the profile stays held: once that has lasted
+          // [startedAgainAfter] (a handle released late, or a scanner
+          // reading the lock file, lets go sooner), another instance runs.
+          if (appPid != null && !host.processAlive(appPid)) {
+            heldSinceExit ??= now();
+            if (!now().isBefore(heldSinceExit.add(startedAgainAfter))) {
+              throw const _StartedAgain();
+            }
+          } else {
+            heldSinceExit = null;
           }
         } on TransactionBusy {
           other = true;
@@ -998,7 +1036,13 @@ class Manager {
         // Past the commit point: the new release is the active one, whatever
         // failed after it.
         installed = true;
-        outcome = {'ok': true, 'release': installing, 'problem': '$error'};
+        outcome = {
+          'ok': true,
+          'version': verifiedManifest?.version,
+          'version_code': verifiedManifest?.versionCode,
+          'release': installing,
+          'problem': '$error',
+        };
         _tryLog('update_applied', {'release': installing, 'problem': '$error'});
       } else {
         // The app has quit for this: always answer and start it again.
@@ -1012,9 +1056,11 @@ class Manager {
       if (stage != null) _discard(stage);
     }
     try {
-      if (download != null && !startedAgain) {
-        // Installed or refused, the download is discarded.
-        download.discard();
+      if (download != null) {
+        // Installed or refused, the download is discarded; unless the app
+        // was started again, whose folder this now is. The reason is
+        // written in either case: the app shows it at its next start.
+        if (!startedAgain) download.discard();
         if (result != null) {
           try {
             _atomicJson(result, outcome);
