@@ -2560,8 +2560,9 @@ class SyncEngine {
   /// batches (SC-058), and FSEvents reports each side on its own (#133 (2)).
   /// A synchronized item is never deleted in the cloud on one such pass
   /// (decision #140). Where the platform looks identities up
-  /// ([RootFilesystem.locatesIdentity], spec #33 I3) a certain answer
-  /// decides at once ([_lookUpVanished]). Elsewhere, and after an uncertain
+  /// ([RootFilesystem.locatesIdentity], spec #33 I3) and the lookup is
+  /// switched on ([identityLookup]) a certain answer decides at once
+  /// ([_lookUpVanished]). Elsewhere, and after an uncertain
   /// answer, the removal is held until the path has been missing for the
   /// watcher's quiet period, longer only while the watcher still has
   /// unprocessed paths, and never longer than its maximum delay. Full scans
@@ -2572,6 +2573,21 @@ class SyncEngine {
   /// Synchronized paths the identity lookup did not find this pass: their
   /// removal is not held.
   final Set<String> _lookedUpGone = {};
+
+  /// Whether a new engine uses the platform's identity lookup (spec #33 I3).
+  /// Off: the lookup ships disabled until it is verified on macOS and
+  /// Windows, so a platform build that answers it does not switch it on.
+  static const bool identityLookupByDefault = false;
+
+  /// The kill switch for the identity lookup ([identityLookupByDefault]).
+  /// Off, the engine never calls [RootFilesystem.locateIdentity] and behaves
+  /// exactly as on a platform that does not support it: every unpaired
+  /// removal on a partial pass is held (decision #140).
+  bool identityLookup = identityLookupByDefault;
+
+  /// At most this many lookups in one pass ([_lookUpVanished]); beyond it the
+  /// rest is uncertain (held, then a full scan decides).
+  static const int maxLookupsPerPass = 512;
 
   /// Synchronized paths whose lookup this pass was uncertain (an error, a
   /// staging answer, an inside answer the rescan did not confirm): held as on
@@ -2649,16 +2665,21 @@ class SyncEngine {
   Duration Function()? debugElapsed;
   Duration get _elapsed => debugElapsed?.call() ?? _clock.elapsed;
 
-  /// Spec #33 I3, on a partial pass where the platform looks identities up:
-  /// each synchronized item missing from [view] is looked up by its
-  /// recorded identity (a vanished folder covers what is beneath it).
+  /// Spec #33 I3, on a partial pass where the platform looks identities up
+  /// and [identityLookup] is on: each synchronized item missing from [view]
+  /// is looked up by its recorded identity. A folder found inside covers
+  /// what is beneath it (it moves with the folder); a folder found gone does
+  /// not, so each missing item beneath it is looked up on its own (at most
+  /// [maxLookupsPerPass] lookups a pass, the rest uncertain).
   ///
   /// Certain answers decide at once (decisions #140 and #143):
   /// * inside the root, confirmed: the path is rescanned into this pass and
   ///   the item there is the recorded one (identity, kind) and names its
   ///   file alone ([_alone]: an effective link count of 1, the engine's own
   ///   staging links discounted), so the pair is planned as a move;
-  /// * outside the root (the Trash) or not found: a delete, not held.
+  /// * outside the root (the Trash) or not found: a delete, not held; for a
+  ///   folder only when every missing item beneath it is certainly gone too,
+  ///   otherwise the folder is held (uncertain) with what is not.
   ///
   /// Every other answer is uncertain ([_uncertain]): an error or a thrown
   /// lookup, an inside answer the rescan does not confirm (nothing there,
@@ -2670,6 +2691,7 @@ class SyncEngine {
     _uncertain.clear();
     final w = watcher;
     if (_localScan != 'partial' ||
+        !identityLookup ||
         !tree.native.locatesIdentity ||
         w == null ||
         !w.active ||
@@ -2696,39 +2718,72 @@ class SyncEngine {
       return false;
     }
 
-    for (final path in missing.where((v) => !beneathMissing(v)).toList()) {
+    var lookups = 0;
+
+    /// The answer for [path], an inside answer only when the rescan confirms
+    /// it (the recorded item, alone at that path); otherwise uncertain.
+    IdentityPlace look(String path) {
+      if (lookups >= maxLookupsPerPass) return IdentityPlace.uncertain;
+      lookups++;
       final entry = manifest.entries[path]!;
       final identity = entry.localIdentity!;
-      var place = IdentityPlace.uncertain;
       try {
         final found = tree.native.locateIdentity(
           tree.fd,
           tree.stageFd,
           identity,
         );
-        place = found.place;
-        if (place == IdentityPlace.inside) {
-          final at = found.path!;
-          if (!view.containsKey(at)) _rescan({at}, const {});
-          final item = view[at];
-          final confirmed =
-              item != null &&
-              item.identity == identity &&
-              item.kind == entry.kind &&
-              _alone(item);
-          if (!confirmed) place = IdentityPlace.uncertain;
-        }
+        if (found.place != IdentityPlace.inside) return found.place;
+        final at = found.path!;
+        if (!view.containsKey(at)) _rescan({at}, const {});
+        final item = view[at];
+        final confirmed =
+            item != null &&
+            item.identity == identity &&
+            item.kind == entry.kind &&
+            _alone(item);
+        return confirmed ? IdentityPlace.inside : IdentityPlace.uncertain;
       } on Object {
-        place = IdentityPlace.uncertain; // Any failure (spec #33 I3).
+        return IdentityPlace.uncertain; // Any failure (spec #33 I3).
       }
-      final under = missing.where((v) => withinOrAt(path, v));
-      switch (place) {
-        case IdentityPlace.inside:
-          break; // Paired below as a move.
-        case IdentityPlace.outside || IdentityPlace.notFound:
-          _lookedUpGone.addAll(under);
-        case IdentityPlace.staging || IdentityPlace.uncertain:
-          _uncertain.addAll(under);
+    }
+
+    bool gone(IdentityPlace place) =>
+        place == IdentityPlace.outside || place == IdentityPlace.notFound;
+
+    for (final top in missing.where((v) => !beneathMissing(v)).toList()) {
+      final place = look(top);
+      final under = missing.where((v) => withinOrAt(top, v)).toList();
+      if (place == IdentityPlace.inside) {
+        continue; // Paired below as a move; what is beneath moves with it.
+      }
+      if (!gone(place)) {
+        _uncertain.addAll(under);
+        continue;
+      }
+      // A certain answer for a folder is no answer for what was beneath it:
+      // an item may have left the folder (moved elsewhere in the root) before
+      // the folder went. Each missing item beneath is looked up on its own,
+      // shallowest first; one found inside is a move, and everything above
+      // an item not certainly gone is held with it (uncertain), so the
+      // folder's deletion never takes it along.
+      final below = under.where((v) => v != top).toList()
+        ..sort((a, b) => '/'.allMatches(a).length - '/'.allMatches(b).length);
+      final moved = <String>[];
+      final kept = <String>[];
+      for (final path in below) {
+        if (moved.any((m) => withinOrAt(m, path))) continue;
+        final answer = look(path);
+        if (answer == IdentityPlace.inside) {
+          moved.add(path);
+        } else if (!gone(answer)) {
+          kept.add(path);
+        }
+      }
+      for (final path in under) {
+        if (moved.any((m) => withinOrAt(m, path))) continue;
+        final holds = [...moved, ...kept].any((k) => withinOrAt(path, k));
+        (holds ? _uncertain : _lookedUpGone).add(path);
       }
     }
   }

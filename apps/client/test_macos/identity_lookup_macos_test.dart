@@ -76,7 +76,10 @@ void main() {
     final store = Manifest(Directory('${fixture.path}/profile'))
       ..setSetting('retention', 'local');
     cloud = _Cloud()..foldersQualified = true;
-    engine = SyncEngine(store, tree, cloud);
+    engine = SyncEngine(store, tree, cloud)
+      // Ships disabled (SyncEngine.identityLookupByDefault); switched on here
+      // to verify it.
+      ..identityLookup = true;
     engine.debugElapsed = () => Duration.zero;
     await engine.startWatching();
     expect(engine.watcher, isNotNull, reason: 'APFS root: FSEvents');
