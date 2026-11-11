@@ -407,8 +407,9 @@ class ScriptSafety(unittest.TestCase):
                 direct.append(node.lineno)
         # System.read (the one executor), System.attended (the terminal-attended one, backup.py's
         # escrow), System.detached (upgrade's redeploy in its own session, decision #122),
+        # System.streamed (upgrade's run of the live release's `converge`, flag SC-110),
         # resolve_source's `git rev-parse` and Release's `git archive`.
-        self.assertEqual(len(direct), 5, direct)
+        self.assertEqual(len(direct), 6, direct)
 
     def test_firewall_render(self):
         text = bootstrap.render_firewall("10.77.10.10", "10.77.10.1")
