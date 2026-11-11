@@ -1,6 +1,7 @@
 """Serialized, bounded mutations with a durable fence for uncertain backend work."""
 
 import asyncio
+from email.utils import parsedate_to_datetime
 import io
 import json
 import logging
@@ -26,6 +27,11 @@ FILE_ID = re.compile(r"([0-9]{1,19})\Z")
 # streamed through a bounded parse. About 37,000 entries fit; a larger folder refuses with 503.
 SIBLING_XML = 8 * 1024 * 1024
 SIBLINGS_PROPFIND = b'<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+# Nextcloud keeps a file's ETag when it is overwritten within the whole second of its previous
+# write (flag SC-103): the cache scanner reuses the stored ETag while the storage mtime, which has
+# one-second resolution, is unchanged. An overwrite therefore waits until the backend's clock has
+# left that second; the margin covers a filesystem clock that trails the backend's by a few ticks.
+SETTLE_MARGIN = 0.05
 log = logging.getLogger(__name__)
 
 
@@ -33,6 +39,30 @@ def split_leaf(relative):
     """(encoded parent ending in '/' or '', decoded final name) of an encoded relative DAV path."""
     parent, _, leaf = relative.rstrip("/").rpartition("/")
     return (parent + "/" if parent else ""), unquote(leaf)
+
+
+def http_seconds(value):
+    """Whole epoch seconds of an HTTP date (getlastmodified, Date), else None."""
+    try:
+        return int(parsedate_to_datetime(value or "").timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def settle_delay(modified, now):
+    """Seconds an overwrite must wait so the backend stamps it in a later second than `modified`.
+
+    `modified` is the file's last-modified second and `now` the backend's clock when it reported
+    it, both whole seconds from the backend, so the gateway's own clock is never compared with
+    it. `now` is truncated: the backend may be anywhere inside that second, hence the full
+    second. A time that cannot be read is treated as written this second. A file dated beyond
+    the next second cannot share a second with a write made now.
+    """
+    if modified is None or now is None:
+        return 1 + SETTLE_MARGIN
+    if now <= modified <= now + 1:
+        return modified + 1 - now + SETTLE_MARGIN
+    return 0
 
 
 def name_refusal(reason):
@@ -67,6 +97,8 @@ class Mutations:
         self.owners = {}
         self.dispatched = set()
         self.added_failures = 0
+        self.unchanged_versions = 0
+        self.sleep = asyncio.sleep
         # A limit set at runtime by the owner console (spec #27) is persisted in the registry and
         # wins over the startup environment, which stays the default until one is set.
         stored = gateway.registry.setting(self.LIMIT_SETTING)
@@ -132,7 +164,7 @@ class Mutations:
     async def current(self, device, relative):
         url = self.gateway.backend + backend_root(device["uid"]) + relative
         body = (b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
-                b'<d:prop><d:getetag/><d:resourcetype/><oc:fileid/></d:prop></d:propfind>')
+                b'<d:prop><d:getetag/><d:getlastmodified/><d:resourcetype/><oc:fileid/></d:prop></d:propfind>')
         async with self.gateway.session.request("PROPFIND", url, data=body, headers={"Depth": "0", "Content-Type": "application/xml", "Accept-Encoding": "identity"},
                                                 auth=BasicAuth(device["uid"], device["token"]), allow_redirects=False) as response:
             if response.status == 404:
@@ -144,7 +176,9 @@ class Mutations:
             if not etag or not CONCRETE_ETAG.fullmatch(etag):
                 raise web.HTTPBadGateway(text="Resource version unavailable")
             return {"etag": etag, "collection": root.find(".//{DAV:}resourcetype/{DAV:}collection") is not None,
-                    "fileid": file_id(root.findtext(".//{http://owncloud.org/ns}fileid"))}
+                    "fileid": file_id(root.findtext(".//{http://owncloud.org/ns}fileid")),
+                    "modified": http_seconds(root.findtext(".//{DAV:}getlastmodified")),
+                    "now": http_seconds(response.headers.get("Date"))}
 
     async def compare(self, request, device, relative, headers):
         current = await self.current(device, relative)
@@ -278,6 +312,14 @@ class Mutations:
                     refused = None
                 if refused is not None:
                     return name_refusal(refused)
+                if request.method == "PUT" and current is not None:
+                    # Flag SC-103: a second write inside the previous write's second keeps the
+                    # ETag, so readers of the first version never see the second and its stale
+                    # If-Match still passes. Held under the lock: no other write can land between
+                    # the version read above and this overwrite.
+                    delay = settle_delay(current["modified"], current["now"])
+                    if delay:
+                        await self.sleep(delay)
                 # Re-check after awaits: revoke/maintenance may have landed during staging/version read.
                 self.ready()
                 gateway.registry.admit(device["fingerprint"], device["certificate_id"])
@@ -304,6 +346,11 @@ class Mutations:
                     gateway.registry.mutation_finish()
                     if request.method == "PUT" and status == 201:
                         self.note_added(device["uid"], response.headers.get("OC-FileId"))
+                    elif (request.method == "PUT" and status in (200, 204) and current
+                          and response.headers.get("ETag") == current["etag"]):
+                        # The bytes are written; only the version failed to move. Never silent.
+                        self.unchanged_versions += 1
+                        log.warning("Overwrite kept its previous ETag; other devices may not see this version")
                     elif request.method == "DELETE" and status in (200, 204) and current and current["fileid"]:
                         self.note_deleted(device["uid"], current["fileid"])
                     gateway.registry.admit(device["fingerprint"], device["certificate_id"])
