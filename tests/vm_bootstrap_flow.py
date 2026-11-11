@@ -44,8 +44,11 @@ def sandbox(root):
     patches = [mock.patch.object(paths, name, moved(value)) for name, value in vars(paths).items()
                if isinstance(value, Path) and str(value).startswith("/srv/anj-cloud")]
     patches += [mock.patch.object(bootstrap, name, moved(getattr(bootstrap, name)))
-                for name in ("SETUP_RECORD", "OPS_CONFIG", "OPS_ECOSYSTEM", "COMMAND_TARGET", "ADMIN_TARGET")]
+                for name in ("SETUP_RECORD", "OPS_CONFIG", "OPS_ECOSYSTEM", "OPS_ECOSYSTEM_PREVIOUS", "COMMAND_TARGET",
+                             "ADMIN_TARGET")]
     patches += [mock.patch.object(bootstrap, "FALLBACK_LOG_DIR", root / "var-log"),
+                mock.patch.object(bootstrap, "UPGRADE_LOG_DIR", root / "var-log"),
+                mock.patch.object(bootstrap, "UPGRADE_LOCK", root / "run-lock" / "anj-cloud-upgrade.lock"),
                 mock.patch.object(bootstrap, "COMMAND_LINK", root / "usr-local-bin" / "anj-cloud-setup"),
                 mock.patch.object(bootstrap, "ADMIN_LINK", root / "usr-local-bin" / "anj-cloud-admin"),
                 mock.patch.object(bootstrap, "FORMATTED_MARKER", root / "formatted")]
