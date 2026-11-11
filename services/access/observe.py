@@ -11,6 +11,7 @@ values. Source, status, bytes and duration are allowed (decisions #68, #69 (g)).
 from collections import Counter, deque
 from datetime import datetime, timezone
 import json
+import math
 import sys
 import time
 
@@ -184,6 +185,22 @@ class EnrollmentGuard:
         times.append(now)
         self.recent.append(now)
         return None
+
+    def retry_after(self, source, reason):
+        """Whole seconds (at least 1) until a request refused with `reason` could be admitted.
+
+        Call right after the `admit` that returned `reason`. It states only the wait: never a
+        count of attempts or failures left (the limits themselves are unchanged).
+        """
+        now = self.clock()
+        if reason == "enroll-blocked":
+            until = self.blocks.get(source, now)
+        elif reason == "enroll-rate":
+            times = self.requests.get(source)
+            until = (times[0] + self.window) if times else now
+        else:
+            until = (self.recent[0] + self.window) if self.recent else now
+        return max(1, math.ceil(until - now))
 
     def failed(self, source):
         """Record one rejected enrollment attempt; start a block at the threshold."""

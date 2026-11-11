@@ -70,6 +70,40 @@ class GuardTests(unittest.TestCase):
         self.assertEqual({"enroll-global"}, set(results[120:]))
 
 
+    def test_retry_after_is_the_exact_wait_for_the_rate_limit_the_block_and_the_backstop(self):
+        # The short per-minute limit: until the oldest request in the window leaves it.
+        self.guard.admit("A")
+        self.clock.advance(20)
+        for _ in range(9):
+            self.guard.admit("A")
+        self.assertEqual("enroll-rate", self.guard.admit("A"))
+        self.assertEqual(40, self.guard.retry_after("A", "enroll-rate"))
+        self.clock.advance(39.5)
+        self.assertEqual("enroll-rate", self.guard.admit("A"))
+        self.assertEqual(1, self.guard.retry_after("A", "enroll-rate"))
+        self.clock.advance(0.5)
+        self.assertIsNone(self.guard.admit("A"), "the stated wait is enough")
+        # The 15-minute block: the time left on the block, counting down.
+        for _ in range(8):
+            self.guard.failed("B")
+        self.assertEqual("enroll-blocked", self.guard.admit("B"))
+        self.assertEqual(900, self.guard.retry_after("B", "enroll-blocked"))
+        self.clock.advance(300.2)
+        self.assertEqual("enroll-blocked", self.guard.admit("B"))
+        self.assertEqual(600, self.guard.retry_after("B", "enroll-blocked"))
+        self.clock.advance(599.7)
+        self.assertEqual("enroll-blocked", self.guard.admit("B"))
+        self.assertEqual(1, self.guard.retry_after("B", "enroll-blocked"))
+        self.clock.advance(0.2)
+        self.assertIsNone(self.guard.admit("B"))
+        # The global backstop is a window wait too.
+        guard = EnrollmentGuard(Events(io.StringIO()), clock=self.clock, wall=self.wall)
+        sources = ["198.51.100.%d" % n for n in range(13)]
+        results = [guard.admit(source) for source in sources for _ in range(10)]
+        self.assertEqual("enroll-global", results[-1])
+        self.assertEqual(60, guard.retry_after(sources[-1], "enroll-global"))
+
+
 class EnrollmentOverProxyTests(unittest.IsolatedAsyncioTestCase):
     """Two crafted sources through the real PROXY v2 accept path."""
 
@@ -105,8 +139,12 @@ class EnrollmentOverProxyTests(unittest.IsolatedAsyncioTestCase):
 
         def run():
             results = {}
-            results["A rate"] = [self.post(A, "/v1/enroll/status", {"code": invitation["code"], "csr": request})[0] for _ in range(11)]
-            results["C failures"] = [self.post(C, "/v1/enroll", bogus)[0] for _ in range(9)]
+            answers = [self.post(A, "/v1/enroll/status", {"code": invitation["code"], "csr": request}) for _ in range(11)]
+            results["A rate"] = [answer[0] for answer in answers]
+            results["A rate headers"], results["A rate body"] = answers[-1][1], answers[-1][2]
+            answers = [self.post(C, "/v1/enroll", bogus) for _ in range(9)]
+            results["C failures"] = [answer[0] for answer in answers]
+            results["C block headers"], results["C block body"] = answers[-1][1], answers[-1][2]
             results["B enrolls"] = self.post(B, "/v1/enroll", second)
             return results
         results = await asyncio.to_thread(run)
@@ -125,6 +163,13 @@ class EnrollmentOverProxyTests(unittest.IsolatedAsyncioTestCase):
         self.clock.advance(900.1)
         status, _, _ = await asyncio.to_thread(self.post, C, "/v1/enroll", bogus)
         self.assertEqual(400, status)
+        # The two 429s are told apart on the wire: a short wait for the rate limit, the block's
+        # remaining time for the block, and nothing about attempts or failures either way.
+        self.assertEqual("60", results["A rate headers"]["retry-after"])
+        self.assertEqual({"error": "Enrollment rate exceeded", "reason": "rate"}, json.loads(results["A rate body"]))
+        self.assertEqual("900", results["C block headers"]["retry-after"])
+        self.assertEqual({"error": "Enrollment rate exceeded", "reason": "blocked"}, json.loads(results["C block body"]))
+        self.assertEqual("no-store", results["C block headers"]["cache-control"])
         # 429s are limit hits: aggregated per source per minute, never one request line each.
         self.assertEqual([], self.harness.requests(status=429))
         self.assertEqual(1, self.harness.counted("enroll-rate", A))

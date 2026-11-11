@@ -1190,6 +1190,17 @@ Future<String> fetchPinnedCa(Uri origin, List<int> pin) async {
   }
 }
 
+/// A `Retry-After` header as a wait: whole seconds only (the gateway never
+/// sends a date), at least one second and at most a day; anything else is
+/// "not stated" so the caller falls back to its fixed wording.
+Duration? parseRetryAfter(String? value) {
+  final text = value?.trim();
+  if (text == null || !RegExp(r'^\d{1,6}$').hasMatch(text)) return null;
+  final seconds = int.parse(text);
+  if (seconds < 1 || seconds > 86400) return null;
+  return Duration(seconds: seconds);
+}
+
 class PairingClient {
   PairingClient(this.origin, SecurityContext context)
     : client = HttpClient(context: context) {
@@ -1226,6 +1237,9 @@ class PairingClient {
       throw CloudFailure(
         'Pairing request failed (${response.statusCode}).',
         status: response.statusCode,
+        retryAfter: response.statusCode == 429
+            ? parseRetryAfter(response.headers.value('retry-after'))
+            : null,
       );
     }
     return jsonDecode(utf8.decode(data)) as Map<String, dynamic>;

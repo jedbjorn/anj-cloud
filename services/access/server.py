@@ -205,7 +205,12 @@ class Gateway:
         limit = self.guard.admit(source)
         if limit:
             request["anj.reason"] = limit
-            raise web.HTTPTooManyRequests(text="Enrollment rate exceeded")
+            # The short per-minute limit and the 15-minute block are told apart by the wait and by
+            # `reason` ("rate" or "blocked"; the global backstop reads as "rate"). Nothing else.
+            wait = self.guard.retry_after(source, limit)
+            raise web.HTTPTooManyRequests(
+                text=json.dumps({"error": "Enrollment rate exceeded", "reason": "blocked" if limit == "enroll-blocked" else "rate"}),
+                content_type="application/json", headers={"Retry-After": str(wait), "Cache-Control": "no-store"})
         try:
             try:
                 body = await asyncio.wait_for(self.envelope(request), self.body_timeout)
