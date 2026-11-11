@@ -13,7 +13,7 @@ Standard library only; used by halo-vm.sh and by the root copy of vm-start.
     anjvm.py compare-domain <expected.xml> <actual.xml>
     anjvm.py compare-net <expected.xml> <actual.xml>
     anjvm.py cpus <domain.xml>...           # host threads pinned by these definitions
-    anjvm.py headroom [--reserved-kib N]     # machine.slice bytes left under MemoryHigh/MemoryMax
+    anjvm.py headroom [--reserved-kib N]     # bytes left under machine.slice's limit, else host MemAvailable (JSON)
     anjvm.py share-check DIR [--account NAME] [--passwd FILE]   # owner/mode of a backup share (JSON)
     anjvm.py share-own DIR --account NAME [--passwd FILE]       # root: create or migrate it to the account
     anjvm.py share-probe DIR --uid N [--uid N]                  # can these the VM host uids read or write it?
@@ -46,6 +46,7 @@ import xml.etree.ElementTree as ET
 HERE = Path(os.path.realpath(__file__)).parent
 TEMPLATES = Path(os.environ.get("ANJ_VM_TEMPLATES", HERE / "libvirt"))
 CGROUP = Path(os.environ.get("ANJ_CGROUP_ROOT", "/sys/fs/cgroup"))
+MEMINFO = Path(os.environ.get("ANJ_MEMINFO", "/proc/meminfo"))
 
 PROFILES = {
     "anj-prod": {"name": "anj-prod", "network": "anj-prod", "bridge": "virbr-anjprod", "subnet": "10.77.10",
@@ -232,19 +233,37 @@ def compare(expected, actual):
     return {key: [expected[key], actual.get(key)] for key in expected if expected[key] != actual.get(key)}
 
 
+def mem_available():
+    """Host MemAvailable in bytes, or None when /proc/meminfo cannot be read or has no such line."""
+    try:
+        for line in MEMINFO.read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def headroom(reserved_kib=0):
-    """Bytes left in machine.slice under its lowest limit, counting running domains at their full size."""
+    """Bytes left for new domains, counting running domains at their full size. basis "slice-limit": machine.slice's
+    lowest limit minus use, never more than host MemAvailable when that is readable. basis "host-available": the
+    slice has no limit, so MemAvailable less what running domains have yet to touch; None when it cannot be read."""
     root = CGROUP / "machine.slice"
-    current = max(int((root / "memory.current").read_text()), reserved_kib * 1024)
+    used = int((root / "memory.current").read_text())
+    current = max(used, reserved_kib * 1024)
+    available = mem_available()
     limits = {}
     for name in ("memory.high", "memory.max"):
         value = (root / name).read_text().strip()
         if value != "max":
             limits[name] = int(value)
     if not limits:
-        return {"current": current, "limit": None, "headroom": None}
+        room = None if available is None else available - (current - used)
+        return {"current": current, "limit": None, "headroom": room, "basis": "host-available",
+                "mem_available": available}
     limit = min(limits.values())
-    return {"current": current, "limit": limit, "headroom": limit - current}
+    room = limit - current if available is None else min(limit - current, available)
+    return {"current": current, "limit": limit, "headroom": room, "basis": "slice-limit", "mem_available": available}
 
 
 # ---------------------------------------------------------------------------------------------

@@ -473,7 +473,7 @@ agent-runnable modes use only the VM host user's libvirt access.
 | `sudo … --recreate --confirm anj-prod` | operator | Replace the domain and both disks from the templates (once, before go-live, #89 (7)) |
 | `sudo … --recreate-os` | operator | Rebuild `vda` from the verified image; the data disk is kept |
 | `sudo … --forward off\|on` | operator | Emergency stop of the 443 forward; only the operator turns it back on |
-| `… --qual [--run-id ID] [--share-readonly \| --scratch-share DIR]` | agent | Throwaway `anj-qual` (4 GiB, threads 14,30,15,31, `10.77.11.0/24`); refused below 5 GiB `machine.slice` headroom; exit 3 `qual-busy` if one exists. A share needs the installed wrapper; `DIR` comes from `anjvm.py scratch-share create` |
+| `… --qual [--run-id ID] [--share-readonly \| --scratch-share DIR]` | agent | Throwaway `anj-qual` (4 GiB, threads 14,30,15,31, `10.77.11.0/24`); refused below 5 GiB headroom (under the `machine.slice` limit, or host `MemAvailable` when the slice has none; unreadable fails closed); exit 3 `qual-busy` if one exists. A share needs the installed wrapper; `DIR` comes from `anjvm.py scratch-share create` |
 | `… --qual-destroy [--run-id ID \| --force]` | agent | Remove `anj-qual` (domain, disks, pool, network) when its run id matches |
 
 ### Backup share ownership (decision #115)

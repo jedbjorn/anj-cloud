@@ -80,15 +80,51 @@ class AnjVmTests(unittest.TestCase):
             dom.write_text("<domain><name>x</name><cputune><vcpupin vcpu='0' cpuset='8-10,^9'/>"
                            "<emulatorpin cpuset='24'/></cputune></domain>")
             self.assertEqual(anjvm("cpus", str(dom)).stdout.strip(), "8 10 24")
-            cgroup = Path(tmp, "machine.slice")
-            cgroup.mkdir()
-            Path(cgroup, "memory.current").write_text("1073741824\n")
-            Path(cgroup, "memory.high").write_text("4294967296\n")
-            Path(cgroup, "memory.max").write_text("max\n")
-            env = dict(os.environ, ANJ_CGROUP_ROOT=tmp)
-            result = json.loads(subprocess.run([sys.executable, str(HOST / "anjvm.py"), "headroom", "--reserved-kib",
-                                                str(2 * 1024 * 1024)], capture_output=True, text=True, env=env).stdout)
+            result = self.headroom(tmp, current="1073741824", high="4294967296", max_="max", available_kib=64 * 1024 ** 2,
+                                   reserved_kib=2 * 1024 * 1024)
             self.assertEqual(result["headroom"], 2 * 1024 ** 3)
+            self.assertEqual(result["basis"], "slice-limit")
+
+    def headroom(self, tmp, current, high, max_, available_kib, reserved_kib=0):
+        """anjvm.py headroom over a fake machine.slice and /proc/meminfo (available_kib None: unreadable)."""
+        cgroup = Path(tmp, "machine.slice")
+        cgroup.mkdir(exist_ok=True)
+        Path(cgroup, "memory.current").write_text(current + "\n")
+        Path(cgroup, "memory.high").write_text(high + "\n")
+        Path(cgroup, "memory.max").write_text(max_ + "\n")
+        meminfo = Path(tmp, "meminfo")
+        meminfo.unlink(missing_ok=True)
+        if available_kib is not None:
+            meminfo.write_text(f"MemTotal: 99999999 kB\nMemAvailable: {available_kib} kB\n")
+        env = dict(os.environ, ANJ_CGROUP_ROOT=tmp, ANJ_MEMINFO=str(meminfo))
+        out = subprocess.run([sys.executable, str(HOST / "anjvm.py"), "headroom", "--reserved-kib", str(reserved_kib)],
+                             capture_output=True, text=True, env=env, check=True).stdout
+        return json.loads(out)
+
+    def test_headroom_without_slice_limit_is_host_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.headroom(tmp, "1073741824", "max", "max", 8 * 1024 ** 2)   # 8 GiB available
+            self.assertEqual((result["basis"], result["limit"], result["headroom"]), ("host-available", None, 8 * 1024 ** 3))
+            # Running domains' untouched memory is still spoken for: 2 GiB reserved, 1 GiB resident.
+            result = self.headroom(tmp, "1073741824", "max", "max", 8 * 1024 ** 2, reserved_kib=2 * 1024 ** 2)
+            self.assertEqual(result["headroom"], 7 * 1024 ** 3)
+
+    def test_headroom_without_slice_limit_and_unreadable_meminfo_is_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.headroom(tmp, "1073741824", "max", "max", None)
+            self.assertEqual((result["basis"], result["headroom"]), ("host-available", None))
+            Path(tmp, "meminfo").write_text("MemTotal: 1 kB\n")   # no MemAvailable line
+            env = dict(os.environ, ANJ_CGROUP_ROOT=tmp, ANJ_MEMINFO=str(Path(tmp, "meminfo")))
+            out = subprocess.run([sys.executable, str(HOST / "anjvm.py"), "headroom"], capture_output=True, text=True,
+                                 env=env, check=True).stdout
+            self.assertIsNone(json.loads(out)["headroom"])
+
+    def test_headroom_with_limit_is_capped_by_host_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.headroom(tmp, "1073741824", "4294967296", "max", 1024 ** 2)   # 3 GiB under limit, 1 GiB available
+            self.assertEqual((result["basis"], result["headroom"]), ("slice-limit", 1024 ** 3))
+            result = self.headroom(tmp, "1073741824", "4294967296", "max", None)   # unreadable: the limit alone, as before
+            self.assertEqual((result["basis"], result["headroom"]), ("slice-limit", 3 * 1024 ** 3))
 
 
 class ShareOwnershipTests(unittest.TestCase):
