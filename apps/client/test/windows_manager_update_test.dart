@@ -843,7 +843,13 @@ void main() {
 
   test('a stage changed during the wait is never activated', () async {
     await install();
-    for (final damage in ['changed', 'removed', 'added']) {
+    for (final damage in [
+      'changed',
+      'removed',
+      'added',
+      'rewritten with its receipt',
+      'replaced by a link',
+    ]) {
       host.started.clear();
       final bytes = release(11, keyText: keyText);
       final (archive, manifest, result) = download(
@@ -871,6 +877,24 @@ void main() {
               File(p.join(top.path, 'flutter_windows.dll')).deleteSync();
             case 'added':
               File(p.join(top.path, 'extra.dll')).writeAsStringSync('x');
+            case 'rewritten with its receipt':
+              // The program and the receipt changed so that they agree:
+              // only the receipt verified from the signed archive tells.
+              const forged = 'NOT THE SIGNED PROGRAM';
+              File(p.join(top.path, 'anj_cloud.exe')).writeAsStringSync(forged);
+              final receipt = File(p.join(top.path, 'bundle-receipt.json'));
+              final data = jsonDecode(
+                receipt.readAsStringSync(),
+              ) as Map<String, dynamic>;
+              (data['files_sha256'] as Map<String, dynamic>)['anj_cloud.exe'] =
+                  sha256.convert(utf8.encode(forged)).toString();
+              receipt.writeAsStringSync(jsonEncode(data));
+            case 'replaced by a link':
+              // An identical copy elsewhere, and a link where the
+              // extracted release was.
+              final copy = Directory(p.join(temp.path, 'elsewhere'));
+              top.renameSync(copy.path);
+              Link(top.path).createSync(copy.path);
           }
         },
       );
@@ -892,8 +916,91 @@ void main() {
         startsWith(changedSinceMessage),
       );
       File(result).deleteSync();
+      final elsewhere = Directory(p.join(temp.path, 'elsewhere'));
+      if (elsewhere.existsSync()) elsewhere.deleteSync(recursive: true);
     }
   });
+
+  test(
+    'a free profile restarts the app whatever its process looks like',
+    () async {
+      await install();
+      final bytes = release(11, keyText: keyText);
+      final (archive, manifest, result) = download(
+        bytes,
+        await signed(11, bytes),
+      );
+      // The update is refused (a staged file is removed during the wait).
+      // The app has gone and its profile is free, but its process id looks
+      // alive for ever: reused, or a process that cannot be opened.
+      host.busyAttempts = 1;
+      host.alive.add(4711);
+      var clock = DateTime.utc(2026, 11, 11);
+      var pauses = 0;
+      final outcome = await manager.applyUpdate(
+        archive,
+        manifest,
+        result: result,
+        appPid: 4711,
+        now: () => clock,
+        pause: (step) async {
+          pauses++;
+          clock = clock.add(step);
+          final stage = Directory(manager.layout.releases)
+              .listSync()
+              .whereType<Directory>()
+              .where((d) => p.basename(d.path).startsWith('.update-'));
+          for (final d in stage) {
+            final top = d.listSync().whereType<Directory>().single;
+            final file = File(p.join(top.path, 'flutter_windows.dll'));
+            if (file.existsSync()) file.deleteSync();
+          }
+        },
+      );
+      expect(outcome['message'], startsWith(changedSinceMessage));
+      // Started at once, not after seven minutes of watching the process.
+      expect(outcome['relaunched'], isTrue);
+      expect(pauses, 1);
+      expect(host.started, [
+        p.join(manager.layout.release(firstRelease), 'anj_cloud.exe'),
+      ]);
+      expectUntouched();
+    },
+  );
+
+  test(
+    'a process id seen exited and then alive again starts the count anew',
+    () async {
+      await install();
+      final bytes = release(11, keyText: keyText);
+      final (archive, manifest, result) = download(
+        bytes,
+        await signed(11, bytes),
+      );
+      // The profile is held for 20 looks (5 s). The handing-over process id
+      // reads exited for 2 s, alive again for 1 s (the id reused), exited
+      // for 2 s: never 3 s on end, so this is not "started again".
+      host.busyAttempts = 20;
+      var clock = DateTime.utc(2026, 11, 11);
+      var pauses = 0;
+      final outcome = await manager.applyUpdate(
+        archive,
+        manifest,
+        result: result,
+        appPid: 4711,
+        now: () => clock,
+        pause: (step) async {
+          pauses++;
+          clock = clock.add(step);
+          if (pauses == 8) host.alive.add(4711);
+          if (pauses == 12) host.alive.remove(4711);
+        },
+      );
+      expect(outcome['ok'], isTrue);
+      expect(pauses, 20);
+      expect(manager.activeState()!['release'], isNot(firstRelease));
+    },
+  );
 
   test('a slow app is told from a restarted one by its process', () async {
     await install();

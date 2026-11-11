@@ -371,6 +371,14 @@ class Manager {
           // published must still be exactly what was verified: a file
           // changed or removed meanwhile (by anything, a security product
           // included) refuses the update instead of activating it.
+          // And it must still be the directory that was extracted, never a
+          // link put in its place.
+          if (FileSystemEntity.typeSync(top, followLinks: false) !=
+              FileSystemEntityType.directory) {
+            throw Refused(
+              '$changedSinceMessage (the release directory was replaced)',
+            );
+          }
           final Map<String, dynamic> now;
           try {
             now = _validate(Directory(top));
@@ -1073,7 +1081,14 @@ class Manager {
         var start = installed;
         if (!start) {
           try {
-            start = await _appGone(state, appPid, relaunchDeadline, now, pause);
+            start = await _appGone(
+              state,
+              appPid,
+              relaunchDeadline,
+              startedAgainAfter,
+              now,
+              pause,
+            );
           } on Object catch (error) {
             // Cannot tell whether it still runs: starting it is harmless
             // (a second start only shows the running one), not starting it
@@ -1270,34 +1285,39 @@ class Manager {
     return (manifest, top, receipt);
   }
 
-  /// Whether the app may be started again after a refusal: the process that
-  /// handed over ([appPid]) has exited and nothing holds the profile (false
-  /// when another instance already runs, or when it has not exited by
-  /// [deadline]). Without [appPid], once nothing holds the profile.
+  /// Whether the app may be started again after a refusal. A free profile
+  /// lock is the proof that it has gone, so the lock is looked at first:
+  /// true as soon as nothing holds the profile, whatever the handing-over
+  /// process [appPid] looks like (a reused or unopenable process id looks
+  /// alive for ever). False when the profile is still held at [deadline],
+  /// or stays held for [heldAfterExit] after [appPid] has exited: another
+  /// instance already runs.
   Future<bool> _appGone(
     Map<String, dynamic> state,
     int? appPid,
     DateTime deadline,
+    Duration heldAfterExit,
     DateTime Function() now,
     Future<void> Function(Duration) pause,
   ) async {
     const step = Duration(milliseconds: 250);
-    if (appPid != null) {
-      while (host.processAlive(appPid)) {
-        if (!now().isBefore(deadline)) return false;
-        await pause(step);
-      }
-    }
     final library = p.join(
       layout.release(state['release'] as String),
       'anj_rootfs.dll',
     );
+    DateTime? heldSinceExit;
     while (true) {
       try {
         host.withProfileLock(state['profile'] as String, library, () {});
         return true;
       } on Busy {
-        if (appPid != null || !now().isBefore(deadline)) return false;
+        if (!now().isBefore(deadline)) return false;
+        if (appPid != null && !host.processAlive(appPid)) {
+          heldSinceExit ??= now();
+          if (!now().isBefore(heldSinceExit.add(heldAfterExit))) return false;
+        } else {
+          heldSinceExit = null;
+        }
         await pause(step);
       }
     }
