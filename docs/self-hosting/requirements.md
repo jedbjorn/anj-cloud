@@ -93,8 +93,8 @@ address is `https://cloud.example.com` with the standard HTTPS port, not a rando
   unique within the list. **The first account becomes the first admin.**
 - A phone with the **ntfy** app for the guided alert setup. Setup can generate a private topic or use an
   existing one. Anyone with the topic can read or post alerts, so protect it like a password.
-- An [official AnJ Cloud client](../clients.md) for the first device. Official Linux, macOS, and Android
-  builds can pair with your server without a client build. There is no official Windows build yet.
+- An [official AnJ Cloud client](../clients.md) for the first device. Official Linux, macOS, Windows and
+  Android builds can pair with your server without a client build. The Windows build is early.
 
 You do **not** need Flutter, Subfloor, a deployment profile, desktop update signing keys, or an Android
 keystore for this installation. Custom client builds and a household-controlled update feed are separate,
