@@ -649,11 +649,18 @@ subnet_free() {
     [[ -z "$routes" ]] || { log "    $subnet.0/24 already routed: $routes"; return 1; }
 }
 
+# Sets HEADROOM_BASIS for the refusal message: the slice limit when machine.slice has one, else host MemAvailable.
+HEADROOM_BASIS="machine.slice"
 headroom_ok() {
-    local profile="$1" need="$2" json room
+    local profile="$1" need="$2" json room basis
     json="$(anjvm headroom --reserved-kib "$(running_reserved_kib "$profile")" 2>&1 || true)"
     room="$(json_get - headroom <<<"$json")"
-    log "    machine.slice: $json (need $need)"
+    basis="$(json_get - basis <<<"$json")"
+    case "$basis" in
+        host-available) HEADROOM_BASIS="host available memory (machine.slice has no limit)" ;;
+        *) HEADROOM_BASIS="machine.slice" ;;
+    esac
+    log "    memory headroom, basis ${basis:-unknown}: $json (need $need)"
     [[ "$room" =~ ^-?[0-9]+$ ]] && (( room >= need ))
 }
 
@@ -781,7 +788,7 @@ step_1() {
     if [[ -z "$version" || "$(printf '%s\n%s\n' "$MIN_LIBVIRT" "$version" | sort -V | head -n1)" != "$MIN_LIBVIRT" ]]; then
         problems+=("libvirt ${version:-unknown} < $MIN_LIBVIRT")
     fi
-    headroom_ok "$PROD" "$PROD_HEADROOM" || problems+=("machine.slice headroom below 4.5 GiB beyond running domains")
+    headroom_ok "$PROD" "$PROD_HEADROOM" || problems+=("$HEADROOM_BASIS headroom below 4.5 GiB beyond running domains")
     threads_free || problems+=("threads 14,30,15,31 pinned by another domain")
     subnet_free 10.77.10 virbr-anjprod || problems+=("10.77.10.0/24 in use")
     image_verified || problems+=("Debian image not verified")
@@ -1945,7 +1952,7 @@ mode_qual() {
             record 1 refused "" "" "qual-unknown: libvirt could not list domains, networks or pools; nothing touched"
             return 3 ;;
     esac
-    headroom_ok "$QUAL" "$QUAL_HEADROOM" || problems+=("machine.slice headroom below 5 GiB (#89 (6))")
+    headroom_ok "$QUAL" "$QUAL_HEADROOM" || problems+=("$HEADROOM_BASIS headroom below 5 GiB (#89 (6))")
     threads_free || problems+=("threads 14,30,15,31 pinned by a non-anj domain")
     subnet_free 10.77.11 virbr-anjqual || problems+=("10.77.11.0/24 in use")
     image_verified || problems+=("Debian image not verified")

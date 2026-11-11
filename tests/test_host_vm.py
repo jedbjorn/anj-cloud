@@ -173,6 +173,8 @@ class Harness:
         self.cgroup = self.tmp / "cgroup/machine.slice"
         self.cgroup.mkdir(parents=True)
         self.set_memory(current=2 * GIB)
+        self.meminfo = self.tmp / "meminfo"
+        self.set_available(64 * 1024 * 1024)   # 64 GiB: ample unless a test says otherwise
         self.topic = self.tmp / "topic"
         self.topic.write_text("testTopicNotReal_0123456789abcdef\n")
         self.tty = self.tmp / "tty"
@@ -199,10 +201,17 @@ class Harness:
         }
         self.save_state()
 
-    def set_memory(self, current, high=int(22.5 * GIB)):
+    def set_memory(self, current, high=int(22.5 * GIB), max_=int(23.5 * GIB)):
         (self.cgroup / "memory.current").write_text(f"{current}\n")
         (self.cgroup / "memory.high").write_text(f"{high}\n")
-        (self.cgroup / "memory.max").write_text(f"{int(23.5 * GIB)}\n")
+        (self.cgroup / "memory.max").write_text(f"{max_}\n")
+
+    def set_available(self, kib):
+        """The host's MemAvailable (None: the file is missing, so it cannot be read)."""
+        if kib is None:
+            self.meminfo.unlink(missing_ok=True)
+        else:
+            self.meminfo.write_text(f"MemTotal:       99999999 kB\nMemAvailable:   {kib} kB\n")
 
     def save_state(self):
         (self.stubs / "state.json").write_text(json.dumps(self.state))
@@ -252,6 +261,7 @@ class Harness:
                        "ANJ_HOST_ROOT": str(self.root), "ANJ_HOST_STUBS": str(self.stubs),
                        "ANJ_HOST_TTY": str(self.tty), "ANJ_HOST_TOPIC_INPUT": str(self.topic),
                        "ANJ_HOST_IMAGE_PIN": str(self.pin), "ANJ_CGROUP_ROOT": str(self.cgroup.parent),
+                       "ANJ_MEMINFO": str(self.meminfo),
                        "ANJ_QUAL_SSH_TIMEOUT": "5", "ANJ_HOST_TEST_OWNERS": str(self.owners),
                        "ANJ_PROFILE": str(HOST.parent / "profile.example.toml")}
         if root:
@@ -1093,7 +1103,28 @@ class HaloVmTests(unittest.TestCase):
         self.h.save_state()
         self.h.set_memory(current=7 * GIB)
         self.assertEqual(self.h.run("--qual", "--run-id", "x", root=False).returncode, 1)
-        self.assertIn("headroom below 5 GiB", self.h.output)
+        self.assertIn("machine.slice headroom below 5 GiB", self.h.output)
+        self.assertNotIn("anj-qual", self.h.load_state()["domains"])
+
+    def test_qual_without_slice_limit_uses_host_available_memory(self):
+        self.h.set_memory(current=7 * GIB, high="max", max_="max")
+        self.h.set_available(6 * 1024 * 1024)   # 6 GiB
+        self.assertEqual(self.h.run("--qual", "--run-id", "x", root=False).returncode, 0, self.h.output)
+        self.assertIn("basis host-available", self.h.output)
+        self.h.run("--qual-destroy", "--run-id", "x", root=False)
+
+    def test_qual_without_slice_limit_refused_on_low_host_memory(self):
+        self.h.set_memory(current=7 * GIB, high="max", max_="max")
+        self.h.set_available(4 * 1024 * 1024)   # 4 GiB
+        self.assertEqual(self.h.run("--qual", "--run-id", "x", root=False).returncode, 1)
+        self.assertIn("host available memory (machine.slice has no limit) headroom below 5 GiB", self.h.output)
+        self.assertNotIn("anj-qual", self.h.load_state()["domains"])
+
+    def test_qual_without_slice_limit_refused_when_host_memory_unreadable(self):
+        self.h.set_memory(current=7 * GIB, high="max", max_="max")
+        self.h.set_available(None)
+        self.assertEqual(self.h.run("--qual", "--run-id", "x", root=False).returncode, 1)
+        self.assertIn("host available memory (machine.slice has no limit) headroom below 5 GiB", self.h.output)
         self.assertNotIn("anj-qual", self.h.load_state()["domains"])
 
     def test_others_untouched_flags_another_domain_change(self):
