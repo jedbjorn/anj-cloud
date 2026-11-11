@@ -7,7 +7,8 @@
 # ssh serves a reverse forward by fetching its -R target directly.
 # Covers: cleanup on success, failure and signals; the lease (owner required
 # and checked, boot identity including the qemu start time, flock between
-# start and stop) and the unleased recovery path.
+# start and stop) and the unleased recovery path. Last, the W6 Admin
+# driver's own tests (tool/test_windows_admin_fixture.py).
 set -euo pipefail
 seat="$(cd "$(dirname "$0")" && pwd)/windows_seat.sh"
 work="$(mktemp -d)"
@@ -248,6 +249,12 @@ rm -f "$work/proc/meminfo"; run preflight
 [ "$code" != 0 ] && grep -q "cannot read host MemAvailable" <<<"$out" && ok "preflight refuses on an unlimited slice when MemAvailable cannot be read" || bad "unlimited, unreadable: $code $out"
 rm -f "$FAKE/mem_max"; run preflight
 [ "$code" = 0 ] && grep -q "machine.slice 19 GiB free" <<<"$out" && ok "a numeric slice limit is used as before" || bad "numeric limit: $code $out"
+
+# The W6 driver's verdict, cleanup, Bob reset and guest-task stop
+# (deploy/windows_admin_fixture.py, tool/windows/w6_run.ps1), with fakes only.
+set +e; out="$(env -u PYTHONPATH python3 -I "$(dirname "$seat")/test_windows_admin_fixture.py" 2>&1)"; code=$?; set -e
+n="$(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' <<<"$out")"
+[ "$code" = 0 ] && ok "windows_admin_fixture: $n driver tests pass" || bad "windows_admin_fixture tests: $code $(tail -30 <<<"$out")"
 
 echo "windows_seat tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]
