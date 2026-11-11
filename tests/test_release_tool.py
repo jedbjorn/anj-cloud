@@ -277,6 +277,45 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertEqual([], destination.published)
         with self.assertRaisesRegex(release.Refused, "not a readable Windows release archive"):
             release.publish("windows-x64", self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+        # What the Windows manager's ZIP reader refuses is never published: every client would
+        # download it and refuse it on each check.
+        import zipfile
+
+        def crafted(change):
+            source = self.windows_artifact()
+            self.made += 1
+            target = self.root / f"{self.made}" / source.name
+            target.parent.mkdir()
+            with zipfile.ZipFile(source) as old, zipfile.ZipFile(target, "w") as new:
+                for info in old.infolist():
+                    new.writestr(info, old.read(info))
+                change(new, old.namelist()[0].split("/")[0])
+            return target
+
+        def link(archive, top):
+            info = zipfile.ZipInfo(f"{top}/link")
+            info.create_system = 3
+            info.external_attr = 0o120777 << 16
+            archive.writestr(info, "anj_cloud.exe")
+
+        def bzip(archive, top):
+            archive.writestr(zipfile.ZipInfo(f"{top}/packed.bin"), b"x" * 64, compress_type=zipfile.ZIP_BZIP2)
+
+        crafts = {
+            "a member is a link or special file": link,
+            "a member uses a compression other than stored or deflate": bzip,
+            "a member has an absolute or backslash name": lambda a, top: a.writestr(f"{top}\\evil.dll", b"x"),
+            "a member has a name Windows cannot hold": lambda a, top: a.writestr(f"{top}/aux.txt", b"x"),
+            "a member has a name Windows cannot hold ": lambda a, top: a.writestr(f"{top}/trailing.", b"x"),
+            "a member repeats a name": lambda a, top: a.writestr(f"{top}/ANJ_CLOUD.EXE", b"x"),
+        }
+        for reason, change in crafts.items():
+            with self.subTest(reason=reason):
+                destination = FakeDestination()
+                with self.assertRaises(release.Refused) as caught:
+                    release.publish("windows-x64", crafted(change), destination, key_dir=self.keys, fetch=False)
+                self.assertIn(reason.strip(), str(caught.exception))
+                self.assertEqual([], destination.published)
         # A macOS zip is not a Windows release.
         with self.assertRaisesRegex(release.Refused, "has no release receipt"):
             release.publish("windows-x64", self.macos_artifact(), FakeDestination(), key_dir=self.keys, fetch=False)

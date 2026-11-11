@@ -270,6 +270,44 @@ def macos_artifact_facts(path):
     return receipt, key, size, checksum.hexdigest()
 
 
+# What the Windows manager's own ZIP reader and release check refuse (apps/client/tool/windows_manager/zip.dart,
+# manager.dart `validRelative`): an archive published past these would be downloaded by every client and
+# refused by each of them, on every check.
+WINDOWS_MAX_MEMBERS = 10000
+WINDOWS_MAX_UNPACKED = 2 * 1024 * 1024 * 1024
+WINDOWS_RESERVED = re.compile(r"(CON|PRN|AUX|NUL|COM[0-9¹²³]|LPT[0-9¹²³]|CONIN\$|CONOUT\$)")
+
+
+def windows_member_refusal(info):
+    """Why the Windows manager would refuse this ZIP member; None when it would not."""
+    import stat as stat_module
+    import zipfile
+    if info.flag_bits & 0x1:
+        return "is encrypted"
+    if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+        return "uses a compression other than stored or deflate"
+    if info.file_size >= 0xFFFFFFFF or info.compress_size >= 0xFFFFFFFF or info.header_offset >= 0xFFFFFFFF:
+        return "needs ZIP64"
+    kind = stat_module.S_IFMT(info.external_attr >> 16)
+    if info.create_system == 3 and kind not in (0, stat_module.S_IFREG, stat_module.S_IFDIR):
+        return "is a link or special file"
+    name = info.orig_filename
+    if not info.flag_bits & 0x800 and not name.isascii():
+        return "has a name that is not UTF-8"
+    directory = name.endswith("/")
+    if directory and info.file_size:
+        return "is a directory with data"
+    name = name[:-1] if directory else name
+    if not name or name.startswith("/") or "\\" in name:
+        return "has an absolute or backslash name"
+    for part in name.split("/"):
+        if (not part or part in (".", "..") or len(part) > 255 or part.endswith((".", " "))
+                or any(ord(c) < 0x20 or c in '<>:"|?*' for c in part)
+                or WINDOWS_RESERVED.fullmatch(part.split(".")[0].rstrip().upper())):
+            return "has a name Windows cannot hold"
+    return None
+
+
 def windows_artifact_facts(path):
     """(receipt, built-in public key or None, size, sha256) of a Windows release archive:
     the zip apps/client/tool/windows/package.ps1 writes, holding one
@@ -286,7 +324,19 @@ def windows_artifact_facts(path):
             size += len(chunk)
     try:
         with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
             names = archive.namelist()
+            if len(members) > WINDOWS_MAX_MEMBERS or sum(info.file_size for info in members) > WINDOWS_MAX_UNPACKED:
+                raise Refused("The artifact has more members or bytes than the Windows manager accepts")
+            seen = set()
+            for info in members:
+                refusal = windows_member_refusal(info)
+                folded = info.orig_filename.rstrip("/").lower()
+                if refusal is None and folded in seen:
+                    refusal = "repeats a name (Windows names ignore case)"
+                if refusal:
+                    raise Refused(f"The Windows manager would refuse this artifact: a member {refusal}")
+                seen.add(folded)
             tops = {PurePosixPath(name).parts[0] for name in names if PurePosixPath(name).parts}
             top = next(iter(tops)) if len(tops) == 1 else ""
             receipt = json.loads(archive.read(f"{top}/bundle-receipt.json")) if f"{top}/bundle-receipt.json" in names else None
