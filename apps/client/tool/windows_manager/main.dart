@@ -20,6 +20,7 @@
 /// program that checks it.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -28,18 +29,41 @@ import 'package:path/path.dart' as p;
 import 'manager.dart';
 import 'windows_host.dart';
 
-Future<void> main(List<String> arguments) async {
+void main(List<String> arguments) {
+  runZonedGuarded(() async => exit(await _main(arguments)), (error, stack) {
+    // A late failure of a standard stream is not the command's failure.
+    if (error is StdoutException) return;
+    _say(stderr, 'anj-cloud-manager: unexpected failure: $error\n$stack');
+    exit(255);
+  });
+}
+
+/// Runs the command and prints its answer; returns the exit code.
+Future<int> _main(List<String> arguments) async {
   try {
     final result = await _dispatch(arguments);
-    stdout.writeln(const JsonEncoder.withIndent('  ').convert(result));
+    await _say(stdout, const JsonEncoder.withIndent('  ').convert(result));
     // apply-update answers a refused hand-over as an outcome, not an error.
-    exitCode = result is Map && result['ok'] == false ? 1 : 0;
+    return result is Map && result['ok'] == false ? 1 : 0;
   } on Refused catch (error) {
-    stderr.writeln('anj-cloud-manager: $error');
-    exitCode = 1;
+    await _say(stderr, 'anj-cloud-manager: $error');
+    return 1;
   } on FileSystemException catch (error) {
-    stderr.writeln('anj-cloud-manager: $error');
-    exitCode = 1;
+    await _say(stderr, 'anj-cloud-manager: $error');
+    return 1;
+  }
+}
+
+/// Prints when there is somewhere to print. The app starts apply-update
+/// detached, with no console and no standard handles: printing fails there,
+/// after the work is done and its outcome is in the result file, and must
+/// not turn the exit code into a crash's.
+Future<void> _say(IOSink sink, String text) async {
+  try {
+    sink.writeln(text);
+    await sink.flush();
+  } on Object {
+    // Nowhere to print.
   }
 }
 
