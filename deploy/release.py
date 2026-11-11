@@ -12,10 +12,12 @@ library plus the `openssl` command (3.0+); never builds anything.
 
     release.py publish --target linux-x86_64 --artifact <anj-cloud-linux-x86_64-*.tar.gz>
     release.py publish --target macos-arm64 --artifact <anj-cloud-macos-arm64-*.zip>
+    release.py publish --target windows-x64 --artifact <anj-cloud-*-windows-x86_64.zip>
                        [--min-client-version-code N] [--dry-run]
                        [--ssh-host anj-prod] [--ssh-config FILE]
                        | --local-project NAME [--port N] [--source-ref REF]
-        Takes an artifact apps/client/tool/package_linux.py built and publishes it signed:
+        Takes an artifact apps/client/tool/package_linux.py built (macOS: tool/macos/release_macos.sh;
+        Windows: tool/windows/package.ps1 with -VersionCode and -Version) and publishes it signed:
           - its receipt's source commit must be in origin/main (fetched first) and its
             version_code must be that commit's apps/client/release-version.json;
           - its built-in release key must be the key that signs it (a release that trusts another
@@ -53,6 +55,7 @@ import re
 from pathlib import Path, PurePosixPath
 import shlex
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -268,8 +271,136 @@ def macos_artifact_facts(path):
     return receipt, key, size, checksum.hexdigest()
 
 
+# What the Windows manager's own ZIP reader and release check refuse (apps/client/tool/windows_manager/zip.dart,
+# manager.dart `validRelative`): an archive published past these would be downloaded by every client and
+# refused by each of them, on every check.
+WINDOWS_MAX_MEMBERS = 10000
+WINDOWS_MAX_UNPACKED = 2 * 1024 * 1024 * 1024
+# manager.dart `requiredFiles`: what every Windows release must carry (tests/test_release_tool.py
+# reads the Dart list and compares).
+WINDOWS_REQUIRED = frozenset({
+    "anj_cloud.exe", "flutter_windows.dll", "anj_rootfs.dll", "anj-cloud-manager.exe", "data/app.so",
+    "data/icudtl.dat", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"})
+WINDOWS_RESERVED = re.compile(r"(CON|PRN|AUX|NUL|COM[0-9¹²³]|LPT[0-9¹²³]|CONIN\$|CONOUT\$)")
+
+
+def windows_member_refusal(info):
+    """Why the Windows manager would refuse this ZIP member; None when it would not."""
+    import stat as stat_module
+    import zipfile
+    if info.flag_bits & 0x1:
+        return "is encrypted"
+    if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+        return "uses a compression other than stored or deflate"
+    if info.file_size >= 0xFFFFFFFF or info.compress_size >= 0xFFFFFFFF or info.header_offset >= 0xFFFFFFFF:
+        return "needs ZIP64"
+    extra = info.extra
+    while len(extra) >= 4:   # the manager reads sizes from the fixed fields only
+        kind, length = struct.unpack("<HH", extra[:4])
+        if kind == 0x0001:
+            return "carries a ZIP64 extra field"
+        extra = extra[4 + length:]
+    kind = stat_module.S_IFMT(info.external_attr >> 16)
+    if info.create_system == 3 and kind not in (0, stat_module.S_IFREG, stat_module.S_IFDIR):
+        return "is a link or special file"
+    name = info.orig_filename
+    if not info.flag_bits & 0x800 and not name.isascii():
+        return "has a name that is not UTF-8"
+    directory = name.endswith("/")
+    if directory and info.file_size:
+        return "is a directory with data"
+    name = name[:-1] if directory else name
+    if not name or name.startswith("/") or "\\" in name:
+        return "has an absolute or backslash name"
+    for part in name.split("/"):
+        if (not part or part in (".", "..") or len(part) > 255 or part.endswith((".", " "))
+                or any(ord(c) < 0x20 or c in '<>:"|?*' for c in part)
+                or WINDOWS_RESERVED.fullmatch(part.split(".")[0].rstrip().upper())):
+            return "has a name Windows cannot hold"
+    return None
+
+
+def windows_payload_refusal(archive, members, top, receipt):
+    """Why the manager's release check (manager.dart `_validate`) would refuse this payload; None when it
+    would not: the files are exactly those the receipt lists, each with its hash, and the required ones
+    are there. Reading every member also checks its CRC-32, as the manager's extraction does."""
+    hashes = receipt.get("files_sha256")
+    if not isinstance(hashes, dict) or not WINDOWS_REQUIRED <= hashes.keys():
+        return "its receipt does not list every file a release must carry"
+    files = {info.orig_filename[len(top) + 1:]: info for info in members if not info.orig_filename.endswith("/")}
+    if files.keys() != hashes.keys() | {"bundle-receipt.json"}:
+        return "its files are not exactly those its receipt lists"
+    for name, expected in hashes.items():
+        if not isinstance(expected, str) or not re.fullmatch(r"[a-f0-9]{64}", expected):
+            return "its receipt has an invalid hash"
+        if hashlib.sha256(archive.read(files[name])).hexdigest() != expected:
+            return f"{name} does not match its receipt hash"
+    return None
+
+
+def windows_artifact_facts(path):
+    """(receipt, built-in public key or None, size, sha256) of a Windows release archive:
+    the zip apps/client/tool/windows/package.ps1 writes, holding one
+    anj-cloud-windows-x86_64-<source12> directory whose bundle-receipt.json carries the version
+    (-VersionCode, -Version)."""
+    import zipfile
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise Refused("The artifact must be a regular file")
+    checksum, size = hashlib.sha256(), 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            checksum.update(chunk)
+            size += len(chunk)
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            names = archive.namelist()
+            if len(members) > WINDOWS_MAX_MEMBERS or sum(info.file_size for info in members) > WINDOWS_MAX_UNPACKED:
+                raise Refused("The artifact has more members or bytes than the Windows manager accepts")
+            # The manager believes the end record's entry count; Python reads the central directory to its end.
+            tail = path.read_bytes()[-(22 + 65535):]
+            end = tail.rfind(b"PK\x05\x06")
+            if end < 0 or struct.unpack("<H", tail[end + 10:end + 12])[0] != len(members):
+                raise Refused("The Windows manager would refuse this artifact: its end record miscounts the members")
+            # Python tolerates bytes in front of an archive and adjusts every offset; the manager does not.
+            if members and min(info.header_offset for info in members) != 0:
+                raise Refused("The Windows manager would refuse this artifact: bytes precede the archive")
+            seen = set()
+            for info in members:
+                refusal = windows_member_refusal(info)
+                folded = info.orig_filename.rstrip("/").lower()
+                if refusal is None and folded in seen:
+                    refusal = "repeats a name (Windows names ignore case)"
+                if refusal:
+                    raise Refused(f"The Windows manager would refuse this artifact: a member {refusal}")
+                seen.add(folded)
+            tops = {PurePosixPath(name).parts[0] for name in names if PurePosixPath(name).parts}
+            top = next(iter(tops)) if len(tops) == 1 else ""
+            # As text in UTF-8, as the manager reads it (json.loads on bytes would also take UTF-16).
+            receipt = (json.loads(archive.read(f"{top}/bundle-receipt.json").decode("utf-8-sig"))
+                       if f"{top}/bundle-receipt.json" in names else None)
+            key = parse_public(archive.read(f"{top}/{KEY_PAYLOAD}").decode()) if f"{top}/{KEY_PAYLOAD}" in names else None
+            payload = windows_payload_refusal(archive, members, top, receipt) if isinstance(receipt, dict) else None
+    except (zipfile.BadZipFile, OSError, ValueError, UnicodeError, KeyError) as error:
+        raise Refused(f"The artifact is not a readable Windows release archive ({error})") from None
+    if not isinstance(receipt, dict):
+        raise Refused("The artifact has no release receipt (build it with apps/client/tool/windows/package.ps1)")
+    if payload:
+        raise Refused(f"The Windows manager would refuse this artifact: {payload}")
+    source, code = receipt.get("source_head"), receipt.get("version_code")
+    if (receipt.get("platform") != "Windows x86_64" or not isinstance(source, str) or len(source) != 40
+            or type(code) is not int or code < 1 or not isinstance(receipt.get("version"), str)):
+        raise Refused("The artifact's receipt has no source commit, version or version_code "
+                      "(package it with tool/windows/package.ps1 -VersionCode <n> -Version <v>)")
+    if top != f"anj-cloud-windows-x86_64-{source[:12]}":
+        raise Refused("The artifact's directory does not match its source commit")
+    return receipt, key, size, checksum.hexdigest()
+
+
 # Desktop targets this tool publishes, and how each artifact is read.
-ARTIFACT_FACTS = {"linux-x86_64": artifact_facts, "macos-arm64": macos_artifact_facts}
+ARTIFACT_FACTS = {"linux-x86_64": artifact_facts, "macos-arm64": macos_artifact_facts,
+                  "windows-x64": windows_artifact_facts}
 
 
 # The files whose code decides what is signed and how (review L5): a local edit could sign bytes

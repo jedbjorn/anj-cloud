@@ -81,6 +81,11 @@ class FakeHost implements Host {
   void seal(String directory, {required bool readOnly}) {}
   @override
   Future<int> start(String executable, List<String> arguments) async => 42;
+
+  /// Process ids that still run.
+  final alive = <int>{};
+  @override
+  bool processAlive(int pid) => alive.contains(pid);
 }
 
 /// A ZIP of [files] (stored, or deflated when [deflate]).

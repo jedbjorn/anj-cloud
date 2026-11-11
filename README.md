@@ -42,7 +42,7 @@ AnJ Cloud is young software built for one household first.
 | Linux client (x86_64) | Usable: installer, tray, start at login, in-app update |
 | Android client (arm64) | Usable: signed APK, in-app update |
 | macOS client (Apple silicon) | Usable: installer, menu-bar item, in-app update |
-| Windows client (x86_64) | Installer exists (install, update, run, start at login, uninstall); in-app updates are not available yet |
+| Windows client (x86_64) | No official build. Installer exists (install, update, run, start at login, uninstall); builds you sign and publish yourself update in the app (run end to end on one Windows 10 test machine) |
 
 Inference access (routing paired devices to your own model gateway) is planned and is not part of this
 repository yet.
@@ -118,8 +118,9 @@ and enter your server address and code. Building your own zip remains an
 
 ### Windows (x86_64)
 
-There is **no official Windows build yet**. An installer and update manager exist; in-app updates are not
-available yet. See [building and installing on Windows](docs/clients.md#windows).
+There is **no official Windows build yet**. An installer and update manager exist. A build you package with
+your own release key updates itself in the app from your gateway, as on the other desktops; this has been run end
+to end on one Windows 10 test machine with test builds, not on a range of machines. See [building and installing on Windows](docs/clients.md#windows).
 
 ### Android (arm64)
 

@@ -21,7 +21,7 @@ installer script.
 | Linux x86_64 | `.tar.gz` | `linux_install.py` |
 | macOS (Apple silicon) | `.zip` | `anj-cloud-macos-install.sh` |
 | Android (arm64) | Signed `.apk` | Open APK on phone, or `adb install` |
-| Windows (x86_64) | None yet | Build your own; no in-app updates yet |
+| Windows (x86_64) | None yet | Build your own; `anj-cloud-manager.exe` |
 
 ## Linux
 
@@ -94,8 +94,11 @@ Keep your signing keys safe; publish your signed updates through your gateway as
 
 ## Windows
 
-There is **no official Windows build yet**. An installer and update manager exist; in-app updates are not
-available yet, so you update by running the manager with a new archive. Treat the Windows client as early.
+There is **no official Windows build yet**. An installer and update manager exist, and a build you package
+with your own release key updates itself in the app. The in-app update has been run end to end on one
+Windows 10 test machine, with test builds, a throwaway key and a test gateway; it has not been tried on other
+Windows versions or machines. You can always update by hand instead: quit the app, then run the manager's
+`update` with a new archive. Treat the Windows client as early.
 
 Building needs Windows x86_64 with Visual Studio Build Tools 2022 (C++ workload and C++ ATL) and the pinned
 Flutter SDK (`apps/client/tool/windows/install.ps1` installs them on a build seat).
@@ -103,6 +106,7 @@ Flutter SDK (`apps/client/tool/windows/install.ps1` installs them on a build sea
 ```powershell
 # in apps\client, after `flutter build windows --release`:
 powershell -File tool\windows\package.ps1 -SourceHead <40-hex commit>   # writes the zip and prints its SHA-256
+#   add -VersionCode <n> -Version <v> for a build that updates itself in the app (see below)
 # install or update (the manager runs from the unpacked release; get its checksum separately):
 anj-cloud-manager.exe install <zip> --sha256 <hex>
 anj-cloud-manager.exe run
@@ -112,6 +116,43 @@ anj-cloud-manager.exe uninstall             # removes exactly what install added
 
 `update <zip> --sha256 <hex>` refuses while the app runs. The app keeps its secrets in Windows DPAPI and shows a
 notification-area icon. Pairing is as on the other desktops.
+
+**In-app updates.** An installed build offers **Update available** when all of these hold: it was built with
+your release key in the tree (`apps/client/tool/apply_profile.py` writes it before `flutter build`), it was
+packaged with `-VersionCode` and `-Version` (`python3 deploy/client_version.py <commit>` prints both for a
+commit), and your gateway serves a newer `windows-x64` release signed with that key
+(`python3 deploy/release.py publish --target windows-x64 --artifact <zip>`, see
+[updates and signing](updates-and-signing.md)). A build without a release key or version shows no update
+notices and is updated by hand.
+
+On **Update now** the app quits and hands the download to the installed manager (`apply-update`). The manager
+verifies the signature, size and SHA-256 again with the key inside the installed release, waits for the app to
+have quit, installs the new release beside the old one and starts the app, which then shows **Updated to
+version …**. Your profile, secrets and synced folder are not touched, and the release you were running is kept.
+
+When the manager refuses an update, nothing is installed and the release you were running stays the active
+one. What you see depends on why:
+
+- The download does not match its signed size and SHA-256, another release was installed in the meantime, or
+  another manager command was still running after two minutes: the manager starts the app again, and the app
+  shows **Update could not be installed** with the reason.
+- The app has not quit two minutes after **Update now**: the same message appears the next time the app
+  starts. The manager starts it again itself only if the app quits within about five more minutes.
+- The files of the update are changed or removed on disk while the manager waits (a security product
+  quarantining one, for example): the manager checks them once more just before installing, refuses, starts
+  the app again, and the app shows **Update could not be installed**.
+- You start the app again yourself before the manager has installed the update: the manager gives up after a
+  few seconds and leaves that instance alone. The reason is shown the next time the app starts, and the
+  update is offered again.
+- You sign out or shut down while it waits: nothing is installed and there is no message; the app offers the
+  update again at its next start.
+
+A release served by your gateway but signed with another key is never downloaded: the app shows **Update
+could not be verified**.
+
+The manager only accepts a download that lies in the profile folder it derives from `LOCALAPPDATA`. A profile
+path with spaces or non-ASCII letters was tried; a short (8.3) or redirected `LOCALAPPDATA` was not. If the two
+ever disagree the update is refused, nothing is installed, and updating by hand still works.
 
 ## First launch on any platform
 

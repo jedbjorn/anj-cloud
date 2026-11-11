@@ -203,6 +203,12 @@ const processCallSites = {
     'result = await Process.run(command, [',
     'await Process.start(command, [',
   ],
+  // The Windows manager's apply-update: the check, then the detached
+  // hand-over.
+  'lib/platform/windows/windows_self_update.dart': [
+    'result = await Process.run(command, [',
+    'await Process.start(command, [',
+  ],
 };
 
 final _openssl = RegExp('openssl', caseSensitive: false);

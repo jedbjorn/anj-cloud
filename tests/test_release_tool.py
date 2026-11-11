@@ -3,10 +3,12 @@ publish of a packaged Linux client. Real openssl, real git in a temporary reposi
 keys only; the destination (VM or local stack) is a fake or a recorded ssh runner."""
 
 import base64
+import hashlib
 import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tarfile
@@ -103,6 +105,32 @@ class ReleaseToolTests(unittest.TestCase):
                 archive.writestr(member, b"x")
         return path
 
+    def windows_artifact(self, commit=None, *, code=None, key_text=None, top=None, platform="Windows x86_64",
+                         stamped=True, extra=(), drop=(), hashes=None, stored=False):
+        """A zip as tool/windows/package.ps1 writes it: one release directory holding every file a
+        release must carry and the receipt that lists each with its hash."""
+        import zipfile
+        commit = commit or self.commits[1]
+        code = int(git(self.repo, "rev-list", "--count", commit)) if code is None else code
+        files = {name: f"{name} payload".encode() * 20 for name in release.WINDOWS_REQUIRED if name not in drop}
+        files[release.KEY_PAYLOAD] = (self.public.read_text() if key_text is None else key_text).encode()
+        receipt = {"platform": platform, "source_head": commit,
+                   "files_sha256": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+                   if hashes is None else hashes}
+        if stamped:
+            receipt.update(version=f"2026.11.11.{code}", version_code=code)
+        top = top or f"anj-cloud-windows-x86_64-{commit[:12]}"
+        self.made = getattr(self, "made", 0) + 1
+        path = self.root / f"{self.made}" / f"anj-cloud-{commit[:12]}-windows-x86_64.zip"
+        path.parent.mkdir()
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED) as archive:
+            for name, data in files.items():
+                archive.writestr(f"{top}/{name}", data)
+            archive.writestr(f"{top}/bundle-receipt.json", json.dumps(receipt))
+            for member in extra:
+                archive.writestr(member, b"x")
+        return path
+
     def publish(self, artifact, destination=None, **kwargs):
         return release.publish("linux-x86_64", artifact, destination or FakeDestination(), key_dir=self.keys, fetch=False, **kwargs)
 
@@ -179,9 +207,10 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertIn(reason, str(caught.exception))
                 self.assertEqual([], destination.published)
         # android-arm64 has its own branch (tests/test_release_android.py).
-        for target, reason in (("ios", "Not a desktop target"), ("windows-x64", "Only linux-x86_64, macos-arm64")):
-            with self.subTest(target=target), self.assertRaisesRegex(release.Refused, reason):
-                release.publish(target, self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+        with self.assertRaisesRegex(release.Refused, "Not a desktop target"):
+            release.publish("ios", self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+        # Every signed target has a reader: none falls through to "cannot be published yet".
+        self.assertEqual(set(release.SIGNED), set(release.ARTIFACT_FACTS))
 
     def test_publish_macos_signs_a_manifest_for_macos_arm64(self):
         artifact = self.macos_artifact()
@@ -217,6 +246,156 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertEqual([], destination.published)
         with self.assertRaisesRegex(release.Refused, "not a readable macOS release archive"):
             release.publish("macos-arm64", self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+
+    def test_publish_windows_signs_a_manifest_for_windows_x64(self):
+        artifact = self.windows_artifact()
+        destination = FakeDestination()
+        result = release.publish("windows-x64", artifact, destination, key_dir=self.keys, fetch=False)
+        (target, data, manifest), = destination.published
+        self.assertEqual(("windows-x64", artifact.read_bytes()), (target, data))
+        self.assertEqual(manifest, manifest_from(manifest, "windows-x64"))
+        self.assertEqual(("windows-x64", 2, "2026.11.11.2", self.generated["key_id"], artifact.stat().st_size),
+                         (manifest["target"], manifest["version_code"], manifest["version"], manifest["key_id"],
+                          manifest["size"]))
+        raw = release.parse_public(self.public.read_text())
+        self.assertTrue(manager.ed25519_verify(raw, signed_message(manifest), base64.b64decode(manifest["signature"])))
+        self.assertEqual(self.commits[1], result["source_head"])
+
+    def test_publish_windows_refuses_what_could_not_update_itself(self):
+        other = self.root / "other.pub"
+        release.keygen(self.root / "other-keys", other)
+        cases = {
+            "not in origin/main": self.windows_artifact(self.commits[2]),
+            "is not its commit's": self.windows_artifact(code=7),
+            "(it has none)": self.windows_artifact(key_text="# none\n"),
+            "it trusts": self.windows_artifact(key_text=other.read_text()),
+            "does not match its source commit": self.windows_artifact(top="anj-cloud-windows-x86_64-000000000000"),
+            # A package made without -VersionCode and -Version installs by hand only.
+            "has no source commit, version or version_code": self.windows_artifact(stamped=False),
+            "has no source commit, version or version_code ": self.windows_artifact(platform="Linux x86_64"),
+            "has no release receipt": self.windows_artifact(extra=("other/x",)),
+        }
+        for reason, artifact in cases.items():
+            with self.subTest(reason=reason):
+                destination = FakeDestination()
+                with self.assertRaises(release.Refused) as caught:
+                    release.publish("windows-x64", artifact, destination, key_dir=self.keys, fetch=False)
+                self.assertIn(reason.strip(), str(caught.exception))
+                self.assertEqual([], destination.published)
+        with self.assertRaisesRegex(release.Refused, "not a readable Windows release archive"):
+            release.publish("windows-x64", self.artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+        # What the Windows manager's ZIP reader refuses is never published: every client would
+        # download it and refuse it on each check.
+        import zipfile
+
+        def crafted(change):
+            source = self.windows_artifact()
+            self.made += 1
+            target = self.root / f"{self.made}" / source.name
+            target.parent.mkdir()
+            with zipfile.ZipFile(source) as old, zipfile.ZipFile(target, "w") as new:
+                for info in old.infolist():
+                    new.writestr(info, old.read(info))
+                change(new, old.namelist()[0].split("/")[0])
+            return target
+
+        def link(archive, top):
+            info = zipfile.ZipInfo(f"{top}/link")
+            info.create_system = 3
+            info.external_attr = 0o120777 << 16
+            archive.writestr(info, "anj_cloud.exe")
+
+        def bzip(archive, top):
+            archive.writestr(zipfile.ZipInfo(f"{top}/packed.bin"), b"x" * 64, compress_type=zipfile.ZIP_BZIP2)
+
+        crafts = {
+            "a member is a link or special file": link,
+            "a member uses a compression other than stored or deflate": bzip,
+            "a member has an absolute or backslash name": lambda a, top: a.writestr(f"{top}\\evil.dll", b"x"),
+            "a member has a name Windows cannot hold": lambda a, top: a.writestr(f"{top}/aux.txt", b"x"),
+            "a member has a name Windows cannot hold ": lambda a, top: a.writestr(f"{top}/trailing.", b"x"),
+            "a member repeats a name": lambda a, top: a.writestr(f"{top}/ANJ_CLOUD.EXE", b"x"),
+        }
+        for reason, change in crafts.items():
+            with self.subTest(reason=reason):
+                destination = FakeDestination()
+                with self.assertRaises(release.Refused) as caught:
+                    release.publish("windows-x64", crafted(change), destination, key_dir=self.keys, fetch=False)
+                self.assertIn(reason.strip(), str(caught.exception))
+                self.assertEqual([], destination.published)
+        # The manager's own release check, done before publishing: the receipt against the payload.
+        import struct
+
+        def rewritten(change, **kwargs):
+            source = self.windows_artifact(**kwargs)
+            source.write_bytes(change(source.read_bytes()))
+            return source
+
+        def bad_crc(data):
+            at = data.find(b"anj_cloud.exe payload")
+            return data[:at] + b"X" + data[at + 1:]
+
+        def zip64_central(data):
+            # The first central-directory entry's sizes moved into a ZIP64 extra field.
+            end = data.rfind(b"PK\x05\x06")
+            _count, cd_size, cd_offset = struct.unpack("<HII", data[end + 10:end + 20])
+            cd = data[cd_offset:cd_offset + cd_size]
+            compressed, size = struct.unpack("<II", cd[20:28])
+            name_len, extra_len, comment_len = struct.unpack("<HHH", cd[28:34])
+            first_end = 46 + name_len + extra_len + comment_len
+            extra = cd[46 + name_len:46 + name_len + extra_len] + struct.pack("<HHQQ", 1, 16, size, compressed)
+            first = (cd[:6] + struct.pack("<H", 45) + cd[8:20] + struct.pack("<II", 0xFFFFFFFF, 0xFFFFFFFF)
+                     + struct.pack("<HHH", name_len, len(extra), comment_len) + cd[34:46 + name_len] + extra
+                     + cd[46 + name_len + extra_len:first_end])
+            new_cd = first + cd[first_end:]
+            return (data[:cd_offset] + new_cd + data[end:end + 12] + struct.pack("<II", len(new_cd), cd_offset)
+                    + data[end + 20:])
+
+        def miscounted(data):
+            end = data.rfind(b"PK\x05\x06")
+            count = struct.unpack("<H", data[end + 10:end + 12])[0] - 1
+            return data[:end + 8] + struct.pack("<HH", count, count) + data[end + 12:]
+
+        def utf16_receipt(data):
+            import io
+            import zipfile
+            out = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(data)) as old, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as new:
+                for info in old.infolist():
+                    body = old.read(info)
+                    if info.filename.endswith("/bundle-receipt.json"):
+                        body = body.decode().encode("utf-16")
+                    new.writestr(info.filename, body)
+            return out.getvalue()
+
+        payloads = {
+            "its end record miscounts the members": rewritten(miscounted),
+            "not a readable Windows release archive ": rewritten(utf16_receipt),
+            "its receipt does not list every file a release must carry": self.windows_artifact(hashes={}),
+            "its receipt does not list every file a release must carry ": self.windows_artifact(drop=("flutter_windows.dll",)),
+            "does not match its receipt hash": self.windows_artifact(
+                hashes={name: "0" * 64 for name in [*release.WINDOWS_REQUIRED, release.KEY_PAYLOAD]}),
+            "its files are not exactly those its receipt lists": self.windows_artifact(
+                extra=(f"anj-cloud-windows-x86_64-{self.commits[1][:12]}/unlisted.dll",)),
+            "not a readable Windows release archive": rewritten(bad_crc, stored=True),
+            "bytes precede the archive": rewritten(lambda data: b"MZ-stub-" * 64 + data),
+            "a member carries a ZIP64 extra field": rewritten(zip64_central),
+        }
+        for reason, artifact in payloads.items():
+            with self.subTest(reason=reason):
+                destination = FakeDestination()
+                with self.assertRaises(release.Refused) as caught:
+                    release.publish("windows-x64", artifact, destination, key_dir=self.keys, fetch=False)
+                self.assertIn(reason.strip(), str(caught.exception))
+                self.assertEqual([], destination.published)
+        # A macOS zip is not a Windows release.
+        with self.assertRaisesRegex(release.Refused, "has no release receipt"):
+            release.publish("windows-x64", self.macos_artifact(), FakeDestination(), key_dir=self.keys, fetch=False)
+
+    def test_the_publisher_requires_the_files_the_windows_manager_requires(self):
+        source = (Path(__file__).resolve().parent.parent / "apps/client/tool/windows_manager/manager.dart").read_text()
+        block = re.search(r"const requiredFiles = \{(.*?)\};", source, re.S).group(1)
+        self.assertEqual(set(re.findall(r"'([^']+)'", block)), set(release.WINDOWS_REQUIRED))
 
     def test_production_goes_through_the_vm_operator_over_ssh(self):
         config = self.root / "ssh_config"

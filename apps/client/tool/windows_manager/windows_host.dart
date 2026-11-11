@@ -142,6 +142,17 @@ final _openProcess = _kernel
       Pointer<Void> Function(Uint32, Int32, Uint32),
       Pointer<Void> Function(int, int, int)
     >('OpenProcess');
+// Leaf calls, so nothing the Dart runtime does lies between the failed open
+// and reading its error.
+final _openProcessLeaf = _kernel
+    .lookupFunction<
+      Pointer<Void> Function(Uint32, Int32, Uint32),
+      Pointer<Void> Function(int, int, int)
+    >('OpenProcess', isLeaf: true);
+final _lastError = _kernel.lookupFunction<Uint32 Function(), int Function()>(
+  'GetLastError',
+  isLeaf: true,
+);
 final _wait = _kernel
     .lookupFunction<
       Uint32 Function(Pointer<Void>, Uint32),
@@ -469,6 +480,22 @@ class WindowsHost implements Host {
       mode: ProcessStartMode.detached,
     );
     return process.pid;
+  }
+
+  @override
+  bool processAlive(int pid) {
+    // SYNCHRONIZE; a wait of 0 ms times out (0x102) while it runs.
+    final handle = _openProcessLeaf(0x00100000, 0, pid);
+    if (handle == nullptr) {
+      // Only "no such process" (ERROR_INVALID_PARAMETER) means it has
+      // exited. Access denied, or anything else, is "cannot tell": treated
+      // as still running, so the update waits rather than concluding that
+      // the app was started again.
+      return _lastError() != 87;
+    }
+    final state = _wait(handle, 0);
+    _closeHandle(handle);
+    return state == 0x102;
   }
 }
 

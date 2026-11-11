@@ -17,6 +17,7 @@ import 'dpapi_secrets.dart';
 import 'windows_change_watchers.dart';
 import 'windows_desktop_session.dart';
 import 'windows_root_fs.dart';
+import 'windows_self_update.dart';
 
 /// The Windows adapter set (spec #32).
 ///
@@ -67,10 +68,12 @@ class WindowsPlatformAdapters implements PlatformAdapters {
   AutostartControl managerAutostart(String command) =>
       ManagerAutostart(command);
 
-  /// U-windows (spec #37) lands with the W5 manager once a Windows seat
-  /// returns (decision #156).
+  /// The installed manager's `apply-update`: the in-app update.
   @override
-  SelfUpdatePort? managerSelfUpdate(String command) => null;
+  SelfUpdatePort? managerSelfUpdate(String command) => WindowsManagerSelfUpdate(
+    command,
+    makePrivate: (path) => windowsRootFilesystem().privateDir(path),
+  );
 
   /// No documents provider: desktop apps open the root directly.
   @override

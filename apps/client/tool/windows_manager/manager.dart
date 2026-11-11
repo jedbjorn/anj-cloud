@@ -24,6 +24,7 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
+import 'package:anj_cloud/core/update/release.dart';
 import 'package:anj_cloud/platform/windows/profile_location.dart';
 
 import 'zip.dart';
@@ -34,6 +35,23 @@ const maxArchiveBytes = 2 * 1024 * 1024 * 1024;
 const busyMessage =
     'This profile is already running. Quit AnJ Cloud from its '
     'notification-area icon before updating or uninstalling.';
+
+const notQuitMessage =
+    'AnJ Cloud did not quit in time; the update was not installed.';
+const startedAgainMessage =
+    'AnJ Cloud was started again before the update was installed; '
+    'nothing was installed.';
+const releaseChangedMessage =
+    'Another release was installed while this update waited; '
+    'nothing was installed.';
+const changedSinceMessage =
+    'The update changed on disk after it was verified; nothing was installed.';
+const otherCommandMessage =
+    'Another manager command was running; the update was not installed.';
+
+/// The household release key inside a release (a Flutter asset).
+const releaseKeyPayload =
+    'data/flutter_assets/assets/release/household-release-key.pub';
 
 /// Files every release must carry (the bundle-receipt lists the rest).
 const requiredFiles = {
@@ -57,6 +75,18 @@ class Refused implements Exception {
 
 class Busy extends Refused {
   Busy() : super(busyMessage);
+}
+
+/// Another manager command holds the transaction lock.
+class TransactionBusy extends Refused {
+  TransactionBusy()
+    : super('Another manager command is running; retry when it ends.');
+}
+
+/// The app that handed an update over has exited and another instance holds
+/// the profile: someone started AnJ Cloud again before the update went in.
+class _StartedAgain implements Exception {
+  const _StartedAgain();
 }
 
 /// What the manager needs from Windows (faked in tests).
@@ -97,6 +127,9 @@ abstract class Host {
 
   /// Starts [executable] detached; returns its process id.
   Future<int> start(String executable, List<String> arguments);
+
+  /// Whether process [pid] is still running.
+  bool processAlive(int pid);
 }
 
 class Layout {
@@ -156,19 +189,25 @@ class Manager {
   Future<T> _transaction<T>(Future<T> Function() action) async {
     Directory(p.dirname(layout.transaction)).createSync(recursive: true);
     sweep();
-    final lock = File(layout.transaction).openSync(mode: FileMode.append);
+    final lock = transactionLock();
     try {
-      try {
-        lock.lockSync(FileLock.exclusive);
-      } on FileSystemException {
-        throw Refused(
-          'Another manager command is running; retry when it ends.',
-        );
-      }
       return await action();
     } finally {
       lock.closeSync();
     }
+  }
+
+  /// The exclusive transaction lock; [TransactionBusy] while another
+  /// manager process holds it.
+  RandomAccessFile transactionLock() {
+    final lock = File(layout.transaction).openSync(mode: FileMode.append);
+    try {
+      lock.lockSync(FileLock.exclusive);
+    } on FileSystemException {
+      lock.closeSync();
+      throw TransactionBusy();
+    }
+    return lock;
   }
 
   /// Best effort: removes what an earlier uninstall could not (its copy in
@@ -277,77 +316,12 @@ class Manager {
         );
       }
       Directory(layout.releases).createSync(recursive: true);
+      _sweepStages(transaction: true);
       final stage = Directory(p.join(layout.releases, '.stage-${_random()}'))
         ..createSync();
       try {
         final (top, receipt) = _extract(archive, sha, stage);
-        final source = receipt['source_head'] as String;
-        final id = '$source-$sha';
-        final destination = layout.release(id);
-        if (FileSystemEntity.typeSync(destination, followLinks: false) !=
-            FileSystemEntityType.notFound) {
-          // Same archive again: the published payload must be exactly it.
-          host.seal(destination, readOnly: false);
-          try {
-            if (jsonEncode(_validate(Directory(destination))) !=
-                jsonEncode(receipt)) {
-              throw Refused(
-                'Release destination collision; no existing payload was replaced.',
-              );
-            }
-          } finally {
-            host.seal(destination, readOnly: true);
-          }
-        } else {
-          Directory(top).renameSync(destination);
-          host.seal(destination, readOnly: true);
-        }
-        final state = <String, Object?>{
-          'owner': owner,
-          'source': source,
-          'archive_sha256': sha,
-          'release': id,
-          // The client's default (#134); choosing another profile is not a
-          // Windows manager command in this delivery.
-          'profile': layout.profile,
-          'previous': previous == null
-              ? null
-              : previous['release'] != id
-              ? previous['release']
-              : previous['previous'],
-        };
-        // A pre-W5 Roaming profile moves to the managed one before the
-        // profile lock (which creates it) can make it look in use.
-        final adopted = adoptLegacyProfile(
-          target: layout.profile,
-          legacy: layout.legacyProfile,
-        );
-        if (!adopted.moved && adopted.profile != layout.profile) {
-          throw Refused('${adopted.note} Quit it and retry.');
-        }
-        if (adopted.moved) {
-          _log('profile_moved', {'from': layout.legacyProfile});
-        }
-        // The client cannot start, and a running one refuses the update,
-        // while the activation record changes.
-        host.withProfileLock(
-          state['profile']! as String,
-          p.join(destination, 'anj_rootfs.dll'),
-          () {
-            _log('activation_prepared', {
-              'source': source,
-              'archive_sha256': sha,
-            });
-            _atomicJson(layout.active, state);
-          },
-        );
-        _log('activated', {'release': id});
-        // Committed: what follows can only add problems to report.
-        final integration = _integrate(state);
-        if (adopted.note != null) {
-          (integration['problems']! as List<String>).add(adopted.note!);
-        }
-        return {...state, 'integration': integration};
+        return _activate(top, receipt, sha, previous);
       } finally {
         if (stage.existsSync()) {
           host.seal(stage.path, readOnly: false);
@@ -357,13 +331,174 @@ class Manager {
     });
   }
 
+  /// Publishes the validated release extracted at [top] and makes it the
+  /// active one (call inside a transaction). The activation record is
+  /// written under the profile lock: the client cannot start, and a running
+  /// one refuses with [Busy], while it changes.
+  ///
+  /// [underLock] (the in-app update): the release directory is published
+  /// inside that lock too, taken through the release being replaced, so
+  /// nothing at all changes while the app runs and nothing can start the
+  /// app between "it has quit" and the activation.
+  Map<String, Object?> _activate(
+    String top,
+    Map<String, dynamic> receipt,
+    String sha,
+    Map<String, dynamic>? previous, {
+    bool underLock = false,
+  }) {
+    final source = receipt['source_head'] as String;
+    final id = '$source-$sha';
+    final destination = layout.release(id);
+    void publish() {
+      if (FileSystemEntity.typeSync(destination, followLinks: false) !=
+          FileSystemEntityType.notFound) {
+        // Same archive again: the published payload must be exactly it.
+        host.seal(destination, readOnly: false);
+        try {
+          if (jsonEncode(_validate(Directory(destination))) !=
+              jsonEncode(receipt)) {
+            throw Refused(
+              'Release destination collision; no existing payload was replaced.',
+            );
+          }
+        } finally {
+          host.seal(destination, readOnly: true);
+        }
+      } else {
+        if (underLock) {
+          // The tree waited in its stage while the app quit. What is
+          // published must still be exactly what was verified: a file
+          // changed or removed meanwhile (by anything, a security product
+          // included) refuses the update instead of activating it.
+          // And it must still be the directory that was extracted, never a
+          // link put in its place.
+          if (FileSystemEntity.typeSync(top, followLinks: false) !=
+              FileSystemEntityType.directory) {
+            throw Refused(
+              '$changedSinceMessage (the release directory was replaced)',
+            );
+          }
+          final Map<String, dynamic> now;
+          try {
+            now = _validate(Directory(top));
+          } on Refused catch (error) {
+            throw Refused('$changedSinceMessage (${error.message})');
+          }
+          if (jsonEncode(now) != jsonEncode(receipt)) {
+            throw Refused(changedSinceMessage);
+          }
+        }
+        Directory(top).renameSync(destination);
+        host.seal(destination, readOnly: true);
+      }
+    }
+
+    final state = <String, Object?>{
+      'owner': owner,
+      'source': source,
+      'archive_sha256': sha,
+      'release': id,
+      // The client's default (#134); choosing another profile is not a
+      // Windows manager command in this delivery.
+      'profile': layout.profile,
+      'previous': previous == null
+          ? null
+          : previous['release'] != id
+          ? previous['release']
+          : previous['previous'],
+    };
+    // A pre-W5 Roaming profile moves to the managed one before the
+    // profile lock (which creates it) can make it look in use.
+    final adopted = adoptLegacyProfile(
+      target: layout.profile,
+      legacy: layout.legacyProfile,
+    );
+    if (!adopted.moved && adopted.profile != layout.profile) {
+      throw Refused('${adopted.note} Quit it and retry.');
+    }
+    if (adopted.moved) {
+      _log('profile_moved', {'from': layout.legacyProfile});
+    }
+    if (!underLock) publish();
+    // The client cannot start, and a running one refuses the update,
+    // while the activation record changes.
+    host.withProfileLock(
+      state['profile']! as String,
+      p.join(
+        underLock
+            ? layout.release(previous!['release'] as String)
+            : destination,
+        'anj_rootfs.dll',
+      ),
+      () {
+        if (underLock) publish();
+        _log('activation_prepared', {'source': source, 'archive_sha256': sha});
+        _atomicJson(layout.active, state);
+      },
+    );
+    // Committed: what follows can only add problems to report.
+    _tryLog('activated', {'release': id});
+    final integration = _integrate(state);
+    if (adopted.note != null) {
+      (integration['problems']! as List<String>).add(adopted.note!);
+    }
+    return {...state, 'integration': integration};
+  }
+
+  /// Removes stages an earlier manager left behind when it was killed
+  /// (sign-out, shutdown, power loss): they hold an archive copy and an
+  /// extracted release. Only stages no running manager can own: install
+  /// stages under the transaction lock ([transaction]), update stages while
+  /// no apply-update runs, check stages once they are older than any check.
+  void _sweepStages({
+    bool transaction = false,
+    bool applying = false,
+    String? keep,
+  }) {
+    final List<Directory> stages;
+    try {
+      stages = Directory(layout.releases)
+          .listSync(followLinks: false)
+          .whereType<Directory>()
+          .toList();
+    } on FileSystemException {
+      return;
+    }
+    RandomAccessFile? idle;
+    try {
+      if (!applying) {
+        try {
+          idle = applyLock();
+        } on FileSystemException {
+          idle = null;
+        }
+      }
+      for (final stage in stages) {
+        final name = p.basename(stage.path);
+        if (keep != null && p.equals(stage.path, keep)) continue;
+        final stale =
+            (name.startsWith('.stage-') && transaction) ||
+            (name.startsWith('.update-') && (applying || idle != null)) ||
+            (name.startsWith('.check-') &&
+                DateTime.now().difference(stage.statSync().modified) >
+                    const Duration(minutes: 30));
+        if (stale) _discard(stage);
+      }
+    } finally {
+      idle?.closeSync();
+    }
+  }
+
   /// Copies [archive] into [stage] while hashing it, so the bytes parsed are
   /// the bytes verified; then extracts and validates the single release.
   (String, Map<String, dynamic>) _extract(
     String archive,
     String sha,
-    Directory stage,
-  ) {
+    Directory stage, {
+    int? size,
+    String? mismatch,
+  }) {
     final copy = File(p.join(stage.path, '.verified-input.zip'));
     final input = File(archive).openSync();
     final output = copy.openSync(mode: FileMode.writeOnly);
@@ -387,9 +522,9 @@ class Manager {
       input.closeSync();
       output.closeSync();
     }
-    if (sink.value != sha) {
+    if (sink.value != sha || (size != null && total != size)) {
       throw Refused(
-        'Archive SHA-256 does not match the independently supplied expected digest.',
+        mismatch ?? 'Archive SHA-256 does not match the independently supplied expected digest.',
       );
     }
     final ZipArchive zip;
@@ -729,6 +864,465 @@ class Manager {
     return {'pid': pid, 'release': state['release'], 'background': background};
   }
 
+  // ---- in-app update -----------------------------------------------------
+
+  /// The in-app update, mirroring tool/linux_install.py `apply_update`. The
+  /// running app downloaded [archive] and its signed [manifest] into the
+  /// active profile's `updates` folder; both (and [result]) must be there.
+  ///
+  /// Nothing the app says is trusted: the manifest's Ed25519 signature is
+  /// verified against the release key built into the ACTIVE release (never
+  /// one from the download), it must be a newer `windows-x64` release, and
+  /// the archive is copied to a private stage while hashed and extracted
+  /// there (signed size and SHA-256, a complete release whose receipt
+  /// carries the signed version code). The extracted files are hashed
+  /// against that receipt once more under the profile lock, immediately
+  /// before they are published, so what is activated is what was verified
+  /// even if something touched the stage during the wait.
+  ///
+  /// [check] raises on any refusal and changes nothing.
+  ///
+  /// Otherwise the release is verified and extracted first. Then, every
+  /// quarter second until [wait] has passed, one transaction tries to take
+  /// the profile lock and, holding it, publishes the release and writes the
+  /// activation record: nothing changes while the app runs, and nothing can
+  /// start the app between "it has quit" and the activation. That
+  /// transaction refuses when the active release is no longer the one the
+  /// download was verified against (a manual update went in meanwhile).
+  ///
+  /// The outcome is written to [result] and the download discarded (only
+  /// the very files handed over; a file replaced since belongs to a newer
+  /// app instance). The app, which quit for this, is started again: at once
+  /// after an update; after a refusal once the handing-over process
+  /// [appPid] has exited, within [wait] + [grace], unless another instance
+  /// is already running. When [appPid] has exited and the profile stays
+  /// held for [startedAgainAfter] all the same, another instance runs (or
+  /// something else holds its lock file): the update is abandoned, the
+  /// reason is written to [result] for the app's next start, and nothing
+  /// is deleted in that folder or started. A failed update leaves the previous release active: the
+  /// activation record is the one commit point, and no release is ever
+  /// changed in place.
+  Future<Map<String, Object?>> applyUpdate(
+    String archive,
+    String manifest, {
+    String? result,
+    bool check = false,
+    bool relaunch = true,
+    int? appPid,
+    Duration wait = const Duration(seconds: 120),
+    Duration grace = const Duration(seconds: 300),
+    Duration startedAgainAfter = const Duration(seconds: 3),
+    Duration applyLockWait = const Duration(seconds: 5),
+    DateTime Function() now = DateTime.now,
+    Future<void> Function(Duration)? pause,
+  }) async {
+    pause ??= Future<void>.delayed;
+    const step = Duration(milliseconds: 250);
+    if (check) {
+      _refuseElevated();
+      final state = _installed();
+      _updateFiles(state, archive, manifest, result);
+      final stage = _updateStage('.check-');
+      try {
+        final (signed, _, _) = _verifyDownload(state, archive, manifest, stage);
+        return {
+          'ok': true,
+          'check': true,
+          'version': signed.version,
+          'version_code': signed.versionCode,
+        };
+      } finally {
+        _discard(stage);
+      }
+    }
+    final deadline = now().add(wait);
+    final relaunchDeadline = deadline.add(grace);
+    Map<String, Object?> outcome;
+    Map<String, dynamic>? state;
+    _Download? download;
+    String? installing;
+    ReleaseManifest? verifiedManifest;
+    var installed = false;
+    var startedAgain = false;
+    RandomAccessFile? lock;
+    Directory? stage;
+    try {
+      _refuseElevated();
+      state = _installed();
+      // A manual install or update holds this lock for a moment while it
+      // sweeps stale stages: wait that out before concluding that another
+      // hand-over runs.
+      final lockDeadline = now().add(applyLockWait);
+      while ((lock = applyLock()) == null && now().isBefore(lockDeadline)) {
+        await pause(step);
+      }
+      if (lock == null) {
+        // Another apply-update owns this hand-over: it writes the result
+        // and starts the app.
+        return {
+          'ok': false,
+          'message': 'Another update is already being applied.',
+          'concurrent': true,
+        };
+      }
+      download = _updateFiles(state, archive, manifest, result);
+      _sweepStages(applying: true);
+      stage = _updateStage('.update-');
+      final (signed, top, receipt) = _verifyDownload(
+        state,
+        archive,
+        manifest,
+        stage,
+      );
+      verifiedManifest = signed;
+      installing = '${receipt['source_head']}-${signed.sha256}';
+      _tryLog('update_waiting', {'version_code': signed.versionCode});
+      final verified = state;
+      final live = stage.path;
+      Map<String, Object?> applied;
+      DateTime? heldSinceExit;
+      while (true) {
+        var other = false;
+        try {
+          applied = await _transaction(() async {
+            final current = activeState();
+            if (current == null || current['release'] != verified['release']) {
+              throw Refused(releaseChangedMessage);
+            }
+            _sweepStages(transaction: true, applying: true, keep: live);
+            return _activate(
+              top,
+              receipt,
+              signed.sha256,
+              current,
+              underLock: true,
+            );
+          });
+          break;
+        } on Busy {
+          // The app still holds its profile. Or the process that handed
+          // over is gone and the profile stays held: once that has lasted
+          // [startedAgainAfter] (a handle released late, or a scanner
+          // reading the lock file, lets go sooner), another instance runs.
+          if (appPid != null && !host.processAlive(appPid)) {
+            heldSinceExit ??= now();
+            if (!now().isBefore(heldSinceExit.add(startedAgainAfter))) {
+              throw const _StartedAgain();
+            }
+          } else {
+            heldSinceExit = null;
+          }
+        } on TransactionBusy {
+          other = true;
+        }
+        if (!now().isBefore(deadline)) {
+          throw Refused(other ? otherCommandMessage : notQuitMessage);
+        }
+        await pause(step);
+      }
+      installed = true;
+      outcome = {
+        'ok': true,
+        'version': signed.version,
+        'version_code': signed.versionCode,
+        'source': applied['source'],
+      };
+      _tryLog('update_applied', {
+        'version_code': signed.versionCode,
+        'source': applied['source'],
+      });
+    } on _StartedAgain {
+      startedAgain = true;
+      outcome = {
+        'ok': false,
+        'message': startedAgainMessage,
+        'started_again': true,
+      };
+      _tryLog('update_refused', {'reason': startedAgainMessage});
+    } on Object catch (error) {
+      if (installing != null && _activeRelease() == installing) {
+        // Past the commit point: the new release is the active one, whatever
+        // failed after it.
+        installed = true;
+        outcome = {
+          'ok': true,
+          'version': verifiedManifest?.version,
+          'version_code': verifiedManifest?.versionCode,
+          'release': installing,
+          'problem': '$error',
+        };
+        _tryLog('update_applied', {'release': installing, 'problem': '$error'});
+      } else {
+        // The app has quit for this: always answer and start it again.
+        final message = error is Refused
+            ? error.message
+            : 'The update could not be installed ($error).';
+        outcome = {'ok': false, 'message': message};
+        _tryLog('update_refused', {'reason': message});
+      }
+    } finally {
+      if (stage != null) _discard(stage);
+    }
+    try {
+      if (download != null) {
+        // Installed or refused, the download is discarded; unless the app
+        // was started again, whose folder this now is. The reason is
+        // written in either case: the app shows it at its next start.
+        if (!startedAgain) download.discard();
+        if (result != null) {
+          try {
+            _atomicJson(result, outcome);
+          } on FileSystemException catch (error) {
+            _tryLog('update_result_unwritten', {'reason': '$error'});
+          }
+        }
+      }
+      if (relaunch && state != null && !startedAgain) {
+        var start = installed;
+        if (!start) {
+          try {
+            start = await _appGone(
+              state,
+              appPid,
+              relaunchDeadline,
+              startedAgainAfter,
+              now,
+              pause,
+            );
+          } on Object catch (error) {
+            // Cannot tell whether it still runs: starting it is harmless
+            // (a second start only shows the running one), not starting it
+            // leaves the user without the app.
+            _tryLog('update_wait_failed', {'reason': '$error'});
+            start = true;
+          }
+        }
+        var started = false;
+        if (start) {
+          try {
+            // The active release: the new one, or after a refusal the one
+            // that was running.
+            await run();
+            started = true;
+          } on Object catch (error) {
+            _tryLog('update_relaunch_failed', {'reason': '$error'});
+          }
+        }
+        outcome['relaunched'] = started;
+      }
+    } finally {
+      lock?.closeSync();
+    }
+    return outcome;
+  }
+
+  Map<String, dynamic> _installed() {
+    final state = activeState();
+    if (state == null) {
+      throw Refused('AnJ Cloud is not installed by this manager.');
+    }
+    return state;
+  }
+
+  String? _activeRelease() {
+    try {
+      return activeState()?['release'] as String?;
+    } on Object {
+      return null;
+    }
+  }
+
+  void _tryLog(String event, Map<String, Object?> fields) {
+    try {
+      _log(event, fields);
+    } on FileSystemException {
+      // The log is not worth failing an update's answer for.
+    }
+  }
+
+  /// One apply-update at a time; null while another process holds it.
+  RandomAccessFile? applyLock() {
+    final lock = File(p.join(layout.base, '.apply-update.lock'))
+        .openSync(mode: FileMode.append);
+    try {
+      lock.lockSync(FileLock.exclusive);
+      return lock;
+    } on FileSystemException {
+      lock.closeSync();
+      return null;
+    }
+  }
+
+  Directory _updateStage(String prefix) =>
+      Directory(p.join(layout.releases, '$prefix${_random()}'))
+        ..createSync(recursive: true);
+
+  void _discard(Directory stage) {
+    try {
+      if (stage.existsSync()) {
+        host.seal(stage.path, readOnly: false);
+        stage.deleteSync(recursive: true);
+      }
+    } on FileSystemException {
+      // Left for a later run's sweep; never trusted again.
+    }
+  }
+
+  /// Refuses unless the update's files are absolute paths directly in the
+  /// active profile's `updates` folder, the download being regular files.
+  /// Returns the download as it is now, for [_Download.discard].
+  _Download _updateFiles(
+    Map<String, dynamic> state,
+    String archive,
+    String manifest,
+    String? result,
+  ) {
+    final updates = p.join(state['profile'] as String, 'updates');
+    final inside =
+        FileSystemEntity.typeSync(updates, followLinks: false) ==
+            FileSystemEntityType.directory &&
+        [archive, manifest, ?result].every(
+          (path) =>
+              p.isAbsolute(path) &&
+              p.equals(p.dirname(p.normalize(path)), updates),
+        );
+    if (!inside) {
+      throw Refused(
+        "Update files must be in the active profile's updates folder.",
+      );
+    }
+    for (final path in [archive, manifest]) {
+      if (FileSystemEntity.typeSync(path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        throw Refused('The downloaded update is missing.');
+      }
+    }
+    return _Download([archive, manifest]);
+  }
+
+  /// The version code the active release's receipt carries; 0 for a release
+  /// packaged without one. A receipt that cannot be read refuses: the
+  /// downgrade check must never pass for lack of a number to compare.
+  int _installedVersionCode(String release) {
+    final Object? receipt;
+    try {
+      receipt = jsonDecode(
+        File(p.join(release, 'bundle-receipt.json')).readAsStringSync(),
+      );
+    } on Object {
+      throw Refused("The installed release's receipt cannot be read.");
+    }
+    if (receipt is! Map) {
+      throw Refused("The installed release's receipt cannot be read.");
+    }
+    final code = receipt['version_code'];
+    if (code == null) return 0;
+    if (code is! int || code < 0) {
+      throw Refused("The installed release's receipt has an invalid version.");
+    }
+    return code;
+  }
+
+  /// The signed manifest, the extracted release and its receipt when
+  /// [archive], copied into [stage] while hashed, is the newer release it
+  /// names for the active release's built-in key.
+  (ReleaseManifest, String, Map<String, dynamic>) _verifyDownload(
+    Map<String, dynamic> state,
+    String archive,
+    String manifestPath,
+    Directory stage,
+  ) {
+    final active = layout.release(state['release'] as String);
+    final ReleaseKey? key;
+    try {
+      final file = File(p.joinAll([active, ...releaseKeyPayload.split('/')]));
+      key = file.existsSync()
+          ? ReleaseKey.parse(file.readAsStringSync())
+          : null;
+    } on FormatException {
+      throw Refused('The built-in release key file is malformed.');
+    }
+    if (key == null) {
+      throw Refused(
+        'This release has no built-in release key; update it with '
+        '`anj-cloud-manager.exe update`.',
+      );
+    }
+    final file = File(manifestPath);
+    if (file.lengthSync() > 64 * 1024) {
+      throw Refused('The update record is too large.');
+    }
+    final Object? data;
+    try {
+      data = jsonDecode(file.readAsStringSync());
+    } on FormatException {
+      throw Refused('The update record is not JSON.');
+    }
+    final ReleaseManifest manifest;
+    try {
+      manifest = ReleaseManifest.fromJson(data, windowsReleaseTarget);
+    } on FormatException catch (error) {
+      throw Refused(error.message);
+    }
+    final refusal = desktopRefusal(
+      manifest,
+      key,
+      _installedVersionCode(active),
+      windowsReleaseTarget,
+    );
+    if (refusal != null) throw Refused(refusal);
+    final (top, receipt) = _extract(
+      archive,
+      manifest.sha256,
+      stage,
+      size: manifest.size,
+      mismatch:
+          'The downloaded update does not match its signed size and SHA-256.',
+    );
+    if (receipt['version_code'] != manifest.versionCode) {
+      throw Refused("The update's receipt does not match its signed version.");
+    }
+    return (manifest, top, receipt);
+  }
+
+  /// Whether the app may be started again after a refusal. A free profile
+  /// lock is the proof that it has gone, so the lock is looked at first:
+  /// true as soon as nothing holds the profile, whatever the handing-over
+  /// process [appPid] looks like (a reused or unopenable process id looks
+  /// alive for ever). False when the profile is still held at [deadline],
+  /// or stays held for [heldAfterExit] after [appPid] has exited: another
+  /// instance already runs.
+  Future<bool> _appGone(
+    Map<String, dynamic> state,
+    int? appPid,
+    DateTime deadline,
+    Duration heldAfterExit,
+    DateTime Function() now,
+    Future<void> Function(Duration) pause,
+  ) async {
+    const step = Duration(milliseconds: 250);
+    final library = p.join(
+      layout.release(state['release'] as String),
+      'anj_rootfs.dll',
+    );
+    DateTime? heldSinceExit;
+    while (true) {
+      try {
+        host.withProfileLock(state['profile'] as String, library, () {});
+        return true;
+      } on Busy {
+        if (!now().isBefore(deadline)) return false;
+        if (appPid != null && !host.processAlive(appPid)) {
+          heldSinceExit ??= now();
+          if (!now().isBefore(heldSinceExit.add(heldAfterExit))) return false;
+        } else {
+          heldSinceExit = null;
+        }
+        await pause(step);
+      }
+    }
+  }
+
   // ---- uninstall ---------------------------------------------------------
 
   /// Removes exactly what install added: the Run value, the Start menu
@@ -820,4 +1414,39 @@ class _DigestSink implements Sink<Digest> {
   void add(Digest data) => value = data.toString();
   @override
   void close() {}
+}
+
+/// The files an app handed over, as they were then. [discard] removes only
+/// those very files: one replaced since (another size or time) is a newer
+/// app instance's own download.
+class _Download {
+  _Download(this.paths) : _then = [for (final path in paths) _facts(path)];
+  final List<String> paths;
+  final List<(int, DateTime)?> _then;
+
+  static (int, DateTime)? _facts(String path) {
+    try {
+      if (FileSystemEntity.typeSync(path, followLinks: false) !=
+          FileSystemEntityType.file) {
+        return null;
+      }
+      final stat = File(path).statSync();
+      return (stat.size, stat.modified);
+    } on FileSystemException {
+      return null;
+    }
+  }
+
+  void discard() {
+    for (var i = 0; i < paths.length; i++) {
+      final then = _then[i];
+      try {
+        if (then != null && _facts(paths[i]) == then) {
+          File(paths[i]).deleteSync();
+        }
+      } on FileSystemException {
+        // The app clears its staging folder at its next start.
+      }
+    }
+  }
 }
