@@ -438,6 +438,15 @@ class SyncEngine {
       );
     }
     if (eventDriven && _verifyWanted) consider(Duration.zero);
+    if (tree.busy.isNotEmpty) {
+      // A busy file is read again without waiting for an event.
+      final last = _busyRetriedAt;
+      consider(
+        last == null
+            ? busyRetryInterval
+            : last + busyRetryInterval - _clock.elapsed,
+      );
+    }
     final audit = _lastStatAudit;
     if (audit != null) consider(audit + statAuditInterval - _clock.elapsed);
     final held = _nextHeldRemoval(w);
@@ -450,6 +459,26 @@ class SyncEngine {
       );
     }
     return best;
+  }
+
+  /// How often a partial pass reads the busy files again
+  /// ([RootTree.busy]). Test seam.
+  Duration busyRetryInterval = const Duration(seconds: 10);
+
+  /// When a partial pass last read the busy files again, or first found
+  /// one waiting.
+  Duration? _busyRetriedAt;
+
+  bool _busyRetryDue(Duration elapsed) {
+    final last = _busyRetriedAt;
+    if (last == null) {
+      // First seen waiting: the interval starts now.
+      _busyRetriedAt = elapsed;
+      return busyRetryInterval == Duration.zero;
+    }
+    if (elapsed - last < busyRetryInterval) return false;
+    _busyRetriedAt = elapsed;
+    return true;
   }
 
   /// The local view for this pass: the full scan without a watcher, else
@@ -470,6 +499,7 @@ class SyncEngine {
     tree.refreshWriteback();
     final work = w.take();
     final elapsed = _clock.elapsed;
+    if (tree.busy.isEmpty) _busyRetriedAt = null;
     final wasEventDriven = _eventDrivenPass;
     _eventDrivenPass = eventDriven;
     // Without periodic writeback no stamp is trusted: every pass reads every
@@ -533,9 +563,15 @@ class SyncEngine {
     }
     _localScan = 'partial';
     final due = _dueConfirmations();
+    // A file left out because another program held it open: releasing it
+    // need not raise an event, so it is read again here, at most once per
+    // [busyRetryInterval] (a full scan tries every file anyway).
+    final retry = tree.busy.isNotEmpty && _busyRetryDue(elapsed)
+        ? tree.busy.toSet()
+        : const <String>{};
     // Paths the engine or a command acted on since the last scan are
     // re-stat-ed too, so the view never lags its own changes.
-    final paths = {...work.paths, ...due, ..._unstamped, ..._touched};
+    final paths = {...work.paths, ...due, ..._unstamped, ..._touched, ...retry};
     _touched.clear();
     try {
       _rescan(paths, work.subtrees);

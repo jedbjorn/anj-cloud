@@ -233,7 +233,9 @@ class RootTree {
   /// Files a pass could not read because another program holds them open
   /// without read sharing (EBUSY from the boundary). The engine neither
   /// uploads, downloads over, nor infers a deletion for them, and shows them
-  /// as busy; each later pass tries them again. A full scan starts afresh.
+  /// as busy. A full scan tries every file again; between full scans the
+  /// engine reads the busy ones again at an interval, since a release need
+  /// not raise a watcher event.
   final Set<String> busy = {};
 
   /// Stored index for a path (set by the engine): the stamp, the hash read

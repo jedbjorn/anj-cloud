@@ -2,10 +2,12 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:anj_cloud/core/local/root_tree.dart';
+import 'package:anj_cloud/core/ports/change_watcher.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -14,7 +16,19 @@ import 'fakes.dart';
 /// A boundary whose reads of [busy] paths fail as Windows' do while another
 /// program holds the file without read sharing (EBUSY, SC-048 F5).
 class _BusyFs extends NativeRootFs {
+  /// [verification] set: the platform hashes only what its watcher reports
+  /// between full verifications, as Windows, macOS and Android do.
+  _BusyFs([Duration? verification])
+    : super(
+        Platform.environment['ANJ_ROOTFS_LIBRARY'],
+        'Linux errno',
+        verification,
+      );
+
   final busy = <String>{};
+
+  /// Content reads tried, per path.
+  final reads = <String, int>{};
   @override
   ({String hash, String stamp}) copyAndHashStamped(
     int root,
@@ -22,6 +36,7 @@ class _BusyFs extends NativeRootFs {
     File? destination, {
     String purpose = 'content',
   }) {
+    reads[relative] = (reads[relative] ?? 0) + 1;
     if (busy.contains(relative)) {
       throw FileSystemException(
         'Filesystem boundary refused operation',
@@ -102,6 +117,73 @@ void main() {
       expect(tree.busy, isEmpty);
     },
   );
+
+  test('event-driven passes: a busy file released with no new write is read '
+      'again at an interval and synced, without a full scan', () async {
+    // Passes that read only what the watcher reported (Windows, macOS,
+    // Android): nothing reports the other program closing the file.
+    engine.close();
+    fs = _BusyFs(const Duration(minutes: 60));
+    final parent = Directory('${fixture.path}/b')..createSync();
+    // No periodic writeback, as on those platforms: stamps are not trusted.
+    tree = RootTree.setup(parent.path, 'b', fs)
+      ..vmDirectory = '${fixture.path}/no-vm';
+    store = Manifest(Directory('${fixture.path}/profile-b'));
+    store.setSetting('retention', 'local');
+    cloud = _HookCloud();
+    engine =
+        SyncEngine(store, tree, cloud, watchers: const LinuxChangeWatchers())
+          ..watcherSettings = const WatcherSettings(
+            quiet: Duration(milliseconds: 150),
+            maxDelay: Duration(seconds: 2),
+          );
+    await engine.startWatching();
+    const held = 'Documents/held.txt';
+    Future<void> passesUntil(bool Function() done) async {
+      for (var i = 0; i < 60 && !done(); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await engine.tick();
+      }
+    }
+
+    local(held).writeAsStringSync('v1');
+    await passesUntil(() => cloud.files[held] != null);
+    for (var i = 0; i < 4; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await engine.tick();
+    }
+    expect(engine.eventDriven, isTrue);
+    expect(remote(held), 'v1');
+
+    local(held).writeAsStringSync('v2');
+    fs.busy.add(held);
+    await passesUntil(() => tree.busy.contains(held));
+    expect(tree.busy, {held});
+    expect(store.entries[held]!.status, fileBusyStatus);
+    expect(remote(held), 'v1');
+
+    // Released, and nothing writes to it again.
+    fs.busy.clear();
+    final fullScans = engine.fullScans;
+    // Within the interval the file is not read on every pass, and a pass
+    // is due for it.
+    final before = fs.reads[held];
+    for (var i = 0; i < 3; i++) {
+      await engine.tick();
+    }
+    expect(fs.reads[held], before);
+    expect(remote(held), 'v1');
+    final due = engine.nextLocalDeadline();
+    expect(due, isNotNull);
+    expect(due! <= engine.busyRetryInterval, isTrue);
+    // Once the interval has passed, the next partial pass reads it.
+    engine.busyRetryInterval = const Duration(milliseconds: 300);
+    await passesUntil(() => remote(held) == 'v2');
+    expect(remote(held), 'v2');
+    expect(tree.busy, isEmpty);
+    expect(isBusyStatus(store.entries[held]!.status), isFalse);
+    expect(engine.fullScans, fullScans, reason: 'no full scan did it');
+  });
 
   test('a busy file is never taken for deleted', () async {
     local('Documents/held.txt').writeAsStringSync('v1');
