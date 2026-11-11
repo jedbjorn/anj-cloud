@@ -13,7 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'admin_section_test.dart' show FakeAdmin;
 import 'fakes.dart';
 
-/// Spec #32 W6 (acceptance row 14) on Linux: the shared shortcut table per
+/// On Linux: the shared shortcut table per
 /// desktop platform, and the shared desktop layout at the logical sizes of
 /// common Windows screens at 100, 125 and 150 % display scaling, with no
 /// overflow and no control cut off at the sides. Input follows the platform,
@@ -65,7 +65,15 @@ void main() {
                     : 'local',
                 'expectedPresent': status != 'cloud-only',
                 'size': 123456789,
-                'presentationErrors': [if (isServerNameHold(status)) status],
+                // Each held or busy row carries its amber reason, and the
+                // local name refusal its Rename button.
+                'presentationErrors': [
+                  if (isServerNameHold(status) ||
+                      isBusyStatus(status) ||
+                      isNameRefusal(status))
+                    status,
+                ],
+                'nameRefused': isNameRefusal(status),
                 'presentationNotes': [if (path == 'deep.txt') longPathNote],
               },
           ];
@@ -142,6 +150,7 @@ void main() {
     );
 
     test('Windows and Linux resolve to Ctrl, macOS to Cmd', () {
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
       for (final (platform, control) in [
         (TargetPlatform.windows, true),
         (TargetPlatform.linux, true),
@@ -164,7 +173,6 @@ void main() {
     testWidgets('library, Select mode, row menu and delete fit: $name', (
       tester,
     ) async {
-      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
       await sized(tester, w, h, s);
       final controller = library(admin: true);
       await tester.pumpWidget(CloudApp(controller: controller));
@@ -199,11 +207,9 @@ void main() {
 
       await tester.pumpWidget(const SizedBox());
       controller.dispose();
-      debugDefaultTargetPlatformOverride = null;
-    });
+    }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 
     testWidgets('pairing fits: $name', (tester) async {
-      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
       await sized(tester, w, h, s);
       final controller = ClientController(
         Directory('/unused-w6-profile'),
@@ -215,13 +221,11 @@ void main() {
       clean(tester, '$name pairing');
       await tester.pumpWidget(const SizedBox());
       controller.dispose();
-      debugDefaultTargetPlatformOverride = null;
-    });
+    }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
 
     testWidgets('every Admin section and the revoke confirmation fit: $name', (
       tester,
     ) async {
-      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
       await sized(tester, w, h, s);
       final api = FakeAdmin();
       await tester.pumpWidget(
@@ -256,7 +260,56 @@ void main() {
       await tester.tap(find.byKey(const ValueKey('admin-confirm-cancel')));
       await tester.pumpAndSettle();
       expect(api.mutations().where((r) => r.$3?['confirm'] != null), isEmpty);
-      debugDefaultTargetPlatformOverride = null;
-    });
+    }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
+  }
+
+  // A window shorter than the Admin rail's five destinations: the rail must
+  // scroll, or the last view cannot be opened. 1366x768 at 200 % and
+  // 1280x720 at 175 % leave about 257 and 284 logical pixels under the app
+  // bar; the rail needs about 330.
+  for (final (name, w, h, s) in const [
+    ('1366x768 at 200%', 1366.0, 768.0, 2.0),
+    ('1280x720 at 175%', 1280.0, 720.0, 1.75),
+  ]) {
+    testWidgets('the Admin rail scrolls to its last view: $name', (
+      tester,
+    ) async {
+      // A tap that lands on nothing is a failure here, not a warning.
+      WidgetController.hitTestWarningShouldBeFatal = true;
+      addTearDown(() => WidgetController.hitTestWarningShouldBeFatal = false);
+      await sized(tester, w, h, s);
+      final api = FakeAdmin();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AdminPage(
+            call: api.call,
+            onNotAdmin: () {},
+            server: 'https://gateway.example.com',
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull, reason: 'no overflow');
+      final rail = find.byType(NavigationRail);
+      final last = find.descendant(
+        of: rail,
+        matching: find.text(AdminView.values.last.label),
+      );
+      // The window really is shorter than the rail: its last destination
+      // starts below the bottom edge.
+      final height =
+          tester.view.physicalSize.height / tester.view.devicePixelRatio;
+      expect(tester.getRect(rail).height, greaterThan(height - 56));
+      expect(tester.getTopLeft(last.first).dy, greaterThan(height - 24));
+      await tester.ensureVisible(last.first);
+      await tester.pumpAndSettle();
+      await tester.tap(last.first);
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<NavigationRail>(rail).selectedIndex,
+        AdminView.values.length - 1,
+      );
+      clean(tester, '$name Admin ${AdminView.values.last.label}');
+    }, variant: TargetPlatformVariant.only(TargetPlatform.windows));
   }
 }
