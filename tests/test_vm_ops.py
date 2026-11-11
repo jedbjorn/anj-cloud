@@ -139,17 +139,30 @@ class Dispatcher(unittest.TestCase):
         self.assertNotIn(self.TOPIC, result.stdout + result.stderr)    # the topic is never logged
         self.assertIn('"event": "alert-sent"', result.stdout)
 
-    def test_drain_sends_records_spooled_by_prod_py_and_scrubs_them(self):
+    def spooled_by_prod_py(self, age):
+        """A record as deploy/prod.py's spool fallback writes it, created `age` before now. The
+        dispatcher runs as a subprocess on the real clock, so the record's time is relative to it."""
         spool = self.state / "run" / "alerts"
-        spool.mkdir(mode=0o700)
+        spool.mkdir(mode=0o700, exist_ok=True)
+        created = datetime.datetime.now(datetime.timezone.utc) - age
         record = {"key": "emergency-stop", "title": "anj-cloud emergency stop", "priority": "urgent",
-                  "message": "stopped; see /srv/anj-cloud/state/run/emergency-stop", "created": "2026-11-03T10:00:00+00:00"}
-        path = spool / "20261103T100000.000000Z-emergency-stop.json"
+                  "message": "stopped; see /srv/anj-cloud/state/run/emergency-stop",
+                  "created": created.isoformat(timespec="seconds")}
+        path = spool / (created.strftime("%Y%m%dT%H%M%S.%fZ") + "-emergency-stop.json")
         path.write_text(json.dumps(record))
         path.chmod(0o600)
+
+    def test_drain_sends_records_spooled_by_prod_py_and_scrubs_them(self):
+        self.spooled_by_prod_py(datetime.timedelta(minutes=5))
         self.alert("--drain", "--once")
         self.assertEqual(len(self.ntfy.posts), 1)
         self.assertNotIn("/srv", self.ntfy.posts[0]["body"])
+
+    def test_drain_drops_a_record_older_than_seven_days_unsent(self):
+        self.spooled_by_prod_py(datetime.timedelta(days=7, minutes=5))
+        result = self.alert("--drain", "--once")
+        self.assertEqual((self.ntfy.posts, self.spool()), ([], []))
+        self.assertIn("older than 7 days", result.stdout)
 
     def test_alerts_tag_prefixes_titles(self):
         (self.state / "run" / "ops.json").write_text(json.dumps({"alerts_tag": "drill"}))
