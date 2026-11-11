@@ -13,6 +13,7 @@ import 'evictions.dart';
 import 'edit_completion.dart';
 import 'excluded_tracking.dart';
 import 'folder_creation.dart';
+import 'name_holds.dart';
 import 'name_policy.dart';
 import '../../platform/watchers.dart';
 import '../ports/change_watcher.dart';
@@ -437,6 +438,15 @@ class SyncEngine {
       );
     }
     if (eventDriven && _verifyWanted) consider(Duration.zero);
+    if (tree.busy.isNotEmpty) {
+      // A busy file is read again without waiting for an event.
+      final last = _busyRetriedAt;
+      consider(
+        last == null
+            ? busyRetryInterval
+            : last + busyRetryInterval - _clock.elapsed,
+      );
+    }
     final audit = _lastStatAudit;
     if (audit != null) consider(audit + statAuditInterval - _clock.elapsed);
     final held = _nextHeldRemoval(w);
@@ -449,6 +459,26 @@ class SyncEngine {
       );
     }
     return best;
+  }
+
+  /// How often a partial pass reads the busy files again
+  /// ([RootTree.busy]). Test seam.
+  Duration busyRetryInterval = const Duration(seconds: 10);
+
+  /// When a partial pass last read the busy files again, or first found
+  /// one waiting.
+  Duration? _busyRetriedAt;
+
+  bool _busyRetryDue(Duration elapsed) {
+    final last = _busyRetriedAt;
+    if (last == null) {
+      // First seen waiting: the interval starts now.
+      _busyRetriedAt = elapsed;
+      return busyRetryInterval == Duration.zero;
+    }
+    if (elapsed - last < busyRetryInterval) return false;
+    _busyRetriedAt = elapsed;
+    return true;
   }
 
   /// The local view for this pass: the full scan without a watcher, else
@@ -469,6 +499,7 @@ class SyncEngine {
     tree.refreshWriteback();
     final work = w.take();
     final elapsed = _clock.elapsed;
+    if (tree.busy.isEmpty) _busyRetriedAt = null;
     final wasEventDriven = _eventDrivenPass;
     _eventDrivenPass = eventDriven;
     // Without periodic writeback no stamp is trusted: every pass reads every
@@ -532,9 +563,15 @@ class SyncEngine {
     }
     _localScan = 'partial';
     final due = _dueConfirmations();
+    // A file left out because another program held it open: releasing it
+    // need not raise an event, so it is read again here, at most once per
+    // [busyRetryInterval] (a full scan tries every file anyway).
+    final retry = tree.busy.isNotEmpty && _busyRetryDue(elapsed)
+        ? tree.busy.toSet()
+        : const <String>{};
     // Paths the engine or a command acted on since the last scan are
     // re-stat-ed too, so the view never lags its own changes.
-    final paths = {...work.paths, ...due, ..._unstamped, ..._touched};
+    final paths = {...work.paths, ...due, ..._unstamped, ..._touched, ...retry};
     _touched.clear();
     try {
       _rescan(paths, work.subtrees);
@@ -967,6 +1004,22 @@ class SyncEngine {
           (entry.etag == null && isNameRefusal(entry.status)) ||
           operation(entry.path, 'delete') != null);
 
+  /// Whether this device's filesystem can hold every name the server can
+  /// write. False on Windows (the Win32 namespace refuses `CON`, a trailing
+  /// dot or space, ...): such server names stay Cloud-only (decision #120 Q2,
+  /// [NameHolds]). Test seam.
+  bool holdsAnyName = !Platform.isWindows;
+
+  /// Whether the root's volume folds case and normalization
+  /// ([RootFilesystem.caseInsensitive]: Windows, default macOS volumes):
+  /// then of server siblings that fold together only one is created
+  /// ([NameHolds]). Test seam.
+  late bool foldsCase = tree.native.caseInsensitive(tree.root.path);
+
+  /// Whether a row says its full path is over [win32MaxPath] characters
+  /// ([longPathNote]; Windows). Test seam.
+  bool notesLongPaths = Platform.isWindows;
+
   /// Status of a never-synchronized local item held for its name (decision
   /// #120): its own name is not allowed on other devices, or it lies in a
   /// folder whose name is not. Sibling clashes need the listing, so they are
@@ -1213,6 +1266,9 @@ class SyncEngine {
   /// under them is uploaded, downloaded, deleted or inferred deleted.
   Set<String> _heldMounts = {};
   bool _held(String path) {
+    // A file another program holds open (SC-048 F5): nothing is inferred
+    // or transferred for it this pass.
+    if (tree.busy.contains(path)) return true;
     final mount = mountOf(path);
     return (mount != null && _heldMounts.contains(mount)) ||
         _heldTargets.any((target) => withinOrAt(target, path));
@@ -3256,6 +3312,21 @@ class SyncEngine {
   /// them; every pass pairs them again.
   final Set<String> _cloudHeld = {};
 
+  /// The names this device cannot hold, for the cloud moves of one pass:
+  /// built on first use and again after each move applied, since a move
+  /// changes which names are on this device.
+  NameHolds? _moveHoldsCache;
+  NameHolds _moveHolds(
+    Map<String, LocalItem> rawLocal,
+    Map<String, RemoteItem> remote,
+  ) => _moveHoldsCache ??= NameHolds(
+    win32Names: !holdsAnyName,
+    foldsCase: foldsCase,
+    remote: remote.keys,
+    local: rawLocal,
+    entries: manifest.entries,
+  );
+
   bool _cloudHolds(String path) {
     if (_cloudHeld.isEmpty) return false;
     for (var at = path; ; at = p.posix.dirname(at)) {
@@ -3347,6 +3418,7 @@ class SyncEngine {
     Map<String, RemoteItem> remote,
   ) {
     _dropMovedTombstones(remote);
+    _moveHoldsCache = null;
     final settled = <String>{};
     try {
       // Each round applies the top pairs; a row moved out of a folder that
@@ -3358,6 +3430,7 @@ class SyncEngine {
         for (final MapEntry(key: from, value: to) in pairs.entries) {
           if (_applyCloudMove(from, to, local, rawLocal, remote)) {
             moved = true;
+            _moveHoldsCache = null;
           } else {
             settled.add(from);
           }
@@ -3368,6 +3441,7 @@ class SyncEngine {
       // A local move the cloud's rename did not settle and did not hold:
       // reconciled the ordinary way (the new local name is uploaded).
       _renamedBothSides.clear();
+      _moveHoldsCache = null;
     }
   }
 
@@ -3511,6 +3585,12 @@ class SyncEngine {
       return false;
     }
 
+    // The item, or something beneath it, is open in another program: a scan
+    // leaves a busy file out, so the pair cannot be judged now. Left to the
+    // ordinary rules it would be downloaded again under the new name and
+    // its old row taken for a remote deletion. Held for the pass; once the
+    // file can be read the move is followed, with any edit made meanwhile.
+    if (tree.busy.any((path) => withinOrAt(at, path))) return hold();
     if (_held(from) ||
         _held(to) ||
         // The cloud renaming Documents, Music or Videos (even in case only)
@@ -3560,7 +3640,18 @@ class SyncEngine {
     }
     // Another local item already holds the new name.
     if (rawLocal.containsKey(to) && !withinOrAt(at, to)) {
-      return hold(serverNameClashStatus);
+      // On this device under its old name: not Cloud-only.
+      return hold(here != null ? movedNameClashStatus : serverNameClashStatus);
+    }
+    if (here != null) {
+      // A new name this device cannot hold (decision #120 Q2): a name the
+      // platform refuses, a sibling that folds onto it, or a folder on the
+      // way that is itself held. The item stays where it is with the
+      // reason; it is never renamed and no folder is made for it, so on a
+      // case-blind volume it cannot land inside the sibling its new folder
+      // folds onto. Nothing is deleted, moved or uploaded for it meanwhile.
+      final refused = _moveHolds(rawLocal, remote).status(to, moving: at);
+      if (refused != null) return hold(movedHoldStatus(refused));
     }
     if (here == null) {
       // Not removal-inferred yet (expected here, no delete): next pass. An
@@ -3789,7 +3880,7 @@ class SyncEngine {
       if (!withinOrAt(to, row.path)) continue;
       row.movedNote = null;
       // Held at its old path for this move: planned afresh at the new one.
-      if (row.status == serverNameClashStatus ||
+      if (isServerNameHold(row.status) ||
           row.status.startsWith('rename pending')) {
         row.status = 'queued';
       }
@@ -3933,7 +4024,9 @@ class SyncEngine {
   static bool _unsettled(Entry entry) =>
       entry.status == 'queued' ||
       entry.status.toLowerCase().contains('pending') ||
-      isNameRefusal(entry.status);
+      isNameRefusal(entry.status) ||
+      // Rechecked each pass: a clash loser comes down once its sibling goes.
+      isServerNameHold(entry.status);
 
   Future<int> _tick(
     bool audit,
@@ -4161,6 +4254,25 @@ class SyncEngine {
       }
     }
     _holdUnavailable();
+    // A new file that is busy has a row too (SC-048 F5): never synchronized,
+    // not expected present, so nothing is inferred from it.
+    for (final path in tree.busy) {
+      if (!isSyncExcluded(path)) {
+        manifest.entries.putIfAbsent(path, () => Entry(path, ItemKind.file));
+      }
+    }
+    for (final entry in manifest.entries.values) {
+      if (entry.conflict != null) continue;
+      if (tree.busy.contains(entry.path)) {
+        entry.status = fileBusyStatus;
+      } else if (entry.status == fileBusyStatus) {
+        // Released: read below as usual; a never-synchronized file that is
+        // gone meanwhile leaves no row.
+        entry.status = entry.etag == null && !local.containsKey(entry.path)
+            ? 'removed locally'
+            : 'current local';
+      }
+    }
     _planLocalMoves(local, raw: rawLocal);
     final movingFrom = [for (final op in _moves) op.path];
     final w = watcher;
@@ -4499,6 +4611,9 @@ class SyncEngine {
         pendingMoves.any((root) => withinOrAt(root, path)) ||
         _parkedOrWaiting(path) ||
         _cloudHolds(path);
+    // Files whose inferred delete was withdrawn because they exist again:
+    // left for the next pass, which reads them as edits.
+    final reappeared = <String>{};
     // Directory creates precede child transfers. Deletes are handled as whole
     // user intents, including descendants, before ordinary file reconciliation.
     _deletesHeld = false;
@@ -4555,12 +4670,42 @@ class SyncEngine {
         _dirty.add(op.path);
         continue;
       }
+      // The item may be at a new name that another program holds open: it
+      // is among the busy files, which a scan leaves out, so its old path
+      // looks removed. The removal waits; once the file can be read, the
+      // scan pairs the two paths as a move.
+      if (op.data['inferred'] == true &&
+          entry.localIdentity != null &&
+          tree.busyIdentities.containsValue(entry.localIdentity)) {
+        _dirty.add(op.path);
+        _localWork = true;
+        continue;
+      }
       if (_holdTopDeletion(op, entry)) continue;
       if (current == null) {
         // Already gone before this client's delete ran: whichever version
         // was deleted is unknown, so preserved copies are retained.
         if (entry.kind == ItemKind.directory) _markUnknownDeletion(op.path);
         acknowledgeDelete(entry, op, local, versionKnown: false);
+        continue;
+      }
+      if (op.data['inferred'] == true &&
+          // A different local item at a name the deleted one was moved onto
+          // in the cloud is not the file coming back.
+          op.data['otherItemHere'] != true &&
+          entry.kind == ItemKind.file &&
+          (local.containsKey(op.path) || tree.statItem(op.path) != null)) {
+        // The file is back under its name (an editor that saves by delete
+        // and recreate, as Paint does): an edit of the same file, never a
+        // delete and a new upload, so the server keeps its version history.
+        // Checked before the etag: a server edit meanwhile is then an
+        // ordinary edit/edit conflict that Keep both can resolve, never a
+        // delete/edit conflict on a file that is present.
+        finish(op);
+        entry.expectedPresent = true;
+        entry.status = 'current local';
+        reappeared.add(op.path);
+        _dirty.add(op.path);
         continue;
       }
       if (current.etag != op.expectedEtag) {
@@ -4737,6 +4882,15 @@ class SyncEngine {
       return remoteNames!.putIfAbsent(p.posix.dirname(path), () => {});
     }
 
+    // Server names this device cannot create (decision #120 Q2), grouped
+    // once per folder for the pass.
+    final holds = NameHolds(
+      win32Names: !holdsAnyName,
+      foldsCase: foldsCase,
+      remote: remote.keys,
+      local: local,
+      entries: manifest.entries,
+    );
     NameProblem? createProblem(String path) =>
         NamePolicy.problem(p.posix.basename(path), siblingsOf(path));
     String? previous;
@@ -4761,7 +4915,7 @@ class SyncEngine {
         return paths.length;
       }
       _visited++;
-      if (_held(path) || moving(path)) {
+      if (_held(path) || moving(path) || reappeared.contains(path)) {
         _dirty.add(path);
         continue;
       }
@@ -4842,6 +4996,9 @@ class SyncEngine {
             entry.status = 'removed locally';
             continue;
           }
+          final heldFolder = current != null && here == null
+              ? holds.status(path)
+              : null;
           if (here != null &&
               current == null &&
               entry.etag == null &&
@@ -4867,6 +5024,13 @@ class SyncEngine {
             entry.awaitingFolderUpload = false;
             entry.expectedPresent = true;
             entry.status = 'current local';
+          } else if (heldFolder != null) {
+            // A server folder this device cannot hold (decision #120 Q2):
+            // never created, so a case-blind filesystem never merges it into
+            // the kept sibling; its files follow the same rule.
+            entry.etag = current!.etag;
+            entry.expectedPresent = false;
+            entry.status = heldFolder;
           } else if (current != null) {
             // Last guard (review D-H1): a share is never adopted over a
             // folder with no synchronized history.
@@ -5035,7 +5199,14 @@ class SyncEngine {
           entry.status = 'current local';
           finish(op);
         } else if (current != null && (changed || here == null)) {
-          if (retention(path) == Retention.cloud && here == null) {
+          final held = here == null ? holds.status(path) : null;
+          if (held != null) {
+            // A server name this device cannot hold (decision #120 Q2):
+            // Cloud-only with its reason; never created, never renamed here.
+            entry.etag = current.etag;
+            entry.baselineHash = null;
+            entry.status = held;
+          } else if (retention(path) == Retention.cloud && here == null) {
             entry.etag = current.etag;
             entry.baselineHash = null;
             entry.status = 'cloud-only';

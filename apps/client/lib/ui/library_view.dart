@@ -186,7 +186,8 @@ String librarySummary(Map<String, dynamic> entry) {
     }.contains(status))
       status,
     if (entry['conflict'] != null) entry['conflict'] as String,
-    // Information lines (the cloud's name won a rename): never amber.
+    // Information lines (the cloud's name won a rename, a Windows long
+    // path): never amber.
     for (final note in entry['presentationNotes'] as List? ?? const [])
       note as String,
   ];
