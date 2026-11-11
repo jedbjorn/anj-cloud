@@ -33,6 +33,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
 import '../tool/eviction_fixture.dart' show ownedAllocated;
+import 'fakes.dart' show FakeCloud;
 import 'qr_image.dart';
 
 class _Device {
@@ -259,13 +260,86 @@ void main() {
         // deletion under Documents waits for losses there to settle (about
         // 12 s), so a fixed number of passes proves nothing: passes repeat
         // until the expected state is there, within a deadline.
+        // For the evidence of a step that times out: what was noted
+        // before it.
+        var noted = '';
         Future<int> until(String what, Future<bool> Function() done) async {
           final deadline = DateTime.now().add(const Duration(seconds: 90));
           for (var rounds = 1; ; rounds++) {
             await cycles();
             if (await done()) return rounds;
             if (DateTime.now().isAfter(deadline)) {
-              throw StateError('Not reached within 90 s: $what');
+              // What each device and the server hold, for the evidence.
+              String rows(_Device d) => [
+                for (final e in d.engine.manifest.entries.values)
+                  if (e.path.startsWith(prefix))
+                    '${e.path}: ${e.status}'
+                        '${e.conflict == null ? '' : ' [${e.conflict}]'}',
+              ].join('; ');
+              String queued(_Device d) => [
+                for (final o in d.engine.manifest.operations.values)
+                  if (o.path.startsWith(prefix)) '${o.kind} ${o.path}',
+              ].join('; ');
+              // Each file as the disk, a fresh stat and the row see it.
+              String files(_Device d) => [
+                for (final e in d.engine.manifest.entries.values)
+                  if (e.path.startsWith(prefix) &&
+                      e.kind == ItemKind.file &&
+                      d.file(e.path).existsSync())
+                    () {
+                      final stat = d.engine.tree.statItem(e.path);
+                      final bytes = d.file(e.path).readAsBytesSync();
+                      return '${p.posix.basename(e.path)} disk '
+                          '${bytes.length}b ${_digest(bytes).substring(0, 8)} '
+                          'stat ${stat?.size}b links ${stat?.links} '
+                          'stamp ${stat?.scanStamp} '
+                          'row base ${e.baselineHash?.substring(0, 8)} '
+                          'etag ${e.etag}';
+                    }(),
+              ].join('; ');
+              String mode(_Device d) =>
+                  'eventDriven ${d.engine.eventDriven} watcher '
+                  '${d.engine.watcher?.active} fullScans '
+                  '${d.engine.fullScans} note ${d.engine.localNote} lastPass '
+                  'full ${d.engine.lastPass?.full}';
+              final listed = [
+                for (final item in await a.cloud.snapshot())
+                  if (item.path.startsWith(prefix)) '${item.path}@${item.etag}',
+              ].join('; ');
+              final listedByB = [
+                for (final item in await b.cloud.snapshot())
+                  if (item.path.startsWith(prefix)) '${item.path}@${item.etag}',
+              ].join('; ');
+              // The bytes the server serves for each small file.
+              final served = <String>[];
+              for (final item in await a.cloud.snapshot()) {
+                if (!item.path.startsWith(prefix) ||
+                    item.kind != ItemKind.file ||
+                    item.size > 1024) {
+                  continue;
+                }
+                final target = File(
+                  p.join(work.path, 'diag-${Random().nextInt(1 << 30)}'),
+                );
+                await a.cloud.download(item.path, target, etag: item.etag);
+                served.add(
+                  '${p.posix.basename(item.path)} '
+                  '${_digest(target.readAsBytesSync()).substring(0, 8)}',
+                );
+                target.deleteSync();
+              }
+              throw StateError(
+                'Not reached within 90 s: $what\n'
+                'noted before: $noted\n'
+                'A (${a.engine.message}; busy ${a.engine.tree.busy}): '
+                '${rows(a)}\nA work: ${queued(a)}\n'
+                'B (${b.engine.message}; busy ${b.engine.tree.busy}): '
+                '${rows(b)}\nB work: ${queued(b)}\nserver: $listed\n'
+                'server as B lists it: $listedByB\n'
+                'server bytes: ${served.join('; ')}\n'
+                'A files: ${files(a)}\nA mode: ${mode(a)}\n'
+                'B files: ${files(b)}\nB mode: ${mode(b)}',
+              );
             }
             await Future<void>.delayed(const Duration(seconds: 1));
           }
@@ -303,6 +377,15 @@ void main() {
         record('create B to server to A');
 
         // ---- edit, rename, delete -------------------------------------
+        final listedBeforeEdit = (await b.cloud.snapshot())
+            .where((e) => e.path == '$prefix/from-b.txt')
+            .map((e) => '${e.etag} ${e.size}b modified ${e.modified}')
+            .join();
+        noted =
+            'from-b.txt before the edit: listed $listedBeforeEdit; '
+            'A row ${a.engine.manifest.entries['$prefix/from-b.txt']?.etag}; '
+            'B row ${b.engine.manifest.entries['$prefix/from-b.txt']?.etag}; '
+            'edit written at ${DateTime.now().toUtc().toIso8601String()}';
         a.file('$prefix/from-b.txt').writeAsStringSync('edited on A');
         await until(
           'the edit on B',
@@ -725,6 +808,105 @@ void main() {
             },
           }),
         );
+        // ---- a busy file released with no new write, watcher-driven -----
+        // A third root with the real Windows watcher and an in-memory cloud:
+        // passes read only what the watcher reported (the two devices above
+        // run without a watcher and scan everything each pass). The file is
+        // edited, held without read sharing, then released and never
+        // written again. First with the engine's own retry far away, to see
+        // whether Windows reports the close by itself; then with the retry.
+        final watchedParent = Directory(p.join(work.path, 'files-watched'))
+          ..createSync();
+        final watchedTree = RootTree.setup(
+          watchedParent.path,
+          'watched',
+          windowsRootFilesystem(),
+        );
+        final watchedStore = Manifest(
+          Directory(p.join(work.path, 'profile-watched')),
+        )..setSetting('retention', 'local');
+        final watchedCloud = FakeCloud();
+        final watched = SyncEngine(watchedStore, watchedTree, watchedCloud);
+        try {
+          await watched.startWatching();
+          const busyPath = 'Documents/open.txt';
+          final busyFile = File(
+            p.joinAll([watchedTree.root.path, ...busyPath.split('/')]),
+          )..parent.createSync(recursive: true);
+          String? uploaded() => watchedCloud.files[busyPath] == null
+              ? null
+              : utf8.decode(watchedCloud.files[busyPath]!);
+          Future<bool> passes(int seconds, bool Function() done) async {
+            final end = DateTime.now().add(Duration(seconds: seconds));
+            while (!done()) {
+              if (DateTime.now().isAfter(end)) return false;
+              await Future<void>.delayed(const Duration(milliseconds: 500));
+              await watched.tick();
+            }
+            return true;
+          }
+
+          busyFile.writeAsStringSync('v1');
+          expect(await passes(60, () => uploaded() == 'v1'), isTrue);
+          // Settled: ordinary passes are partial from here on.
+          for (var i = 0; i < 6; i++) {
+            await Future<void>.delayed(const Duration(milliseconds: 500));
+            await watched.tick();
+          }
+          expect(watched.eventDriven, isTrue);
+          busyFile.writeAsStringSync('v2');
+          final busyHolder = await Process.start(
+            'powershell',
+            [
+              '-NoProfile',
+              '-Command',
+              r"$f = [IO.File]::Open($env:ANJ_HELD, 'Open', 'ReadWrite', 'None'); "
+                  r"[Console]::Out.WriteLine('held'); Start-Sleep 60; $f.Close()",
+            ],
+            environment: {'ANJ_HELD': busyFile.path},
+          );
+          await busyHolder.stdout
+              .transform(utf8.decoder)
+              .firstWhere((line) => line.contains('held'));
+          expect(
+            await passes(60, () => watchedTree.busy.contains(busyPath)),
+            isTrue,
+            reason: 'the sharing violation reaches the scan as busy',
+          );
+          expect(isBusyStatus(watchedStore.entries[busyPath]!.status), isTrue);
+          expect(uploaded(), 'v1');
+          // Released; nothing writes to the file again.
+          watched.busyRetryInterval = const Duration(hours: 1);
+          final scansAtRelease = watched.fullScans;
+          busyHolder.kill();
+          await busyHolder.exitCode;
+          final byEvent = await passes(8, () => uploaded() == 'v2');
+          var byRetry = false;
+          if (!byEvent) {
+            watched.busyRetryInterval = const Duration(seconds: 2);
+            byRetry = await passes(30, () => uploaded() == 'v2');
+          }
+          expect(uploaded(), 'v2');
+          expect(watchedTree.busy, isEmpty);
+          expect(isBusyStatus(watchedStore.entries[busyPath]!.status), isFalse);
+          expect(
+            watched.fullScans,
+            scansAtRelease,
+            reason: 'no full scan did it',
+          );
+          record(
+            'watcher-driven: a busy file released with no new write syncs',
+            {
+              'windows_reported_the_close': byEvent,
+              'synced_by_the_retry': byRetry,
+              'full_scans_meanwhile': watched.fullScans - scansAtRelease,
+              'event_driven': watched.eventDriven,
+            },
+          );
+        } finally {
+          watched.close();
+        }
+
         record('done');
       } finally {
         for (final device in devices) {

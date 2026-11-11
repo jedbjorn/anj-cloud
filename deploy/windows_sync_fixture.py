@@ -234,7 +234,8 @@ def main():
                 moved = True
             time.sleep(2)
         code = runner.wait(timeout=60)
-        log = (args.evidence / "guest-run.txt").read_text()
+        # Windows tools mix OEM bytes into the log.
+        log = (args.evidence / "guest-run.txt").read_text(encoding="utf-8", errors="replace")
         progress = guest_file("progress.json")
         (args.evidence / "progress.json").write_text(progress or "[]")
         step("the Windows test ran", ok=code == 0 and "All tests passed" in log,
