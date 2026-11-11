@@ -40,11 +40,16 @@ if (-not $Inner) {
   $deadline = (Get-Date).AddSeconds(1200)
   Start-Sleep 3
   while ((Get-ScheduledTask -TaskPath '\anj\' -TaskName 'anj-update-test').State -eq 'Running' -and (Get-Date) -lt $deadline) { Start-Sleep 3 }
-  Get-Content $out -ErrorAction SilentlyContinue
+  $report = @(Get-Content $out -ErrorAction SilentlyContinue)
+  $report
   Unregister-ScheduledTask -TaskPath '\anj\' -TaskName 'anj-update-test' -Confirm:$false -ErrorAction SilentlyContinue
   Get-Process anj_cloud, anj-cloud-manager -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
   $s = New-Object -ComObject Schedule.Service; $s.Connect()
   try { $s.GetFolder('\').DeleteFolder('anj', 0) } catch {}
+  # The inner run's verdict is this script's: a failed or unfinished run exits 1.
+  $verdict = $report | Where-Object { $_ -match '^RESULT passed=(\d+) failed=(\d+)$' } | Select-Object -Last 1
+  if (-not $verdict) { 'no RESULT line: the run did not finish'; exit 1 }
+  if ($verdict -notmatch 'failed=0$') { exit 1 }
   exit 0
 }
 
@@ -234,8 +239,17 @@ try {
   $handover = Hand-Over $gone.Id
   $quick = $handover.WaitForExit(20000)
   $outcome = Printed (Get-Content $handoverOut -Raw -ErrorAction SilentlyContinue)
-  Check 'an app started again abandons the update at once' ($quick -and $handover.ExitCode -eq 1 -and $outcome.started_again -eq $true -and (Active).release -eq $first.release) "$($outcome.message)"
-  Check 'that instance keeps its download, gets no result and stays the only one' ((Test-Path $archive) -and (Test-Path $record) -and -not (Test-Path $result) -and (Running).Count -eq 1 -and (Running)[0].Id -eq $instance)
+  Check 'an app started again abandons the update within seconds' ($quick -and $handover.ExitCode -eq 1 -and $outcome.started_again -eq $true -and (Active).release -eq $first.release) "$($outcome.message)"
+  $told = Outcome
+  Check 'that instance keeps its download and stays the only one; the reason waits for its next start' ((Test-Path $archive) -and (Test-Path $record) -and $told.started_again -eq $true -and (Running).Count -eq 1 -and (Running)[0].Id -eq $instance)
+
+  # A process the manager may not open (the System process) is "cannot
+  # tell", never "exited": the hand-over keeps waiting for the app.
+  Stage
+  $handover = Hand-Over 4
+  Start-Sleep 8
+  Check 'a process that cannot be opened does not read as the app having exited' (-not $handover.HasExited -and (Active).release -eq $first.release -and -not (Test-Path $result))
+  $handover.Kill(); $handover.WaitForExit()
   Check 'tray Quit ends it again' (Quit-Client)
 
   # Another manager command holds the transaction for a while: the update
