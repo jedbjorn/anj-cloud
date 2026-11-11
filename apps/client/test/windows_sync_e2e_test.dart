@@ -260,6 +260,16 @@ void main() {
         // deletion under Documents waits for losses there to settle (about
         // 12 s), so a fixed number of passes proves nothing: passes repeat
         // until the expected state is there, within a deadline.
+        // The server (Nextcloud on local storage) keeps a file's ETag when
+        // the file is overwritten again within the same second: the second
+        // version is then invisible to every device that saw the first.
+        // That is the server's behaviour, not this client's, and a person
+        // does not edit a file twice in one second from two devices; this
+        // run does, so it lets the second pass before it overwrites a file
+        // that has just synced.
+        Future<void> nextSecond() =>
+            Future<void>.delayed(const Duration(milliseconds: 1200));
+
         // For the evidence of a step that times out: what was noted
         // before it.
         var noted = '';
@@ -386,6 +396,7 @@ void main() {
             'A row ${a.engine.manifest.entries['$prefix/from-b.txt']?.etag}; '
             'B row ${b.engine.manifest.entries['$prefix/from-b.txt']?.etag}; '
             'edit written at ${DateTime.now().toUtc().toIso8601String()}';
+        await nextSecond();
         a.file('$prefix/from-b.txt').writeAsStringSync('edited on A');
         await until(
           'the edit on B',
@@ -415,6 +426,7 @@ void main() {
         final shared = '$prefix/conflict.txt';
         a.file(shared).writeAsStringSync('base');
         await until('the base on B', () async => b.file(shared).existsSync());
+        await nextSecond();
         a.file(shared).writeAsStringSync('alpha edit');
         b.file(shared).writeAsStringSync('beta edit');
         // A uploads its edit first; B then meets it with its own.
@@ -471,6 +483,7 @@ void main() {
         final held = '$prefix/held.txt';
         a.file(held).writeAsStringSync('v1');
         await until('v1 on B', () async => b.file(held).existsSync());
+        await nextSecond();
         a.file(held).writeAsStringSync('v2');
         final holder = await Process.start(
           'powershell',
