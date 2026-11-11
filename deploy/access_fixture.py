@@ -61,6 +61,29 @@ class Actor:
             await self.session.close()
 
 
+# The gateway admits 10 enrollment requests per minute per source (a 429 with Retry-After beyond
+# that) and blocks a source for 15 minutes after repeated rejected codes. Fixtures only ever honour
+# the first and never wait out the second: the limits are the gateway's, unchanged and unaware of tests.
+ENROLL_MAX_WAIT = 90
+
+
+async def enroll_post(session, url, payload, *, sleep=asyncio.sleep):
+    """POST one enrollment request. On a 429 with a short Retry-After, wait that long and retry once.
+
+    A block (a wait over ENROLL_MAX_WAIT, or none stated) is not waited out: the caller sees the 429
+    and the run fails loudly instead of hiding a real rejection storm. Returns (status, json body).
+    """
+    for attempt in (0, 1):
+        async with session.post(url, json=payload) as response:
+            status = response.status
+            wait = response.headers.get("Retry-After", "")
+            body = await response.json(content_type=None) if status == 200 else None
+        if status != 429 or attempt or not wait.isdigit() or not 0 < int(wait) <= ENROLL_MAX_WAIT:
+            return status, body
+        await sleep(int(wait))
+    return status, body
+
+
 async def pair(stack, operator, uid, directory, rights="write", retained=None):
     private_directory(directory)
     key = retained.key if retained else ec.generate_private_key(ec.SECP256R1())
@@ -78,16 +101,15 @@ async def pair(stack, operator, uid, directory, rights="write", retained=None):
                 raise RuntimeError("Bootstrap connection gained file access without a certificate")
         code = invitation["code"]
         manual = "-".join(code[i:i+4] for i in range(0, 32, 4)).lower()
-        async with bootstrap.post(stack.origin + "/v1/enroll", json={"code": manual, "csr": csr_pem, "label": "synthetic fixture"}) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Real bootstrap enrollment failed HTTP {response.status}")
-            pending = await response.json()
+        status, pending = await enroll_post(bootstrap, stack.origin + "/v1/enroll", {"code": manual, "csr": csr_pem, "label": "synthetic fixture"})
+        if status != 200:
+            raise RuntimeError(f"Real bootstrap enrollment failed HTTP {status}")
         fingerprint = key_fingerprint(key.public_key())
         if pending["fingerprint"] != fingerprint or pending["state"] != "pending":
             raise RuntimeError("Client/operator CSR public-key fingerprint mismatch")
-        async with bootstrap.post(stack.origin + "/v1/enroll/status", json={"code": code, "csr": csr_pem}) as response:
-            if await response.json() != pending:
-                raise RuntimeError("QR/manual or same-key retry identity changed")
+        status, again = await enroll_post(bootstrap, stack.origin + "/v1/enroll/status", {"code": code, "csr": csr_pem})
+        if status != 200 or again != pending:
+            raise RuntimeError("QR/manual or same-key retry identity changed")
         try:
             await asyncio.to_thread(operator.approve, pending["pairing_id"], "0" * 64)
         except RuntimeError:
@@ -95,8 +117,9 @@ async def pair(stack, operator, uid, directory, rights="write", retained=None):
         else:
             raise RuntimeError("Mismatched operator fingerprint was approved")
         await asyncio.to_thread(operator.approve, pending["pairing_id"], fingerprint)
-        async with bootstrap.post(stack.origin + "/v1/enroll/status", json={"code": code, "csr": csr_pem}) as response:
-            approved = await response.json()
+        status, approved = await enroll_post(bootstrap, stack.origin + "/v1/enroll/status", {"code": code, "csr": csr_pem})
+        if status != 200:
+            raise RuntimeError(f"Fixture enrollment status failed HTTP {status}")
     if approved.get("state") != "approved":
         raise RuntimeError("Approved fixture did not receive its certificate")
     certificate = x509.load_pem_x509_certificate(approved["certificate"].encode())
