@@ -1727,6 +1727,27 @@ ANJ_API int anj_mkdir_exclusive(int fd, const char* path) {
   if (!e) flush_committed(dir.h);
   return done(e);
 }
+// Create an empty regular file at an absent root-relative path and return
+// its descriptor (read-write); an existing name, or a case or 8.3 alias of
+// one, is never replaced (EEXIST). Part of the shared ABI
+// (native/posix/exports.txt): Android's documents provider calls it; no
+// Windows code path does today.
+ANJ_API int anj_create_file(int fd, const char* path) {
+  Owned dir;
+  std::wstring leaf;
+  int e = open_parent(handle_of(fd), path, dir, leaf);
+  if (e) return fail(e);
+  Owned made;
+  e = create_child(dir.h, leaf, GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+      kShareAll, false, made);
+  // A directory of that name is an existing name too, as O_CREAT | O_EXCL
+  // reports it.
+  if (e == lx::ISDIR) e = lx::EXIST;
+  if (e) return fail(e);
+  flush_committed(dir.h);
+  int out = put(made);
+  return out < 0 ? fail(-out) : (error_number = 0, out);
+}
 // Publish a journaled, private empty directory without accepting an existing
 // destination. An ambiguous previous publication remains pending for review.
 ANJ_API int anj_install_directory(int fd, int stage, const char* staged,
