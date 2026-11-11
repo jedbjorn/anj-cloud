@@ -140,6 +140,32 @@ class _Fs extends NativeRootFs {
   final renames = <String>[];
   void Function()? afterRename;
 
+  /// Paths whose content reads fail as Windows' do while another program
+  /// holds the file without read sharing (EBUSY).
+  final busy = <String>{};
+
+  @override
+  ({String hash, String stamp}) copyAndHashStamped(
+    int root,
+    String relative,
+    File? destination, {
+    String purpose = 'content',
+  }) {
+    if (busy.contains(relative)) {
+      throw FileSystemException(
+        'Filesystem boundary refused operation',
+        relative,
+        const OSError('Linux errno', fileBusyErrno),
+      );
+    }
+    return super.copyAndHashStamped(
+      root,
+      relative,
+      destination,
+      purpose: purpose,
+    );
+  }
+
   /// When set, every name this binding creates or renames to resolves the
   /// way a case- and normalization-insensitive volume (NTFS, default APFS)
   /// does: an existing sibling whose name differs only by case or
@@ -746,6 +772,51 @@ void main() {
       expect(cloud.directories.contains('Archive/Trip'), isFalse);
       expect(exists('Archive/Trip'), isFalse);
     });
+
+    test(
+      'a file deleted here inside a folder whose cloud rename is held by '
+      'a busy file: the delete waits, then follows the rename (SC-105)',
+      () async {
+        await library();
+        // Edited and held open by another program: the folder's cloud rename
+        // is held until the file can be read.
+        write('Photos/2026/Trip/deep/b.jpg', 'b2 edited here');
+        fs.busy.add('Photos/2026/Trip/deep/b.jpg');
+        await cloud.moveElsewhere('Photos/2026/Trip', 'Archive/Trip');
+        await ticks(2);
+        expect(fs.renames, isEmpty);
+        File(root('Photos/2026/Trip/a.jpg')).deleteSync();
+        await ticks();
+        // Nothing is sent while held, and the removal is not taken for done.
+        expect(cloud.calls, isEmpty);
+        expect(remote('Archive/Trip/a.jpg'), 'a');
+        expect(
+          [
+            for (final o in store.operations.values)
+              if (o.kind == 'delete') o.path,
+          ],
+          ['Photos/2026/Trip/a.jpg'],
+        );
+        fs.busy.clear();
+        await ticks(4);
+        expect(fs.renames, ['Photos/2026/Trip -> Archive/Trip']);
+        // Deleted at the new path; never fetched back.
+        expect(cloud.calls.where((c) => c.startsWith('GET')), isEmpty);
+        expect(cloud.calls, contains('DELETE Archive/Trip/a.jpg'));
+        expect(remote('Archive/Trip/a.jpg'), isNull);
+        expect(exists('Archive/Trip/a.jpg'), isFalse);
+        expect(exists('Photos/2026/Trip'), isFalse);
+        // The edit made while held uploads as an edit of the moved file.
+        expect(remote('Archive/Trip/deep/b.jpg'), 'b2 edited here');
+        expect(store.entries.values.where((e) => e.conflict != null), isEmpty);
+        expect(store.entries['Archive/Trip/a.jpg']?.status, 'deleted');
+        expect(store.entries['Archive/Trip/a.jpg']!.expectedPresent, isFalse);
+        expect(
+          store.operations.values.where((o) => o.kind == 'delete'),
+          isEmpty,
+        );
+      },
+    );
   });
 
   group('row 3 on partial passes (fake clock)', () {
@@ -943,6 +1014,39 @@ void main() {
         expect(store.entries.containsKey('Docs/report.txt'), isFalse);
       },
     );
+
+    test('a file deleted here inside a folder kept at its old name for a '
+        'refused cloud name: the delete waits, then follows a later good name '
+        '(SC-105)', () async {
+      await library();
+      await cloud.moveElsewhere('Photos/2026/Trip', 'Photos/2026/Trip.');
+      await ticks(3);
+      expect(
+        store.entries['Photos/2026/Trip']!.status,
+        movedNameNotAllowedStatus,
+      );
+      File(root('Photos/2026/Trip/a.jpg')).deleteSync();
+      await ticks(3);
+      expect(cloud.calls, isEmpty);
+      expect(remote('Photos/2026/Trip./a.jpg'), 'a');
+      expect(
+        [
+          for (final o in store.operations.values)
+            if (o.kind == 'delete') o.path,
+        ],
+        ['Photos/2026/Trip/a.jpg'],
+      );
+      await cloud.moveElsewhere('Photos/2026/Trip.', 'Photos/2026/Fine');
+      await ticks(4);
+      expect(fs.renames, ['Photos/2026/Trip -> Photos/2026/Fine']);
+      expect(cloud.calls, ['DELETE Photos/2026/Fine/a.jpg']);
+      expect(remote('Photos/2026/Fine/a.jpg'), isNull);
+      expect(exists('Photos/2026/Fine/a.jpg'), isFalse);
+      expect(disk('Photos/2026/Fine/deep/b.jpg'), 'b');
+      expect(store.entries['Photos/2026/Fine/a.jpg']?.status, 'deleted');
+      expect(store.entries['Photos/2026/Fine/a.jpg']!.expectedPresent, isFalse);
+      expect(store.operations.values.where((o) => o.kind == 'delete'), isEmpty);
+    });
 
     test('a cloud rename onto a sibling that differs only by case: not '
         'renamed, held as a clash, both files untouched', () async {

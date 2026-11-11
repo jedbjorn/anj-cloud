@@ -4635,6 +4635,18 @@ class SyncEngine {
       final entry = manifest.entries[op.path]!;
       final current = remote[op.path];
       if (entry.conflict != null || _held(op.path)) continue;
+      // Beneath a folder whose cloud move is held for a later pass (a busy
+      // file inside it, a new name this device cannot hold): the cloud has
+      // the item under the folder's new path, so nothing is listed here and
+      // the delete would read as already done, its row dropped and the item
+      // fetched back once the move is followed. It stays queued, unsent, and
+      // moves with the folder's rows when the move is followed, to be sent
+      // at the new path (SC-105). The held item itself is not covered: its
+      // own pairing has already decided what its delete means.
+      if (op.path.contains('/') && _cloudHolds(p.posix.dirname(op.path))) {
+        _dirty.add(op.path);
+        continue;
+      }
       // A folder holding someone else's share: deleting it in the cloud
       // could reach into the share, so the deletion waits. A share inside
       // is left only when its own folder alone was removed (spec #34 P6);
