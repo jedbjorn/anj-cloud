@@ -512,6 +512,29 @@ class NativeRootFs implements RootFilesystem, DocumentsFilesystem {
   @override
   String? locateIdentity(int fd, String identity) => null;
 
+  /// Windows: true (NTFS in the Win32 namespace; a directory with WSL case
+  /// sensitivity turned on is treated as insensitive too, which only keeps a
+  /// clash loser in the cloud). macOS: the volume's own answer,
+  /// `pathconf(_PC_CASE_SENSITIVE)`, assumed insensitive (the default) when
+  /// it cannot be read. Elsewhere false.
+  @override
+  bool caseInsensitive(String rootPath) {
+    if (Platform.isWindows) return true;
+    if (!Platform.isMacOS) return false;
+    const pcCaseSensitive = 11; // <sys/unistd.h> on Darwin
+    final pathconf = DynamicLibrary.process()
+        .lookupFunction<
+          IntPtr Function(Pointer<Utf8>, Int32),
+          int Function(Pointer<Utf8>, int)
+        >('pathconf');
+    final path = rootPath.toNativeUtf8();
+    try {
+      return pathconf(path, pcCaseSensitive) != 1;
+    } finally {
+      malloc.free(path);
+    }
+  }
+
   @override
   List<Map<String, dynamic>> scan(int fd) =>
       (jsonDecode(_string(_scan(fd))) as List).cast<Map<String, dynamic>>();

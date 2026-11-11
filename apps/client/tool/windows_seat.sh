@@ -4,7 +4,8 @@
 # to the VM broker (#120 Q3). This script only starts, ACPI-shuts down and
 # screenshots the domain: it never snapshots, reverts or redefines it (#117).
 #
-#   windows_seat.sh preflight            seat free, machine.slice headroom, no anj-qual
+#   windows_seat.sh preflight            seat free, memory headroom (machine.slice, or the
+#                                        host when the slice has no limit), no anj-qual
 #   windows_seat.sh start                start the shut-off VM, take the lease, wait for SSH
 #   windows_seat.sh ssh <command...>     run a command on the guest
 #   windows_seat.sh ps <script> [args]   copy a .ps1 into C:\anj\tools and run it
@@ -172,13 +173,23 @@ preflight() {
   if grep -qx 'anj-qual' <<<"$names"; then
     die "an anj-qual run is active: wait for it, never stop it"
   fi
-  local max cur free
+  local max cur free source
   max=$(systemctl show machine.slice -p MemoryMax --value)
-  cur=$(systemctl show machine.slice -p MemoryCurrent --value)
-  [[ "$max" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]] || die "cannot read machine.slice memory ($max, $cur)"
-  free=$(( (max - cur) / 1073741824 ))
-  [ "$free" -ge "$need_gib" ] || die "machine.slice has ${free} GiB free, need ${need_gib}"
-  echo "preflight ok: $domain shut off, no anj-qual, machine.slice ${free} GiB free"
+  if [ "$max" = infinity ]; then
+    # No slice limit: the headroom is what the host itself has available.
+    local avail
+    avail=$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\) kB$/\1/p' "$proc_root/meminfo" 2>/dev/null | head -1) || true
+    [[ "$avail" =~ ^[0-9]+$ ]] || die "cannot read host MemAvailable ($proc_root/meminfo) and machine.slice has no limit"
+    free=$(( avail / 1048576 ))
+    source="host MemAvailable (machine.slice has no limit)"
+  else
+    cur=$(systemctl show machine.slice -p MemoryCurrent --value)
+    [[ "$max" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]] || die "cannot read machine.slice memory ($max, $cur)"
+    free=$(( (max - cur) / 1073741824 ))
+    source="machine.slice"
+  fi
+  [ "$free" -ge "$need_gib" ] || die "$source has ${free} GiB free, need ${need_gib}"
+  echo "preflight ok: $domain shut off, no anj-qual, $source ${free} GiB free"
 }
 
 start() {
@@ -340,5 +351,5 @@ case "$cmd" in
   stop) stop "$@" ;;
   state) state ;;
   lease) if [ -f "$lease" ]; then cat "$lease"; else echo "no lease ($lease)"; fi ;;
-  *) sed -n '2,51p' "$0"; exit 2 ;;
+  *) sed -n '2,52p' "$0"; exit 2 ;;
 esac

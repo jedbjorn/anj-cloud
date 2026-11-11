@@ -7,7 +7,8 @@
 # ssh serves a reverse forward by fetching its -R target directly.
 # Covers: cleanup on success, failure and signals; the lease (owner required
 # and checked, boot identity including the qemu start time, flock between
-# start and stop) and the unleased recovery path.
+# start and stop) and the unleased recovery path. Last, the W6 Admin
+# driver's own tests (tool/test_windows_admin_fixture.py).
 set -euo pipefail
 seat="$(cd "$(dirname "$0")" && pwd)/windows_seat.sh"
 work="$(mktemp -d)"
@@ -72,7 +73,7 @@ printf '#!/usr/bin/env bash\n[ -f "$FAKE/magick_fail" ] && exit 1\ncp "$1" "$2"\
 cat >"$fake/systemctl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
-  *MemoryMax*) echo 25190940672 ;;
+  *MemoryMax*) cat "$FAKE/mem_max" 2>/dev/null || echo 25190940672 ;;
   *MemoryCurrent*) echo 4294967296 ;;
   *) exec /usr/bin/systemctl "$@" ;;
 esac
@@ -253,6 +254,23 @@ as laneB start; echo "shut off" >"$FAKE/state"; run stop
 as laneB stop; [ "$code" = 0 ] && [ ! -f "$lease" ] && ok "stop on a shut-off seat drops its own stale lease" || bad "own stale lease: $code $out"
 touch "$FAKE/qual"; run start; rm -f "$FAKE/qual"
 [ "$code" != 0 ] && [ ! -f "$lease" ] && ok "start refuses during an anj-qual run, no lease" || bad "anj-qual: $code $out"
+
+# A machine.slice with no limit (MemoryMax=infinity): the headroom is the
+# host's MemAvailable; a numeric limit keeps the slice arithmetic.
+reset; echo infinity >"$FAKE/mem_max"; echo "MemAvailable:   33554432 kB" >"$work/proc/meminfo"; run preflight
+[ "$code" = 0 ] && grep -q "host MemAvailable (machine.slice has no limit) 32 GiB free" <<<"$out" && ok "preflight passes on an unlimited slice with enough host memory" || bad "unlimited, enough: $code $out"
+echo "MemAvailable:   8388608 kB" >"$work/proc/meminfo"; run start
+[ "$code" != 0 ] && [ ! -f "$lease" ] && grep -q "host MemAvailable (machine.slice has no limit) has 8 GiB free, need 13" <<<"$out" && ok "start refuses on an unlimited slice with too little host memory, no lease" || bad "unlimited, short: $code $out"
+rm -f "$work/proc/meminfo"; run preflight
+[ "$code" != 0 ] && grep -q "cannot read host MemAvailable" <<<"$out" && ok "preflight refuses on an unlimited slice when MemAvailable cannot be read" || bad "unlimited, unreadable: $code $out"
+rm -f "$FAKE/mem_max"; run preflight
+[ "$code" = 0 ] && grep -q "machine.slice 19 GiB free" <<<"$out" && ok "a numeric slice limit is used as before" || bad "numeric limit: $code $out"
+
+# The W6 driver's verdict, cleanup, Bob reset and guest-task stop
+# (deploy/windows_admin_fixture.py, tool/windows/w6_run.ps1), with fakes only.
+set +e; out="$(env -u PYTHONPATH python3 -I "$(dirname "$seat")/test_windows_admin_fixture.py" 2>&1)"; code=$?; set -e
+n="$(sed -n 's/^Ran \([0-9]*\) tests.*/\1/p' <<<"$out")"
+[ "$code" = 0 ] && ok "windows_admin_fixture: $n driver tests pass" || bad "windows_admin_fixture tests: $code $(tail -30 <<<"$out")"
 
 echo "windows_seat tests: $pass passed, $fail failed"
 [ "$fail" = 0 ]

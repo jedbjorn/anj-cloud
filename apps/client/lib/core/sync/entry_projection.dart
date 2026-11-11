@@ -15,6 +15,11 @@ Future<Map<String, Object?>> projectEntry(
     if (isSizeRefusal(entry.status)) entry.status,
     // Name not allowed on other devices (decision #120): amber, with Rename.
     if (isNameRefusal(entry.status)) entry.status,
+    // A server name this device cannot hold (#120 Q2): amber, no Rename.
+    if (isServerNameHold(entry.status)) entry.status,
+    // Open in another app without read sharing (SC-048 F5): amber until
+    // a pass can read it.
+    if (isBusyStatus(entry.status)) entry.status,
     for (final operation in operations)
       if (operation.kind == 'working' &&
           operation.data['presentationError'] is String)
@@ -50,6 +55,9 @@ Future<Map<String, Object?>> projectEntry(
     ..['presentationNotes'] = [
       // The cloud's name won over a rename here (spec #33).
       ?entry.movedNote,
+      if (engine.notesLongPaths &&
+          engine.tree.root.path.length + 1 + entry.path.length > win32MaxPath)
+        longPathNote,
     ]
     ..['nameRefused'] = isNameRefusal(entry.status)
     // Recent ranks such a file by its local modification time.

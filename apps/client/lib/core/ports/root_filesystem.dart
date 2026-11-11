@@ -112,6 +112,14 @@ abstract interface class RootFilesystem implements RootIdentitySource {
   /// root, hard-linked or on any error. Bounded; never throws.
   String? locateIdentity(int fd, String identity);
 
+  /// Whether the volume holding [rootPath] treats names that differ only by
+  /// case (or Unicode normalization) as one name: NTFS on Windows, APFS and
+  /// HFS+ in their default case-insensitive form on macOS. Where it does,
+  /// two server items that fold together cannot both be created, and one
+  /// written under the other's name would land inside it (decision #120 Q2,
+  /// spec #32 W4). False on case-sensitive Linux and Android app storage.
+  bool caseInsensitive(String rootPath);
+
   List<Map<String, dynamic>> scan(int fd);
 
   /// Stat-only listing of [path] (and, when [recursive], of everything
