@@ -31,6 +31,8 @@ void main() {
   late HttpServer server;
   String path(String name) => '${fixture.path}/$name';
   var approve = false;
+  var limited = false;
+  String? limitRetryAfter;
   var serial = 1;
   String? leaf;
   String? wrongLeaf;
@@ -220,6 +222,15 @@ void main() {
         await response.close();
         return;
       }
+      if (limited) {
+        // The gateway's 429 (the per-minute limit or the 15-minute block).
+        await utf8.decoder.bind(request).join();
+        response.statusCode = 429;
+        final wait = limitRetryAfter;
+        if (wait != null) response.headers.set('retry-after', wait);
+        await response.close();
+        return;
+      }
       final body = jsonDecode(
         await utf8.decoder.bind(request).join(),
       ) as Map<String, dynamic>;
@@ -358,6 +369,59 @@ void main() {
     expect(store.setting('accountOrigin'), origin);
     store.close();
   }
+
+  test(
+    'a 429 shows the wait the gateway stated, and the old wording when none',
+    () async {
+      const lead = 'Too many pairing attempts from this network.';
+      final cases = <String?, String>{
+        '37': '$lead Wait 37 seconds, then try again.',
+        '1': '$lead Wait 1 second, then try again.',
+        '60': '$lead Wait 1 minute, then try again.',
+        '61': '$lead Wait 2 minutes, then try again.',
+        '900': '$lead Wait 15 minutes, then try again.',
+        '421': '$lead Wait 8 minutes, then try again.',
+        // Not stated, or not a plain wait: an older gateway's old wording.
+        null: '$lead Wait 15 minutes, then try again.',
+        '0': '$lead Wait 15 minutes, then try again.',
+        'soon': '$lead Wait 15 minutes, then try again.',
+        'Wed, 21 Oct 2026 07:28:00 GMT':
+            '$lead Wait 15 minutes, then try again.',
+      };
+      final controller = ClientController(
+        Directory(path('profile-limited')),
+        secrets: MemorySecrets(),
+        nativeLibrary: testNativeLibrary,
+      );
+      addTearDown(controller.dispose);
+      limited = true;
+      addTearDown(() => limited = false);
+      for (final entry in cases.entries) {
+        limitRetryAfter = entry.key;
+        await expectLater(
+          controller.pair(
+            '127.0.0.1:${server.port}',
+            _code,
+            caPath: path('issuer.crt'),
+          ),
+          throwsA(
+            isA<CloudFailure>().having((e) => e.status, 'status', 429),
+          ),
+          reason: '${entry.key}',
+        );
+        expect(controller.pairingMessage, entry.value, reason: '${entry.key}');
+      }
+    },
+  );
+
+  test('Retry-After is read as whole seconds between one second and a day', () {
+    expect(parseRetryAfter('37'), const Duration(seconds: 37));
+    expect(parseRetryAfter(' 900 '), const Duration(minutes: 15));
+    expect(parseRetryAfter('86400'), const Duration(days: 1));
+    for (final bad in [null, '', '0', '-5', '1.5', '86401', '1e3', 'x']) {
+      expect(parseRetryAfter(bad), isNull, reason: '$bad');
+    }
+  });
 
   test(
     'first pairing, retained-key re-pairing, key recovery and pickup',

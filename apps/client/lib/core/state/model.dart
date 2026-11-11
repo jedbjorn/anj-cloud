@@ -652,9 +652,13 @@ class Operation {
 }
 
 class CloudFailure implements Exception {
-  const CloudFailure(this.message, {this.status});
+  const CloudFailure(this.message, {this.status, this.retryAfter});
   final String message;
   final int? status;
+
+  /// The wait the server stated with a 429 (`Retry-After`, whole seconds);
+  /// null when it stated none (an older gateway).
+  final Duration? retryAfter;
   @override
   String toString() => message;
 }

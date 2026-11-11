@@ -1464,7 +1464,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
       message = failure.status == 400
           ? 'Code not valid. Ask for a new code.'
           : failure.status == 429
-          ? 'Too many pairing attempts from this network. Wait 15 minutes, then try again.'
+          ? pairingLimitMessage(failure.retryAfter)
           : 'Pairing failed. Check the server address and the network, then try again. Retry uses the same device key.';
       rethrow;
     } on SecretStoreUnavailable catch (error) {

@@ -40,3 +40,18 @@ String? invitationFromQr(String text) {
     return null;
   }
 }
+
+/// What to tell a user whose pairing request got a 429. The gateway states
+/// how long to wait (the short per-minute limit and the 15-minute block differ
+/// only by that wait); [wait] null means an older gateway that stated none,
+/// which keeps the long-standing wording.
+String pairingLimitMessage(Duration? wait) {
+  const lead = 'Too many pairing attempts from this network.';
+  if (wait == null) return '$lead Wait 15 minutes, then try again.';
+  final seconds = wait.inSeconds < 1 ? 1 : wait.inSeconds;
+  if (seconds < 60) {
+    return '$lead Wait $seconds ${seconds == 1 ? 'second' : 'seconds'}, then try again.';
+  }
+  final minutes = (seconds + 59) ~/ 60;
+  return '$lead Wait $minutes ${minutes == 1 ? 'minute' : 'minutes'}, then try again.';
+}
