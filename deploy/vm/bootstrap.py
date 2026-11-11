@@ -31,6 +31,8 @@ deploy/vm/paths.py; the guided copy is deploy/vm/guide.py.
 """
 
 import argparse
+import contextlib
+import ctypes
 import datetime
 import fcntl
 import getpass
@@ -52,6 +54,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import tomllib
 import uuid as uuid_module
@@ -94,6 +97,7 @@ SETUP_RECORD = paths.STATE_ROOT / "setup.json"     # this install: machine, rele
 # can install the dispatcher before the snapshot lands.
 OPS_CONFIG = paths.RUN_DIR / "ops.json"
 OPS_ECOSYSTEM = paths.STATE_ROOT / "ops" / "ecosystem.config.js"
+OPS_ECOSYSTEM_PREVIOUS = paths.STATE_ROOT / "ops" / "ecosystem.previous.config.js"   # step 10's fallback, one run long
 SOURCE_DIR = Path(__file__).resolve().parent         # deploy/vm of this tree
 # The stable command every printed instruction uses once step 10 links it (S3); before that, the
 # absolute path of the copy that is running.
@@ -250,22 +254,6 @@ class System:
                              "Fix the cause above, then run setup again; every finished step is kept.")
         return code, out, err
 
-    def streamed(self, argv, *, timeout=3600):
-        """A changing command run as root whose stderr goes straight to this terminal (its progress)
-        and whose stdout is returned (its result). Skipped in a dry run. Returns (code, stdout)."""
-        self.commands.append({"argv": [str(a) for a in argv]})
-        if self.dry:
-            return 0, ""
-        try:
-            result = subprocess.run([str(a) for a in argv], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=None,
-                                    text=True, timeout=timeout, check=False, cwd="/",
-                                    env=dict(os.environ, LC_ALL="C.UTF-8"))
-        except FileNotFoundError:
-            return 127, ""
-        except subprocess.TimeoutExpired:
-            return 124, ""
-        return result.returncode, result.stdout
-
     def attended(self, argv, *, user=None, timeout=3600):
         """A changing command that talks to the person at the terminal: stdin is inherited (it
         reads /dev/tty), stdout and stderr are captured. Skipped in a dry run; never given a secret."""
@@ -282,7 +270,7 @@ class System:
             return 124, "", f"{argv[0]}: timed out"
         return result.returncode, result.stdout, result.stderr
 
-    def detached(self, argv, *, user=None, cwd=None, timeout=3600, grace=1800, logs=None):
+    def detached(self, argv, *, user=None, cwd=None, timeout=3600, grace=1800, logs=None, pass_fds=()):
         """A changing command in its own session with no terminal (decision #122 review H1): Ctrl-C
         at this terminal or a dropped ssh never reaches it, so it finishes or falls back by
         itself. stdout and stderr go to `logs` (two files, 0600, in a root 0700 directory) and are
@@ -302,7 +290,7 @@ class System:
             # review D1). The command itself is the session leader, under anj's uid, gid and groups.
             child = subprocess.Popen([str(a) for a in argv], stdin=subprocess.DEVNULL, stdout=streams[0],
                                      stderr=streams[1], cwd=cwd, env=environment, start_new_session=True,
-                                     **identity)
+                                     pass_fds=tuple(pass_fds), **identity)
             try:
                 code = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -373,6 +361,22 @@ class System:
         uid = pwd.getpwnam(owner).pw_uid if owner else -1
         gid = grp.getgrnam(group).gr_gid if group else (pwd.getpwnam(owner).pw_gid if owner else -1)
         os.chown(path, uid, gid)
+
+    def exchange(self, new, old):
+        """Swap two directories in one step (renameat2 RENAME_EXCHANGE): at every instant `old`'s
+        path holds a complete tree, the previous one or the new one. Skipped in a dry run."""
+        self.files.append({"path": str(old), "exchanged_with": str(new)})
+        if self.dry:
+            return
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.renameat2(-100, os.fsencode(str(new)), -100, os.fsencode(str(old)), 2) != 0:   # AT_FDCWD, RENAME_EXCHANGE
+            number = ctypes.get_errno()
+            raise OSError(number, os.strerror(number), str(old))
+
+    def rename(self, source, target):
+        self.files.append({"path": str(target), "renamed_from": str(source)})
+        if not self.dry:
+            os.rename(source, target)
 
     def symlink(self, target, link):
         self.files.append({"path": str(link), "symlink": str(target)})
@@ -1036,6 +1040,32 @@ def ecosystem_text(apps):
             "module.exports = " + json.dumps({"apps": apps}, indent=2, sort_keys=True) + ";\n")
 
 
+def ecosystem_names(text):
+    """The app names an ecosystem_text() file defines (empty when unreadable)."""
+    try:
+        return {app.get("name") for app in json.loads(text.split("=", 1)[1].strip().rstrip(";"))["apps"]}
+    except (ValueError, KeyError, IndexError, AttributeError, TypeError):
+        return set()
+
+
+class signals_held:
+    """Hang-up, Ctrl-C and SIGTERM are ignored inside (the main thread only): a pair of commands
+    that must not be split, such as `pm2 delete` and `pm2 start`, finishes even if the session drops."""
+
+    SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+
+    def __enter__(self):
+        self.saved = {}
+        if threading.current_thread() is threading.main_thread():
+            self.saved = {number: signal.signal(number, signal.SIG_IGN) for number in self.SIGNALS}
+        return self
+
+    def __exit__(self, *exc):
+        for number, handler in self.saved.items():
+            signal.signal(number, handler)
+        return False
+
+
 def app_digest(app):
     return sha256(json.dumps(app, sort_keys=True))
 
@@ -1107,6 +1137,7 @@ class Setup:
         self.read_only = False             # doctor and --dry-run: no command that changes or spawns anything
         self._ssh_source = False           # False: not looked up yet
         self.handoff = None                # what the VM host hand-off delivered (names, socket mode)
+        self.evidence_tag = None           # converge: <UTC>-converge.json, apart from its upgrade's <UTC>.json
 
     # Output -------------------------------------------------------------------------------
     def say(self, text=""):
@@ -1698,6 +1729,11 @@ class Setup:
         if busy:
             # Review M3: a re-run restarts apps (prod.py up); never during a backup, restore or update.
             raise SetupError(f"Not now: {busy}. Nothing was changed.", "Run setup again when that has finished.")
+        # SC-110: never beside an upgrade, a rollback or a converge (they take the same lock).
+        with setup_lock() if self.installed_here() else contextlib.nullcontext():
+            return self.run_steps(interactive)
+
+    def run_steps(self, interactive):
         disk = DataDisk(self)
         if interactive and not self.confirm_review(disk):
             self.say("Nothing was changed. Run setup again when you are ready.")
@@ -2004,7 +2040,7 @@ class Setup:
         restoring = self.mode == "restore" and not paths.STACK_CONFIG.exists()
         directory = paths.SETUP_LOG_DIR if paths.STATE_ROOT.is_dir() and self.facts.user() and not restoring \
             else FALLBACK_LOG_DIR
-        path = directory / f"{utc_stamp(self.started)}.json"
+        path = directory / (utc_stamp(self.started) + (f"-{self.evidence_tag}" if self.evidence_tag else "") + ".json")
         try:
             if directory == paths.SETUP_LOG_DIR:
                 self.system.mkdir(directory, mode=0o700, owner=self.user)
@@ -2452,18 +2488,47 @@ class Pm2(Step):
                 f"npm ci --omit=optional --ignore-scripts in {PM2_DIR}", f"link {PM2_LINK}"]
 
     def apply(self):
+        """Install into a fresh staging tree beside PM2_DIR, check it loads and is the pin, then swap
+        the two directories in one step (SC-110). `npm ci` empties node_modules first: done in
+        place, a failed or interrupted install (registry down, session gone) would leave PM2_DIR
+        empty, hidden by the running daemon until the next boot, when pm2-anj.service could not
+        resurrect the gateway and HAProxy. A failure here leaves PM2_DIR exactly as it was.
+
+        The running daemon keeps the version it started with: a new pin reaches it at its next
+        start (a reboot). `pm2 update`, which restarts every app, is never run by setup."""
+        staging = PM2_DIR.with_name(PM2_DIR.name + ".new")
+        before = json.loads(System.text(PM2_DIR / "node_modules" / "pm2" / "package.json") or "{}").get("version")
         self.system.mkdir(PM2_DIR.parent, mode=0o755)
-        self.system.mkdir(PM2_DIR, mode=0o755)
-        # npm ci replaces the packages but retains this directory and its old mode.
-        # Repair the public package directory too when resuming a restrictive install.
-        self.system.mkdir(PM2_DIR / "node_modules", mode=0o755)
+        self.system.change(["rm", "-rf", "--", str(staging)])         # a leftover of an interrupted run
+        self.system.mkdir(staging, mode=0o755)
+        self.system.mkdir(staging / "node_modules", mode=0o755)
         for name in ("package.json", "package-lock.json"):
-            self.system.write(PM2_DIR / name, (SOURCE_DIR / "pm2" / name).read_bytes())
+            self.system.write(staging / name, (SOURCE_DIR / "pm2" / name).read_bytes())
         # Only npm's public package tree needs this mask; preserve the installer's
         # inherited mask for all other work, including secret material.
         self.system.change(["npm", "ci", "--omit=optional", "--ignore-scripts", "--no-audit", "--no-fund"],
-                           cwd=str(PM2_DIR), show_errors=True, umask=0o022)
+                           cwd=str(staging), show_errors=True, umask=0o022)
+        if not self.system.dry:
+            # As the service user, load the installed package (no daemon: only `pm2` commands
+            # connect to one) and read its version.
+            probe = "const d=process.argv[1];const v=require(d+'/package.json').version;require(d);process.stdout.write(v)"
+            code, out, _ = self.system.read(["node", "-e", probe, str(staging / "node_modules" / "pm2")],
+                                            user=self.setup.user, timeout=120)
+            if code != 0 or out.strip() != self.pin():
+                raise SetupError(f"The new PM2 install does not load as pin {self.pin()} (node exit {code}); the installed "
+                                 "PM2 was left as it is.", "Check the network to registry.npmjs.org, then run setup again.")
+        if PM2_DIR.exists() and not PM2_DIR.is_symlink():
+            self.system.exchange(staging, PM2_DIR)
+            # Now the previous tree; a leftover is removed by the next install's first command.
+            self.system.change(["rm", "-rf", "--", str(staging)], check=False)
+        else:
+            self.system.rename(staging, PM2_DIR)
         self.system.symlink(PM2_DIR / "node_modules" / "pm2" / "bin" / "pm2", PM2_LINK)
+        if before and before != self.pin():
+            note = (f"PM2 {self.pin()} is installed; the running PM2 daemon stays on {before} until its next start "
+                    "(a reboot). `pm2 update` restarts every app, so setup never runs it.")
+            self.setup.notes.append(note)
+            self.setup.say("  " + note)
 
     def verify(self):
         done, current = self.state()
@@ -2654,6 +2719,20 @@ class Firewall(Step):
     number, name = 5, "Firewall"
     title, purpose, expect = "Turning on the firewall", "only 443, and SSH from one address", "seconds"
     disruptive = None       # checked with nft -c, then one atomic reload; no service restarts
+
+    def reapply_refusal(self, current):
+        """Converge never moves the SSH source: a live rule that differs from the recorded answer
+        (changed by hand, or an answer gone stale) stops step 5, and so does the lockout guard of
+        the --answers path (this session's own address)."""
+        live, wanted = firewall_admin_source(), self.setup.answers.get("admin_ssh_source")
+        if live and live != wanted:
+            return (f"the live firewall accepts SSH from {live} but setup.json records {wanted}; rewriting it could lock "
+                    "SSH out, so the firewall is left as it is")
+        try:
+            self.setup.guard_answers()
+        except SetupError as error:
+            return f"{error} The firewall is left as it is"
+        return None
 
     def text(self):
         return render_firewall(self.setup.answers["bind_address"], self.setup.answers["admin_ssh_source"])
@@ -3216,6 +3295,10 @@ class Operations(Step):
                               secret=True)
         apps = self.apps()
         self.system.mkdir(OPS_ECOSYSTEM.parent, mode=0o700, owner=anj)
+        previous = System.text(OPS_ECOSYSTEM)
+        if previous is not None and previous != ecosystem_text(apps):
+            # Kept until this run is over: a definition that will not start is replaced by the one before.
+            self.system.write(OPS_ECOSYSTEM_PREVIOUS, previous, mode=0o600, owner=anj)
         self.system.write(OPS_ECOSYSTEM, ecosystem_text(apps), mode=0o600, owner=anj)
         running = pm2_list(self.setup) or {}
         recorded = dict(self.setup.record.get("ops_apps", {}))
@@ -3224,15 +3307,37 @@ class Operations(Step):
             if name in running and recorded.get(name) == app_digest(app) and (
                     name == paths.DDNS_APP or running[name] == "online"):
                 continue
-            if name in running:
+            if name not in running:
+                self.setup.change_as_anj(["pm2", "start", str(OPS_ECOSYSTEM), "--only", name], show_errors=True)
+                recorded[name] = app_digest(app)
+                continue
+            # PM2 applies a changed script or arguments only to a new process: delete, then start.
+            # The pair runs with hang-up, Ctrl-C and SIGTERM held off, so a dropped session cannot
+            # leave the app deleted; a start that fails brings back the previous definition.
+            with signals_held():
                 self.setup.change_as_anj(["pm2", "delete", name])
-            self.setup.change_as_anj(["pm2", "start", str(OPS_ECOSYSTEM), "--only", name], show_errors=True)
+                code, _out, err = self.setup.change_as_anj(["pm2", "start", str(OPS_ECOSYSTEM), "--only", name],
+                                                           check=False)
+                restored = False
+                if code and previous is not None and name in ecosystem_names(previous):
+                    restored = self.setup.change_as_anj(["pm2", "start", str(OPS_ECOSYSTEM_PREVIOUS), "--only", name],
+                                                        check=False)[0] == 0
+            if code:
+                self.setup.save_record(ops_apps=recorded)
+                if restored:
+                    self.setup.change_as_anj(["pm2", "save"], check=False)
+                last = (err or "").strip().splitlines()[-1:] or [""]
+                raise SetupError(f"PM2 could not start {name} from the new definition (exit {code}) {last[0][:200]}; "
+                                 + ("its previous definition runs again." if restored else "it is not running."),
+                                 f"See `pm2 logs {name}` as {paths.VM_USER}, then run setup again.")
             recorded[name] = app_digest(app)
         if self.setup.answers["ddns"] == "off" and paths.DDNS_APP in running:
             self.setup.change_as_anj(["pm2", "delete", paths.DDNS_APP])
             recorded.pop(paths.DDNS_APP, None)
         self.setup.save_record(ops_apps=recorded)
         self.setup.change_as_anj(["pm2", "save"])
+        if OPS_ECOSYSTEM_PREVIOUS.exists():
+            self.system.remove(OPS_ECOSYSTEM_PREVIOUS)
 
 
 def ops_config_text(answers):
@@ -3577,13 +3682,18 @@ def doctor(setup):
     return problems, status
 
 
+def firewall_rule_text():
+    """The installed firewall file's rule lines only: a commented-out rule is no rule."""
+    return "\n".join(nft_rules(System.text(FIREWALL_FILE)) or [])
+
+
 def firewall_bind_address():
-    match = re.search(r"ip daddr (\S+) tcp dport 443", System.text(FIREWALL_FILE) or "")
+    match = re.search(r"^\s*ip daddr (\S+) tcp dport 443\b", firewall_rule_text(), re.M)
     return match.group(1) if match else None
 
 
 def firewall_admin_source():
-    match = re.search(r"ip saddr (\S+) tcp dport 22", System.text(FIREWALL_FILE) or "")
+    match = re.search(r"^\s*ip saddr (\S+) tcp dport 22\b", firewall_rule_text(), re.M)
     return match.group(1) if match else None
 
 
@@ -3617,20 +3727,23 @@ def converge_answers(setup):
     return validate_answers(answers)
 
 
-def converge(setup):
+def converge(setup, lock_fd=None):
     """`anj-cloud-setup converge`: make this server what the live release's setup wants, asking
-    nothing. `upgrade` runs it with the live release's own code after every switch (and on an
-    upgrade to the live release), so a rollback converges to the old release's wants.
+    nothing. `upgrade` runs it, detached, with the live release's own code after every switch (and
+    on an upgrade to the live release), so a rollback converges to the old release's wants.
 
     Every step's state is read under the recorded answers. A step that is not done is re-applied
     through the same execute() (state -> apply -> verify) as an install, when it is safe
-    (Step.disruptive is None): PM2, firewall, journald, operations apps, timers, updates. When any
-    other step (packages, data disk, Docker, release, stack) is not done, nothing is applied and it
-    says which and why: those can restart the gateway, Nextcloud, the database or HAProxy. No
-    prompt, pairing code, backup or secret. Then doctor's checks; any problem left is a failure.
+    (Step.reapply_refusal is None): PM2, firewall, journald, operations apps, timers, updates. When
+    any step is not done and not safe (packages, data disk, Docker, release, stack, a firewall whose
+    SSH source would move), nothing is applied and it says which and why. A safe step that fails
+    does not stop the later ones; every failure is named. No prompt, pairing code, backup or
+    secret. Then doctor's checks; any problem left is a failure. It holds the setup lock (or the
+    one its upgrade passed down, `lock_fd`).
 
     Returns (exit code, result); `upgrade` records the result in its evidence."""
     result = {"result": None, "steps": setup.steps, "blocked": [], "problems": [], "evidence": None}
+    setup.evidence_tag = "converge"          # its own evidence file, beside the upgrade's of the same second
     setup.answers = converge_answers(setup)
     setup.mode = "converge"
     stack = json.loads(System.text(paths.STACK_CONFIG) or "{}")
@@ -3642,10 +3755,15 @@ def converge(setup):
     if Path(ROOT).resolve() != Path(os.path.realpath(paths.RELEASE_CURRENT)):
         raise SetupError(f"This copy of anj-cloud-setup ({ROOT}) is not the live release's; converge applies only the "
                          "live release's setup.", f"Run the installed command: sudo {setup_command()} converge")
-    busy = ops_busy()
-    if busy:
-        raise SetupError(f"Not now: {busy}. Nothing was changed.",
-                         f"Run `sudo {setup_command()} converge` when it has finished.")
+    with setup_lock(lock_fd):
+        busy = ops_busy()
+        if busy:
+            raise SetupError(f"Not now: {busy}. Nothing was changed.",
+                             f"Run `sudo {setup_command()} converge` when it has finished.")
+        return converge_locked(setup, release, result)
+
+
+def converge_locked(setup, release, result):
     setup.release = release
     setup.say(f"Checking every setup step against release {release[:12]} …")
     pending, blocked = [], []
@@ -3673,18 +3791,41 @@ def converge(setup):
         setup.say(f"Next, at a terminal: `sudo {setup_command()}` shows each step and applies it (it re-runs only what is "
                   f"missing); `sudo {setup_command()} doctor` lists what is wrong.")
         result["result"] = "blocked"
-        result["evidence"] = str(setup.write_evidence("blocked", quiet=True, command="converge", blocked=result["blocked"]))
+        result["evidence"] = evidence_name(setup.write_evidence("blocked", quiet=True, command="converge",
+                                                                blocked=result["blocked"]))
         return 1, result
     if pending:
         setup.say(f"Re-applying {len(pending)} setup step(s) that are not done for this release:")
+    failed = []
     for position, (step, current, _why) in enumerate(pending, 1):
         setup.current = (position, len(pending), step)
         try:
             setup.execute(step, position, len(pending), known=(False, current))
         except SetupError as error:
-            return converge_failed(setup, result, step, str(error), error.fix)
+            failed.append((step, str(error), error.fix))
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-            return converge_failed(setup, result, step, guide.plain_error(error), None)
+            failed.append((step, guide.plain_error(error), None))
+        else:
+            continue
+        # The steps are independent: a failed one is named, the later ones still run.
+        failed_step, what, fix = failed[-1]
+        setup.say(f"  Step {failed_step.number} ({failed_step.name}) failed: {what}" + (f"\n  Fix: {fix}" if fix else ""))
+        if not setup.steps or setup.steps[-1].get("step") != failed_step.number:
+            setup.steps.append({"step": failed_step.number, "name": failed_step.name, "before": current,
+                                "result": "failed", "passed": False, "error": what[:400]})
+        else:
+            setup.steps[-1].update(result="failed", error=what[:400])
+    applied = ", ".join(f"step {entry['step']} {entry['name']}" for entry in setup.steps
+                        if entry.get("result") == "changed") or "none needed"
+    if failed:
+        result["result"] = "failed"
+        result["problems"] = [f"Step {step.number} {step.name}: {what}" for step, what, _fix in failed]
+        setup.say(f"\n{len(failed)} setup step(s) could not be re-applied: "
+                  + ", ".join(f"step {step.number} {step.name}" for step, _w, _f in failed)
+                  + f" (re-applied: {applied}). Finished steps are kept; `sudo {setup_command()} converge` tries again.")
+        result["evidence"] = evidence_name(setup.write_evidence("failed", quiet=True, command="converge",
+                                                                problems=result["problems"]))
+        return 1, result
     # Doctor's own checks, read-only by construction: what `sudo anj-cloud-setup doctor` reports.
     setup.facts._cache.clear()
     dry = setup.system.dry
@@ -3694,30 +3835,23 @@ def converge(setup):
     finally:
         setup.system.dry, setup.read_only = dry, False
     result["problems"] = [problem for _name, problem, _fix in problems]
-    applied = ", ".join(f"step {entry['step']} {entry['name']}" for entry in setup.steps) or "none needed"
     if problems:
         setup.say(f"\nDoctor still finds {len(problems)} problem(s) (setup re-applied: {applied}):")
         for _name, problem, fix in problems:
             setup.say(f"PROBLEM {problem}\n  Fix: {fix}")
         result["result"] = "problems remain"
-        result["evidence"] = str(setup.write_evidence("problems remain", quiet=True, command="converge",
-                                                      problems=result["problems"]))
+        result["evidence"] = evidence_name(setup.write_evidence("problems remain", quiet=True, command="converge",
+                                                                problems=result["problems"]))
         return 1, result
     setup.say(f"Setup re-applied: {applied}. Doctor: all checks pass.")
     result["result"] = "converged"
-    result["evidence"] = str(setup.write_evidence("converged", quiet=True, command="converge"))
+    result["evidence"] = evidence_name(setup.write_evidence("converged", quiet=True, command="converge"))
     return 0, result
 
 
-def converge_failed(setup, result, step, what, fix):
-    setup.say(f"\nRe-applying step {step.number} ({step.name}) failed: {what}")
-    if fix:
-        setup.say(f"Fix: {fix}")
-    setup.say(f"Steps already re-applied are kept; `sudo {setup_command()} converge` continues.")
-    result["result"] = "failed"
-    result["problems"] = [f"Step {step.number} {step.name}: {what}"]
-    result["evidence"] = str(setup.write_evidence("failed", quiet=True, command="converge", error=what))
-    return 1, result
+def evidence_name(path):
+    """write_evidence's path as text, or None when it could not be written (never "None")."""
+    return str(path) if path else None
 
 
 # first-code --reissue ----------------------------------------------------------------------
@@ -3749,6 +3883,33 @@ FALLBACK_GRACE = 1800           # after SIGTERM at the timeout: prod.py's own fa
 BACKUP_TIMEOUT = 3600           # backup.py run: its 30-minute window cap plus housekeeping
 BACKUP_FRESH = 24 * 3600        # a successful backup younger than this needs no new one before an update
 UPGRADE_LOG_DIR = FALLBACK_LOG_DIR      # root 0700: prod.py redeploy's output (it carries no secret)
+
+
+def setup_lock(lock_fd=None):
+    """The one setup lock (UPGRADE_LOCK, flock): an upgrade or rollback, a converge and a setup
+    re-run on an installed server exclude each other. Returns the open lock file (a context
+    manager), or None for `lock_fd`: the lock an upgrade holds, passed to its converge child, which
+    must be an open file description of that very file already holding it."""
+    if lock_fd is not None:
+        try:
+            held = os.path.samestat(os.fstat(lock_fd), os.stat(UPGRADE_LOCK))
+            if held:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # the same description: granted at once
+        except OSError:
+            held = False
+        if not held:
+            raise SetupError("--lock-fd is not the upgrade lock held for this run; nothing was changed.",
+                             f"Run `sudo {setup_command()} converge` without it.")
+        return contextlib.nullcontext()
+    UPGRADE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(UPGRADE_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.close()
+        raise SetupError("Another upgrade, rollback, converge or setup run is in progress; nothing was changed.",
+                         "Wait for it to finish, then run this again.") from None
+    return lock
 
 
 def prod_takes_source(tree):
@@ -3961,12 +4122,8 @@ class Upgrade:
         if (setup.record.get("answers") or {}).get("start_stack") is False:
             raise SetupError("This install does not run the stack (start_stack = false), so there is nothing to update.",
                              "Run the install with the stack started first.")
-        UPGRADE_LOCK.parent.mkdir(parents=True, exist_ok=True)
-        with open(UPGRADE_LOCK, "w") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise SetupError("Another upgrade or rollback is running.", "Wait for it to finish.") from None
+        with setup_lock() as lock:
+            self.lock = lock            # handed to the converge child (--lock-fd)
             return self.switch(rollback, source, expect, no_backup)
 
     def switch(self, rollback, source, expect, no_backup):
@@ -4044,49 +4201,71 @@ class Upgrade:
 
     # After the switch: the live release's setup converges (flag SC-110) --------------------------
     def converge_live(self):
-        """`converge` of the live release's own anj-cloud-setup (as root; its progress goes straight to
-        the terminal, its result comes back as one JSON line), so the setup a rollback re-applies is
-        the old release's. A live release older than `converge` gets its own read-only `doctor`.
-        Returns {via, code, result, steps, blocked, problems, evidence}. The steps it re-applied
-        become this run's evidence steps."""
+        """`converge` of the live release's own anj-cloud-setup, so the setup a rollback re-applies is
+        the old release's. Like the switch it runs detached (its own session, no terminal; output
+        in /var/log/anj-cloud-setup): a dropped session or Ctrl-C here never cuts it short. It gets
+        this upgrade's setup lock (--lock-fd), so nothing else runs setup meanwhile. Its result
+        comes back as one JSON line. A live release older than `converge` gets its own read-only
+        `doctor` instead. Returns {via, code, result, steps, blocked, problems, evidence, logs};
+        `steps` (what converge re-applied) becomes this run's evidence steps, or "unknown"."""
         setup = self.setup
         tree = Path(os.path.realpath(paths.RELEASE_CURRENT))
         launcher = tree / "deploy" / "vm" / "anj-cloud-setup"
+        stamp = utc_stamp()
+        logs = (UPGRADE_LOG_DIR / f"converge-{stamp}.out", UPGRADE_LOG_DIR / f"converge-{stamp}.err")
         outcome = {"via": "converge", "code": 1, "result": None, "steps": [], "blocked": [], "problems": [],
-                   "evidence": None}
+                   "evidence": None, "logs": [str(path) for path in logs]}
+        lock = getattr(self, "lock", None)
         try:
             if setup_has_converge(tree):
                 setup.say("  Setup: re-applying what this release changed (asks nothing; restarts no core service) …")
-                code, out = self.system.streamed(["python3", "-I", str(launcher), "converge", "--json"],
-                                                 timeout=CONVERGE_TIMEOUT)
+                argv = ["python3", "-I", str(launcher), "converge", "--json"]
+                fds = ()
+                if lock is not None and hasattr(lock, "fileno"):
+                    argv += ["--lock-fd", str(lock.fileno())]
+                    fds = (lock.fileno(),)
+                with guide.Heartbeat(setup.say):
+                    code, out, err = self.system.detached(argv, cwd="/", timeout=CONVERGE_TIMEOUT, grace=120, logs=logs,
+                                                          pass_fds=fds)
+                for line in (err or "").splitlines():
+                    setup.say("    " + line)
                 try:
-                    result = json.loads((out.strip().splitlines() or ["{}"])[-1])
+                    result = json.loads(((out or "").strip().splitlines() or ["{}"])[-1])
                 except ValueError:
                     result = {}
                 result = result if isinstance(result, dict) else {}
+                if not result.get("result"):
+                    # It stopped without a result (a crash, a kill): what it re-applied is unknown.
+                    outcome["steps"] = "unknown (converge ended without a result; see its logs and setup-log/*-converge.json)"
                 outcome.update({key: result[key] for key in ("steps", "blocked", "problems", "evidence")
                                 if result.get(key)})
-                outcome["result"] = result.get("result") or f"converge exit {code}"
+                outcome["result"] = result.get("result") or f"converge exit {code}, no result"
                 outcome["code"] = code if code != 0 or result.get("result") == "converged" else 1
             else:
                 outcome["via"] = "doctor"
                 setup.say(f"  Setup: release {tree.name} predates `converge`; checking it with its own doctor …")
-                code, out = self.system.streamed(["python3", "-I", str(launcher), "doctor"], timeout=CONVERGE_TIMEOUT)
-                for line in out.splitlines():
+                with guide.Heartbeat(setup.say):
+                    code, out, _err = self.system.detached(["python3", "-I", str(launcher), "doctor"], cwd="/",
+                                                           timeout=CONVERGE_TIMEOUT, grace=120, logs=logs)
+                for line in (out or "").splitlines():
                     setup.say("    " + line)
-                outcome["problems"] = [line[len("PROBLEM "):] for line in out.splitlines() if line.startswith("PROBLEM ")]
+                outcome["problems"] = [line[len("PROBLEM "):] for line in (out or "").splitlines()
+                                       if line.startswith("PROBLEM ")]
                 outcome["result"] = "doctor passes" if code == 0 else "doctor found problems"
                 outcome["code"] = code
         except KeyboardInterrupt:
-            outcome.update(code=130, result="interrupted")
-        setup.steps = list(outcome["steps"])
+            outcome.update(code=130, result="interrupted",
+                           steps="unknown (converge goes on in the VM; see its logs and setup-log/*-converge.json)")
+        setup.steps = outcome["steps"] if isinstance(outcome["steps"], str) else list(outcome["steps"])
         return outcome
 
     def report_converge(self, converged):
         """The setup lines of the final output; returns the upgrade's exit code."""
         setup = self.setup
         command = setup_command()
-        applied = ", ".join(f"step {entry.get('step')} {entry.get('name')}" for entry in converged["steps"])
+        steps = converged["steps"] if isinstance(converged["steps"], list) else []
+        applied = ", ".join(f"step {entry.get('step')} {entry.get('name')}" for entry in steps
+                            if entry.get("result", "changed") == "changed")
         if converged["code"] == 0:
             if converged["via"] == "doctor":
                 setup.say("  Setup: this release cannot re-apply its setup by itself; its doctor finds nothing wrong.")
@@ -4096,16 +4275,19 @@ class Upgrade:
             setup.say("  Doctor: all checks pass.")
             return 0
         if converged["code"] == 130:
-            setup.say(f"  Setup: stopped while re-applying it. Finish it: sudo {command} converge")
+            setup.say(f"  Setup: stopped waiting; converge goes on in the VM (output: {converged['logs'][1]}). "
+                      f"Check it with `sudo {command} doctor`; `sudo {command} converge` finishes it if needed.")
             return 130
         if applied:
             setup.say(f"  Setup re-applied: {applied}")
+        if isinstance(converged["steps"], str):
+            setup.say(f"  Setup steps re-applied: {converged['steps']}")
         for item in converged["blocked"]:
             setup.say(f"  NOT APPLIED step {item.get('step')} {item.get('name')}: {item.get('state')} — {item.get('why')}")
         for problem in converged["problems"]:
             setup.say(f"  PROBLEM {problem}")
         if not converged["blocked"] and not converged["problems"]:
-            setup.say(f"  Setup: {converged['result']} (see the output above).")
+            setup.say(f"  Setup: {converged['result']} (output: {converged['logs'][1]}).")
         if converged["via"] == "doctor":
             setup.say(f"Next: this release cannot re-apply its setup by itself. At a terminal, `sudo {command}` re-applies "
                       f"what is missing (its questions default to the recorded answers); then `sudo {command} doctor`.")
@@ -4114,13 +4296,17 @@ class Upgrade:
                       f"applies each one; then `sudo {command} doctor`.")
         else:
             setup.say(f"Next: fix each problem, then `sudo {command} converge` (or `sudo {command} doctor` to check).")
+        if not converged["blocked"]:
+            setup.say("The release itself is live. If a problem was passing (for example the network was briefly "
+                      "unreachable), run the same upgrade again: the release is already live, so it switches nothing and "
+                      "only re-applies and re-checks.")
         if converged["evidence"]:
             setup.say(f"Details (no secrets): {converged['evidence']}")
         return converged["code"] if converged["code"] not in (0, None) else 1
 
     @staticmethod
     def converge_evidence(converged):
-        return {key: converged[key] for key in ("via", "code", "result", "blocked", "problems", "evidence")}
+        return {key: converged[key] for key in ("via", "code", "result", "blocked", "problems", "evidence", "logs")}
 
     def failed(self, command, verb, commit, before, code, err, elapsed, logs):
         setup = self.setup
@@ -4201,6 +4387,7 @@ def parser():
     p.add_argument("--rollback", action="store_true", help="upgrade: switch back to the previous release")
     p.add_argument("--no-backup", action="store_true", help="upgrade: skip the backup before the switch (warns)")
     p.add_argument("--expect", help=argparse.SUPPRESS)          # stage.py --upgrade: the commit it staged (review L4)
+    p.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)   # upgrade -> converge: the setup lock it holds
     p.add_argument("--secrets-socket", help=argparse.SUPPRESS)   # stage.py --with-secrets (decision #109)
     return p
 
@@ -4289,7 +4476,7 @@ def main(argv=None, *, system=None, facts=None, prompter=None, out=sys.stdout):
         if args.command == "backup":
             return backup_command(setup, args.show_password)
         if args.command == "upgrade":
-            if args.dry_run or args.answers or args.adopt_data or args.restore_from:
+            if args.dry_run or args.answers or args.adopt_data or args.restore_from or args.lock_fd is not None:
                 parser().error("upgrade takes only --rollback or --source")
             if args.rollback and (args.source or args.expect):
                 parser().error("--rollback switches to the recorded previous release; it takes no --source")
@@ -4309,7 +4496,7 @@ def main(argv=None, *, system=None, facts=None, prompter=None, out=sys.stdout):
             try:
                 if os.geteuid() != 0:
                     raise SetupError("converge needs root.", f"Run it with sudo: sudo {setup_command()} converge")
-                code, result = converge(setup)
+                code, result = converge(setup, lock_fd=args.lock_fd)
             except SetupError as error:
                 setup.say(f"anj-cloud-setup: {error}")
                 if error.fix:
@@ -4321,6 +4508,8 @@ def main(argv=None, *, system=None, facts=None, prompter=None, out=sys.stdout):
             return code
         if args.rollback or args.no_backup or args.expect:
             parser().error("--rollback, --no-backup and --expect belong to upgrade")
+        if args.lock_fd is not None:
+            parser().error("--lock-fd belongs to converge")
         if args.dry_run:
             # Review R3: strictly read-only, like doctor. No pm2 (which starts a daemon), no
             # prod.py status, no unattended-upgrade run; System(dry=True) skips every change.

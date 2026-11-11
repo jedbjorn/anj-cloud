@@ -37,6 +37,44 @@ def git(repository, *args):
                           env=dict(os.environ, **COMMIT_ENV)).stdout.strip()
 
 
+CHILD_LAUNCHER = r'''#!/usr/bin/python3 -I
+"""Release B's anj-cloud-setup in the process-chain test: the real bootstrap.main() of the checkout
+under test, in a real child process, with the test's sandboxed paths (ANJ_TEST_CHILD), a fake
+machine and one stand-in setup step that is not done."""
+import json, os, sys
+from pathlib import Path
+from unittest import mock
+
+config = json.loads(os.environ["ANJ_TEST_CHILD"])
+sys.path.insert(0, config["checkout"])
+from deploy.vm import bootstrap, paths  # noqa: E402
+from tests.vm_bootstrap_fakes import FakeFacts, FakeSystem  # noqa: E402
+
+marker = Path(config["marker"])
+
+
+class Timers(bootstrap.Step):
+    number, name, title, disruptive = 11, "Timers", "Scheduling backups, reboots and checks", None
+
+    def state(self):
+        return (True, "in place") if marker.exists() else (False, "to do: anj-cloud-backup.timer")
+
+    def apply(self):
+        marker.write_text("applied\n")
+
+
+patches = [mock.patch.object(paths, key, Path(value)) for key, value in config["paths"].items()]
+patches += [mock.patch.object(bootstrap, key, Path(value)) for key, value in config["bootstrap"].items()]
+patches += [mock.patch.object(bootstrap.os, "geteuid", return_value=0),
+            mock.patch.object(bootstrap, "doctor", return_value=([], {})),
+            mock.patch.object(bootstrap.Setup, "step_list", lambda setup: [Timers(setup)])]
+for patch in patches:
+    patch.start()
+system = FakeSystem(dry=False)
+sys.exit(bootstrap.main(system=system, facts=FakeFacts(system)))
+'''
+
+
 def make_releases(directory, *, new_has_source=True, old_has_source=False):
     """A git repository with releases A then B; returns (repository, {"a": sha, "b": sha})."""
     repository = Path(directory) / "repo"
@@ -53,6 +91,8 @@ def make_releases(directory, *, new_has_source=True, old_has_source=False):
             # The new release knows `converge` (flag SC-110); an old one that has `upgrade` may not.
             (repository / "deploy" / "vm" / "bootstrap.py").write_text(
                 'choices = ("install", "upgrade", "converge")\n' if name == "b" else 'choices = ("install", "upgrade")\n')
+            if name == "b":
+                (repository / "deploy" / "vm" / "anj-cloud-setup").write_text(CHILD_LAUNCHER)
         git(repository, "add", "-A")
         git(repository, "commit", "-q", "-m", name)
         commits[name] = git(repository, "rev-parse", "HEAD")
@@ -308,8 +348,10 @@ class UpgradeSystem(FakeSystem):
             return self.test.backup_run
         return 0, "", ""
 
-    def detached(self, argv, *, user=None, cwd=None, timeout=3600, grace=1800, logs=None):
+    def detached(self, argv, *, user=None, cwd=None, timeout=3600, grace=1800, logs=None, pass_fds=()):
         argv = [str(a) for a in argv]
+        if "converge" in argv or argv[-1] == "doctor":
+            return self.child(argv, pass_fds)
         self.commands.append({"argv": argv, **({"user": user} if user else {})})
         self.detached_calls.append({"timeout": timeout, "grace": grace, "logs": [str(p) for p in logs]})
         if len(argv) > 3 and argv[2].endswith("deploy/backup.py"):
@@ -325,19 +367,19 @@ class UpgradeSystem(FakeSystem):
             return 0, json.dumps(self.test.backup_status), ""
         return super().read(argv, user=user, timeout=timeout, data=data, cwd=cwd)
 
-    def streamed(self, argv, *, timeout=3600):
-        """The live release's `converge --json` (or an old release's `doctor`), as root."""
-        argv = [str(a) for a in argv]
+    def child(self, argv, pass_fds):
+        """The live release's `converge --json` (or an old release's `doctor`), detached as root."""
         self.commands.append({"argv": argv})
         self.test.children.append(argv)
+        self.test.child_fds.append(tuple(pass_fds))
         if self.test.child_raises:
             raise self.test.child_raises
-        if argv[-2:] == ["converge", "--json"]:
+        if argv[3:5] == ["converge", "--json"]:
             code, result = self.test.converge_result
-            return code, "progress goes to stderr\n" + json.dumps(result) + "\n"
+            return code, json.dumps(result) + "\n", "Checking every setup step against release …\n"
         if argv[-1] == "doctor":
-            return self.test.doctor_result
-        return 127, ""
+            return (*self.test.doctor_result, "")
+        return 127, "", ""
 
 
 class UpgradeTests(unittest.TestCase):
@@ -374,6 +416,7 @@ class UpgradeTests(unittest.TestCase):
         self.backup_status = {}
         self.backup_run = (0, "{}", "")
         self.children = []                  # what ran after the switch: converge or an old release's doctor
+        self.child_fds = []
         self.converge_result = (0, {"result": "converged", "steps": [], "blocked": [], "problems": [],
                                     "evidence": "/srv/anj-cloud/state/setup-log/converge.json"})
         self.doctor_result = (0, "doctor: all checks pass\n")
@@ -439,7 +482,8 @@ class UpgradeTests(unittest.TestCase):
         return json.loads((self.state / "setup.json").read_text())
 
     def evidence(self):
-        files = sorted((self.state / "setup-log").glob("*.json"))
+        """The upgrade's own evidence (a converge child writes <UTC>-converge.json beside it)."""
+        files = sorted(path for path in (self.state / "setup-log").glob("*.json") if not path.stem.endswith("-converge"))
         return json.loads(files[-1].read_text())
 
     def test_upgrade_installs_the_staged_release_and_switches_through_redeploy(self):
@@ -484,9 +528,8 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual([], self.redeploys)
         # Nothing switches, restarts or backs up; the live release's setup still converges (SC-110),
         # so re-running the same upgrade finishes a setup an earlier one left incomplete.
-        converge = ["python3", "-I", str(self.sources / self.commits["b"][:12] / "deploy" / "vm" / "anj-cloud-setup"),
-                    "converge", "--json"]
-        self.assertEqual([converge], [c["argv"] for c in self.system.commands if c["argv"][0] in ("pm2", "python3")])
+        self.assertEqual([self.converge_argv("b")],
+                         [c["argv"] for c in self.system.commands if c["argv"][0] in ("pm2", "python3")])
         self.assertIn("is already live", self.out.getvalue())
         self.assertIn("every step was already done", self.out.getvalue())
         self.assertEqual("already current", self.evidence()["result"])
@@ -709,12 +752,20 @@ class UpgradeTests(unittest.TestCase):
     def launcher(self, name):
         return str(self.sources / self.commits[name][:12] / "deploy" / "vm" / "anj-cloud-setup")
 
+    def converge_argv(self, name):
+        """The converge child's argv; its last item is the descriptor of the lock the upgrade holds."""
+        child = next((argv for argv in self.children if "converge" in argv), None)
+        fd = child[-1] if child else "?"
+        return ["python3", "-I", self.launcher(name), "converge", "--json", "--lock-fd", fd]
+
     def test_after_the_switch_the_new_release_reapplies_what_changed_and_the_evidence_records_it(self):
         b = self.commits["b"]
         self.converge_result = (0, {"result": "converged", "steps": [self.STEP_10], "blocked": [], "problems": [],
                                     "evidence": "/srv/anj-cloud/state/setup-log/converge.json"})
         self.assertEqual(0, self.main("upgrade"), self.out.getvalue())
-        self.assertEqual([["python3", "-I", self.launcher("b"), "converge", "--json"]], self.children)
+        self.assertEqual([self.converge_argv("b")], self.children)
+        # It runs under this upgrade's own setup lock, handed down as an open descriptor.
+        self.assertEqual([(int(self.children[0][-1]),)], self.child_fds)
         argvs = [c["argv"] for c in self.system.commands]
         redeploy = next(i for i, argv in enumerate(argvs) if "redeploy" in argv)
         self.assertLess(redeploy, argvs.index(self.children[0]), "converge runs after the switch")
@@ -759,12 +810,16 @@ class UpgradeTests(unittest.TestCase):
         self.assertNotIn("live and healthy", text)
         self.assertIn("Setup re-applied: step 10 Operations apps", text)
         self.assertIn("PROBLEM Step 5 Firewall: not installed or different", text)
+        self.assertIn("The release itself is live. If a problem was passing (for example the network was briefly "
+                      "unreachable), run the same upgrade again", text)
         self.assertEqual([self.STEP_10], self.evidence()["steps"])
         # A converge that says nothing readable is no success either.
         self.converge_result = (0, {"result": None})
         self.out.truncate(0)
         self.assertEqual(1, self.main("upgrade"))
-        self.assertIn("converge exit 0", self.out.getvalue())
+        self.assertIn("converge exit 0, no result", self.out.getvalue())
+        # What a converge that ended without a result re-applied is unknown, never "none".
+        self.assertTrue(self.evidence()["steps"].startswith("unknown"), self.evidence()["steps"])
 
     def test_a_rollback_checks_the_old_release_with_its_own_doctor(self):
         """Release A predates `converge`: its setup's wants are checked by its own read-only doctor,
@@ -790,13 +845,62 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(0, self.main("upgrade", "--rollback"))
         self.children.clear()
         self.assertEqual(0, self.main("upgrade", "--rollback"))         # back to B, which has `converge`
-        self.assertEqual([["python3", "-I", self.launcher("b"), "converge", "--json"]], self.children)
+        self.assertEqual([self.converge_argv("b")], self.children)
+
+    def test_the_real_parent_and_child_processes(self):
+        """No faked child: upgrade starts release B's launcher as a real detached process, which runs
+        the real bootstrap.main() converge (sandboxed paths, one stand-in step not done) under the
+        lock descriptor the upgrade hands down; its JSON result and its own evidence come back."""
+        b = self.commits["b"]
+        record = self.record()
+        record["answers"].update(household_lan="192.168.77.0/24", admin_ssh_source="10.99.0.1", timezone="Europe/Paris")
+        (self.state / "setup.json").write_text(json.dumps(record))
+        self.write_stack(household_lan="192.168.77.0/24")
+        marker = self.temp / "timers-applied"
+        names = ("STATE_ROOT", "STACK_CONFIG", "RELEASE_DIR", "RELEASE_SOURCE_DIR", "RELEASE_CURRENT", "BIN_DIR",
+                 "ALERT_COMMAND", "SETUP_LOG_DIR", "RUN_DIR", "OPS_LOCK", "RESTORE_LOCK", "BACKUP_IN_PROGRESS",
+                 "RESTORE_IN_PROGRESS", "BACKUP_RECORD")
+        config = {"checkout": str(ROOT), "marker": str(marker),
+                  "paths": {name: str(getattr(paths, name)) for name in names},
+                  "bootstrap": {"SETUP_RECORD": str(bootstrap.SETUP_RECORD), "UPGRADE_LOCK": str(bootstrap.UPGRADE_LOCK),
+                                "ROOT": str(self.sources / b[:12]), "COMMAND_LINK": str(bootstrap.COMMAND_LINK),
+                                "FALLBACK_LOG_DIR": str(self.temp / "log"),
+                                "FIREWALL_FILE": str(self.temp / "no-firewall.nft")}}
+        fake = UpgradeSystem.detached
+
+        def detached(system, argv, **options):
+            if "converge" in [str(a) for a in argv]:
+                system.test.children.append([str(a) for a in argv])
+                return bootstrap.System.detached(system, argv, **dict(options, timeout=120, grace=10))
+            return fake(system, argv, **options)
+        with mock.patch.object(UpgradeSystem, "detached", detached), \
+                mock.patch.dict(os.environ, ANJ_TEST_CHILD=json.dumps(config),
+                                ANJ_PROFILE=str(ROOT / "deploy" / "profile.example.toml")):   # the child runs in /
+            code = self.main("upgrade")
+        text = self.out.getvalue()
+        self.assertEqual(0, code, text)
+        self.assertEqual("applied\n", marker.read_text())
+        [child] = self.children
+        self.assertEqual(["python3", "-I", self.launcher("b"), "converge", "--json", "--lock-fd"], child[:-1])
+        self.assertIn("    Checking every setup step against release " + b[:12], text)    # the child's progress
+        self.assertIn(f"Release {b[:12]} is live and healthy", text)
+        self.assertIn("Setup re-applied: step 11 Timers", text)
+        evidence = self.evidence()
+        self.assertEqual([[11, "Timers", "changed"]], [[e["step"], e["name"], e["result"]] for e in evidence["steps"]])
+        # Both wrote evidence in the same second, under different names.
+        children = sorted((self.state / "setup-log").glob("*-converge.json"))
+        self.assertEqual(1, len(children))
+        self.assertEqual(str(children[0]), evidence["converge"]["evidence"])
+        self.assertEqual("converged", json.loads(children[0].read_text())["result"])
+        self.assertEqual(2, len(list((self.state / "setup-log").glob("*.json"))))
 
     def test_ctrl_c_while_converging_says_how_to_finish(self):
         self.child_raises = KeyboardInterrupt()
         self.assertEqual(130, self.main("upgrade"))
         text = self.out.getvalue()
-        self.assertIn("Setup: stopped while re-applying it. Finish it: sudo", text)
+        self.assertIn("Setup: stopped waiting; converge goes on in the VM (output: ", text)
+        self.assertIn("converge` finishes it if needed", text)
+        self.assertTrue(self.evidence()["steps"].startswith("unknown"))
         self.assertNotIn("nothing was switched", text)
         self.assertEqual("interrupted", self.evidence()["converge"]["result"])
 

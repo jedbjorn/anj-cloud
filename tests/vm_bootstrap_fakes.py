@@ -40,15 +40,6 @@ class FakeSystem(bootstrap.System):
         self.events.append(("run", " ".join(str(a) for a in argv)))
         return 0, "", ""
 
-    def streamed(self, argv, *, timeout=3600):
-        argv = [str(a) for a in argv]
-        self.commands.append({"argv": argv})
-        self.events.append(("streamed", " ".join(argv)))
-        for prefix, answer in self.responses.items():
-            if " ".join(argv).startswith(prefix):
-                return answer(argv, None) if callable(answer) else answer
-        return 1, ""
-
     def attended(self, argv, *, user=None, timeout=3600):
         argv = [str(a) for a in argv]
         self.commands.append({"argv": argv, **({"user": user} if user else {})})

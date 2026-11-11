@@ -28,6 +28,22 @@ RUNNING = {"alerts": "online", "watchdog": "online", "watchers": "online", paths
            paths.DDNS_APP: "stopped"}             # ddns is idle between its 5-minute runs
 
 
+class ScriptedSystem(FakeSystem):
+    """FakeSystem whose changing commands can fail: `failing` maps an argv prefix to (code, err)."""
+
+    failing = {}
+
+    def change(self, argv, **options):
+        result = super().change(argv, **options)
+        text = " ".join(str(a) for a in argv)
+        for prefix, (code, err) in self.failing.items():
+            if text.startswith(prefix):
+                if options.get("check", True):
+                    raise bootstrap.SetupError(f"`{argv[0]} {argv[1]}` failed (exit {code}). {err}", "Fix it.")
+                return code, "", err
+        return result
+
+
 class Stub(bootstrap.Step):
     """A setup step that only reports a state (and counts applies)."""
 
@@ -77,6 +93,12 @@ class ConvergeTests(unittest.TestCase):
         self.doctor_problems = []
         self.doctor_calls = []
         self.steps = None
+        self.responses, self.failing, self.facts_values = {}, {}, {}
+        etc = self.root / "etc-anj-cloud"
+        for patch in (mock.patch.multiple(bootstrap, ETC_DIR=etc, FIREWALL_FILE=etc / "firewall.nft",
+                                          SYSTEMD_DIR=self.root / "etc-systemd", PM2_DIR=self.root / "opt" / "pm2",
+                                          PM2_LINK=self.root / "usr-local-bin" / "pm2"),):
+            stack.enter_context(patch)
         for patch in (mock.patch.object(bootstrap.os, "geteuid", return_value=0),
                       mock.patch.object(bootstrap, "pm2_list", return_value=dict(RUNNING)),
                       mock.patch.object(bootstrap, "doctor", side_effect=self.doctor),
@@ -109,15 +131,18 @@ class ConvergeTests(unittest.TestCase):
     def step_list(self, setup):
         if self.steps is None:
             self.steps = {"docker": Stub(setup, 4, "Docker", done=self.docker_done,
-                                         disruptive="it restarts the Docker daemon, and with it every container"),
-                          "operations": bootstrap.Operations(setup),
-                          "timers": Stub(setup, 11, "Timers", disruptive=None)}
+                                         disruptive="it restarts the Docker daemon, and with it every container")}
+            for name, factory in self.extra_steps:
+                self.steps[name] = factory(setup)
+            self.steps.update({"operations": bootstrap.Operations(setup),
+                               "timers": Stub(setup, 11, "Timers", disruptive=None)})
         else:
             for step in self.steps.values():
                 step.setup, step.system, step.facts = setup, setup.system, setup.facts
         return list(self.steps.values())
 
     docker_done = True
+    extra_steps = ()            # (name, factory) of real steps placed before step 10
 
     def doctor(self, setup):
         self.doctor_calls.append((setup.read_only, setup.system.dry))
@@ -125,9 +150,10 @@ class ConvergeTests(unittest.TestCase):
 
     def converge(self, *argv):
         self.out = io.StringIO()
-        self.system = FakeSystem(dry=False, out=self.out)
-        code = bootstrap.main(["converge", "--json", *argv], system=self.system, facts=FakeFacts(self.system),
-                              out=self.out)
+        self.system = ScriptedSystem(dry=False, out=self.out, responses=self.responses)
+        self.system.failing = self.failing
+        code = bootstrap.main(["converge", "--json", *argv], system=self.system,
+                              facts=FakeFacts(self.system, **self.facts_values), out=self.out)
         self.result = json.loads(self.out.getvalue().strip().splitlines()[-1])
         return code
 
@@ -236,6 +262,167 @@ class ConvergeTests(unittest.TestCase):
         self.assertEqual("refused", self.result["result"])
         self.assertNotIn("--zone-id", bootstrap.OPS_ECOSYSTEM.read_text())
         self.assertEqual([], self.doctor_calls)
+
+    # B1: the SSH source ------------------------------------------------------------------------------
+    def firewall_step(self, live_source="10.99.0.1", drop_rule="udp dport 546"):
+        """Real step 5. The installed file is this release's rendering for `live_source`, minus one
+        rule (an older release's file), so the step is not done."""
+        self.extra_steps = (("firewall", bootstrap.Firewall),)
+        wanted = bootstrap.render_firewall("10.99.0.10", live_source)
+        bootstrap.FIREWALL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        bootstrap.FIREWALL_FILE.write_text("\n".join(line for line in wanted.splitlines() if drop_rule not in line) + "\n")
+        units = bootstrap.SYSTEMD_DIR
+        units.mkdir(parents=True, exist_ok=True)
+        (units / "anj-cloud-firewall.service").write_text(
+            (bootstrap.SOURCE_DIR / "systemd" / "anj-cloud-firewall.service").read_text())
+        self.responses.update({"nft list table inet anj_cloud": (0, "", ""),
+                               "systemctl is-enabled anj-cloud-firewall.service": (0, "enabled\n", ""),
+                               "systemctl is-active anj-cloud-firewall.service": (0, "active\n", ""),
+                               "nft list tables": (0, "table ip nat\ntable ip filter\ntable inet anj_cloud\n", "")})
+
+    def test_the_firewall_step_is_reapplied_through_check_and_atomic_reload(self):
+        self.installed(self.wanted)
+        self.firewall_step()
+        self.assertEqual(0, self.converge(), self.out.getvalue())
+        self.assertEqual([[5, "Firewall", "changed", True]],
+                         [[e["step"], e["name"], e["result"], e["passed"]] for e in self.result["steps"]])
+        candidate = str(bootstrap.FIREWALL_FILE) + ".new"
+        self.assertEqual([["nft", "-c", "-f", candidate], ["systemctl", "daemon-reload"],
+                          ["systemctl", "enable", "anj-cloud-firewall.service"],
+                          ["systemctl", "reload", "anj-cloud-firewall.service"]], self.commands())
+        self.assertEqual(bootstrap.render_firewall("10.99.0.10", "10.99.0.1"), bootstrap.FIREWALL_FILE.read_text())
+
+    def test_a_live_ssh_source_other_than_the_recorded_one_blocks_the_firewall(self):
+        """setup.json says one admin source, the live firewall (changed by hand) another: rewriting
+        it for the recorded one would drop every new SSH login from the real admin address."""
+        self.installed(self.wanted)
+        self.firewall_step(live_source="10.99.0.2")
+        before = bootstrap.FIREWALL_FILE.read_text()
+        self.assertEqual(1, self.converge())
+        self.assertEqual("blocked", self.result["result"])
+        [blocked] = self.result["blocked"]
+        self.assertEqual(5, blocked["step"])
+        self.assertIn("the live firewall accepts SSH from 10.99.0.2 but setup.json records 10.99.0.1", blocked["why"])
+        self.assertEqual(before, bootstrap.FIREWALL_FILE.read_text())
+        self.assertEqual([], self.commands())
+
+    def test_the_lockout_guard_of_the_answers_path_blocks_the_firewall(self):
+        self.installed(self.wanted)
+        self.firewall_step()
+        self.facts_values = {"ssh_client": "10.99.0.77"}           # this session comes from another address
+        self.assertEqual(1, self.converge())
+        [blocked] = self.result["blocked"]
+        self.assertEqual(5, blocked["step"])
+        self.assertIn("You are connected over SSH from 10.99.0.77", blocked["why"])
+        self.assertEqual([], self.commands())
+        self.facts_values = {"ssh_client": "10.99.0.1"}            # from the recorded source: applied
+        self.steps = None
+        self.assertEqual(0, self.converge(), self.out.getvalue())
+
+    def test_answers_prefer_the_record_and_fall_back_to_the_live_rule_never_a_commented_one(self):
+        bootstrap.FIREWALL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        rendered = bootstrap.render_firewall("10.99.0.10", "10.99.0.3")
+        bootstrap.FIREWALL_FILE.write_text(rendered)
+        self.installed(self.wanted)
+        setup = bootstrap.Setup(bootstrap.parser().parse_args(["converge"]), system=FakeSystem(),
+                                facts=FakeFacts(FakeSystem()), out=io.StringIO())
+        self.assertEqual("10.99.0.1", bootstrap.converge_answers(setup)["admin_ssh_source"])     # recorded wins
+        record = json.loads(bootstrap.SETUP_RECORD.read_text())
+        del record["answers"]["admin_ssh_source"]
+        bootstrap.SETUP_RECORD.write_text(json.dumps(record))
+        self.assertEqual("10.99.0.3", bootstrap.converge_answers(setup)["admin_ssh_source"])     # the live rule
+        commented = rendered.replace("\t\tip saddr 10.99.0.3 tcp dport 22 accept",
+                                     "\t\t# ip saddr 10.99.0.3 tcp dport 22 accept")
+        self.assertNotEqual(rendered, commented)
+        bootstrap.FIREWALL_FILE.write_text(commented)
+        self.assertIsNone(bootstrap.firewall_admin_source())
+        with self.assertRaisesRegex(bootstrap.SetupError, "does not record admin_ssh_source"):
+            bootstrap.converge_answers(setup)
+        bootstrap.FIREWALL_FILE.write_text(commented.replace("ip daddr 10.99.0.10 tcp dport 443",
+                                                             "# ip daddr 10.99.0.10 tcp dport 443"))
+        self.assertIsNone(bootstrap.firewall_bind_address())
+
+    # B2 and continuation -------------------------------------------------------------------------------
+    def test_a_failed_pm2_install_keeps_the_old_tree_and_the_later_steps_still_run(self):
+        old = bootstrap.PM2_DIR / "node_modules" / "pm2"
+        (old / "bin").mkdir(parents=True)
+        (old / "package.json").write_text(json.dumps({"version": "6.0.0"}))
+        (bootstrap.PM2_DIR / "package-lock.json").write_text("{}")
+        (old / "bin" / "pm2").write_text("old pm2\n")
+        self.extra_steps = (("pm2", bootstrap.Pm2),)
+        self.failing = {"npm ci": (1, "npm error network request to registry.npmjs.org failed")}
+        self.installed(self.old_release_apps())
+        self.assertEqual(1, self.converge())
+        self.assertEqual("old pm2\n", (old / "bin" / "pm2").read_text())                    # untouched
+        self.assertEqual({"version": "6.0.0"}, json.loads((old / "package.json").read_text()))
+        self.assertFalse([entry for entry in self.system.files if "exchanged_with" in entry or "renamed_from" in entry])
+        self.assertEqual("failed", self.result["result"])
+        self.assertEqual(1, len(self.result["problems"]))
+        self.assertIn("Step 2 PM2: `npm ci` failed (exit 1). npm error network", self.result["problems"][0])
+        # Step 10, the incident's fix, still ran after the failed step 2.
+        self.assertEqual([[2, "failed"], [10, "changed"]], [[e["step"], e["result"]] for e in self.result["steps"]])
+        self.assertIn(["pm2", "start", str(bootstrap.OPS_ECOSYSTEM), "--only", paths.DDNS_APP], self.commands())
+        text = self.out.getvalue()
+        self.assertIn("Step 2 (PM2) failed: `npm ci` failed", text)
+        self.assertIn("1 setup step(s) could not be re-applied: step 2 PM2 (re-applied: step 10 Operations apps)", text)
+        self.assertEqual([], self.doctor_calls)
+        self.assertTrue(self.result["evidence"].endswith("-converge.json"))
+
+    def test_an_operations_app_that_will_not_start_gets_its_previous_definition_back(self):
+        self.installed(self.old_release_apps())
+        new_start = f"pm2 start {bootstrap.OPS_ECOSYSTEM} --only {paths.DDNS_APP}"
+        self.failing = {new_start: (1, "[PM2][ERROR] Script not found")}
+        self.assertEqual(1, self.converge())
+        self.assertEqual([["pm2", "delete", paths.DDNS_APP],
+                          ["pm2", "start", str(bootstrap.OPS_ECOSYSTEM), "--only", paths.DDNS_APP],
+                          ["pm2", "start", str(bootstrap.OPS_ECOSYSTEM_PREVIOUS), "--only", paths.DDNS_APP],
+                          ["pm2", "save"]], self.commands())
+        self.assertIn("PM2 could not start ddns from the new definition (exit 1) [PM2][ERROR] Script not found; its "
+                      "previous definition runs again.", self.result["problems"][0])
+        old = next(app for app in self.old_release_apps() if app["name"] == paths.DDNS_APP)
+        record = json.loads(bootstrap.SETUP_RECORD.read_text())
+        self.assertEqual(bootstrap.app_digest(old), record["ops_apps"][paths.DDNS_APP])      # still the old one
+        self.assertIn('"args": "run"', bootstrap.OPS_ECOSYSTEM_PREVIOUS.read_text())
+
+    def test_delete_and_start_run_with_hang_up_held_off(self):
+        self.installed(self.old_release_apps())
+        seen = []
+        original = ScriptedSystem.change
+
+        def change(system, argv, **options):
+            if argv[:2] in (["pm2", "delete"], ["pm2", "start"]):
+                seen.append((argv[1], bootstrap.signal.getsignal(bootstrap.signal.SIGHUP)))
+            return original(system, argv, **options)
+        with mock.patch.object(ScriptedSystem, "change", change):
+            self.assertEqual(0, self.converge(), self.out.getvalue())
+        self.assertEqual([("delete", bootstrap.signal.SIG_IGN), ("start", bootstrap.signal.SIG_IGN)], seen)
+        self.assertNotEqual(bootstrap.signal.SIG_IGN, bootstrap.signal.getsignal(bootstrap.signal.SIGHUP))
+        self.assertFalse(bootstrap.OPS_ECOSYSTEM_PREVIOUS.exists())
+
+    # The lock and the evidence ---------------------------------------------------------------------------
+    def test_converge_takes_the_setup_lock(self):
+        import fcntl
+        self.installed(self.old_release_apps())
+        bootstrap.UPGRADE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        with open(bootstrap.UPGRADE_LOCK, "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertEqual(1, self.converge())
+            self.assertIn("Another upgrade, rollback, converge or setup run is in progress", self.out.getvalue())
+            self.assertEqual([], self.commands())
+            # A descriptor of another open of the lock file is not the holder's.
+            with open(bootstrap.UPGRADE_LOCK) as other:
+                self.assertEqual(1, self.converge("--lock-fd", str(other.fileno())))
+            self.assertIn("--lock-fd is not the upgrade lock held for this run", self.out.getvalue())
+            # The holder's own descriptor (what upgrade hands down) is.
+            self.assertEqual(0, self.converge("--lock-fd", str(held.fileno())), self.out.getvalue())
+        self.assertTrue(self.result["evidence"].endswith("-converge.json"))
+
+    def test_setup_lock_excludes_a_setup_rerun(self):
+        with bootstrap.setup_lock():
+            with self.assertRaisesRegex(bootstrap.SetupError, "Another upgrade, rollback, converge or setup run"):
+                bootstrap.setup_lock()
+        with bootstrap.setup_lock():
+            pass
 
     def test_arguments(self):
         for argv in (["converge", "--dry-run"], ["converge", "--answers", "/dev/null"], ["converge", "--rollback"]):

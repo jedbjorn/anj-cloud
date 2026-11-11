@@ -274,6 +274,8 @@ class Pm2Permissions(unittest.TestCase):
                        "p('node_modules/dependency/index.js').write_text('module.exports = {};')\n"
                        "pin=json.loads(p('package.json').read_text())['dependencies']['pm2']\n"
                        "p('node_modules/pm2/package.json').write_text(json.dumps({'version':pin}))\n"
+                       # Loadable, as the post-install check requires (no daemon: nothing runs).
+                       "p('node_modules/pm2/index.js').write_text('module.exports = {};')\n"
                        "binary=p('node_modules/pm2/bin/pm2')\n"
                        "binary.write_text('#!/bin/sh\\ntouch '+str(p('daemon-started').absolute())+'\\n')\n"
                        "binary.chmod(0o755)\n")
@@ -315,7 +317,9 @@ class Pm2Permissions(unittest.TestCase):
         self.assertEqual(modules.stat().st_mode & 0o777, 0o755)
         self.assertEqual((modules / "dependency/index.js").stat().st_mode & 0o777, 0o644)
         self.assertEqual(private_file.stat().st_mode & 0o777, 0o600)
-        self.assertEqual((self.directory / "install-count").read_text(), "2")
+        # SC-110: every install is a fresh tree swapped in whole, so each counts once.
+        self.assertEqual((self.directory / "install-count").read_text(), "1")
+        self.assertFalse(self.directory.with_name("pm2.new").exists())
         self.assertTrue(self.step.verify()[0])
         self.assertFalse((self.directory / "daemon-started").exists())
 
@@ -325,6 +329,9 @@ class Pm2Permissions(unittest.TestCase):
         dependency = self.directory / "node_modules/dependency"
         dependency.chmod(0o000)
         self.addCleanup(dependency.chmod, 0o755)
+        # After the swap the unreadable tree is the previous one (pm2.new), which a non-root runner cannot remove.
+        previous = self.directory.with_name("pm2.new") / "node_modules" / "dependency"
+        self.addCleanup(lambda: previous.chmod(0o755) if previous.exists() else None)
         self.assertFalse(self.step.state()[0])
         self.assertFalse(self.step.verify()[0])
         bootstrap.Setup.execute(self.setup, self.step, 2, 12)
@@ -332,8 +339,27 @@ class Pm2Permissions(unittest.TestCase):
         self.assertTrue(self.step.verify()[0])
         bootstrap.Setup.execute(self.setup, self.step, 2, 12)
         self.assertEqual(self.setup.steps[-1]["result"], "already done")
-        self.assertEqual((self.directory / "install-count").read_text(), "2")
+        self.assertEqual((self.directory / "install-count").read_text(), "1")   # the one fresh install
         self.assertFalse((self.directory / "daemon-started").exists())
+
+    def test_a_failed_or_unloadable_install_leaves_the_installed_pm2_untouched(self):
+        """SC-110: npm ci empties node_modules first, so it runs in a staging tree; only a complete,
+        loadable install of the pin is swapped in."""
+        self.step.apply()
+        before = sorted(str(path.relative_to(self.directory)) for path in self.directory.rglob("*"))
+        npm = self.bin / "npm"
+        working = npm.read_text()
+        npm.write_text("#!/usr/bin/python3\nimport pathlib,shutil,sys\nshutil.rmtree('node_modules')\n"
+                       "print('npm error network', file=sys.stderr)\nsys.exit(1)\n")
+        with self.assertRaisesRegex(bootstrap.SetupError, "npm ci` failed"):
+            self.step.apply()
+        npm.write_text(working.replace("index.js').write_text('module.exports = {};')",
+                                       "index.js').write_text('throw new Error(\"broken\")')"))
+        with self.assertRaisesRegex(bootstrap.SetupError, "does not load as pin"):
+            self.step.apply()
+        self.assertEqual(before, sorted(str(path.relative_to(self.directory)) for path in self.directory.rglob("*")))
+        self.assertEqual("1", (self.directory / "install-count").read_text())
+        self.assertTrue(self.step.verify()[0])
 
     def test_dry_run_never_installs_pm2(self):
         self.system.dry = True
@@ -406,10 +432,9 @@ class ScriptSafety(unittest.TestCase):
                     and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess":
                 direct.append(node.lineno)
         # System.read (the one executor), System.attended (the terminal-attended one, backup.py's
-        # escrow), System.detached (upgrade's redeploy in its own session, decision #122),
-        # System.streamed (upgrade's run of the live release's `converge`, flag SC-110),
-        # resolve_source's `git rev-parse` and Release's `git archive`.
-        self.assertEqual(len(direct), 6, direct)
+        # escrow), System.detached (upgrade's redeploy and converge in their own session, decision
+        # #122, flag SC-110), resolve_source's `git rev-parse` and Release's `git archive`.
+        self.assertEqual(len(direct), 5, direct)
 
     def test_firewall_render(self):
         text = bootstrap.render_firewall("10.77.10.10", "10.77.10.1")
