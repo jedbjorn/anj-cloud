@@ -627,6 +627,170 @@ static void stage_path_rows(int stage) {
 #endif
 }
 
+// Spec #33 I3: anj_locate_identity. Linux: unsupported (0) whatever is
+// asked. Darwin: a rename and a folder move are found at their new paths
+// (1), a move out of the root is outside (2), a file whose only remaining
+// link is in staging is staging (3), and a deleted file, another volume and
+// malformed identities are not found (4). Every error is uncertain (5,
+// decision #143), with anj_error set: a closed root, a short buffer, a
+// volume key that fell back to st_dev and does not match.
+void locate_rows(int root, int stage) {
+  auto identity = [&](const std::string& rel) {
+    struct stat st = {};
+    lstat(at("root/" + rel).c_str(), &st);
+    return volume_key(root, st) + ":" + std::to_string(st.st_ino);
+  };
+  auto locate = [&](const std::string& id) {
+    char out[4096];
+    long long links = -1;
+    int place = anj_locate_identity(root, stage, id.c_str(), out, sizeof(out), &links);
+    return std::to_string(place) + (place == 1 ? " " + std::string(out) : "") +
+      " links=" + std::to_string(links);
+  };
+  mkdir(at("root/loc").c_str(), 0700);
+  mkdir(at("root/loc/from").c_str(), 0700);
+  write_file(at("root/loc/from/a.txt"), "a");
+  std::string file = identity("loc/from/a.txt"), folder = identity("loc/from");
+  rename(at("root/loc/from/a.txt").c_str(), at("root/loc/from/b c.txt").c_str());
+#ifdef __APPLE__
+  row("locate: renamed file", locate(file) == "1 loc/from/b c.txt links=1",
+      "1 loc/from/b c.txt links=1", locate(file));
+  rename(at("root/loc/from").c_str(), at("root/loc/to").c_str());
+  row("locate: moved folder and the file beneath it",
+      locate(folder) == "1 loc/to links=1" && locate(file) == "1 loc/to/b c.txt links=1",
+      "1 loc/to links=1; 1 loc/to/b c.txt links=1", locate(folder) + "; " + locate(file));
+  rename(at("root/loc/to/b c.txt").c_str(), at("outside.txt").c_str());
+  row("locate: moved out of the root", locate(file) == "2 links=0", "2 links=0", locate(file));
+  unlink(at("outside.txt").c_str());
+  row("locate: deleted", locate(file) == "4 links=0", "4 links=0", locate(file));
+  write_file(at("stage/down.part"), "d");
+  int linked = anj_install(root, "loc/down.txt", at("stage/down.part").c_str());
+  std::string down = identity("loc/down.txt");
+  rename(at("root/loc/down.txt").c_str(), at("root/loc/to/down.txt").c_str());
+  std::string renamed = locate(down);
+  row("locate: renamed download (its other link in staging)",
+      linked == 0 && (renamed == "1 loc/to/down.txt links=2" || renamed == "3 links=2"),
+      "1 loc/to/down.txt links=2 or 3 links=2", renamed,
+      "fsgetpath names one link of a hard-linked file");
+  unlink(at("root/loc/to/down.txt").c_str());
+  row("locate: download deleted (only the staging link left)", locate(down) == "3 links=1",
+      "3 links=1", locate(down));
+  unlink(at("stage/down.part").c_str());
+  std::string volume = file.substr(0, file.rfind(':'));
+  std::string bad;
+  for (const char* id : {"", "x", ":5", "u:"}) bad += locate(id) + ";";
+  bad += locate(volume + ":abc") + ";";
+  row("locate: malformed identities are not found", bad == std::string(
+      "4 links=0;4 links=0;4 links=0;4 links=0;4 links=0;"), "4 for each", bad);
+  // Another volume: proven only by a stable root key (the APFS volume UUID);
+  // against the st_dev fallback a mismatch is uncertain (decision #143).
+  struct stat root_st = {};
+  fstat(root, &root_st);
+  bool stable = false;
+  volume_key(root, root_st, &stable);
+  std::string other = locate("nonsense:12") + ";" +
+    locate(volume + "x:" + file.substr(file.rfind(':') + 1)) + ";";
+  std::string want_other = stable ? "4 links=0;4 links=0;" : "5 links=0;5 links=0;";
+  row("locate: another volume", other == want_other, want_other, other,
+      stable ? "stable root key" : "st_dev fallback root key");
+  char small[4];
+  write_file(at("root/loc/to/long-name.txt"), "l");
+  long long links = -1;
+  int place = anj_locate_identity(root, stage, identity("loc/to/long-name.txt").c_str(), small,
+                                  sizeof(small), &links);
+  row("locate: a path longer than the buffer is uncertain",
+      place == 5 && small[0] == 0 && links == 0 && anj_error() == ENAMETOOLONG, "5 ENAMETOOLONG",
+      std::to_string(place) + " " + err(anj_error()));
+  place = anj_locate_identity(-1, -1, file.c_str(), small, sizeof(small), &links);
+  row("locate: a closed root is uncertain", place == 5 && anj_error() == EBADF, "5 EBADF",
+      std::to_string(place) + " " + err(anj_error()));
+  {
+    // A sibling whose name extends the root's ("root2"): outside.
+    mkdir(at("root2").c_str(), 0700);
+    write_file(at("root/loc/to/sib.txt"), "s");
+    std::string sib = identity("loc/to/sib.txt");
+    rename(at("root/loc/to/sib.txt").c_str(), at("root2/sib.txt").c_str());
+    row("locate: moved to a sibling named root2 is outside", locate(sib) == "2 links=0",
+        "2 links=0", locate(sib));
+    unlink(at("root2/sib.txt").c_str());
+    rmdir(at("root2").c_str());
+  }
+  {
+    // Moved out of the root, with a symlink inside the root to where it
+    // went: outside, never reached through the link.
+    mkdir(at("root/loc/st").c_str(), 0700);
+    write_file(at("root/loc/st/s.txt"), "s");
+    std::string sfolder = identity("loc/st"), sfile = identity("loc/st/s.txt");
+    rename(at("root/loc/st").c_str(), at("st-outside").c_str());
+    bool linked_in = symlink(at("st-outside").c_str(), at("root/loc/slink").c_str()) == 0;
+    row("locate: moved out, a symlink inside the root to it: outside",
+        linked_in && locate(sfolder) == "2 links=0" && locate(sfile) == "2 links=0",
+        "2 links=0; 2 links=0",
+        locate(sfolder) + "; " + locate(sfile));
+    unlink(at("root/loc/slink").c_str());
+    unlink(at("st-outside/s.txt").c_str());
+    rmdir(at("st-outside").c_str());
+  }
+  {
+    // Case-only and normalization-only renames come back spelled as the
+    // directory now lists them.
+    auto listed = [&](const std::string& dir, const std::string& prefix) {
+      std::string name;
+      if (DIR* d = opendir(at(dir).c_str())) {
+        while (dirent* e = readdir(d))
+          if (std::string(e->d_name).compare(0, prefix.size(), prefix) == 0) name = e->d_name;
+        closedir(d);
+      }
+      return name;
+    };
+    write_file(at("root/loc/to/case.txt"), "c");
+    std::string cased = identity("loc/to/case.txt");
+    rename(at("root/loc/to/case.txt").c_str(), at("root/loc/to/CASE.TXT").c_str());
+    std::string want = "1 loc/to/" + listed("root/loc/to", "CASE") + " links=1";
+    row("locate: a case-only rename", locate(cased) == want && want == "1 loc/to/CASE.TXT links=1",
+        want, locate(cased));
+    const std::string nfc = "caf\xc3\xa9.txt", nfd = "cafe\xcc\x81.txt";
+    write_file(at("root/loc/to/" + nfc), "n");
+    std::string normal = identity("loc/to/" + nfc);
+    rename(at("root/loc/to/" + nfc).c_str(), at("root/loc/to/" + nfd).c_str());
+    want = "1 loc/to/" + listed("root/loc/to", "caf") + " links=1";
+    row("locate: an NFC name renamed to its NFD spelling", locate(normal) == want, want,
+        locate(normal));
+    unlink(at("root/loc/to/CASE.TXT").c_str());
+    unlink(at("root/loc/to/" + nfd).c_str());
+  }
+  {
+    // The volume key (anj_debug_volume): a stable key for another volume is
+    // not found; a key that fell back to st_dev proves nothing (uncertain).
+    write_file(at("root/loc/to/vol.txt"), "v");
+    anj_debug_volume(0, 1, 0x1234);
+    std::string keyed = identity("loc/to/vol.txt");
+    anj_debug_volume(0, 1, 0x5678);
+    row("locate: a stable key for another volume is not found", locate(keyed) == "4 links=0",
+        "4 links=0", locate(keyed));
+    anj_debug_volume(0, 0, 0);
+    std::string real = identity("loc/to/vol.txt");
+    // stable_volume fails now (an APFS attribute read failing, say): the
+    // key falls back to st_dev and no longer matches the recorded one.
+    anj_debug_volume(0, 1, 0x1234);
+    std::string recorded = identity("loc/to/vol.txt");
+    anj_debug_volume(0, 1, 0);
+    std::string fallback = locate(recorded);
+    int cause = anj_error();
+    anj_debug_volume(0, 0, 0);
+    row("locate: a mismatch on the st_dev fallback key is uncertain",
+        fallback == "5 links=0" && cause == EXDEV, "5 links=0 EXDEV",
+        fallback + " " + err(cause));
+    row("locate: the stable key again finds it", locate(real) == "1 loc/to/vol.txt links=1",
+        "1 loc/to/vol.txt links=1", locate(real));
+    unlink(at("root/loc/to/vol.txt").c_str());
+  }
+#else
+  (void)folder;
+  row("locate: unsupported on Linux", locate(file) == "0 links=0", "0 links=0", locate(file));
+#endif
+}
+
 int main(int argc, char** argv) {
   if (argc != 2) { fprintf(stderr, "usage: boundary_test <scratch directory>\n"); return 64; }
   char* real = realpath(argv[1], nullptr);
@@ -645,6 +809,7 @@ int main(int argc, char** argv) {
   guard_sync_rows(root, stage);
 #endif
   lock_rows();
+  locate_rows(root, stage);
 
   int failed = 0;
   std::string out = "{\"platform\":" + json_escape(

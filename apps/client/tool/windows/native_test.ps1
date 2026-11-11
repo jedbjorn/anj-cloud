@@ -10,7 +10,7 @@ param(
   [string]$Out = 'C:\anj\work\w2build',
   [string]$Evidence = 'C:\anj\evidence\w2',
   [switch]$Dart,
-  [string[]]$DartTests = @('test/windows_root_fs_test.dart', 'test/native_portability_test.dart', 'test/windows_skeleton_test.dart', 'test/windows_session_native_test.dart', 'test/windows_desktop_session_test.dart', 'test/windows_watch_seat_test.dart', 'test/windows_stat_audit_test.dart'),
+  [string[]]$DartTests = @('test/windows_root_fs_test.dart', 'test/native_portability_test.dart', 'test/identity_lookup_native_test.dart', 'test/windows_skeleton_test.dart', 'test/windows_session_native_test.dart', 'test/windows_desktop_session_test.dart', 'test/windows_watch_seat_test.dart', 'test/windows_stat_audit_test.dart'),
   [int]$Timeout = 600
 )
 $ErrorActionPreference = 'Stop'

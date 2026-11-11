@@ -504,13 +504,83 @@ class NativeRootFs implements RootFilesystem, DocumentsFilesystem {
   int fsMagic(int fd, String path) =>
       _path(path.isEmpty ? '' : path, (ptr) => _fsMagic(fd, ptr));
 
-  /// Spec #33 I3 adds the macOS and Windows lookup export; until then no
-  /// platform answers, and every platform holds an unpaired removal.
+  late final _locate = lib
+      .lookupFunction<
+        Int32 Function(
+          Int32,
+          Int32,
+          Pointer<Utf8>,
+          Pointer<Uint8>,
+          Int32,
+          Pointer<Int64>,
+        ),
+        int Function(
+          int,
+          int,
+          Pointer<Utf8>,
+          Pointer<Uint8>,
+          int,
+          Pointer<Int64>,
+        )
+      >('anj_locate_identity');
+
+  /// Room for a root-relative path in UTF-8 (Windows allows 32,767 UTF-16
+  /// units; each takes at most 3 bytes).
+  static const _locateCapacity = 3 * 32768;
+
+  bool? _locates;
+
+  /// Whether the library answers `anj_locate_identity` (spec #33 I3): macOS
+  /// and Windows; Linux and Android report it unsupported (0), and a library
+  /// without the export never looks anything up.
   @override
-  bool get locatesIdentity => false;
+  bool get locatesIdentity => _locates ??= () {
+    try {
+      return _locate(-1, -1, nullptr, nullptr, 0, nullptr) != 0;
+    } on Object {
+      return false;
+    }
+  }();
 
   @override
-  String? locateIdentity(int fd, String identity) => null;
+  IdentityLocation locateIdentity(int fd, int stageFd, String identity) {
+    if (!locatesIdentity) return identityUncertain;
+    if (identity.contains('\x00')) return identityNotFound;
+    final id = identity.toNativeUtf8();
+    final out = malloc<Uint8>(_locateCapacity);
+    final links = malloc<Int64>();
+    try {
+      final place = switch (_locate(
+        fd,
+        stageFd,
+        id,
+        out,
+        _locateCapacity,
+        links,
+      )) {
+        1 => IdentityPlace.inside,
+        2 => IdentityPlace.outside,
+        3 => IdentityPlace.staging,
+        4 => IdentityPlace.notFound,
+        _ => IdentityPlace.uncertain,
+      };
+      if (place == IdentityPlace.notFound) return identityNotFound;
+      if (place == IdentityPlace.uncertain) return identityUncertain;
+      final path = place == IdentityPlace.inside
+          ? out.cast<Utf8>().toDartString()
+          : null;
+      if (place == IdentityPlace.inside && (path == null || path.isEmpty)) {
+        return identityUncertain;
+      }
+      return (place: place, path: path, links: links.value);
+    } on Object {
+      return identityUncertain; // Never throws (spec #33 I3).
+    } finally {
+      malloc.free(id);
+      malloc.free(out);
+      malloc.free(links);
+    }
+  }
 
   /// Windows: true (NTFS in the Win32 namespace; a directory with WSL case
   /// sensitivity turned on is treated as insensitive too, which only keeps a

@@ -1904,6 +1904,196 @@ ANJ_API char* anj_info_fd(int fd) {
   error_number = 0;
   return duplicate_string(info_json(h, s));
 }
+// ---- identity lookup (spec #33 I3) -----------------------------------------
+//
+// anj_locate_identity: the root-relative path of the item whose identity is
+// [identity] (`w<volume serial>:<file id>`, as the scans report it). Same
+// ABI and results as native/posix/locate.inc. Certain: 1 inside the root
+// ([out], '/'-separated UTF-8, and [links]), 2 elsewhere on the root's
+// volume, 4 not found (no file with that ID, another volume, a malformed
+// identity). Every error is 5 (uncertain), with error_number set: an
+// unexpected OpenFileById failure, a name that no longer opens as the same
+// file beneath the root (it changed after it was listed), allocation, a
+// buffer too small. Never 3 (staging): every link name is enumerated
+// (FindFirstFileNameW), so a file whose only other link is a staging copy is
+// still found where it is.
+// The item is opened by its file ID relative to the root's volume with
+// attribute-only access and full sharing, so no other app is blocked, and
+// closed before returning; every name is re-opened beneath the root through
+// the boundary (no reparse point, exact name) and must be the same file.
+
+namespace {
+constexpr int kLocateInside = 1, kLocateOutside = 2, kLocateNotFound = 4,
+              kLocateUncertain = 5;
+constexpr DWORD kLocateMaxLinks = 1024;  // NTFS allows 1024 links per file
+#ifdef ANJ_TEST_SEAMS
+// Test seam (anj_win_debug_locate_race): every name re-opened beneath the
+// root fails as if the file had moved after its names were listed.
+std::atomic<bool> debug_locate_race{false};
+#endif
+
+// The volume-relative path ("\dir\name") of an open handle.
+bool volume_relative(HANDLE h, std::wstring& out) {
+  DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_NONE;
+  DWORD n = GetFinalPathNameByHandleW(h, nullptr, 0, flags);
+  if (!n || n > 32768) return false;
+  std::wstring path(n, L'\0');
+  n = GetFinalPathNameByHandleW(h, &path[0], n, flags);
+  if (!n || n >= path.size()) return false;
+  path.resize(n);
+  out = path;
+  return !out.empty() && out[0] == L'\\';
+}
+// [path] strictly beneath [root] (both volume-relative), compared as Windows
+// compares paths; [rest] is '/'-separated UTF-8.
+bool locate_beneath(const std::wstring& path, const std::wstring& root, std::string& rest) {
+  std::wstring prefix = root;
+  if (prefix.empty() || prefix.back() != L'\\') prefix += L'\\';
+  if (path.size() <= prefix.size() ||
+      CompareStringOrdinal(path.c_str(), static_cast<int>(prefix.size()), prefix.c_str(),
+          static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL)
+    return false;
+  std::wstring tail = path.substr(prefix.size());
+  for (auto& c : tail) if (c == L'\\') c = L'/';
+  return to_utf8(tail.c_str(), tail.size(), rest) && !rest.empty();
+}
+// Every link name of the file [h] (volume-relative), at most kLocateMaxLinks.
+bool link_names(HANDLE h, std::vector<std::wstring>& names) {
+  DWORD n = GetFinalPathNameByHandleW(h, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID);
+  if (!n || n > 32768) return false;
+  std::wstring full(n, L'\0');
+  n = GetFinalPathNameByHandleW(h, &full[0], n, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID);
+  if (!n || n >= full.size()) return false;
+  full.resize(n);
+  std::vector<WCHAR> buffer(1024);
+  DWORD length = static_cast<DWORD>(buffer.size());
+  HANDLE find = FindFirstFileNameW(full.c_str(), 0, &length, buffer.data());
+  if (find == INVALID_HANDLE_VALUE && GetLastError() == ERROR_MORE_DATA && length <= 32768) {
+    buffer.resize(length);
+    find = FindFirstFileNameW(full.c_str(), 0, &length, buffer.data());
+  }
+  if (find == INVALID_HANDLE_VALUE) return false;
+  bool ok = true;
+  while (true) {
+    names.emplace_back(buffer.data());
+    if (names.size() >= kLocateMaxLinks) break;
+    length = static_cast<DWORD>(buffer.size());
+    if (FindNextFileNameW(find, &length, buffer.data())) continue;
+    DWORD error = GetLastError();
+    if (error == ERROR_MORE_DATA && length <= 32768) {
+      buffer.resize(length);
+      length = static_cast<DWORD>(buffer.size());
+      if (FindNextFileNameW(find, &length, buffer.data())) continue;
+      error = GetLastError();
+    }
+    ok = error == ERROR_HANDLE_EOF;
+    break;
+  }
+  FindClose(find);
+  return ok;
+}
+// Uncertain, with its cause in error_number.
+int uncertain(int& cause, int e) { cause = e ? e : lx::IO; return kLocateUncertain; }
+int locate_identity(int fd, const char* identity, char* out, int cap, long long& links,
+    int& cause) {
+  HANDLE root = handle_of(fd);
+  if (!root) return uncertain(cause, lx::BADF);
+  if (!out || cap <= 1) return uncertain(cause, lx::INVAL);
+  if (!identity) return kLocateNotFound;
+  std::string id(identity);
+  size_t colon = id.rfind(':');
+  if (colon == std::string::npos || colon == 0 || colon + 1 >= id.size()) return kLocateNotFound;
+  std::string digits = id.substr(colon + 1);
+  size_t sign = digits[0] == '-' ? 1 : 0;
+  if (digits.size() == sign || digits.find_first_not_of("0123456789", sign) != std::string::npos)
+    return kLocateNotFound;
+  errno = 0;
+  long long file_id = _strtoi64(digits.c_str(), nullptr, 10);
+  if (errno != 0) return kLocateNotFound;
+  Stat rs;
+  int e = stat_of(root, rs);
+  if (e) return uncertain(cause, e);
+  if (!rs.directory()) return uncertain(cause, lx::NOTDIR);
+  // The volume serial is the scans' own key and stable: another volume is
+  // never this root's item.
+  if (volume_key(rs) != id.substr(0, colon)) return kLocateNotFound;
+  FILE_ID_DESCRIPTOR descriptor = {};
+  descriptor.dwSize = sizeof(descriptor);
+  descriptor.Type = FileIdType;
+  descriptor.FileId.QuadPart = file_id;
+  HANDLE opened = OpenFileById(root, &descriptor, FILE_READ_ATTRIBUTES, kShareAll, nullptr,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+  if (!opened || opened == INVALID_HANDLE_VALUE) {
+    DWORD error = GetLastError();
+    // NTFS answers an ID with no file record (or a reused record's old
+    // sequence number) with one of these; anything else, such as a file
+    // whose deletion is pending (access denied), is uncertain.
+    if (error == ERROR_INVALID_PARAMETER || error == ERROR_FILE_NOT_FOUND ||
+        error == ERROR_PATH_NOT_FOUND)
+      return kLocateNotFound;
+    return uncertain(cause, from_win32(error));
+  }
+  Owned item(opened);
+  Stat s;
+  if ((e = stat_of(item.h, s))) return uncertain(cause, e);
+  if (s.volume != rs.volume || s.id != file_id) return uncertain(cause, lx::STALE);
+  if (s.reparse()) return uncertain(cause, lx::LOOP);
+  std::wstring root_path;
+  std::vector<std::wstring> names;
+  if (!volume_relative(root, root_path)) return uncertain(cause, from_win32(GetLastError()));
+  if (s.directory() || s.links <= 1) {
+    std::wstring name;
+    if (!volume_relative(item.h, name)) return uncertain(cause, from_win32(GetLastError()));
+    names.push_back(name);
+  } else if (!link_names(item.h, names)) {
+    return uncertain(cause, from_win32(GetLastError()));
+  }
+  item.reset();  // Closed at once: nothing below needs it.
+  int raced = 0;
+  for (const auto& name : names) {
+    std::string relative;
+    if (!locate_beneath(name, root_path, relative)) continue;
+    Owned again;
+    Stat now;
+    e = open_beneath(root, relative.c_str(), kWalk, kShareAll, Want::Any, again, &now);
+    if (!e && (now.reparse() || now.volume != s.volume || now.id != s.id)) e = lx::STALE;
+#ifdef ANJ_TEST_SEAMS
+    if (!e && debug_locate_race.load()) e = lx::STALE;
+#endif
+    if (e) {
+      // Listed beneath the root but not that file now (it moved or was
+      // replaced after the listing): not proof that it left.
+      raced = e;
+      continue;
+    }
+    if (relative.size() + 1 > static_cast<size_t>(cap)) return uncertain(cause, lx::NAMETOOLONG);
+    memcpy(out, relative.c_str(), relative.size() + 1);
+    links = now.directory() ? 1 : static_cast<long long>(now.links);
+    return kLocateInside;
+  }
+  if (raced) return uncertain(cause, raced);
+  return kLocateOutside;
+}
+}  // namespace
+
+ANJ_API int anj_locate_identity(int fd, int stage, const char* identity, char* out,
+    int cap, long long* links) {
+  (void)stage;  // Every link is enumerated; see above.
+  long long count = 0;
+  int cause = 0;
+  if (out && cap > 0) out[0] = '\0';
+  int result = kLocateUncertain;
+  try {
+    result = locate_identity(fd, identity, out, cap, count, cause);
+  } catch (...) {
+    result = uncertain(cause, lx::NOMEM);  // std::bad_alloc: never a crash
+  }
+  if (result != kLocateInside && out && cap > 0) out[0] = '\0';
+  if (links) *links = result == kLocateInside ? count : 0;
+  error_number = result == kLocateUncertain ? cause : 0;
+  return result;
+}
+
 ANJ_API char* anj_preview_editor(int directory, const char* name) {
   HANDLE dir = handle_of(directory);
   std::wstring leaf;
@@ -2142,4 +2332,6 @@ ANJ_API int anj_win_watch_debug_cancel(void* handle) {
   auto* w = static_cast<Watch*>(handle);
   return w->dir && CancelIoEx(w->dir, nullptr) ? 0 : -1;
 }
+// Test seam: see debug_locate_race.
+ANJ_API void anj_win_debug_locate_race(int on) { debug_locate_race = on != 0; }
 #endif  // ANJ_TEST_SEAMS

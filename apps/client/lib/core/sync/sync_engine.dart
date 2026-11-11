@@ -17,6 +17,7 @@ import 'name_holds.dart';
 import 'name_policy.dart';
 import '../../platform/watchers.dart';
 import '../ports/change_watcher.dart';
+import '../ports/root_filesystem.dart';
 import 'pass_metrics.dart';
 import 'recovery_copies.dart';
 import 'sync_path_policy.dart';
@@ -2559,16 +2560,24 @@ class SyncEngine {
   /// batches (SC-058), and FSEvents reports each side on its own (#133 (2)).
   /// A synchronized item is never deleted in the cloud on one such pass
   /// (decision #140). Where the platform looks identities up
-  /// ([RootFilesystem.locatesIdentity], spec #33 I3) the lookup decides at
-  /// once ([_lookUpVanished]). Elsewhere the removal is held until the path
-  /// has been missing for the watcher's quiet period, longer only while the
-  /// watcher still has unprocessed paths, and never longer than its maximum
-  /// delay. Full scans and the stat audit decide at once.
+  /// ([RootFilesystem.locatesIdentity], spec #33 I3) a certain answer
+  /// decides at once ([_lookUpVanished]). Elsewhere, and after an uncertain
+  /// answer, the removal is held until the path has been missing for the
+  /// watcher's quiet period, longer only while the watcher still has
+  /// unprocessed paths, and never longer than its maximum delay. Full scans
+  /// and the stat audit decide at once; an uncertain hold that ends asks for
+  /// one ([_uncertain]).
   final Map<String, Duration> _missingSince = {};
 
   /// Synchronized paths the identity lookup did not find this pass: their
   /// removal is not held.
   final Set<String> _lookedUpGone = {};
+
+  /// Synchronized paths whose lookup this pass was uncertain (an error, a
+  /// staging answer, an inside answer the rescan did not confirm): held as on
+  /// Linux, and when the hold ends they are never deleted on a partial pass.
+  /// The full scan they ask for decides at once.
+  final Set<String> _uncertain = {};
 
   bool _deferRemoval(String path, ChangeWatcher? w) {
     if (_localScan != 'partial' ||
@@ -2600,6 +2609,29 @@ class SyncEngine {
     return false;
   }
 
+  /// An uncertain lookup's hold ended ([_deferRemoval] returned false) on a
+  /// partial pass: the removal is not inferred here. One full scan is asked
+  /// for instead ([ChangeWatcher.fullAuditWanted], the audit path), which
+  /// decides at once on the next pass; a full scan clears every hold, so
+  /// this never keeps the worker due at once (the wake loop a stale hold
+  /// would cause).
+  bool _auditUncertain(String path, ChangeWatcher? w) {
+    if (_localScan != 'partial' ||
+        w == null ||
+        !w.active ||
+        !_uncertain.contains(path)) {
+      return false;
+    }
+    if (!w.fullAuditWanted) {
+      w.fullAuditWanted = true;
+      uncertainAudits++;
+    }
+    return true;
+  }
+
+  /// Full scans asked for by uncertain lookups ([_auditUncertain]).
+  int uncertainAudits = 0;
+
   /// When the next held removal is due (see [_deferRemoval]).
   Duration? _nextHeldRemoval(ChangeWatcher w) {
     if (_missingSince.isEmpty) return null;
@@ -2617,14 +2649,25 @@ class SyncEngine {
   Duration Function()? debugElapsed;
   Duration get _elapsed => debugElapsed?.call() ?? _clock.elapsed;
 
-  /// Spec #33 I3 seam, on a partial pass where the platform looks
-  /// identities up: each synchronized item missing from [view] is looked up
-  /// by its recorded identity (a vanished folder covers what is beneath
-  /// it). Found inside the root at a path the view lacks, that path is
-  /// rescanned into this pass, so the pair is planned as a move. Not found,
-  /// or outside the root: its removal is inferred without a hold.
+  /// Spec #33 I3, on a partial pass where the platform looks identities up:
+  /// each synchronized item missing from [view] is looked up by its
+  /// recorded identity (a vanished folder covers what is beneath it).
+  ///
+  /// Certain answers decide at once (decisions #140 and #143):
+  /// * inside the root, confirmed: the path is rescanned into this pass and
+  ///   the item there is the recorded one (identity, kind) and names its
+  ///   file alone ([_alone]: an effective link count of 1, the engine's own
+  ///   staging links discounted), so the pair is planned as a move;
+  /// * outside the root (the Trash) or not found: a delete, not held.
+  ///
+  /// Every other answer is uncertain ([_uncertain]): an error or a thrown
+  /// lookup, an inside answer the rescan does not confirm (nothing there,
+  /// another item, a second link), and a staging answer (macOS names one
+  /// link of a hard-linked file). The removal is held as on Linux and never
+  /// deleted on a partial pass; when the hold ends a full scan decides.
   void _lookUpVanished(Map<String, LocalItem> view) {
     _lookedUpGone.clear();
+    _uncertain.clear();
     final w = watcher;
     if (_localScan != 'partial' ||
         !tree.native.locatesIdentity ||
@@ -2654,22 +2697,39 @@ class SyncEngine {
     }
 
     for (final path in missing.where((v) => !beneathMissing(v)).toList()) {
-      String? found;
+      final entry = manifest.entries[path]!;
+      final identity = entry.localIdentity!;
+      var place = IdentityPlace.uncertain;
       try {
-        found = tree.native.locateIdentity(
+        final found = tree.native.locateIdentity(
           tree.fd,
-          manifest.entries[path]!.localIdentity!,
+          tree.stageFd,
+          identity,
         );
-        if (found != null && found.isNotEmpty && !view.containsKey(found)) {
-          _rescan({found}, const {});
+        place = found.place;
+        if (place == IdentityPlace.inside) {
+          final at = found.path!;
+          if (!view.containsKey(at)) _rescan({at}, const {});
+          final item = view[at];
+          final confirmed =
+              item != null &&
+              item.identity == identity &&
+              item.kind == entry.kind &&
+              _alone(item);
+          if (!confirmed) place = IdentityPlace.uncertain;
         }
       } on Object {
-        found = null; // Any failure is "not found" (spec #33 I3).
+        place = IdentityPlace.uncertain; // Any failure (spec #33 I3).
       }
-      if (found != null && found.isNotEmpty && view.containsKey(found)) {
-        continue;
+      final under = missing.where((v) => withinOrAt(path, v));
+      switch (place) {
+        case IdentityPlace.inside:
+          break; // Paired below as a move.
+        case IdentityPlace.outside || IdentityPlace.notFound:
+          _lookedUpGone.addAll(under);
+        case IdentityPlace.staging || IdentityPlace.uncertain:
+          _uncertain.addAll(under);
       }
-      _lookedUpGone.addAll(missing.where((v) => withinOrAt(path, v)));
     }
   }
 
@@ -4303,7 +4363,7 @@ class SyncEngine {
         // item restored with its top folder (#150) is never a move or a
         // deletion, so its restore is not held.
         if (!restoredWithTopFolder(entry.path, local) &&
-            _deferRemoval(entry.path, w)) {
+            (_deferRemoval(entry.path, w) || _auditUncertain(entry.path, w))) {
           // Not reconciled this pass (no restore, no deletion); revisited
           // on the next.
           _deferred.add(entry.path);

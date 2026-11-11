@@ -83,6 +83,8 @@ struct Api {
   void (*watch_fail)(void*, const char*);
   int (*watch_buffer)(void*, unsigned int);
   int (*watch_cancel)(void*);
+  int (*locate_identity)(int, int, const char*, char*, int, long long*);
+  void (*debug_locate_race)(int);
 };
 Api api;
 bool load(const char* path) {
@@ -130,6 +132,8 @@ bool load(const char* path) {
   get(api.watch_fail, "anj_watch_debug_fail_add");
   get(api.watch_buffer, "anj_win_watch_debug_buffer");
   get(api.watch_cancel, "anj_win_watch_debug_cancel");
+  get(api.locate_identity, "anj_locate_identity");
+  get(api.debug_locate_race, "anj_win_debug_locate_race");
   return ok;
 }
 
@@ -730,6 +734,161 @@ int run(const std::string& dir, const std::string& dll) {
     DeleteFileW(longpath(stage + "\\via-path").c_str());
     check("stage_path of a closed number is EBADF", take(api.stage_path(99999)).empty() &&
         api.error() == 9);
+  }
+  {
+    // Spec #33 I3: anj_locate_identity (OpenFileById, every link enumerated).
+    auto identity = [&](const std::string& rel) {
+      int fd = api.open_read(rootfd, rel.c_str());
+      if (fd < 0) fd = api.open_directory(rootfd, rel.c_str());
+      std::string id = fd >= 0 ? identity_of_fd(fd) : std::string();
+      if (fd >= 0) api.close(fd);
+      return id;
+    };
+    auto locate = [&](const std::string& id) {
+      char out[4096];
+      long long links = -1;
+      int place = api.locate_identity(rootfd, stagefd, id.c_str(), out, sizeof(out), &links);
+      return std::to_string(place) + (place == 1 ? " " + std::string(out) : std::string()) +
+          " links=" + std::to_string(links);
+    };
+    const int open_before = api.open_count();
+    make_dir(root + "\\loc"); make_dir(root + "\\loc\\from");
+    write_file(root + "\\loc\\from\\a.txt", "a");
+    std::string file = identity("loc/from/a.txt"), folder = identity("loc/from");
+    MoveFileW(longpath(root + "\\loc\\from\\a.txt").c_str(),
+        longpath(root + "\\loc\\from\\b c.txt").c_str());
+    check("locate: renamed file", locate(file) == "1 loc/from/b c.txt links=1", locate(file));
+    MoveFileW(longpath(root + "\\loc\\from").c_str(), longpath(root + "\\loc\\to").c_str());
+    check("locate: moved folder and the file beneath it",
+        locate(folder) == "1 loc/to links=1" && locate(file) == "1 loc/to/b c.txt links=1",
+        locate(folder) + "; " + locate(file));
+    {
+      // Held open by another app without delete sharing: still found.
+      HANDLE busy = CreateFileW(longpath(root + "\\loc\\to\\b c.txt").c_str(), GENERIC_READ,
+          FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+      check("locate: a file another app holds open", busy != INVALID_HANDLE_VALUE &&
+          locate(file) == "1 loc/to/b c.txt links=1", locate(file));
+      if (busy != INVALID_HANDLE_VALUE) CloseHandle(busy);
+    }
+    CreateHardLinkW(longpath(root + "\\loc\\to\\second.txt").c_str(),
+        longpath(root + "\\loc\\to\\b c.txt").c_str(), nullptr);
+    std::string both = locate(file);
+    check("locate: a second link in the root reports two links",
+        both == "1 loc/to/b c.txt links=2" || both == "1 loc/to/second.txt links=2", both);
+    DeleteFileW(longpath(root + "\\loc\\to\\second.txt").c_str());
+    MoveFileW(longpath(root + "\\loc\\to\\b c.txt").c_str(),
+        longpath(outside + "\\b c.txt").c_str());
+    check("locate: moved out of the root", locate(file) == "2 links=0", locate(file));
+    DeleteFileW(longpath(outside + "\\b c.txt").c_str());
+    check("locate: deleted", locate(file) == "4 links=0", locate(file));
+    // A download: installed by hard link from its staging copy, then renamed.
+    write_file(stage + "\\down.part", "d");
+    int linked = api.install(rootfd, "loc/down.txt", (stage + "\\down.part").c_str());
+    std::string down = identity("loc/down.txt");
+    MoveFileW(longpath(root + "\\loc\\down.txt").c_str(),
+        longpath(root + "\\loc\\to\\down.txt").c_str());
+    check("locate: renamed download (its other link in staging)",
+        linked == 0 && locate(down) == "1 loc/to/down.txt links=2", locate(down));
+    DeleteFileW(longpath(root + "\\loc\\to\\down.txt").c_str());
+    check("locate: download deleted (only the staging link left)",
+        locate(down) == "2 links=0", locate(down));
+    DeleteFileW(longpath(stage + "\\down.part").c_str());
+    std::string volume = file.substr(0, file.rfind(':'));
+    std::string bad;
+    for (std::string id : {std::string(), std::string("x"), std::string(":5"),
+             volume + ":", volume + ":abc", volume + "x:" + file.substr(file.rfind(':') + 1),
+             volume + ":9223372036854775"})
+      bad += locate(id) + ";";
+    check("locate: malformed identities, another volume, an unknown id",
+        bad == "4 links=0;4 links=0;4 links=0;4 links=0;4 links=0;4 links=0;4 links=0;", bad);
+    char small[4];
+    long long links = -1;
+    write_file(root + "\\loc\\to\\long-name.txt", "l");
+    // Decision #143: every error is uncertain (5, error_number set), never
+    // folded into not found or outside.
+    check("locate: a path longer than the buffer is uncertain",
+        api.locate_identity(rootfd, stagefd, identity("loc/to/long-name.txt").c_str(), small,
+            sizeof(small), &links) == 5 && small[0] == 0 && links == 0 && api.error() == 36,
+        std::to_string(api.error()));
+    check("locate: a closed number is uncertain",
+        api.locate_identity(99999, -1, file.c_str(), small, sizeof(small), &links) == 5 &&
+            api.error() == 9, std::to_string(api.error()));
+    {
+      // A name listed beneath the root that no longer opens as the file (it
+      // moved after the listing): uncertain, where it used to be outside.
+      std::string long_id = identity("loc/to/long-name.txt");
+      api.debug_locate_race(1);
+      std::string raced = locate(long_id);
+      int cause = api.error();
+      api.debug_locate_race(0);
+      check("locate: the file changes between listing and re-open: uncertain",
+          raced == "5 links=0" && cause == 116 && locate(long_id) == "1 loc/to/long-name.txt links=1",
+          raced + " errno " + std::to_string(cause));
+    }
+    {
+      // A sibling whose name extends the root's ("root2"): outside.
+      const std::string sibling = work + "\\root2";
+      make_dir(sibling);
+      write_file(root + "\\loc\\to\\sib.txt", "s");
+      std::string sib = identity("loc/to/sib.txt");
+      MoveFileW(longpath(root + "\\loc\\to\\sib.txt").c_str(),
+          longpath(sibling + "\\sib.txt").c_str());
+      check("locate: moved to a sibling named root2 is outside", locate(sib) == "2 links=0",
+          locate(sib));
+      DeleteFileW(longpath(sibling + "\\sib.txt").c_str());
+      RemoveDirectoryW(longpath(sibling).c_str());
+    }
+    {
+      // Moved out of the root, with a junction inside the root to where it
+      // went: outside, never reached through the link.
+      make_dir(root + "\\loc\\jt");
+      write_file(root + "\\loc\\jt\\j.txt", "j");
+      std::string jfolder = identity("loc/jt"), jfile = identity("loc/jt/j.txt");
+      MoveFileW(longpath(root + "\\loc\\jt").c_str(), longpath(outside + "\\jt").c_str());
+      if (!make_junction(root + "\\loc\\jlink", L"\\??\\" + wide(outside + "\\jt"),
+              wide(outside + "\\jt"))) {
+        skip("locate: a junction inside the root", "junction creation failed " +
+            std::to_string(GetLastError()));
+      } else {
+        check("locate: moved out, a junction inside the root to it: outside",
+            locate(jfolder) == "2 links=0" && locate(jfile) == "2 links=0",
+            locate(jfolder) + "; " + locate(jfile));
+        RemoveDirectoryW(longpath(root + "\\loc\\jlink").c_str());
+      }
+      DeleteFileW(longpath(outside + "\\jt\\j.txt").c_str());
+      RemoveDirectoryW(longpath(outside + "\\jt").c_str());
+    }
+    {
+      // Case-only and normalization-only renames come back spelled as now.
+      write_file(root + "\\loc\\to\\case.txt", "c");
+      std::string cased = identity("loc/to/case.txt");
+      MoveFileW(longpath(root + "\\loc\\to\\case.txt").c_str(),
+          longpath(root + "\\loc\\to\\CASE.TXT").c_str());
+      check("locate: a case-only rename", locate(cased) == "1 loc/to/CASE.TXT links=1",
+          locate(cased));
+      const std::string nfc = "caf\xc3\xa9.txt", nfd = "cafe\xcc\x81.txt";
+      write_file(root + "\\loc\\to\\" + nfc, "n");
+      std::string normal = identity("loc/to/" + nfc);
+      MoveFileW(longpath(root + "\\loc\\to\\" + nfc).c_str(),
+          longpath(root + "\\loc\\to\\" + nfd).c_str());
+      check("locate: an NFC name renamed to its NFD spelling",
+          locate(normal) == "1 loc/to/" + nfd + " links=1", locate(normal));
+      DeleteFileW(longpath(root + "\\loc\\to\\CASE.TXT").c_str());
+      DeleteFileW(longpath(root + "\\loc\\to\\" + nfd).c_str());
+    }
+    ULONGLONG start = GetTickCount64();
+    std::string again = identity("loc/to/long-name.txt");
+    bool same = true;
+    DWORD handles_before = 0, handles_after = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &handles_before);
+    for (int i = 0; i < 500; i++) same = same && locate(again) == "1 loc/to/long-name.txt links=1";
+    GetProcessHandleCount(GetCurrentProcess(), &handles_after);
+    ULONGLONG spent = GetTickCount64() - start;
+    check("locate: 500 lookups, bounded, no handle left open",
+        same && spent < 5000 && api.open_count() == open_before &&
+            handles_after <= handles_before + 2,
+        std::to_string(spent) + " ms, process handles " + std::to_string(handles_before) +
+            " -> " + std::to_string(handles_after));
   }
   {
     // The profile lifetime lock (spec #32 W3): no sharing, held until close.
