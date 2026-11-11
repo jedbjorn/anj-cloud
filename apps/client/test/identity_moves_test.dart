@@ -1227,8 +1227,16 @@ void main() {
 
       test('found inside at a path that now holds a different item: held, '
           'then the full scan deletes; never paired', () async {
-        File(root('Docs/a.txt')).deleteSync();
+        // The other item is created while Docs/a.txt still holds its inode,
+        // so it is a different item on every filesystem. Created after the
+        // delete, ext4 may give it the freed inode: the same identity, which
+        // the engine treats as the same file (not what this test is about).
         write('Other/b.txt', 'another file');
+        File(root('Docs/a.txt')).deleteSync();
+        expect(
+          fs.fileIdentity(tree.fd, 'Other/b.txt'),
+          isNot(store.entries['Docs/a.txt']!.localIdentity),
+        );
         fs.answer = (_) => inside('Other/b.txt');
         await heldThenFullScan('Docs/a.txt');
         expect(store.entries['Docs/a.txt']?.expectedPresent ?? false, isFalse);
