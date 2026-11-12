@@ -12,8 +12,10 @@ after an extraction error, and the copy replaces the working one only after it r
 blocked update leaves the working copy as it was.
 """
 
+import contextlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -39,6 +41,9 @@ UPDATE_EVERY = 24 * 3600
 UPDATE_AFTER_ERROR_EVERY = 3600
 CHECK_TIMEOUT = 15 * 60
 MAX_INFO = 64 * 1024 * 1024
+KEEPALIVE = 20.0  # while merging, checking or updating there is no byte progress: `tick` moves instead
+# yt-dlp's post-processing steps, announced on stdout once the download itself is over.
+PROCESSING = re.compile(r"\[(Merger|ExtractAudio|VideoRemuxer|VideoConvertor|EmbedThumbnail|ThumbnailsConvertor|Metadata|Fixup\w*)\]")
 DISPATCH_LENGTH = 24
 
 
@@ -164,12 +169,33 @@ class Job:
     def __init__(self, worker, directory, request):
         self.worker, self.dir, self.request = worker, directory, request
         self.kind, self.height = request["kind"], request.get("height")
-        self.status = {"v": 1, "boot": worker.boot, "state": "checking", "bytes": 0}
+        self.status = {"v": 1, "boot": worker.boot, "state": "checking", "bytes": 0, "tick": 0}
+        self.lock = threading.Lock()
+        self.busy = 0  # > 0 while merging, probing or updating: the keepalive moves `tick`
 
     def report(self, **fields):
-        self.status.update(fields)
-        if (self.dir / "request.json").exists():
-            atomic_json(self.dir / "status.json", self.status)
+        with self.lock:
+            self.status.update(fields)
+            if (self.dir / "request.json").exists():
+                atomic_json(self.dir / "status.json", self.status)
+
+    @contextlib.contextmanager
+    def keepalive(self):
+        """Keep the status moving (`tick`) while work without byte progress runs, so the gateway's
+        5-minute stall rule only ever sees a real stall."""
+        self.busy += 1
+        try:
+            yield
+        finally:
+            self.busy -= 1
+
+    def ticker(self, done):
+        while not done.wait(KEEPALIVE):
+            if self.busy:
+                try:
+                    self.report(tick=self.status["tick"] + 1)
+                except OSError:
+                    pass
 
     def stopped(self):
         return (self.dir / "cancel").exists() or not (self.dir / "request.json").exists()
@@ -177,7 +203,9 @@ class Job:
     def tool(self, args, *, on_line=None, limit=None, timeout=None):
         """Run yt-dlp; stdout lines go to `on_line` (or are collected). Raises Stopped on cancel,
         too-large or timeout. Returns (exit code, stdout, stderr)."""
-        argv = [sys.executable, "-I", str(self.worker.tools.path), "--ignore-config", "--no-warnings", "--no-color",
+        # Warnings stay in the captured stderr (never logged): they tell a site change from a link
+        # that never had a fitting format.
+        argv = [sys.executable, "-I", str(self.worker.tools.path), "--ignore-config", "--no-color",
                 "--no-playlist", "--cache-dir", str(self.worker.tools.dir / "cache"), "--socket-timeout", "30",
                 "--retries", "3", "--fragment-retries", "3", "--js-runtimes", "deno:" + DENO, "--ffmpeg-location", FFMPEG_DIR, *args]
         with tempfile.TemporaryFile(dir="/tmp") as errors:
@@ -265,9 +293,16 @@ class Job:
                 reason, retry = "worker-error", False
             else:
                 reason, retry = presets.classify(stderr)
-            if attempt == 1 and retry and self.worker.update_after_error():
-                continue
-            self.report(state="failed" if presets_state(reason) == "failed" else "rejected", code=reason)
+            if attempt == 1 and retry:
+                with self.keepalive():
+                    updated = self.worker.update_after_error()
+                if updated:
+                    continue
+            if reason == "unsupported-format" and retry:
+                # The site normally offers fitting formats, or yt-dlp warned of a challenge it could
+                # not solve: a site change, not an unsupported link. It may work after an update.
+                reason = "site-changed"
+            self.report(state=presets_state(reason), code=reason)
             return None
         return None
 
@@ -277,9 +312,12 @@ class Job:
         for item in info.get("requested_formats") or [info]:
             size = presets.estimated_bytes({**item, "duration": info.get("duration")}) if item is not info else presets.estimated_bytes(info)
             expected[str(item.get("format_id"))] = size or 0
-        seen = {}
+        seen, processing = {}, []
 
         def on_line(line):
+            if PROCESSING.match(line) and not processing:
+                processing.append(True)
+                self.busy += 1  # the download is over; merging and fixing have no byte progress
             if not line.startswith("ANJ "):
                 return
             parts = line.split()
@@ -308,6 +346,8 @@ class Job:
                     "download:ANJ %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(info.format_id)s"]
             try:
                 code, _, stderr = self.tool(args, on_line=on_line, limit=too_large, timeout=3 * 3600)
+                if processing:
+                    self.busy -= 1
             except Stopped as stop:
                 if stop.reason == "too-large":
                     self.clean(keep=())
@@ -325,8 +365,9 @@ class Job:
         if size > presets.MAX_BYTES:
             staged.unlink()
             return self.report(state="rejected", code="too-large")
-        probe = subprocess.run([os.path.join(FFMPEG_DIR, "ffprobe"), "-v", "error", "-show_format", "-show_streams",
-                                "-of", "json", str(staged)], capture_output=True, timeout=300)
+        with self.keepalive():
+            probe = subprocess.run([os.path.join(FFMPEG_DIR, "ffprobe"), "-v", "error", "-show_format", "-show_streams",
+                                    "-of", "json", str(staged)], capture_output=True, timeout=300)
         ok, obtained = presets.verdict(probe.stdout if probe.returncode == 0 else b"", self.kind, self.height)
         if not ok or size <= 0:
             staged.unlink()
@@ -345,6 +386,7 @@ class Job:
 
 
 def presets_state(code):
+    # "site-changed" is a failure (Couldn't download, may work later), never "Not supported".
     return "rejected" if code in ("unsupported-format", "too-long", "too-large", "private-address", "unsupported-link",
                                   "live", "empty-playlist", "mismatch") else "failed"
 
@@ -368,15 +410,19 @@ class Worker:
         self.seq = 0
         self.job = None
         self.version = None
+        self.updating = False
+        self.beat_lock = threading.Lock()
         self.stop = threading.Event()
 
     def beat(self):
-        self.seq += 1
-        try:
-            atomic_json(self.spool / "worker" / "heartbeat.json",
-                        {"v": 1, "boot": self.boot, "seq": self.seq, "job": self.job, "version": self.version})
-        except OSError:
-            pass  # the gateway has not prepared the spool yet
+        with self.beat_lock:
+            self.seq += 1
+            try:
+                atomic_json(self.spool / "worker" / "heartbeat.json",
+                            {"v": 1, "boot": self.boot, "seq": self.seq, "job": self.job, "version": self.version,
+                             "updating": self.updating})
+            except OSError:
+                pass  # the gateway has not prepared the spool yet
 
     def heartbeat(self):
         while not self.stop.wait(2.0):
@@ -427,6 +473,8 @@ class Worker:
         self.beat()
         job = Job(self, directory, request)
         log("job %s started" % name[:8])
+        done = threading.Event()
+        threading.Thread(target=job.ticker, args=(done,), daemon=True).start()
         try:
             if not guarded():
                 job.report(state="failed", code="worker-error")
@@ -445,6 +493,8 @@ class Worker:
                 job.report(state="failed", code="worker-error")
             except OSError:
                 pass
+        finally:
+            done.set()
         log("job %s %s%s" % (name[:8], job.status.get("state"), " " + job.status["code"] if job.status.get("code") else ""))
         self.job = None
         self.beat()
@@ -458,7 +508,14 @@ class Worker:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         while True:
             if self.tools.due():
-                self.version = self.tools.update("daily")
+                # Said in the heartbeat: a job handed over meanwhile is waiting, not stalled.
+                self.updating = True
+                self.beat()
+                try:
+                    self.version = self.tools.update("daily")
+                finally:
+                    self.updating = False
+                    self.beat()
             if not self.serve_one():
                 time.sleep(1.0)
 

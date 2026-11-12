@@ -39,8 +39,13 @@ class PresetTests(unittest.TestCase):
     def test_selectors_only_copy_h264_and_aac(self):
         self.assertEqual("bestaudio[acodec~='^(mp4a|aac)'][vcodec=none]/best[acodec~='^(mp4a|aac)'][vcodec~='^(avc|h264)']",
                          presets.selector("audio"))
-        self.assertEqual("bestvideo[vcodec~='^(avc|h264)'][height<=720]+bestaudio[acodec~='^(mp4a|aac)']"
-                         "/best[vcodec~='^(avc|h264)'][acodec~='^(mp4a|aac)'][height<=720]", presets.selector("video", 720))
+        video = presets.selector("video", 720).split("/")
+        self.assertEqual(["bestvideo[vcodec~='^(avc|h264)'][aspect_ratio>=1][height<=720]+bestaudio[acodec~='^(mp4a|aac)']",
+                          "bestvideo[vcodec~='^(avc|h264)'][aspect_ratio<1][width<=720]+bestaudio[acodec~='^(mp4a|aac)']",
+                          "bestvideo[vcodec~='^(avc|h264)'][height<=720]+bestaudio[acodec~='^(mp4a|aac)']",
+                          "best[vcodec~='^(avc|h264)'][aspect_ratio>=1][height<=720][acodec~='^(mp4a|aac)']",
+                          "best[vcodec~='^(avc|h264)'][aspect_ratio<1][width<=720][acodec~='^(mp4a|aac)']",
+                          "best[vcodec~='^(avc|h264)'][height<=720][acodec~='^(mp4a|aac)']"], video)
         for kind in presets.PRESETS:
             args = " ".join(presets.PRESETS[kind]["args"])
             for transcode in ("--recode-video", "--postprocessor-args", "--audio-quality", "-S"):
@@ -56,6 +61,11 @@ class PresetTests(unittest.TestCase):
             self.assertFalse(presets.verdict(probe(streams), kind, 1080)[0], (streams, kind))
         self.assertFalse(presets.verdict(probe([AAC], name="matroska,webm"), "audio")[0])
         self.assertFalse(presets.verdict(b"not json", "audio")[0])
+        # Review fix 9: the short side counts, for portrait sources and rotated ones alike.
+        portrait = dict(video(height=1920), width=1080)
+        self.assertEqual((True, 1080), presets.verdict(probe([portrait, AAC]), "video", 1080))
+        self.assertEqual((False, 1080), presets.verdict(probe([portrait, AAC]), "video", 720))
+        self.assertEqual((True, 720), presets.verdict(probe([dict(video(height=720), width=1280), AAC]), "video", 720))
 
     def test_limits_from_metadata(self):
         self.assertIsNone(presets.limits({"duration": 4 * 3600, "requested_formats": [{"filesize": 8 * 2 ** 30}]}))
@@ -76,6 +86,16 @@ class PresetTests(unittest.TestCase):
                  "ERROR: unable to download video data: HTTP Error 403: Forbidden": ("site-error", False)}
         for text, expected in cases.items():
             self.assertEqual(expected, presets.classify("WARNING: noise\n" + text + "\n"), text)
+        # Review fix 5: a format error after a challenge warning, or from an extractor that normally
+        # offers fitting formats, may be a site change: retry after an update.
+        generic = "ERROR: [generic] x: Requested format is not available. Use --list-formats\n"
+        self.assertEqual(("unsupported-format", True),
+                         presets.classify("WARNING: [youtube] x: n challenge solving failed: Some formats may be missing\n" + generic))
+        self.assertEqual(("unsupported-format", True),
+                         presets.classify("ERROR: [youtube] abc: Requested format is not available. Use --list-formats\n"))
+        self.assertEqual(("unsupported-format", False), presets.classify("WARNING: [generic] Falling back on generic information extractor\n" + generic))
+        # A warning never chooses the code itself.
+        self.assertEqual(("unsupported-format", False), presets.classify("WARNING: please sign in for more\n" + generic))
 
 
 class ReachTests(unittest.TestCase):
@@ -128,6 +148,70 @@ class GuardTests(unittest.TestCase):
         rules = guard.ruleset(["172.30.0.4"])
         self.assertIn("ip daddr 172.30.0.4 accept", rules)
         self.assertEqual([], guard.fixture_addresses(""))
+
+
+class SiteChangeTests(unittest.TestCase):
+    """Review fix 5: a format error that looks like a site change updates yt-dlp once and retries,
+    and if it still fails the job fails (Couldn't download, may work later), never 'Not supported'."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        directory = Path(self.temporary.name) / "run"
+        directory.mkdir()
+        (directory / "request.json").write_text("{}")
+        self.worker = mock.Mock(boot="0" * 16)
+        self.worker.tools.path, self.worker.tools.dir = Path("/opt/yt-dlp"), Path(self.temporary.name)
+        self.job = worker.Job(self.worker, directory, {"url": "https://m.example/x", "kind": "video", "height": 1080})
+        self.broken = "WARNING: [youtube] x: Signature solving failed: Some formats may be missing\n" \
+                      "ERROR: [youtube] x: Requested format is not available\n"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_updated_and_retried_then_failed_as_a_site_change(self):
+        self.worker.update_after_error.return_value = True
+        with mock.patch.object(self.job, "tool", return_value=(1, b"", self.broken)) as tool:
+            self.assertIsNone(self.job.check("https://m.example/x", "sel"))
+        self.assertEqual(2, tool.call_count)
+        self.assertEqual(("failed", "site-changed"), (self.job.status["state"], self.job.status["code"]))
+
+    def test_a_retry_that_works_downloads(self):
+        self.worker.update_after_error.return_value = True
+        with mock.patch.object(self.job, "tool", side_effect=[(1, b"", self.broken), (0, b'{"id": "x"}', "")]):
+            self.assertEqual({"id": "x"}, self.job.check("https://m.example/x", "sel"))
+
+    def test_no_new_version_still_fails_not_rejects(self):
+        self.worker.update_after_error.return_value = False
+        with mock.patch.object(self.job, "tool", return_value=(1, b"", self.broken)) as tool:
+            self.job.check("https://m.example/x", "sel")
+        self.assertEqual((1, "failed", "site-changed"), (tool.call_count, self.job.status["state"], self.job.status["code"]))
+
+    def test_a_link_without_fitting_formats_is_still_unsupported(self):
+        error = "ERROR: [generic] x: Requested format is not available\n"
+        with mock.patch.object(self.job, "tool", return_value=(1, b"", error)):
+            self.job.check("https://m.example/x", "sel")
+        self.worker.update_after_error.assert_not_called()
+        self.assertEqual(("rejected", "unsupported-format"), (self.job.status["state"], self.job.status["code"]))
+
+    def test_warnings_reach_the_captured_stderr(self):
+        with mock.patch.object(worker.subprocess, "Popen") as popen:
+            popen.side_effect = OSError("stop")
+            with self.assertRaises(OSError):
+                self.job.tool(["-J", "x"])
+        self.assertNotIn("--no-warnings", popen.call_args[0][0])
+
+    def test_keepalive_moves_tick_only_while_busy(self):
+        with mock.patch.object(worker, "KEEPALIVE", 0.01):
+            done = __import__("threading").Event()
+            thread = __import__("threading").Thread(target=self.job.ticker, args=(done,))
+            thread.start()
+            __import__("time").sleep(0.1)
+            self.assertEqual(0, self.job.status["tick"])
+            with self.job.keepalive():
+                __import__("time").sleep(0.1)
+            done.set()
+            thread.join()
+        self.assertGreater(self.job.status["tick"], 2)
 
 
 class ToolsTests(unittest.TestCase):
@@ -225,7 +309,8 @@ class WorkerSpoolTests(unittest.TestCase):
         self.worker.job, self.worker.version = "d" * 24, "2026.10.26"
         self.worker.beat()
         beat = json.loads((self.spool / "worker/heartbeat.json").read_text())
-        self.assertEqual({"v", "boot", "seq", "job", "version"}, set(beat))
+        self.assertEqual({"v", "boot", "seq", "job", "version", "updating"}, set(beat))
+        self.assertFalse(beat["updating"])
         self.assertEqual(("d" * 24, 1, 16), (beat["job"], beat["seq"], len(beat["boot"])))
 
     def test_status_is_never_written_into_a_removed_run(self):
@@ -307,6 +392,7 @@ class ComposeTests(unittest.TestCase):
                 self.assertRegex(line, r"@sha256:[0-9a-f]{64}")
         self.assertRegex(dockerfile, r"YTDLP_SHA256=[0-9a-f]{64}")
         self.assertIn("USER 10003:10004", dockerfile)
+        self.assertNotRegex(dockerfile, r"nftables=")  # review fix 8: a superseded Debian version would break the build
 
 
 if __name__ == "__main__":

@@ -14,9 +14,10 @@ FROM denoland/deno:bin-2.9.8@sha256:b507583d3c68ba69f3ed2ce5969ae5b8b70f43421c78
 FROM python:3.14.10-slim-bookworm@sha256:516b51cb9db2ef061e465c803e50f64361b82cefd91e525b889b967b83e83527
 ARG YTDLP_VERSION=2026.10.26
 ARG YTDLP_SHA256=e51e69e89489f199530f13d32a4342da3ddb2cf34842f364603a066db05afbf3
-# nftables only for the guard service (fetch-net); pinned to Debian 12's release.
+# nftables only for the guard service (fetch-net). Not pinned to a package version: Debian drops
+# superseded versions, which would break the build; the base image is pinned by digest.
 RUN apt-get update \
- && apt-get install --no-install-recommends -y nftables=1.0.6-2+deb12u2 \
+ && apt-get install --no-install-recommends -y nftables \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
 COPY --from=deno /deno /usr/local/bin/deno

@@ -25,10 +25,13 @@ PRESETS = {
               "format": "bestaudio[acodec%s][vcodec=none]/best[acodec%s][vcodec%s]" % (AAC, AAC, H264),
               "args": ["-x", "--audio-format", "m4a", "--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "png"]},
     # The best H.264 stream at or below the height plus AAC audio, merged without re-encoding; else
-    # one file already holding both.
+    # one file already holding both. "Height" is the short side: for portrait video (a 1080x1920
+    # Short is 1080p) the limit applies to the width; without a known aspect ratio, to the height.
     "video": {"ext": "mp4",
-              "format": "bestvideo[vcodec%s][height<={height}]+bestaudio[acodec%s]/best[vcodec%s][acodec%s][height<={height}]"
-                        % (H264, AAC, H264, AAC),
+              "format": "/".join(
+                  "%s[vcodec%s]%s%s" % (video, H264, side, audio)
+                  for video, audio in (("bestvideo", "+bestaudio[acodec%s]" % AAC), ("best", "[acodec%s]" % AAC))
+                  for side in ("[aspect_ratio>=1][height<={height}]", "[aspect_ratio<1][width<={height}]", "[height<={height}]")),
               "args": ["--merge-output-format", "mp4", "--remux-video", "mp4"]},
 }
 
@@ -89,7 +92,9 @@ def verdict(probe, kind, height=None):
         return (not video), None
     if len(video) != 1 or video[0].get("codec_name") != "h264" or not isinstance(video[0].get("height"), int):
         return False, None
-    obtained = video[0]["height"]
+    # The short side is the height obtained (portrait video, or a rotation flag, swaps the sides).
+    width = video[0].get("width")
+    obtained = min(video[0]["height"], width) if isinstance(width, int) and width > 0 else video[0]["height"]
     return obtained <= int(height), obtained
 
 
@@ -105,14 +110,26 @@ ERRORS = (
     ("site-error", r"http error (403|429|5\d\d)|forbidden|too many requests"),
 )
 EXTRACTOR = re.compile(r"unable to extract|extractor|please report this issue|unable to (download|parse) .*json|signature|nsig|player", re.I)
+# Warnings that mean yt-dlp could not get every format this time (a site change, an unsolved JS
+# challenge), so "no fitting format" may be wrong until yt-dlp is updated.
+BROKEN = re.compile(r"challenge|signature|nsig|n parameter|javascript|js runtime|po token|player|some formats may be missing|"
+                    r"sabr|unable to extract|please report this issue", re.I)
+# Extractors whose media normally include an H.264/AAC format: "no fitting format" there is
+# more likely a site change than the link itself.
+USUALLY_FITS = re.compile(r"^ERROR: \[(youtube[^\]]*|vimeo[^\]]*|dailymotion|twitter|instagram[^\]]*|tiktok|reddit)\]", re.I | re.M)
 
 
 def classify(stderr):
-    """(code, whether an updated yt-dlp might fix it) for a failed yt-dlp run."""
-    lines = [line for line in stderr.splitlines() if line.startswith("ERROR:")] or stderr.splitlines()[-3:]
-    text = " ".join(lines).lower()
+    """(code, whether an updated yt-dlp might fix it) for a failed yt-dlp run. Only ERROR lines
+    choose the code; WARNING lines only mark a format error as possibly a site change."""
+    lines = stderr.splitlines()
+    errors = [line for line in lines if line.startswith("ERROR:")] or [line for line in lines if not line.startswith("WARNING:")][-3:]
+    warnings = " ".join(line for line in lines if line.startswith("WARNING:"))
+    text = " ".join(errors).lower()
     for code, pattern in ERRORS:
         if re.search(pattern, text):
+            if code == "unsupported-format":
+                return code, bool(BROKEN.search(warnings) or USUALLY_FITS.search(stderr))
             return code, False
     return "site-error", bool(EXTRACTOR.search(text))
 
