@@ -343,6 +343,17 @@ void main() {
       expect(seen.length, count);
     });
 
+    test('cancel while the file is being placed says so', () async {
+      handler = (request, _) => reply(request, 409, {'error': 'placing'});
+      await expectLater(api.deleteFetchJob('a'), failsWith(FetchError.saving));
+      expect(
+        FetchError.saving.message,
+        'This download is already being saved.',
+      );
+      // Only Cancel has this answer; elsewhere a 409 is unexpected.
+      await expectLater(api.clearFetchJobs(), failsWith(FetchError.unexpected));
+    });
+
     test('no server: a network error', () async {
       final closed = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       final port = closed.port;

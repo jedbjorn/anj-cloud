@@ -562,7 +562,7 @@ void main() {
         final finished = mixed.firstWhere((job) => job.id == id).isFinished;
         expect(
           find.byKey(ValueKey('job-cancel:$id')),
-          finished ? findsNothing : findsOneWidget,
+          finished || id == 'p' ? findsNothing : findsOneWidget,
           reason: 'cancel $id',
         );
         expect(
@@ -695,6 +695,31 @@ void main() {
       expect(home.fetch.calls, contains('delete f'));
       expect(find.byKey(const ValueKey('job:f')), findsNothing);
       expect(find.byKey(const ValueKey('job:r')), findsOneWidget);
+    });
+
+    testWidgets('a row being saved offers no Cancel; a late Cancel says why', (
+      tester,
+    ) async {
+      final home = await _open(
+        tester,
+        rows: const [
+          FetchJob(id: 'p', state: FetchState.placing, title: 'Saving one'),
+          FetchJob(id: 'c', state: FetchState.checking, title: 'Still early'),
+        ],
+      );
+      await _tab(tester, 'Downloader');
+      expect(find.text('Saving'), findsOneWidget);
+      expect(find.byKey(const ValueKey('job-cancel:p')), findsNothing);
+      expect(find.byKey(const ValueKey('job-remove:p')), findsNothing);
+      expect(find.byKey(const ValueKey('job-cancel:c')), findsOneWidget);
+      // The row moved to Saving after the list was shown: the server refuses.
+      home.fetch.actionError = FetchError.saving;
+      await tester.tap(find.byKey(const ValueKey('job-cancel:c')));
+      await tester.pumpAndSettle();
+      expect(
+        find.text('This download is already being saved.'),
+        findsOneWidget,
+      );
     });
 
     testWidgets('a refused action says why in plain words', (tester) async {

@@ -10,6 +10,7 @@ import 'dart:io';
 ///     POST   /v1/fetch/jobs          {urls, kind, height}  202 with the new rows
 ///     GET    /v1/fetch/jobs          the account's rows, newest first
 ///     DELETE /v1/fetch/jobs/{id}     cancel an unfinished job, remove a finished row
+///                                    (409 while the file is being placed)
 ///     POST   /v1/fetch/jobs/clear    remove the account's finished rows
 ///
 /// A gateway without the fetch worker answers 404 on all four: the feature is
@@ -225,6 +226,9 @@ enum FetchError {
   /// A submit asked while this client was still sending one.
   inProgress('The last request is still being sent. Wait a moment.'),
 
+  /// 409 on Cancel: the file is being placed, which cannot be undone.
+  saving('This download is already being saved.'),
+
   /// 404 on one row: it is no longer on the server.
   notFound('That download is no longer on the server.'),
 
@@ -390,6 +394,7 @@ class HttpFetchTransport implements FetchTransport {
     }
     final (status, _) = await _send('DELETE', [id]);
     if (status == 404) throw const FetchFailure(FetchError.notFound);
+    if (status == 409) throw const FetchFailure(FetchError.saving);
     if (!_ok(status)) _refused(status);
   }
 

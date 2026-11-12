@@ -332,7 +332,8 @@ class _DownloaderTabState extends State<DownloaderTab> {
       key: ValueKey('job:${job.id}'),
       job: job,
       actions: [
-        if (!job.isFinished)
+        // A file being placed cannot be cancelled (the server refuses).
+        if (!job.isFinished && job.state != FetchState.placing)
           _JobAction(
             'job-cancel:${job.id}',
             Icons.close,
