@@ -280,6 +280,102 @@ void main() {
       expect(await jobs.clearFinished(), FetchError.busy);
     });
 
+    test('a list asked before a submit never replaces the new rows', () async {
+      final old = fetchJob('old', FetchState.done);
+      final fresh = fetchJob('new', FetchState.waiting);
+      fake.rows = [old];
+      await jobs.probe('https://a.example');
+      jobs.setTabVisible(true);
+      await settle();
+      expect(active(), isEmpty, reason: 'nothing unfinished: no poll');
+      // A list is under way; the server answered it before the submit.
+      fake.listGate = Completer<void>();
+      fake.listAnswers.add([old]);
+      final list = jobs.refresh();
+      await settle();
+      fake.submitted = [fresh];
+      expect(await jobs.submit(['https://x.example/1']), isNull);
+      expect(jobs.jobs.map((job) => job.id), ['new', 'old']);
+      // What the server lists from now on.
+      fake.rows = [fresh, old];
+      final lists = fake.calls.where((c) => c == 'list').length;
+      final shown = <List<String>>[];
+      jobs.addListener(() => shown.add([for (final j in jobs.jobs) j.id]));
+      fake.listGate!.complete();
+      fake.listGate = null;
+      await list;
+      await settle();
+      expect(shown, everyElement(['new', 'old']));
+      expect(jobs.jobs.map((job) => job.id), ['new', 'old']);
+      expect(
+        fake.calls.where((c) => c == 'list').length,
+        lists + 1,
+        reason: 'one more list follows the one that was dropped',
+      );
+      expect(active().single.delay, const Duration(seconds: 2));
+    });
+
+    test(
+      'a list asked before a cancel, remove or clear never undoes it',
+      () async {
+        final run = fetchJob('run', FetchState.downloading);
+        final fin = fetchJob('fin', FetchState.done);
+        final bad = fetchJob('bad', FetchState.failed);
+        fake.rows = [run, fin, bad];
+        await jobs.probe('https://a.example');
+        final shown = <List<String>>[];
+        jobs.addListener(() => shown.add([for (final j in jobs.jobs) j.id]));
+        Future<void> during(
+          List<FetchJob> after,
+          Future<FetchError?> Function() change,
+        ) async {
+          fake.listGate = Completer<void>();
+          fake.listAnswers.add(fake.rows);
+          final list = jobs.refresh();
+          await settle();
+          fake.rows = after;
+          expect(await change(), isNull);
+          shown.clear();
+          fake.listGate!.complete();
+          fake.listGate = null;
+          await list;
+          await settle();
+        }
+
+        await during([run, bad], () => jobs.remove('fin'));
+        expect(shown, everyElement(['run', 'bad']));
+        await during([run], jobs.clearFinished);
+        expect(shown, everyElement(['run']));
+        // Cancel keeps the row; the list after it shows it cancelled.
+        await during([
+          fetchJob('run', FetchState.cancelled),
+        ], () => jobs.cancel('run'));
+        expect(jobs.jobs.single.state, FetchState.cancelled);
+        // A row already gone on the server stays gone.
+        fake.actionError = FetchError.notFound;
+        await during(const [], () => jobs.remove('run'));
+        expect(shown, everyElement(isEmpty));
+      },
+    );
+
+    test('a submit asked during a submit sends nothing and says so', () async {
+      await jobs.probe('https://a.example');
+      fake.submitGate = Completer<void>();
+      fake.submitted = [fetchJob('n', FetchState.waiting)];
+      final first = jobs.submit(['https://x.example/1']);
+      await settle();
+      expect(jobs.submitting, isTrue);
+      final second = await jobs.submit(['https://x.example/2']);
+      expect(second, isNotNull, reason: 'never mistaken for success');
+      expect(second!.name, 'inProgress');
+      expect(second.message, isNot(contains(RegExp(r'\d'))));
+      expect(fake.calls.where((c) => c == 'submit').length, 1);
+      fake.submitGate!.complete();
+      expect(await first, isNull);
+      expect(fake.lastSubmit!.urls, ['https://x.example/1']);
+      expect(jobs.submitting, isFalse);
+    });
+
     test('a refresh asked during a list lists once more after it', () async {
       fake.rows = [fetchJob('a', FetchState.done)];
       await jobs.probe('https://a.example');

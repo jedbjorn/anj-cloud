@@ -254,14 +254,22 @@ class FakeFetch implements FetchTransport {
   /// When set, the list waits for it (a list under way).
   Completer<void>? listGate;
 
+  /// When not empty, each list takes its answer from here when it is asked
+  /// (the server's rows at that moment), whenever it then answers.
+  final listAnswers = <List<FetchJob>?>[];
+
+  /// When set, the submit waits for it (a submit under way).
+  Completer<void>? submitGate;
+
   @override
   Future<List<FetchJob>?> listFetchJobs() async {
     calls.add('list');
+    final asked = listAnswers.isEmpty ? null : [listAnswers.removeAt(0)];
     final gate = listGate;
     if (gate != null) await gate.future;
     final error = listError;
     if (error != null) throw FetchFailure(error);
-    return rows;
+    return asked == null ? rows : asked.single;
   }
 
   @override
@@ -272,6 +280,8 @@ class FakeFetch implements FetchTransport {
   }) async {
     calls.add('submit');
     lastSubmit = (urls: urls, kind: kind, resolution: resolution);
+    final gate = submitGate;
+    if (gate != null) await gate.future;
     final error = actionError;
     if (error != null) throw FetchFailure(error);
     return submitted;

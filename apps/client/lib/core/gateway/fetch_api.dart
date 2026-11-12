@@ -123,16 +123,14 @@ class FetchJob {
   bool get isFinished =>
       state.terminal || (state == FetchState.unknown && finished != null);
 
-  /// Parses one row; null when it has no usable id (the row is skipped).
+  /// Parses one row of the gateway's contract: `id`, `state`, `kind`, `url`,
+  /// `title`, `percent`, `path`, `message`, `height`, and `submitted` and
+  /// `finished` in Unix seconds. Null when it has no usable id (the row is
+  /// skipped).
   static FetchJob? fromJson(Object? json) {
     if (json is! Map) return null;
-    final rawId = json['id'];
-    final id = rawId is String
-        ? rawId
-        : rawId is int
-        ? '$rawId'
-        : null;
-    if (id == null || !jobIdPattern.hasMatch(id)) return null;
+    final id = json['id'];
+    if (id is! String || !jobIdPattern.hasMatch(id)) return null;
     final percent = json['percent'];
     final height = json['height'];
     final state = json['state'];
@@ -142,15 +140,15 @@ class FetchJob {
       rawState: state is String ? state : null,
       kind: FetchKind.parse(json['kind']),
       title: _text(json['title']),
-      url: _text(json['url'] ?? json['link']),
+      url: _text(json['url']),
       percent: percent is num && percent.isFinite
           ? percent.toDouble().clamp(0, 100).toDouble()
           : null,
-      path: _text(json['path'] ?? json['destination']),
+      path: _text(json['path']),
       message: _text(json['message']),
       height: height is int && height > 0 ? height : null,
-      submitted: _time(json['submitted'] ?? json['submitted_at']),
-      finished: _time(json['finished'] ?? json['finished_at']),
+      submitted: _time(json['submitted']),
+      finished: _time(json['finished']),
     );
   }
 
@@ -164,24 +162,29 @@ class FetchJob {
     'path': ?path,
     'message': ?message,
     'height': ?height,
-    'submitted': ?submitted?.toUtc().toIso8601String(),
-    'finished': ?finished?.toUtc().toIso8601String(),
+    'submitted': ?_seconds(submitted),
+    'finished': ?_seconds(finished),
   };
 
   static String? _text(Object? value) =>
       value is String && value.isNotEmpty ? value : null;
 
-  /// Unix seconds (as the gateway's added times) or an ISO 8601 string.
+  /// Unix seconds; null for anything else, or a time no date can hold.
   static DateTime? _time(Object? value) {
-    if (value is num && value.isFinite && value >= 0) {
-      return DateTime.fromMillisecondsSinceEpoch(
-        (value * 1000).round(),
-        isUtc: true,
-      );
+    if (value is! num || !value.isFinite || value < 0 || value > _latest) {
+      return null;
     }
-    if (value is String) return DateTime.tryParse(value)?.toUtc();
-    return null;
+    return DateTime.fromMillisecondsSinceEpoch(
+      (value * 1000).round(),
+      isUtc: true,
+    );
   }
+
+  /// The last second a [DateTime] holds (100 million days after 1970).
+  static const _latest = 8640000000000;
+
+  static num? _seconds(DateTime? time) =>
+      time == null ? null : time.millisecondsSinceEpoch / 1000;
 }
 
 /// Ids the client sends back in a path: opaque, short, URL-safe.
@@ -218,6 +221,9 @@ enum FetchError {
   deviceRefused(
     'The server refused this device. Check pairing in Device pairing.',
   ),
+
+  /// A submit asked while this client was still sending one.
+  inProgress('The last request is still being sent. Wait a moment.'),
 
   /// 404 on one row: it is no longer on the server.
   notFound('That download is no longer on the server.'),
@@ -394,14 +400,28 @@ class HttpFetchTransport implements FetchTransport {
   }
 }
 
-/// The rows of a list or submit answer: a JSON list, or an object holding it
-/// under `jobs`. Rows without a usable id are skipped; anything else that
-/// is not a list is [FetchError.unexpected].
+/// The rows of a list or submit answer: `{"jobs": [...]}`. A row without a
+/// usable id, or one that cannot be read at all, is skipped and never fails
+/// the list; a body of any other shape is [FetchError.unexpected].
 List<FetchJob> parseFetchJobs(Object? data) {
-  final rows = data is Map ? data['jobs'] : data;
+  final rows = data is Map ? data['jobs'] : null;
   if (rows is! List) throw const FetchFailure(FetchError.unexpected);
-  return [for (final row in rows) ?FetchJob.fromJson(row)];
+  final jobs = <FetchJob>[];
+  for (final row in rows) {
+    try {
+      final job = FetchJob.fromJson(row);
+      if (job != null) jobs.add(job);
+    } on Object {
+      // One malformed row: the others are still shown.
+    }
+  }
+  return jobs;
 }
+
+/// The same body shape across the worker boundary.
+Map<String, Object?> _jobsBody(List<FetchJob> jobs) => {
+  'jobs': [for (final job in jobs) job.toJson()],
+};
 
 /// The worker's half of the app-to-worker boundary: runs one `fetch`
 /// command on [transport] and sends a `fetchResult` event. Never throws.
@@ -417,7 +437,7 @@ Future<void> answerFetchCommand(
     switch (command['op']) {
       case 'list':
         final jobs = await transport.listFetchJobs();
-        data = jobs == null ? null : [for (final job in jobs) job.toJson()];
+        data = jobs == null ? null : _jobsBody(jobs);
       case 'submit':
         final kind = FetchKind.parse(command['kind']);
         final urls = command['urls'];
@@ -429,7 +449,7 @@ Future<void> answerFetchCommand(
           kind,
           resolution: FetchResolution.parse(command['height']),
         );
-        data = [for (final job in jobs) job.toJson()];
+        data = _jobsBody(jobs);
       case 'delete':
         await transport.deleteFetchJob(command['id'] as String);
       case 'clear':

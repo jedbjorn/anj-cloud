@@ -43,6 +43,8 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     this.placement = const PickerOnlyPlacement(),
     this.pairingOptions = PairingOptions.desktop,
     this.defaultNetworkPolicy,
+    this.fetchTimeout = fetchReplyTimeout,
+    this.workerEntry = syncWorker,
   }) : secrets = secrets ?? platformAdapters().secretStore(),
        launcher =
            launcher ??
@@ -66,6 +68,12 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   String? secretsUnavailable;
   final String? nativeLibrary;
   final Duration folderCommandTimeout;
+
+  /// The wait for the worker's answer to one Downloader request.
+  final Duration fetchTimeout;
+
+  /// The sync worker isolate's entry point; tests pass a scripted one.
+  final Future<void> Function(Map<String, Object?> initial) workerEntry;
 
   /// Where a new profile's synced folder and desktop shortcut go (spec #34
   /// P1, P2). The default has no automatic root: only `main()` passes the
@@ -582,8 +590,8 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         notifyListeners();
       });
     _worker = await Isolate.spawn(
-      syncWorker,
-      {
+      workerEntry,
+      <String, Object?>{
         'output': _output!.sendPort,
         'profile': profile.path,
         'privateKey': key,
@@ -1098,7 +1106,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     _fetchRequests[request] = result;
     input.send({...command, 'request': request});
     return result.future.timeout(
-      fetchReplyTimeout,
+      fetchTimeout,
       onTimeout: () {
         _fetchRequests.remove(request);
         return {'ok': false, 'error': FetchError.network.name};

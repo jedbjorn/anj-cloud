@@ -34,21 +34,22 @@ void main() {
             'future_field': {'nested': true},
           },
           {
-            'id': 7,
+            'id': 'b2',
             'state': 'archived-later',
             'kind': 'podcast',
             'percent': 140,
             'path': 'Music/Song.m4a',
             'message': 'Saved.',
-            'submitted': '2026-11-12T10:00:00Z',
-            'finished_at': '2026-11-12T10:05:00+01:00',
+            'submitted': 1793613600,
+            'finished': 1793613900,
           },
           {'state': 'done'},
+          {'id': 7, 'state': 'done'},
           {'id': '../escape', 'state': 'done'},
           'not a row',
         ],
       });
-      expect(rows.map((row) => row.id), ['a1', '7']);
+      expect(rows.map((row) => row.id), ['a1', 'b2']);
       final first = rows[0];
       expect(first.state, FetchState.downloading);
       expect(first.kind, FetchKind.video);
@@ -69,41 +70,112 @@ void main() {
       expect(second.kind, isNull);
       expect(second.percent, 100);
       expect(second.path, 'Music/Song.m4a');
-      expect(second.finished, DateTime.utc(2026, 11, 12, 9, 5));
+      expect(
+        second.finished,
+        DateTime.fromMillisecondsSinceEpoch(1793613900000, isUtc: true),
+      );
       // An unknown state with a finish time is finished; without, it is not.
       expect(second.isFinished, isTrue);
       expect(fetchJob('x', FetchState.unknown).isFinished, isFalse);
-      // A bare list is accepted too; anything else is not.
-      expect(parseFetchJobs([]), isEmpty);
-      expect(
-        () => parseFetchJobs({'rows': []}),
-        throwsA(
-          isA<FetchFailure>().having(
-            (f) => f.error,
-            'error',
-            FetchError.unexpected,
+      // The body is {"jobs": [...]} and nothing else.
+      expect(parseFetchJobs({'jobs': []}), isEmpty);
+      for (final body in [
+        [],
+        {'rows': []},
+        {'jobs': 'none'},
+        null,
+        'jobs',
+      ]) {
+        expect(
+          () => parseFetchJobs(body),
+          throwsA(
+            isA<FetchFailure>().having(
+              (f) => f.error,
+              'error',
+              FetchError.unexpected,
+            ),
           ),
-        ),
+          reason: '$body',
+        );
+      }
+    });
+
+    test('only the contract\'s field names and Unix seconds are read', () {
+      final row = parseFetchJobs({
+        'jobs': [
+          {
+            'id': 'a',
+            'state': 'done',
+            'link': 'https://media.example/v/1',
+            'destination': 'Music/A.m4a',
+            'submitted_at': 1793613600,
+            'finished_at': 1793613900,
+            'submitted': '2026-11-12T10:00:00Z',
+            'finished': '2026-11-12T10:05:00Z',
+          },
+        ],
+      }).single;
+      expect(
+        (row.url, row.path, row.submitted, row.finished),
+        (null, null, null, null),
       );
     });
 
-    test('survive the worker boundary unchanged, unknown state included', () {
-      final rows = parseFetchJobs([
-        {
-          'id': 'a',
-          'state': 'brand-new',
-          'kind': 'audio',
-          'title': 'T',
-          'percent': 3,
-          'path': 'Music/T.m4a',
-          'message': 'm',
-          'submitted': 0,
-          'finished': '2026-11-12T10:00:00Z',
-        },
-      ]);
-      final again = parseFetchJobs(
-        jsonDecode(jsonEncode([for (final row in rows) row.toJson()])),
+    test('a time no date can hold is dropped; the list still loads', () {
+      final rows = parseFetchJobs({
+        'jobs': [
+          {'id': 'a', 'state': 'waiting', 'submitted': 1e20},
+          {'id': 'b', 'state': 'done', 'finished': 8640000000001},
+          {'id': 'c', 'state': 'done', 'finished': -5, 'submitted': 12},
+          {'id': 'd', 'state': 'done', 'finished': 8640000000000},
+          {'id': 'e', 'state': 'done', 'finished': double.infinity},
+        ],
+      });
+      expect(rows.map((row) => row.id), ['a', 'b', 'c', 'd', 'e']);
+      expect(rows[0].submitted, isNull);
+      expect(rows[1].finished, isNull);
+      expect(rows[2].finished, isNull);
+      expect(
+        rows[2].submitted,
+        DateTime.fromMillisecondsSinceEpoch(12000, isUtc: true),
       );
+      expect(rows[3].finished, isNotNull);
+      expect(rows[4].finished, isNull);
+      // A done row without a readable finish time is still finished.
+      expect(rows[1].isFinished, isTrue);
+    });
+
+    test('survive the worker boundary unchanged, unknown state included', () {
+      final rows = parseFetchJobs({
+        'jobs': [
+          {
+            'id': 'a',
+            'state': 'brand-new',
+            'kind': 'audio',
+            'title': 'T',
+            'url': 'https://media.example/t',
+            'percent': 3,
+            'path': 'Music/T.m4a',
+            'message': 'm',
+            'height': 720,
+            'submitted': 0,
+            'finished': 1793613900.25,
+          },
+        ],
+      });
+      final again = parseFetchJobs(
+        jsonDecode(
+          jsonEncode({
+            'jobs': [for (final row in rows) row.toJson()],
+          }),
+        ),
+      );
+      expect(again.single.finished, rows.single.finished);
+      expect(
+        again.single.finished,
+        DateTime.fromMillisecondsSinceEpoch(1793613900250, isUtc: true),
+      );
+      expect(again.single.submitted, rows.single.submitted);
       expect(
         jsonEncode(again.single.toJson()),
         jsonEncode(rows.single.toJson()),
@@ -163,10 +235,12 @@ void main() {
         throwsA(isA<FetchFailure>().having((f) => f.error, 'error', error));
 
     test('list: rows newest first; 404 means the feature is absent', () async {
-      handler = (request, _) => reply(request, 200, [
-        {'id': 'b', 'state': 'waiting', 'kind': 'audio'},
-        {'id': 'a', 'state': 'done', 'kind': 'audio', 'path': 'Music/A.m4a'},
-      ]);
+      handler = (request, _) => reply(request, 200, {
+        'jobs': [
+          {'id': 'b', 'state': 'waiting', 'kind': 'audio'},
+          {'id': 'a', 'state': 'done', 'kind': 'audio', 'path': 'Music/A.m4a'},
+        ],
+      });
       final rows = (await api.listFetchJobs())!;
       expect(rows.map((row) => (row.id, row.state)), [
         ('b', FetchState.waiting),

@@ -168,6 +168,11 @@ class FetchJobs extends ChangeNotifier {
 
   bool _again = false;
 
+  /// Counts the changes this client made to the rows (submit, cancel,
+  /// remove, clear). A list asked before one may answer after it without
+  /// it: such an answer is dropped and one more list follows.
+  int _changes = 0;
+
   Future<void> _lists() async {
     try {
       do {
@@ -183,6 +188,7 @@ class FetchJobs extends ChangeNotifier {
 
   Future<void> _list() async {
     try {
+      final changes = _changes;
       final rows = await transport.listFetchJobs();
       if (_disposed) return;
       listError = null;
@@ -193,6 +199,11 @@ class FetchJobs extends ChangeNotifier {
       }
       availability = FetchAvailability.available;
       loaded = true;
+      if (changes != _changes) {
+        // Asked before a change made here: the rows shown are newer.
+        _again = true;
+        return;
+      }
       _replace(rows);
     } on FetchFailure catch (failure) {
       if (failure.error == FetchError.absent) {
@@ -204,10 +215,11 @@ class FetchJobs extends ChangeNotifier {
 
   /// Submits [links] (from [parseFetchLinks]) with the remembered [kind]
   /// and [resolution]. Returns null on success (the new rows are shown at
-  /// once), or the error to show under the field.
+  /// once), or the error to show under the field; a submit asked while one
+  /// is under way sends nothing and returns [FetchError.inProgress].
   Future<FetchError?> submit(List<String> links) async {
     if (links.isEmpty) return FetchError.badLink;
-    if (submitting) return null;
+    if (submitting) return FetchError.inProgress;
     submitting = true;
     _notify();
     try {
@@ -217,6 +229,7 @@ class FetchJobs extends ChangeNotifier {
         resolution: kind == FetchKind.video ? resolution : null,
       );
       final ids = {for (final row in rows) row.id};
+      _changes++;
       _replace([...rows, ..._jobs.where((job) => !ids.contains(job.id))]);
       _schedule();
       return null;
@@ -240,11 +253,13 @@ class FetchJobs extends ChangeNotifier {
   Future<FetchError?> _delete(String id, {required bool removeRow}) async {
     try {
       await transport.deleteFetchJob(id);
+      _changes++;
       if (removeRow) _replace(_jobs.where((job) => job.id != id).toList());
       return null;
     } on FetchFailure catch (failure) {
       if (failure.error == FetchError.notFound) {
         // Already gone on the server: the list catches up below.
+        _changes++;
         _replace(_jobs.where((job) => job.id != id).toList());
         return null;
       }
@@ -259,6 +274,7 @@ class FetchJobs extends ChangeNotifier {
   Future<FetchError?> clearFinished() async {
     try {
       await transport.clearFetchJobs();
+      _changes++;
       _replace(_jobs.where((job) => !job.isFinished).toList());
       return null;
     } on FetchFailure catch (failure) {
