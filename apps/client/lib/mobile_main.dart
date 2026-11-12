@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'core/app/add_files.dart';
 import 'core/app/controller.dart';
 import 'core/app/network_transfer_policy.dart';
 import 'core/app/pairing_inputs.dart';
@@ -13,6 +14,7 @@ import 'core/sync/first_sync.dart';
 import 'core/update/app_updater.dart';
 import 'core/update/update_blocker.dart';
 import 'platform/adapters.dart';
+import 'platform/android/android_add_files.dart';
 import 'platform/android/android_package_installer.dart';
 import 'ui/app.dart';
 
@@ -108,6 +110,14 @@ Future<void> mobileMain() async {
   );
   // The "AnJ Cloud" documents provider and its allowlist (spec #28 A5).
   final access = adapters.startDocuments(controller, profile.path);
+  // Folder ⋮ → Add files… / Add folder… and the Share sheet (spec #43):
+  // the system picker's grant; the copy is a worker command.
+  final addFiles = AddFiles(
+    AndroidAddFiles(),
+    command: controller.documentsCommand,
+    cancelWorker: controller.cancelAdd,
+    root: () => controller.root,
+  );
   // No root picker on Android: the root is fixed app-private storage.
   // Touch input: rows open on tap, long-press for the icon colour.
   runApp(
@@ -120,6 +130,7 @@ Future<void> mobileMain() async {
       mobile: mobile,
       androidUpdater: updater,
       appAccess: access,
+      addFiles: addFiles,
     ),
   );
   try {
