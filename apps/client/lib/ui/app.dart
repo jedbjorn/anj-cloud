@@ -35,8 +35,11 @@ import '../core/sync/sync_schedule.dart';
 import '../core/sync/top_folders.dart';
 
 String workingCopyDetails(Map<String, dynamic> entry) {
-  final copies = (entry['workingCopies'] as List? ?? []).cast<Map>();
-  if (copies.isEmpty) return entry['workingCopy'] as String? ?? 'none';
+  if ((entry['workingCopies'] as List? ?? []).isEmpty) {
+    return entry['workingCopy'] as String? ?? 'none';
+  }
+  final copies = editedCopies(entry);
+  if (copies.isEmpty) return 'none';
   return copies
       .map(
         (copy) =>
@@ -592,8 +595,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     BuildContext context,
     Map<String, dynamic> entry,
   ) async {
-    final copies = (entry['workingCopies'] as List? ?? []).cast<Map>();
-    final sessions = copies
+    final sessions = editedCopies(entry)
         .where((c) => c['id'] is String)
         .map((c) => Map<String, dynamic>.from(c))
         .toList();
@@ -1252,11 +1254,8 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                           final directory = row.directory;
                           final collapsed =
                               !filtering && _collapsed[_active]!.contains(path);
-                          final copies = (entry['workingCopies'] as List? ?? [])
-                              .cast<Map>();
-                          final confirmable = copies.any(
-                            (copy) => copy['id'] is String,
-                          );
+                          final confirmable = editedCopies(entry)
+                              .any((copy) => copy['id'] is String);
                           return LibraryEntryCard(
                             touchInput: widget.touchInput,
                             key: ValueKey('row:$path'),

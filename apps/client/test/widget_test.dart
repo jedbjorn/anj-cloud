@@ -147,6 +147,8 @@ void main() {
         engine = SyncEngine(manifest, tree, cloud);
         await engine.tick();
         working = await engine.openFile('Library/open.txt');
+        // Decision #183: only a changed copy is an editor copy to finish.
+        File(working).writeAsStringSync('edited bytes', flush: true);
         await engine.tick();
         final entry = manifest.entries['Library/open.txt']!;
         controller =
@@ -175,7 +177,7 @@ void main() {
         await tester.tap(find.text('Details and preserved copies'));
         await tester.pumpAndSettle();
         expect(find.textContaining('$working (12 bytes)'), findsOneWidget);
-        expect(File(working).readAsStringSync(), 'editor bytes');
+        expect(File(working).readAsStringSync(), 'edited bytes');
       } finally {
         await tester.pumpWidget(const SizedBox());
         controller.dispose();
