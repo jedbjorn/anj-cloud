@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import '../gateway/certificate_renewal.dart';
 import '../gateway/cloud_api.dart';
 import '../gateway/dav_api.dart';
+import '../gateway/fetch_api.dart';
 import '../gateway/admin_api.dart';
 import '../gateway/releases_api.dart';
 import 'documents_ops.dart';
@@ -174,6 +175,8 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
     // The update feed over the device certificate (spec #28 G1, spec #37);
     // not file sync, so neither the pause gate nor sync activity applies.
     releases: cloud is ReleaseTransport ? cloud as ReleaseTransport : null,
+    // Media fetch job routes (spec #42): not file sync either.
+    fetch: cloud is FetchTransport ? cloud as FetchTransport : null,
     defaultNetworkPolicy: initial['networkPolicy'] as String?,
     pickupIfDue: renewal?.runIfDue,
   );
@@ -228,6 +231,7 @@ class WorkerLoop {
     this.abortGrace = const Duration(seconds: 5),
     this.activityInterval = const Duration(milliseconds: 500),
     this.releases,
+    this.fetch,
     this.defaultNetworkPolicy,
     this.pickupIfDue,
     this.joinedListingAge = const Duration(seconds: 60),
@@ -250,6 +254,9 @@ class WorkerLoop {
   /// The update feed; null while unpaired.
   final ReleaseTransport? releases;
   bool _downloadingRelease = false;
+
+  /// The media fetch job routes (spec #42); null while unpaired.
+  final FetchTransport? fetch;
 
   /// The running download's request and its cancel signal.
   final _releaseCancels = <Object?, Completer<void>>{};
@@ -466,6 +473,14 @@ class WorkerLoop {
       if (command['action'] == 'releaseCancel') {
         final cancel = _releaseCancels[command['request']];
         if (cancel != null && !cancel.isCompleted) cancel.complete();
+        return;
+      }
+      // Media fetch (spec #42): answered beside passes and the queue, so
+      // the Downloader's 2 s poll neither waits for a pass nor makes the
+      // loop send the whole library state.
+      if (command['action'] == 'fetch') {
+        // A stopping worker answers at once that it cannot send.
+        unawaited(answerFetchCommand(_stopping ? null : fetch, command, send));
         return;
       }
       if (command['action'] == 'background' && _inPass) {
