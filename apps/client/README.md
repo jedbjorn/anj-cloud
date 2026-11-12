@@ -85,11 +85,17 @@ land on the real desktop, dangle after cleanup and keep the real profile from
 getting its own. The synced folder is `$fixture/home/anj-cloud/`; the fixture
 home has no desktop folder, so no link is made. The permanently enrolled root always
 uses **Local and cloud**. Select **Cloud-only / free up space** or **Local and
-cloud** on folder menus. Files inherit their nearest containing folder's policy;
-files directly in the root stay Local. Explicit nested folder choices survive
-changes to their parent. Obsolete file-level choices are ignored and discarded
-through normal state loading. Cloud-only remains synchronized and guarded release
-follows verified upload. File-manager deletion still deletes synchronized content.
+cloud** on folder menus, and **Cloud-only / free up space** or **Keep on this
+device** on file menus (spec #45); Select mode applies either to files, folders
+or a mix, without confirmation. A file uses its own choice when it has one,
+otherwise its nearest containing folder's ("(as folder)" in its menu); files
+directly in the root follow the root, which stays Local. Choosing a folder's
+storage clears the own choices of the files that follow it (for Documents,
+Music and Videos: their loose files); explicit nested folder choices survive
+changes to their parent. Cloud-only remains synchronized and guarded release
+follows verified upload: a file that is open, not yet uploaded or in conflict
+stays on the device, its row says **Frees space when closed** or **Frees space
+after upload**, and a later pass releases it. File-manager deletion still deletes synchronized content.
 The app creates `anj-cloud/Music`, `Videos` and `Documents`, and keeps them
 (spec #34 P7, decision #150): the three are always Local (Cloud-only and Delete
 everywhere are not offered and are refused; a Cloud-only choice an earlier
