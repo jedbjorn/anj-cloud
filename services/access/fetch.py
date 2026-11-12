@@ -890,7 +890,7 @@ class Fetch:
             except Exception:  # noqa: BLE001 - best effort, as for an upload
                 pass
         top = KINDS[row["kind"]][0]
-        message = "Saved to %s." % top
+        message = None  # a plain done row needs no sentence: the tab already shows the path
         if row["kind"] == "video" and row["obtained"] and row["obtained"] < row["height"]:
             message = "Saved to %s at %dp; %dp was not available." % (top, row["obtained"], row["height"])
         self.finish(row, "done", message, stop=False, destination=target)

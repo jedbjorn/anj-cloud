@@ -556,7 +556,8 @@ class ImportTests(FetchTestCase):
         tree["Music/song_ one (2).m4a"] = b"case clash"
         [identity] = await self.submit(["https://media.example/a"])
         row = await self.finish_item(identity, title="Song: One")
-        self.assertEqual(("Music/Song_ One (3).m4a", "Saved to Music."), (row["destination"], row["message"]))
+        self.assertEqual(("Music/Song_ One (3).m4a", None), (row["destination"], row["message"]))
+        self.assertIsNone(public_row(row)["message"])
         self.assertEqual(MP4, tree["Music/Song_ One (3).m4a"])
         self.assertEqual(1, len(self.gateway.registry.added_since("alice")["added"]))  # added time recorded
         self.assertEqual([], os.listdir(self.fetch.jobs))

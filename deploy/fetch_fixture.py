@@ -187,7 +187,7 @@ async def case_presets(run):
         if row["state"] == "done":
             run.remember(alice, row["path"])
     audio = result["song-audio"]
-    assert audio["state"] == "done" and audio["path"] == "Music/Fixture Song_ One.m4a", audio
+    assert audio["state"] == "done" and audio["path"] == "Music/Fixture Song_ One.m4a" and audio["message"] is None, audio
     probe, _, _ = await run.readback(alice, audio["path"], "song-audio.m4a")
     tags = probe["format"].get("tags", {})
     assert "mp4" in probe["format"]["format_name"].split(",") and ("audio", "aac", None, 0) in streams(probe), streams(probe)
@@ -198,6 +198,7 @@ async def case_presets(run):
     for key, height in (("song-video1080", 1080), ("song-video720", 720), ("low-video1080", 480)):
         row = result[key]
         assert row["state"] == "done" and row["path"].startswith("Videos/") and row["path"].endswith(".mp4") and row["height"] == height, row
+        assert (row["message"] is None) == (height != 480), row  # a sentence only when it adds information
         probe, _, _ = await run.readback(alice, row["path"], key + ".mp4")
         kinds = streams(probe)
         assert ("video", "h264", height, 0) in kinds and ("audio", "aac", None, 0) in kinds and len(kinds) == 2, kinds
