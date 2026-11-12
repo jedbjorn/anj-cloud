@@ -1,6 +1,7 @@
 package cloud.anj.grantee
 
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -8,6 +9,7 @@ import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
+import android.provider.MediaStore
 import android.util.Log
 import android.widget.TextView
 import java.io.File
@@ -35,6 +37,10 @@ import java.io.FileInputStream
  *                             -> out/pickfile-S.json
  *   readfile --es slot S --es out O
  *                             read the single file S through its own grant -> out/O.json
+ *   share --esa names N1,N2 --esa texts T1,T2 [--ei repeat R] --es target PKG --es out O
+ *                             save each Ni (Ti repeated R times) as this app's own download in
+ *                             MediaStore, then send them to PKG with ACTION_SEND_MULTIPLE and a
+ *                             read grant, as Gallery or Files would (spec #43 AC7) -> out/O.json
  */
 class GranteeActivity : Activity() {
     private val prefs get() = getSharedPreferences("g", Context.MODE_PRIVATE)
@@ -89,6 +95,9 @@ class GranteeActivity : Activity() {
                     "seed" -> seed(slot)
                     "persisted" -> persisted()
                     "readfile" -> readFile(slot)
+                    "share" -> share(i.getStringArrayExtra("names") ?: emptyArray(),
+                        i.getStringArrayExtra("texts") ?: emptyArray(), i.getIntExtra("repeat", 1),
+                        i.getStringExtra("target") ?: error("no target"))
                     "write" -> write(slot, i.getStringExtra("name") ?: "written.txt",
                         i.getStringExtra("text") ?: "written\n")
                     else -> "{\"error\":\"unknown cmd\"}"
@@ -99,6 +108,30 @@ class GranteeActivity : Activity() {
             out(name, json)
             runOnUiThread { finish() }
         }.start()
+    }
+
+    private fun share(names: Array<String>, texts: Array<String>, repeat: Int, target: String): String {
+        val uris = ArrayList<Uri>()
+        for ((index, name) in names.withIndex()) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.RELATIVE_PATH, "Download/anj-share")
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: error("insert refused for $name")
+            contentResolver.openOutputStream(uri)!!.use { out ->
+                val bytes = texts.getOrElse(index) { name }.toByteArray()
+                repeat(repeat) { out.write(bytes) }
+            }
+            contentResolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
+            uris += uri
+        }
+        val send = Intent(Intent.ACTION_SEND_MULTIPLE).setType("*/*").setPackage(target)
+            .putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        runOnUiThread { startActivity(send) }
+        return "{\"ok\":true,\"uris\":[${uris.joinToString(",") { q(it.toString()) }}]}"
     }
 
     @Deprecated("platform API")
