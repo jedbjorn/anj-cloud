@@ -206,6 +206,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   final _bulkRequests = <String, Completer<Map<String, dynamic>>>{};
   final _folderRequests = <String, Completer<String>>{};
   final _sharingRequests = <String, Completer<Object?>>{};
+  final _trashRequests = <String, Completer<Map<String, dynamic>>>{};
   final _adminRequests = <String, Completer<AdminResponse>>{};
   final _releaseRequests = <String, Completer<Map>>{};
   final _releaseProgress = <String, void Function(int)>{};
@@ -256,6 +257,14 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
       );
     }
     _sharingRequests.clear();
+    for (final request in _trashRequests.values) {
+      request.completeError(
+        const CloudFailure(
+          'Sync stopped before Trash answered. Open Trash again to see it.',
+        ),
+      );
+    }
+    _trashRequests.clear();
     for (final run in _backgroundRuns.values) {
       run.complete({'stopped': true});
     }
@@ -511,6 +520,15 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
                 status: event['status'] as int?,
               ),
             );
+          }
+        case 'trashResult':
+          final pending = _trashRequests.remove(event['request']);
+          if (event['ok'] == true) {
+            pending?.complete(
+              Map<String, dynamic>.from(event['data'] as Map? ?? const {}),
+            );
+          } else {
+            pending?.completeError(CloudFailure(event['message'] as String));
           }
         case 'documentsResult':
           final pending = _documentsRequests.remove(event['request']);
@@ -1172,6 +1190,33 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         _sharingRequests.remove(request);
         throw const CloudFailure(
           'The server did not answer in time. Reopen to see the current state.',
+        );
+      },
+    );
+  }
+
+  /// One Trash request (spec #44): `list`, `restore`, `restoreDevice`,
+  /// `delete`, `empty` or `undo`, answered by the worker.
+  Future<Map<String, dynamic>> trash(
+    String op, [
+    Map<String, Object?> args = const {},
+  ]) {
+    final input = _input;
+    if (input == null) {
+      return Future.error(
+        const CloudFailure('Sync is not running. Try again shortly.'),
+      );
+    }
+    final request = uniqueId();
+    final result = Completer<Map<String, dynamic>>();
+    _trashRequests[request] = result;
+    input.send({...args, 'action': 'trash', 'request': request, 'op': op});
+    return result.future.timeout(
+      const Duration(seconds: 120),
+      onTimeout: () {
+        _trashRequests.remove(request);
+        throw const CloudFailure(
+          'Trash did not answer in time. Open Trash to see what changed.',
         );
       },
     );

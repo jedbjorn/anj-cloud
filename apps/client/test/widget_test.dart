@@ -190,6 +190,10 @@ void main() {
   testWidgets(
     'deleted-file late edit can be recovered through its actual menu action',
     (tester) async {
+      // The Keep both path of a conflicted deleted row; such copies now go
+      // to the device trash (spec #44, device_trash_test.dart).
+      SyncEngine.debugDeletionRecoveryRows = true;
+      addTearDown(() => SyncEngine.debugDeletionRecoveryRows = false);
       late Directory fixture;
       late RootTree tree;
       late Manifest manifest;

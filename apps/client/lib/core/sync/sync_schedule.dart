@@ -244,6 +244,8 @@ SyncStatus deriveStatus({
     'excluded-entry',
     'excluded-operation',
     'working',
+    // A device-trash copy (spec #44) is never pending work.
+    'trash',
   };
   if (operations.any((o) => !passive.contains(o.kind)) ||
       entries.any((e) {

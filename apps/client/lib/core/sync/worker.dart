@@ -858,6 +858,57 @@ class WorkerLoop {
     }
   }
 
+  /// Trash (spec #44): the Trash view's list and actions, and Undo. While
+  /// paused or offline only this device's trash is reached. Answered with
+  /// its own result; a change starts a pass at once.
+  Future<void> _trash(Map command) async {
+    final request = command['request'];
+    final op = command['op'];
+    final server = !_paused && !schedule.offline;
+    List<String> list(String key) =>
+        (command[key] as List? ?? const []).cast<String>();
+    try {
+      final Object data = switch (op) {
+        'list' => await engine.trashListing(server: server),
+        'restore' => await engine.trashRestore(
+          serverId: server ? command['serverId'] as String? : null,
+          deviceId: command['deviceId'] as String?,
+        ),
+        'restoreDevice' => await engine.trashRestore(
+          deviceId: command['deviceId'] as String,
+        ),
+        'delete' => await engine.trashDelete(
+          server ? list('serverIds') : const [],
+          list('deviceIds'),
+        ),
+        'empty' => await engine.trashEmpty(server: server),
+        'undo' => await engine.undoDelete(
+          list('paths'),
+          command['at'] as int,
+          server: server,
+        ),
+        _ => throw const CloudFailure('Unknown trash request.'),
+      };
+      if (op != 'list') {
+        if (!_paused) schedule.requestNow();
+        _passWanted = true;
+      }
+      send({
+        'event': 'trashResult',
+        'request': request,
+        'ok': true,
+        'data': data,
+      });
+    } catch (error) {
+      send({
+        'event': 'trashResult',
+        'request': request,
+        'ok': false,
+        'message': error is FileSystemException ? error.message : '$error',
+      });
+    }
+  }
+
   /// Household administration (spec #27): one gateway call per command,
   /// answered with its status and body. The gateway authorizes every call.
   Future<void> _admin(Map command) async {
@@ -1152,6 +1203,8 @@ class WorkerLoop {
           await _documents(command);
         case 'sharing':
           await _sharing(command);
+        case 'trash':
+          await _trash(command);
         case 'admin':
           await _admin(command);
         case 'releaseCheck':

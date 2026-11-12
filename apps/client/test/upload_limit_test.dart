@@ -381,19 +381,26 @@ void main() {
   });
 
   group('a file removed before it ever synchronized', () {
-    Future<void> expectRecoveryCopy(String bytes) async {
+    Future<void> expectInDeviceTrash(String bytes) async {
       expect(entry(big).status, 'removed locally');
       expect(store.operations.values.where((o) => o.kind == 'upload'), isEmpty);
+      // Spec #44: the only copy of these bytes is in the device trash, not
+      // a Recovery row.
+      expect(
+        store.operations.values.where(
+          (o) => o.kind == 'retained' && o.path == big,
+        ),
+        isEmpty,
+      );
       final kept = store.operations.values
-          .where((o) => o.kind == 'retained' && o.path == big)
+          .where((o) => o.kind == 'trash' && o.path == big)
           .toList();
       expect(kept, hasLength(1));
       expect(File(kept.single.staged!).readAsStringSync(), bytes);
       final row = await projected(big);
-      expect(fileBadge(row), 'Recovery copy');
       expect(isTerminalDeletion(row), isTrue);
       expect(hasQueuedWork(row), isFalse);
-      expect(visibleInLibrary(row), isTrue);
+      expect(visibleInLibrary(row), isFalse);
       expect(overall(), SyncStatus.upToDate, reason: 'not Syncing');
       expect(engine.uploads.length, 0);
       // Settled: no retries, nothing shown as syncing, no re-read of the copy.
@@ -416,7 +423,7 @@ void main() {
       expect(entry(big).status, startsWith('pending: '));
       local(big).deleteSync();
       await engine.tick();
-      await expectRecoveryCopy('local only bytes');
+      await expectInDeviceTrash('local only bytes');
     });
 
     test('deleted after a 413 needs-attention state', () async {
@@ -426,7 +433,7 @@ void main() {
       expect(entry(big).status, startsWith('Too large'));
       local(big).deleteSync();
       await engine.tick();
-      await expectRecoveryCopy('refused bytes');
+      await expectInDeviceTrash('refused bytes');
     });
 
     test('deleted while its upload is in flight, which then fails', () async {
@@ -440,7 +447,7 @@ void main() {
       cloud.gates[big]!.complete();
       await pass;
       await engine.tick();
-      await expectRecoveryCopy('in flight');
+      await expectInDeviceTrash('in flight');
     });
 
     test(
@@ -507,7 +514,7 @@ void main() {
         engine = SyncEngine(store, tree, cloud);
         engine.uploads = UploadBackoff(clock: () => now, random: _Jitter(0));
         await engine.tick();
-        await expectRecoveryCopy('probe bytes');
+        await expectInDeviceTrash('probe bytes');
       },
     );
   });
