@@ -4,6 +4,7 @@
 import 'dart:io';
 
 import 'package:anj_cloud/core/app/controller.dart';
+import 'package:anj_cloud/core/app/fetch_jobs.dart';
 import 'package:anj_cloud/core/app/pairing_inputs.dart';
 import 'package:anj_cloud/core/gateway/admin_api.dart';
 import 'package:anj_cloud/core/sync/first_sync.dart';
@@ -31,6 +32,13 @@ class LayoutController extends ClientController {
     }
     return response;
   }
+
+  /// The Downloader's state over a FakeFetch (spec #42); without one the
+  /// controller's own, which has no worker and so never shows the tab.
+  FetchJobs? fetch;
+
+  @override
+  FetchJobs get fetchJobs => fetch ?? super.fetchJobs;
 
   @override
   bool get canCreateFolder => true;
