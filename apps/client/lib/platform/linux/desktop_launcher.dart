@@ -29,6 +29,10 @@ class PlatformDesktopLauncher implements DesktopLauncher {
   @override
   Future<bool> openFile(String path) => _launch(Uri.file(path));
 
+  /// The working copy's path goes to the OS: its opens are not tracked.
+  @override
+  bool get handsOutThroughProvider => false;
+
   @override
   Future<bool> openDirectory(
     String root,

@@ -1130,7 +1130,10 @@ class WorkerLoop {
             'rootIdentity': tree.native.identity(tree.fd),
           });
         case 'open':
-          final path = await engine.openFile(command['path'] as String);
+          final path = await engine.openFile(
+            command['path'] as String,
+            providerTracked: command['providerTracked'] == true,
+          );
           send({'event': 'open', 'path': path});
         case 'documents':
           await _documents(command);

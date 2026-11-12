@@ -511,6 +511,30 @@ void main() {
     },
   );
 
+  test('a kept working-copy grant says "being edited" only once the copy '
+      'changed (decision #183)', () async {
+    List<Map<String, dynamic>> withCopy({required bool edited}) => [
+      ...library(),
+      {
+        ...file('Docs.txt', present: false),
+        'workingCopies': [
+          {
+            'id': 'op',
+            'path': '/data/files/.anj-cloud-x/working-1-Docs.txt',
+            'edited': edited,
+          },
+        ],
+      },
+    ];
+    revoker.documents = [
+      (id: 'w:working-1-Docs.txt', read: true, write: false),
+    ];
+    host.set(withCopy(edited: false));
+    expect((await service.fileGrants()).single.name, 'Docs.txt');
+    host.set(withCopy(edited: true));
+    expect((await service.fileGrants()).single.name, 'Docs.txt (being edited)');
+  });
+
   test('top folders carry no delete, rename or move flags (spec #34 P7)', () {
     final rows = service.children('root', system)['rows'] as List;
     final music = rows.cast<Map>().singleWhere((r) => r['name'] == 'Music');

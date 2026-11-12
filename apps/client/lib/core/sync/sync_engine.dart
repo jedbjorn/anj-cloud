@@ -5539,7 +5539,11 @@ class SyncEngine {
 
   /// Opening is not editing (decision #183, narrowing #108 Q10): a working
   /// copy no app changed is a downloaded copy, released once no app holds it
-  /// open, without Finish editing. It goes through the guarded staging
+  /// open, without Finish editing. Only a copy every hand-out of which went
+  /// through the tracked documents provider qualifies (decision #184): an
+  /// app given a plain path (desktop Open) may have closed it and still save
+  /// to it later, so such a copy, or one with no record of its hand-out, is
+  /// kept until Finish editing. It goes through the guarded staging
   /// release (the lease, and on Android the open-descriptor registry, refuse
   /// a copy an app holds open; the bytes must still hash to the version that
   /// was downloaded), so an open copy is retried by a later pass and a
@@ -5578,7 +5582,8 @@ class SyncEngine {
         manifest.save();
       }
       final since = _workingOpenedAt[work.id];
-      if (artifacts.workingEdited(work) ||
+      if (work.data['handout'] != 'provider' ||
+          artifacts.workingEdited(work) ||
           (since != null && _elapsed - since < workingCopyGrace) ||
           record == null ||
           record.data['role'] != 'working' ||
@@ -6356,7 +6361,11 @@ class SyncEngine {
     markDirty(path, descendants: true);
   }
 
-  Future<String> openFile(String path) async {
+  /// Downloads (or snapshots) [path] into a private working copy. Pass
+  /// [providerTracked] only when every hand-out of the copy goes through the
+  /// documents provider's tracked open path (decision #184); only such a
+  /// copy is cleared automatically while unchanged.
+  Future<String> openFile(String path, {bool providerTracked = false}) async {
     requireStorageReady();
     final entry = manifest.entries[path]!;
     if (entry.kind != ItemKind.file) {
@@ -6383,7 +6392,7 @@ class SyncEngine {
       expectedEtag: entry.etag,
       staged: tree.durablePath(copy),
       hash: hash,
-    );
+    )..data['handout'] = providerTracked ? 'provider' : 'untracked';
     manifest.operations[op.id] = op;
     markDirty(path);
     artifacts.complete(copy, hash: hash, etag: entry.etag);

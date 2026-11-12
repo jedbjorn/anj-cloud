@@ -507,4 +507,35 @@ void main() {
     expect(sessions(), isEmpty);
     expect(stagedWorking(), isEmpty);
   });
+  test('a copy handed out as a plain path (desktop Open) is never cleared '
+      'automatically; once written it is Editing (decision #184)', () async {
+    await cloudOnly('Far', 'notes.txt', 'plain');
+    var shift = Duration.zero;
+    final clock = Stopwatch()..start();
+    engine.debugElapsed = () => clock.elapsed + shift;
+    // What the worker's Open does where the launcher hands out the path.
+    final staged = File(await engine.openFile('Far/notes.txt'));
+    expect(sessions().single.data['handout'], 'untracked');
+    shift = engine.workingCopyGrace * 2;
+    await engine.tick();
+    await engine.tick();
+    expect(sessions(), hasLength(1), reason: 'never reclaimed');
+    expect(staged.readAsStringSync(), 'plain');
+    var projected = await row('Far/notes.txt');
+    expect(hasEditing(projected), isFalse);
+    expect(editedCopies(projected), isEmpty);
+    expect(fileBadge(projected), 'Cloud');
+    // The editor saves later, after closing the file long ago.
+    staged.writeAsStringSync('plain, edited', flush: true);
+    await engine.tick();
+    expect(
+      String.fromCharCodes(cloud.files['Far/notes.txt']!),
+      'plain, edited',
+    );
+    projected = await row('Far/notes.txt');
+    expect(editedCopies(projected), hasLength(1), reason: 'Finish editing');
+    expect(fileBadge(projected), 'Editing');
+    await engine.tick();
+    expect(sessions(), hasLength(1));
+  });
 }

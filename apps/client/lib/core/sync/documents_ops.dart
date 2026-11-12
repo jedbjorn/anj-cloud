@@ -160,7 +160,7 @@ class DocumentsOps {
     }
     final String staged;
     try {
-      staged = await engine.openFile(path);
+      staged = await engine.openFile(path, providerTracked: true);
     } on CloudFailure catch (error) {
       throw DocumentsFailure('unavailable', error.message);
     }
