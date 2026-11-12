@@ -150,8 +150,10 @@ class DocumentsOps {
     // Cloud-only: the Open action's private editor working copy. One
     // unchanged copy of the current version is reused, so an app that
     // reopens a file does not download it again.
-    final reuse = _reusableWorkingCopy(path, entry);
-    if (reuse != null) return _openWorking(reuse, write, token);
+    final reuse = engine.reusableWorkingCopy(path);
+    if (reuse != null) {
+      return _openWorking(p.basename(reuse.staged!), write, token);
+    }
     if (_paused) {
       throw const DocumentsFailure(
         'paused',
@@ -165,26 +167,6 @@ class DocumentsOps {
       throw DocumentsFailure('unavailable', error.message);
     }
     return _openWorking(p.basename(staged), write, token);
-  }
-
-  String? _reusableWorkingCopy(String path, Entry entry) {
-    for (final op in engine.manifest.operationsAt(path)) {
-      if (op.kind != 'working' ||
-          op.staged == null ||
-          op.expectedEtag != entry.etag) {
-        continue;
-      }
-      final file = engine.artifacts.resolve(op.staged!);
-      final record = engine.artifacts.record(file);
-      final name = p.basename(op.staged!);
-      try {
-        final now = engine.artifacts.native.info(tree.stageFd, name);
-        if (record?.data['stamp'] == now.stamp) return name;
-      } on FileSystemException {
-        continue;
-      }
-    }
-    return null;
   }
 
   Map<String, Object?> _openWorking(String name, bool write, String token) {
@@ -210,7 +192,7 @@ class DocumentsOps {
     }
     tree.native.checkRoot(tree.stageFd, tree.staging.path);
     final handed = _hand(tree.stageFd, name, path, write, token, working: name);
-    engine.workingCopyOpened(owner.first);
+    engine.workingCopyOpened(owner.first, providerTracked: true);
     return handed;
   }
 

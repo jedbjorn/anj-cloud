@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
+import 'package:anj_cloud/core/sync/evictions.dart' show openedCopyKept;
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 
@@ -163,8 +164,9 @@ void main() {
     expect(File(path).readAsStringSync(), 'remote bytes');
     expect(local('Library/open.txt').existsSync(), isFalse);
     await engine.tick();
-    // Decision #183: an unchanged copy leaves the row Cloud-only.
-    expect(store.entries['Library/open.txt']!.status, 'cloud-only');
+    // Decisions #183/#184: an unchanged copy is not an edit; the Cloud row
+    // explains the opened copy it keeps.
+    expect(store.entries['Library/open.txt']!.status, openedCopyKept);
     File(path).writeAsStringSync('edited bytes', flush: true);
     await engine.tick();
     expect(

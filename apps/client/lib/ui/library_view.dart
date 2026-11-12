@@ -100,6 +100,13 @@ List<Map> editedCopies(Map<String, dynamic> entry) => [
     if (copy['edited'] != false) copy,
 ];
 
+/// Unchanged working copies: opened, never written. Details offers Remove
+/// opened copy for them (decision #184).
+List<Map> openedCopies(Map<String, dynamic> entry) => [
+  for (final copy in (entry['workingCopies'] as List? ?? const []).cast<Map>())
+    if (copy['edited'] == false) copy,
+];
+
 bool hasEditing(Map<String, dynamic> entry) =>
     editedCopies(entry).isNotEmpty || entry['finishPending'] == true;
 

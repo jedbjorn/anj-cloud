@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
+import 'package:anj_cloud/core/sync/evictions.dart' show openedCopyKept;
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 
@@ -184,10 +185,12 @@ void main() {
     expect(engine.workingCopies(path), hasLength(1));
     expect(engine.workingCopies(path).single['path'], later.path);
     expect(later.readAsStringSync(), 'initial bytes');
-    // Decision #183: the later, unchanged copy is not an edit and pins
-    // nothing; it waits for reclamation, not for Finish editing.
+    // Decisions #183/#184: the later copy is a new one (a copy confirmed for
+    // Finish editing is never handed out again). Unchanged, it is not an edit
+    // and pins nothing; opened outside the documents provider, it is kept
+    // until the user removes it, never released automatically.
     expect(engine.workingCopies(path).single['edited'], isFalse);
-    expect(store.entries[path]!.status, isNot(contains('pinned')));
+    expect(store.entries[path]!.status, openedCopyKept);
   });
 
   test('offline request remains durable and uploads before cleanup', () async {
@@ -224,9 +227,12 @@ void main() {
   });
 
   test('multiple divergent editor versions remain recoverable', () async {
-    final first = File(await engine.openFile(path));
+    // One unchanged copy per version is handed out (decision #184): the
+    // second editor session starts once the first copy is already changed.
+    final first = File(await engine.openFile(path))
+      ..writeAsStringSync('first edit');
     final second = File(await engine.openFile(path));
-    first.writeAsStringSync('first edit');
+    expect(second.path, isNot(first.path));
     second.writeAsStringSync('second edit');
     engine.editing.request(path, preview());
     await engine.tick();
@@ -297,10 +303,12 @@ void main() {
     'request prevalidates all previews before any ownership authorization',
     () async {
       final first = File(await engine.openFile(path));
-      final second = File(await engine.openFile(path));
       (File(
         '${first.path}.new',
       )..writeAsStringSync('same bytes')).renameSync(first.path);
+      // Changed, so the second Open is a second copy (decision #184).
+      final second = File(await engine.openFile(path));
+      expect(second.path, isNot(first.path));
       final shown = preview();
       second.writeAsStringSync('changed after preview');
       expect(

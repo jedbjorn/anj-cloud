@@ -1370,6 +1370,30 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                                 'Status: ${entry['status']}\n${entry['conflict'] ?? ''}\nPreserved local copies:\n${(entry['preservedCopies'] as List? ?? []).join('\n')}\nEditor working copies (retained until Finish editing):\n${workingCopyDetails(entry)}\n${artifactSummary(entry) ?? 'Local staging files: ${(entry['localArtifacts'] as Map?) == null ? 'unknown' : 'none'}'}\nLocal temporary/recovery locations:\n${localRecoveryDetails(entry)}\nRemote conflict copy: ${entry['remoteCopy'] ?? 'none'}',
                                               ),
                                               actions: [
+                                                if (openedCopies(entry)
+                                                    .isNotEmpty)
+                                                  TextButton(
+                                                    key: ValueKey(
+                                                      'removeOpened:$path',
+                                                    ),
+                                                    onPressed: () {
+                                                      Navigator.pop(context);
+                                                      controller.command(
+                                                        'removeOpenedCopy',
+                                                        path,
+                                                        sessions: [
+                                                          for (final copy
+                                                              in openedCopies(
+                                                                entry,
+                                                              ))
+                                                            {'id': copy['id']},
+                                                        ],
+                                                      );
+                                                    },
+                                                    child: const Text(
+                                                      'Remove opened copy',
+                                                    ),
+                                                  ),
                                                 TextButton(
                                                   onPressed: () =>
                                                       Navigator.pop(context),
