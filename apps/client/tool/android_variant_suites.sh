@@ -16,7 +16,7 @@ clang++ -std=c++17 -Wall -Wextra -Werror -O2 -fPIC -shared -DANJ_ANDROID_BOUNDAR
 suites=(test/android_storage_test.dart test/staging_release_test.dart
   test/recover_dismiss_test.dart test/eviction_test.dart
   test/edit_completion_test.dart test/root_retention_test.dart test/sync_test.dart
-  test/top_folders_test.dart test/sharing_engine_test.dart)
+  test/top_folders_test.dart test/sharing_engine_test.dart test/add_files_test.dart)
 if [ -n "${ANJ_TEST_EXCLUDE:-}" ]; then   # CI: the same seat-dependent files tool/check.sh skips
   mapfile -t suites < <(printf '%s\n' "${suites[@]}" | grep -Ev "$ANJ_TEST_EXCLUDE")
 fi

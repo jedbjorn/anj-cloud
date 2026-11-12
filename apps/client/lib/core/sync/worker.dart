@@ -475,6 +475,11 @@ class WorkerLoop {
         if (cancel != null && !cancel.isCompleted) cancel.complete();
         return;
       }
+      // Add files (spec #43): the copy in progress stops at its next chunk.
+      if (command['action'] == 'addCancel') {
+        documents.adder.cancel(command['run'] as String);
+        return;
+      }
       // Media fetch (spec #42): answered beside passes and the queue, so
       // the Downloader's 2 s poll neither waits for a pass nor makes the
       // loop send the whole library state.

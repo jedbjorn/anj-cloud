@@ -13,6 +13,7 @@ import 'evictions.dart';
 import 'open_documents.dart';
 import 'edit_completion.dart';
 import 'excluded_tracking.dart';
+import 'file_adder.dart';
 import 'folder_creation.dart';
 import 'name_holds.dart';
 import 'name_policy.dart';
@@ -69,6 +70,8 @@ class SyncEngine {
     tree.native.beforeDestructiveChange = manifest.commitPoint;
     interruptedInstalls = artifacts.removeInterruptedInstalls();
     artifacts.finishInterruptedMoves();
+    // An add copy the process did not finish (spec #43 Interruption).
+    FileAdder.sweep(this);
   }
 
   /// Leftovers of interrupted installs removed at start (test seam).

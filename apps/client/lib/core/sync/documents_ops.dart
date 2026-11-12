@@ -6,6 +6,7 @@ import '../gateway/sharing.dart';
 import '../local/root_tree.dart';
 import '../ports/documents_filesystem.dart';
 import '../state/model.dart';
+import 'file_adder.dart';
 import 'name_policy.dart';
 import 'open_documents.dart';
 import 'sync_engine.dart';
@@ -57,6 +58,10 @@ class DocumentsOps {
 
   bool get _paused => paused?.call() ?? false;
 
+  /// Add files, Add folder and the Share sheet (spec #43): copies into the
+  /// root through the same worker channel.
+  late final FileAdder adder = FileAdder(engine, paused: paused);
+
   void _notPaused() {
     if (_paused) {
       throw const DocumentsFailure(
@@ -107,6 +112,33 @@ class DocumentsOps {
         };
       case 'delete':
         delete(command['path'] as String);
+        return const {};
+      case 'addCheck':
+        return adder.check(
+          command['destination'] as String,
+          (command['items'] as List).cast<Map>(),
+          free: command['free'] as int?,
+        );
+      case 'addFolder':
+        return {
+          'path': adder.addFolder(
+            command['parent'] as String,
+            command['name'] as String,
+            number: command['number'] == true,
+          ),
+        };
+      case 'addFile':
+        return {
+          'path': await adder.addFile(
+            command['parent'] as String,
+            command['name'] as String,
+            command['source'] as String,
+            number: command['number'] == true,
+            run: command['run'] as String? ?? '',
+          ),
+        };
+      case 'addDone':
+        adder.finished(command['run'] as String? ?? '');
         return const {};
     }
     throw DocumentsFailure('refused', 'Unknown documents command $op.');
