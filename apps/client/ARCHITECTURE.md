@@ -297,6 +297,24 @@ The native library keeps its C ABI: the `anj_*` exports of
 `libanj_rootfs.so` and the FFI symbol names bound in `native_root_fs.dart`,
 `eviction_native.dart`, `local_watcher.dart` and `profile_lifetime.dart`.
 
+## Media fetch (spec #42 F4)
+
+The Downloader's client core is shared code with no port.
+`core/gateway/fetch_api.dart` holds the job row (`FetchJob`, `FetchState`
+with `unknown` for states a newer gateway adds), the plain-language
+outcomes (`FetchError`) and the four `/v1/fetch/jobs` routes
+(`HttpFetchTransport`, which `DavCloud` and `RenewableCloud` expose as
+`FetchTransport`). Like Admin and the update feed, every request is sent by
+the sync worker over this device's certificate and skips the pause gate (not
+file sync). The worker answers a `fetch` command beside its queue
+(`answerFetchCommand`), so a poll neither waits for a pass nor makes the loop
+send library state. `core/app/fetch_jobs.dart` (`FetchJobs`, reached as
+`ClientController.fetchJobs`) holds availability (a 404 means absent),
+the rows, polling every 2 s only while the tab and the app are visible and a
+row is unfinished, a sync pass (`requestSyncPass`) when a poll sees rows
+turn done (never twice for one row), the remembered choice in `<profile>/downloader.json`, and the link
+parser.
+
 ## How to add a platform
 
 1. Create `lib/platform/<os>/` with a class for each port and an
