@@ -1214,6 +1214,8 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
       'path': path,
       'value': value,
       'sessions': sessions,
+      // How Open will hand the working copy out (decision #184).
+      if (action == 'open') 'providerTracked': launcher.handsOutThroughProvider,
     });
   }
 

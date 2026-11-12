@@ -18,7 +18,9 @@ import 'top_folders.dart';
 ///
 /// - **open**: a Local file is a descriptor on the root file; a Cloud-only
 ///   file is downloaded into a private editor working copy (as the Open
-///   action does, #16) and that copy's descriptor is returned. Every
+///   action does, #16) and that copy's descriptor is returned; it is an
+///   edit only once changed, and an unchanged one is reclaimed by a later
+///   pass when no app holds it (decision #183). Every
 ///   descriptor is entered in [OpenDocuments] until the app closes it, and a
 ///   written one marks the file for the next pass (conditional upload).
 /// - **create**: an exclusive mkdir or file create (never replacing a
@@ -148,8 +150,10 @@ class DocumentsOps {
     // Cloud-only: the Open action's private editor working copy. One
     // unchanged copy of the current version is reused, so an app that
     // reopens a file does not download it again.
-    final reuse = _reusableWorkingCopy(path, entry);
-    if (reuse != null) return _openWorking(reuse, write, token);
+    final reuse = engine.reusableWorkingCopy(path);
+    if (reuse != null) {
+      return _openWorking(p.basename(reuse.staged!), write, token);
+    }
     if (_paused) {
       throw const DocumentsFailure(
         'paused',
@@ -158,31 +162,11 @@ class DocumentsOps {
     }
     final String staged;
     try {
-      staged = await engine.openFile(path);
+      staged = await engine.openFile(path, providerTracked: true);
     } on CloudFailure catch (error) {
       throw DocumentsFailure('unavailable', error.message);
     }
     return _openWorking(p.basename(staged), write, token);
-  }
-
-  String? _reusableWorkingCopy(String path, Entry entry) {
-    for (final op in engine.manifest.operationsAt(path)) {
-      if (op.kind != 'working' ||
-          op.staged == null ||
-          op.expectedEtag != entry.etag) {
-        continue;
-      }
-      final file = engine.artifacts.resolve(op.staged!);
-      final record = engine.artifacts.record(file);
-      final name = p.basename(op.staged!);
-      try {
-        final now = engine.artifacts.native.info(tree.stageFd, name);
-        if (record?.data['stamp'] == now.stamp) return name;
-      } on FileSystemException {
-        continue;
-      }
-    }
-    return null;
   }
 
   Map<String, Object?> _openWorking(String name, bool write, String token) {
@@ -207,7 +191,9 @@ class DocumentsOps {
       );
     }
     tree.native.checkRoot(tree.stageFd, tree.staging.path);
-    return _hand(tree.stageFd, name, path, write, token, working: name);
+    final handed = _hand(tree.stageFd, name, path, write, token, working: name);
+    engine.workingCopyOpened(owner.first, providerTracked: true);
+    return handed;
   }
 
   /// A read-only descriptor of [relative] beneath [directory], recorded in
@@ -238,11 +224,15 @@ class DocumentsOps {
 
   /// The app closed descriptor [token]: a written file is reconciled by the
   /// next pass (Local: uploaded through the conditional path; a working
-  /// copy: kept for Finish editing, #108 Q10).
+  /// copy: kept for Finish editing once changed, #108 Q10 as narrowed by
+  /// decision #183). A working copy is always revisited, so an unchanged one
+  /// no app holds open any more is reclaimed by that pass.
   void closed(String token) {
     final document = registry.remove(token);
     if (document == null) return;
-    if (document.write) engine.markDirty(document.path);
+    if (document.write || document.working != null) {
+      engine.markDirty(document.path);
+    }
   }
 
   // ---- names ---------------------------------------------------------------

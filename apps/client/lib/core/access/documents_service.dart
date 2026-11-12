@@ -128,6 +128,7 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
   Map<String, List<String>> _children = {};
   Map<String, String> _signature = {};
   Map<String, String> _working = {}; // staged basename -> entry path
+  Set<String> _edited = {}; // staged basenames holding an edit (#183)
   bool _ready = false;
 
   bool get ready => _ready;
@@ -144,12 +145,16 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     final byPath = <String, Map<String, dynamic>>{};
     final children = <String, List<String>>{};
     final working = <String, String>{};
+    final edited = <String>{};
     final shown = <String, Map<String, dynamic>>{};
     for (final entry in host.entries) {
       final path = entry['path'] as String;
       for (final copy in (entry['workingCopies'] as List? ?? const [])) {
         final staged = (copy as Map)['path'];
-        if (staged is String) working[p.basename(staged)] = path;
+        if (staged is String) {
+          working[p.basename(staged)] = path;
+          if (copy['edited'] != false) edited.add(p.basename(staged));
+        }
       }
       if (visible(entry)) shown[path] = entry;
     }
@@ -194,6 +199,7 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     _children = children;
     _signature = signature;
     _working = working;
+    _edited = edited;
     _ready = host.documentsReady;
     if (_ready) {
       final ended = [
@@ -874,7 +880,9 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     try {
       final target = resolve(id);
       if (target.working != null) {
-        return '${_working[target.working]} (being edited)';
+        // An unchanged copy is not being edited (decision #183).
+        final path = _working[target.working]!;
+        return _edited.contains(target.working) ? '$path (being edited)' : path;
       }
       return target.path!.isEmpty ? 'All of AnJ Cloud' : target.path!;
     } on DocumentsFailure {

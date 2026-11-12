@@ -92,9 +92,23 @@ int compareRanked(
 
 bool hasConflict(Map<String, dynamic> entry) => entry['conflict'] != null;
 
+/// Working copies that hold an edit. Opening is not editing (decision
+/// #183): an unchanged copy reads as the downloaded file it is and needs no
+/// Finish editing; a later pass reclaims it.
+List<Map> editedCopies(Map<String, dynamic> entry) => [
+  for (final copy in (entry['workingCopies'] as List? ?? const []).cast<Map>())
+    if (copy['edited'] != false) copy,
+];
+
+/// Unchanged working copies: opened, never written. Details offers Remove
+/// opened copy for them (decision #184).
+List<Map> openedCopies(Map<String, dynamic> entry) => [
+  for (final copy in (entry['workingCopies'] as List? ?? const []).cast<Map>())
+    if (copy['edited'] == false) copy,
+];
+
 bool hasEditing(Map<String, dynamic> entry) =>
-    (entry['workingCopies'] as List? ?? []).isNotEmpty ||
-    entry['finishPending'] == true;
+    editedCopies(entry).isNotEmpty || entry['finishPending'] == true;
 
 const terminalDeletionStatuses = {
   'deleted',

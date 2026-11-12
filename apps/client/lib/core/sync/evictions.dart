@@ -10,6 +10,11 @@ import '../state/model.dart';
 import 'recovery_copies.dart';
 import '../local/root_tree.dart';
 
+/// The status of a row whose only working copies are unchanged opened
+/// copies (decision #184): kept, not released automatically from here.
+const openedCopyKept =
+    'An opened copy is kept on this device. Close the app using it, then remove it in Details to free space.';
+
 /// No network awaits occur after the first lease is acquired. Test barriers are
 /// synchronous and absent in the application; they exercise exact crash/order
 /// boundaries without adding operator authority to the product.
@@ -199,11 +204,15 @@ class Evictions {
         return;
       }
     }
-    if (manifest.operations.values.any(
-      (o) => o.path == entry.path && o.kind == 'working',
-    )) {
-      entry.status =
-          'Cloud pending: editor working copies stay pinned in this prototype.';
+    final working = manifest.operations.values
+        .where((o) => o.path == entry.path && o.kind == 'working')
+        .toList();
+    if (working.isNotEmpty) {
+      // Decision #183: only an edited copy pins the row as an edit; an
+      // unchanged one is explained and kept until it is released (#184).
+      entry.status = working.any(artifacts.workingEdited)
+          ? 'Cloud pending: editor working copies stay pinned in this prototype.'
+          : openedCopyKept;
       return;
     }
     if (manifest.operations.values.any(

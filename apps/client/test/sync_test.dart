@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
+import 'package:anj_cloud/core/sync/evictions.dart' show openedCopyKept;
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 
@@ -154,7 +155,7 @@ void main() {
     expect(Directory('${outside.path}/empty').existsSync(), isTrue);
     expect(local('Documents/Nonempty/unknown.txt').readAsStringSync(), 'keep');
   });
-  test('opening a cloud-only file keeps a pinned working copy and a truthful Cloud pending status', () async {
+  test('opening a cloud-only file is not editing; a changed working copy is pinned with a truthful Cloud pending status', () async {
     // Documents itself never takes the legacy Cloud choice (spec #34 P7).
     store.setSetting('retention', 'cloud');
     cloud.put('Library/open.txt', 'remote bytes');
@@ -163,12 +164,17 @@ void main() {
     expect(File(path).readAsStringSync(), 'remote bytes');
     expect(local('Library/open.txt').existsSync(), isFalse);
     await engine.tick();
+    // Decisions #183/#184: an unchanged copy is not an edit; the Cloud row
+    // explains the opened copy it keeps.
+    expect(store.entries['Library/open.txt']!.status, openedCopyKept);
+    File(path).writeAsStringSync('edited bytes', flush: true);
+    await engine.tick();
     expect(
       store.entries['Library/open.txt']!.status,
       contains('Cloud pending'),
     );
     expect(store.entries['Library/open.txt']!.status, contains('pinned'));
-    expect(File(path).readAsStringSync(), 'remote bytes');
+    expect(File(path).readAsStringSync(), 'edited bytes');
   });
   test('delete/edit conflict retains changed remote bytes', () async {
     await baseline();

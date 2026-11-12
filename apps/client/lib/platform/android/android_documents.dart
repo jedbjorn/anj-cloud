@@ -192,6 +192,10 @@ class AndroidDocuments implements GrantRevoker, PlatformApps {
 /// folder opens the Files app at that folder. Either reports false when no
 /// app accepts it, and the shared UI says so.
 class AndroidLauncher extends DesktopLauncher {
+  /// Only the `w:` provider document is handed out (decision #184).
+  @override
+  bool get handsOutThroughProvider => true;
+
   @override
   Future<bool> openFile(String path) async {
     final name = path.split('/').last;

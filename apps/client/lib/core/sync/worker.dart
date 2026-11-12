@@ -1118,6 +1118,14 @@ class WorkerLoop {
           // Completion runs in the next pass, which starts immediately.
           engine.markDirty(command['path'] as String);
           _passWanted = true;
+        case 'removeOpenedCopy':
+          // Details' Remove opened copy (decision #184): each unchanged copy.
+          for (final copy in (command['sessions'] as List? ?? const [])) {
+            engine.removeOpenedCopy(
+              command['path'] as String,
+              (copy as Map)['id'] as String,
+            );
+          }
         case 'keepBoth':
           await engine.keepBoth(command['path'] as String);
         case 'openDirectory':
@@ -1130,7 +1138,10 @@ class WorkerLoop {
             'rootIdentity': tree.native.identity(tree.fd),
           });
         case 'open':
-          final path = await engine.openFile(command['path'] as String);
+          final path = await engine.openFile(
+            command['path'] as String,
+            providerTracked: command['providerTracked'] == true,
+          );
           send({'event': 'open', 'path': path});
         case 'documents':
           await _documents(command);

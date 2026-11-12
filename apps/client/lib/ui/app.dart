@@ -35,8 +35,11 @@ import '../core/sync/sync_schedule.dart';
 import '../core/sync/top_folders.dart';
 
 String workingCopyDetails(Map<String, dynamic> entry) {
-  final copies = (entry['workingCopies'] as List? ?? []).cast<Map>();
-  if (copies.isEmpty) return entry['workingCopy'] as String? ?? 'none';
+  if ((entry['workingCopies'] as List? ?? []).isEmpty) {
+    return entry['workingCopy'] as String? ?? 'none';
+  }
+  final copies = editedCopies(entry);
+  if (copies.isEmpty) return 'none';
   return copies
       .map(
         (copy) =>
@@ -592,8 +595,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     BuildContext context,
     Map<String, dynamic> entry,
   ) async {
-    final copies = (entry['workingCopies'] as List? ?? []).cast<Map>();
-    final sessions = copies
+    final sessions = editedCopies(entry)
         .where((c) => c['id'] is String)
         .map((c) => Map<String, dynamic>.from(c))
         .toList();
@@ -621,6 +623,47 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     if (confirmed == true) {
       controller.command(
         'finishEditing',
+        entry['path'] as String,
+        sessions: sessions,
+      );
+    }
+  }
+
+  /// Remove opened copy (decision #184), after the user confirms every app
+  /// using it is closed: an editor that read and closed the copy and saves
+  /// later would write a file nothing syncs.
+  Future<void> removeOpenedCopy(
+    BuildContext context,
+    Map<String, dynamic> entry,
+  ) async {
+    final sessions = [
+      for (final copy in openedCopies(entry)) {'id': copy['id']},
+    ];
+    if (sessions.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Remove opened copy of ${entry['path']}'),
+        scrollable: compactLayout(context),
+        content: const Text(
+          'Close every app using this copy first. Changes saved to it after removal will not sync. The file stays in the cloud.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            key: const ValueKey('removeOpenedConfirm'),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Apps closed — remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      controller.command(
+        'removeOpenedCopy',
         entry['path'] as String,
         sessions: sessions,
       );
@@ -1252,11 +1295,8 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                           final directory = row.directory;
                           final collapsed =
                               !filtering && _collapsed[_active]!.contains(path);
-                          final copies = (entry['workingCopies'] as List? ?? [])
-                              .cast<Map>();
-                          final confirmable = copies.any(
-                            (copy) => copy['id'] is String,
-                          );
+                          final confirmable = editedCopies(entry)
+                              .any((copy) => copy['id'] is String);
                           return LibraryEntryCard(
                             touchInput: widget.touchInput,
                             key: ValueKey('row:$path'),
@@ -1371,6 +1411,25 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                                 'Status: ${entry['status']}\n${entry['conflict'] ?? ''}\nPreserved local copies:\n${(entry['preservedCopies'] as List? ?? []).join('\n')}\nEditor working copies (retained until Finish editing):\n${workingCopyDetails(entry)}\n${artifactSummary(entry) ?? 'Local staging files: ${(entry['localArtifacts'] as Map?) == null ? 'unknown' : 'none'}'}\nLocal temporary/recovery locations:\n${localRecoveryDetails(entry)}\nRemote conflict copy: ${entry['remoteCopy'] ?? 'none'}',
                                               ),
                                               actions: [
+                                                if (openedCopies(entry)
+                                                    .isNotEmpty)
+                                                  TextButton(
+                                                    key: ValueKey(
+                                                      'removeOpened:$path',
+                                                    ),
+                                                    onPressed: () {
+                                                      Navigator.pop(context);
+                                                      unawaited(
+                                                        removeOpenedCopy(
+                                                          this.context,
+                                                          entry,
+                                                        ),
+                                                      );
+                                                    },
+                                                    child: const Text(
+                                                      'Remove opened copy',
+                                                    ),
+                                                  ),
                                                 TextButton(
                                                   onPressed: () =>
                                                       Navigator.pop(context),

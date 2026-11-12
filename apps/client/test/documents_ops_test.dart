@@ -7,15 +7,30 @@ import 'dart:io';
 
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/ports/documents_filesystem.dart';
+import 'package:anj_cloud/core/ports/release_guard.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/documents_ops.dart';
+import 'package:anj_cloud/core/sync/evictions.dart' show openedCopyKept;
+import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/open_documents.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
+import 'package:anj_cloud/ui/library_view.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
+
+/// The Android binding: the release guard behind the provider's registry.
+class _ProviderFs extends NativeRootFs {
+  _ProviderFs(this.registry);
+  final OpenDocuments registry;
+  @override
+  ReleaseGuard releaseGuard() =>
+      RegisteredReleaseGuard(super.releaseGuard(), registry);
+}
+
+class _Crash implements Exception {}
 
 void main() {
   late Directory fixture;
@@ -368,4 +383,320 @@ void main() {
       );
     },
   );
+  // Decision #183 (narrows #108 Q10): opening is not editing.
+  Future<Map<String, dynamic>> row(String path) async =>
+      Map<String, dynamic>.from(
+        await projectEntry(engine, store.entries[path]!),
+      );
+  Iterable<Operation> sessions() =>
+      store.operations.values.where((o) => o.kind == 'working');
+  Iterable<String> stagedWorking() => tree.staging
+      .listSync()
+      .map((f) => f.uri.pathSegments.last)
+      .where((name) => name.startsWith('working-'));
+
+  test('an opened, unchanged copy is not Editing and the next pass reclaims '
+      'it once closed', () async {
+    await cloudOnly('Far', 'song.txt', 'tune');
+    engine.workingCopyGrace = Duration.zero;
+    final opened = await ops.open(
+      path: 'Far/song.txt',
+      write: false,
+      token: 't1',
+    );
+    expect(read(opened['fd'] as int), 'tune');
+    tree.native.closeFd(opened['fd'] as int);
+    var projected = await row('Far/song.txt');
+    expect((projected['workingCopies'] as List).single['edited'], isFalse);
+    expect(editedCopies(projected), isEmpty, reason: 'no Finish editing');
+    expect(hasEditing(projected), isFalse);
+    expect(fileBadge(projected), 'Cloud');
+    expect(librarySummary(projected), isNot(contains('editing')));
+    // Nothing for an update to wait on (the worker's `finishing`).
+    expect(engine.editing.requests, isEmpty);
+    ops.closed('t1');
+    await engine.tick();
+    expect(sessions(), isEmpty);
+    expect(stagedWorking(), isEmpty);
+    expect(
+      store.operations.values.where((o) => o.data['role'] == 'working'),
+      isEmpty,
+    );
+    expect(store.entries['Far/song.txt']!.status, 'cloud-only');
+    expect(store.entries['Far/song.txt']!.workingCopy, isNull);
+    expect(String.fromCharCodes(cloud.files['Far/song.txt']!), 'tune');
+    projected = await row('Far/song.txt');
+    expect(fileBadge(projected), 'Cloud');
+    expect(engine.editing.requests, isEmpty);
+  });
+
+  test('an opened copy that was written is Editing with Finish editing, as '
+      'before', () async {
+    await cloudOnly('Far', 'doc.txt', 'draft');
+    engine.workingCopyGrace = Duration.zero;
+    final opened = await ops.open(
+      path: 'Far/doc.txt',
+      write: true,
+      token: 't1',
+    );
+    final fd = opened['fd'] as int;
+    final app = File('/proc/self/fd/$fd').openSync(mode: FileMode.append);
+    tree.native.closeFd(fd);
+    app.writeStringSync(' edited');
+    app.closeSync();
+    ops.closed('t1');
+    await engine.tick();
+    await engine.tick();
+    expect(String.fromCharCodes(cloud.files['Far/doc.txt']!), 'draft edited');
+    expect(sessions(), hasLength(1), reason: 'kept for Finish editing');
+    expect(sessions().single.data['edited'], isTrue);
+    final projected = await row('Far/doc.txt');
+    expect(editedCopies(projected), hasLength(1));
+    expect(fileBadge(projected), 'Editing');
+    engine.editing.request(
+      'Far/doc.txt',
+      engine.workingCopies('Far/doc.txt').cast(),
+    );
+    await engine.tick();
+    await engine.tick();
+    expect(sessions(), isEmpty);
+    expect(stagedWorking(), isEmpty);
+    expect(String.fromCharCodes(cloud.files['Far/doc.txt']!), 'draft edited');
+  });
+
+  test('an unchanged copy an app still holds open is not reclaimed', () async {
+    await cloudOnly('Far', 'film.txt', 'frames');
+    engine.workingCopyGrace = Duration.zero;
+    final opened = await ops.open(
+      path: 'Far/film.txt',
+      write: false,
+      token: 't1',
+    );
+    final fd = opened['fd'] as int;
+    // The app's own descriptor (the runner reopens it this way).
+    final app = File('/proc/self/fd/$fd').openSync();
+    tree.native.closeFd(fd);
+    await engine.tick();
+    await engine.tick();
+    expect(sessions(), hasLength(1), reason: 'still open');
+    expect(stagedWorking(), hasLength(1));
+    expect(fileBadge(await row('Far/film.txt')), 'Cloud');
+    expect(app.readSync(6), 'frames'.codeUnits);
+    app.closeSync();
+    ops.closed('t1');
+    await engine.tick();
+    expect(sessions(), isEmpty);
+    expect(stagedWorking(), isEmpty);
+  });
+
+  test('a reopen reuses the unchanged copy while it exists; a just-opened '
+      'copy is kept for its app', () async {
+    await cloudOnly('Far', 'track.txt', 'notes');
+    var now = DateTime.utc(2026, 11, 12);
+    engine.wallClock = () => now;
+    final first = await ops.open(
+      path: 'Far/track.txt',
+      write: false,
+      token: 't1',
+    );
+    tree.native.closeFd(first['fd'] as int);
+    ops.closed('t1');
+    await engine.tick();
+    expect(sessions(), hasLength(1), reason: 'within the grace');
+    final downloads = cloud.completedDownloads;
+    final second = await ops.open(
+      path: 'Far/track.txt',
+      write: false,
+      token: 't2',
+    );
+    expect(read(second['fd'] as int), 'notes');
+    tree.native.closeFd(second['fd'] as int);
+    ops.closed('t2');
+    expect(cloud.completedDownloads, downloads, reason: 'reused');
+    expect(sessions(), hasLength(1));
+    now = now.add(engine.workingCopyGrace);
+    await engine.tick();
+    expect(sessions(), isEmpty);
+    expect(stagedWorking(), isEmpty);
+  });
+  test('a copy handed out as a plain path (desktop Open) is never cleared '
+      'automatically; once written it is Editing (decision #184)', () async {
+    await cloudOnly('Far', 'notes.txt', 'plain');
+    var now = DateTime.utc(2026, 11, 12);
+    engine.wallClock = () => now;
+    // What the worker's Open does where the launcher hands out the path.
+    final staged = File(await engine.openFile('Far/notes.txt'));
+    expect(sessions().single.data['handout'], 'untracked');
+    now = now.add(engine.workingCopyGrace * 2);
+    await engine.tick();
+    await engine.tick();
+    expect(sessions(), hasLength(1), reason: 'never reclaimed');
+    expect(staged.readAsStringSync(), 'plain');
+    var projected = await row('Far/notes.txt');
+    expect(hasEditing(projected), isFalse);
+    expect(editedCopies(projected), isEmpty);
+    expect(fileBadge(projected), 'Cloud');
+    expect(store.entries['Far/notes.txt']!.status, openedCopyKept);
+    // The editor saves later, after closing the file long ago.
+    staged.writeAsStringSync('plain, edited', flush: true);
+    await engine.tick();
+    expect(
+      String.fromCharCodes(cloud.files['Far/notes.txt']!),
+      'plain, edited',
+    );
+    projected = await row('Far/notes.txt');
+    expect(editedCopies(projected), hasLength(1), reason: 'Finish editing');
+    expect(fileBadge(projected), 'Editing');
+    await engine.tick();
+    expect(sessions(), hasLength(1));
+  });
+
+  /// The engine again over the same root and profile, as after a restart.
+  void restart([NativeRootFs? fs]) {
+    final root = tree.root.path;
+    final staging = tree.staging.path;
+    engine.close();
+    tree = RootTree(Directory(root), Directory(staging), fs ?? NativeRootFs());
+    store = Manifest(Directory('${fixture.path}/profile'));
+    engine = SyncEngine(store, tree, cloud);
+    ops = DocumentsOps(engine, registry: registry, paused: () => paused);
+  }
+
+  test('repeated desktop Open of an unchanged file hands out one copy per '
+      'version (decision #184)', () async {
+    await cloudOnly('Far', 'same.txt', 'v1');
+    final first = await engine.openFile('Far/same.txt');
+    final downloads = cloud.completedDownloads;
+    expect(await engine.openFile('Far/same.txt'), first);
+    expect(cloud.completedDownloads, downloads, reason: 'no new download');
+    expect(sessions(), hasLength(1));
+    // A Local file: the same bytes reuse the copy; new bytes get a new one.
+    tree.ensureDirectory('Near');
+    local('Near/doc.txt').writeAsStringSync('one');
+    await engine.tick();
+    final near = await engine.openFile('Near/doc.txt');
+    expect(await engine.openFile('Near/doc.txt'), near);
+    expect(stagedWorking(), hasLength(2));
+    local('Near/doc.txt').writeAsStringSync('two');
+    await engine.tick();
+    final next = await engine.openFile('Near/doc.txt');
+    expect(next, isNot(near));
+    expect(File(next).readAsStringSync(), 'two');
+    expect(sessions().where((o) => o.path == 'Near/doc.txt'), hasLength(2));
+  });
+
+  test('Remove opened copy clears an unchanged copy, is refused while open, '
+      'and leaves a changed one as Editing', () async {
+    await cloudOnly('Far', 'keep.txt', 'bytes');
+    final staged = File(await engine.openFile('Far/keep.txt'));
+    await engine.tick();
+    expect(store.entries['Far/keep.txt']!.status, openedCopyKept);
+    final id = sessions().single.id;
+    final app = staged.openSync();
+    engine.removeOpenedCopy('Far/keep.txt', id);
+    expect(engine.message, SyncEngine.openedCopyBusy);
+    expect(sessions(), hasLength(1));
+    expect(staged.existsSync(), isTrue);
+    app.closeSync();
+    engine.removeOpenedCopy('Far/keep.txt', id);
+    expect(engine.message, 'Opened copy removed.');
+    expect(sessions(), isEmpty);
+    expect(staged.existsSync(), isFalse);
+    expect(store.entries['Far/keep.txt']!.status, 'cloud-only');
+    // A changed copy is an edit: kept, Editing, Finish editing.
+    final edited = File(await engine.openFile('Far/keep.txt'))
+      ..writeAsStringSync('bytes, changed', flush: true);
+    engine.removeOpenedCopy('Far/keep.txt', sessions().single.id);
+    expect(engine.message, 'This copy has changes. Use Finish editing.');
+    expect(edited.readAsStringSync(), 'bytes, changed');
+    final projected = await row('Far/keep.txt');
+    expect(editedCopies(projected), hasLength(1));
+    expect(openedCopies(projected), isEmpty);
+    expect(fileBadge(projected), 'Editing');
+  });
+
+  test(
+    'a session from before hand-outs were recorded is kept on desktop',
+    () async {
+      await cloudOnly('Far', 'old.txt', 'legacy');
+      engine.workingCopyGrace = Duration.zero;
+      final opened = await ops.open(
+        path: 'Far/old.txt',
+        write: false,
+        token: 't',
+      );
+      tree.native.closeFd(opened['fd'] as int);
+      ops.closed('t');
+      sessions().single.data
+        ..remove('handout')
+        ..remove('handedAt');
+      store.save();
+      await engine.tick();
+      await engine.tick();
+      expect(sessions(), hasLength(1), reason: 'no registry-backed guard');
+    },
+  );
+
+  test('on Android a session from before hand-outs were recorded is '
+      'provider-tracked and gets the full grace from its first pass', () async {
+    await cloudOnly('Far', 'song.txt', 'legacy song');
+    final opened = await ops.open(
+      path: 'Far/song.txt',
+      write: false,
+      token: 't',
+    );
+    tree.native.closeFd(opened['fd'] as int);
+    ops.closed('t');
+    sessions().single.data
+      ..remove('handout')
+      ..remove('handedAt');
+    store.save();
+    restart(_ProviderFs(registry));
+    var now = DateTime.utc(2026, 11, 12);
+    engine.wallClock = () => now;
+    await engine.tick();
+    expect(sessions(), hasLength(1), reason: 'grace starts at first sight');
+    expect(sessions().single.data['handedAt'], now.millisecondsSinceEpoch);
+    now = now.add(const Duration(hours: 11));
+    await engine.tick();
+    expect(sessions(), hasLength(1));
+    now = now.add(const Duration(hours: 1));
+    await engine.tick();
+    expect(sessions(), isEmpty);
+    expect(stagedWorking(), isEmpty);
+  });
+
+  test('a reclaim interrupted after the unlink finishes on restart', () async {
+    await cloudOnly('Far', 'cut.txt', 'interrupted');
+    engine.workingCopyGrace = Duration.zero;
+    final opened = await ops.open(
+      path: 'Far/cut.txt',
+      write: false,
+      token: 't',
+    );
+    tree.native.closeFd(opened['fd'] as int);
+    ops.closed('t');
+    engine.releases.barrier = (point, record, fd) {
+      if (point == 'after-unlink-before-db' &&
+          record.data['role'] == 'working') {
+        throw _Crash();
+      }
+    };
+    try {
+      await engine.tick();
+    } on _Crash {
+      // The process dies here.
+    }
+    restart();
+    expect(stagedWorking(), isEmpty, reason: 'bytes already unlinked');
+    expect(sessions().single.data['reclaiming'], isTrue);
+    await engine.tick();
+    expect(sessions(), isEmpty);
+    expect(
+      store.operations.values.where((o) => o.data['role'] == 'working'),
+      isEmpty,
+    );
+    expect(store.entries['Far/cut.txt']!.status, 'cloud-only');
+    expect(String.fromCharCodes(cloud.files['Far/cut.txt']!), 'interrupted');
+  });
 }
