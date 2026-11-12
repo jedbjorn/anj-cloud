@@ -4,7 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
 import '../design/badge_palette.dart';
+import 'add_files_flow.dart';
 import 'admin_section.dart';
+import '../core/app/add_files.dart';
 import '../core/app/controller.dart';
 import '../core/app/fetch_jobs.dart';
 import '../core/sync/bulk_targets.dart';
@@ -83,6 +85,7 @@ class CloudApp extends StatelessWidget {
     this.mobile,
     this.androidUpdater,
     this.appAccess,
+    this.addFiles,
   });
   final ClientController controller;
   final DesktopLifecycle? lifecycle;
@@ -113,6 +116,9 @@ class CloudApp extends StatelessWidget {
 
   /// "Apps with access" (spec #28 A5, decision #127); Android only.
   final AppAccess? appAccess;
+
+  /// Add files, Add folder and the Share sheet (spec #43); Android only.
+  final AddFiles? addFiles;
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'AnJ Cloud',
@@ -122,20 +128,30 @@ class CloudApp extends StatelessWidget {
       useMaterial3: true,
       extensions: const [BadgePalette.light],
     ),
-    home: ClientHome(
-      controller: controller,
-      lifecycle: lifecycle,
-      notices: notices,
-      autostart: autostart,
-      updater: updater,
-      rootPicker: rootPicker,
-      touchInput: touchInput,
-      autostartLabel: autostartLabel,
-      mobile: mobile,
-      androidUpdater: androidUpdater,
-      appAccess: appAccess,
+    home: _withShares(
+      ClientHome(
+        controller: controller,
+        lifecycle: lifecycle,
+        notices: notices,
+        autostart: autostart,
+        updater: updater,
+        rootPicker: rootPicker,
+        touchInput: touchInput,
+        autostartLabel: autostartLabel,
+        mobile: mobile,
+        androidUpdater: androidUpdater,
+        appAccess: appAccess,
+        addFiles: addFiles,
+      ),
     ),
   );
+
+  Widget _withShares(Widget home) {
+    final adds = addFiles;
+    return adds == null
+        ? home
+        : ShareReceiver(adds: adds, controller: controller, child: home);
+  }
 }
 
 class ClientHome extends StatefulWidget {
@@ -152,6 +168,7 @@ class ClientHome extends StatefulWidget {
     this.mobile,
     this.androidUpdater,
     this.appAccess,
+    this.addFiles,
   });
   final ClientController controller;
   final DesktopLifecycle? lifecycle;
@@ -171,6 +188,7 @@ class ClientHome extends StatefulWidget {
   /// Android's in-app updater (spec #28 A7); null on desktop.
   final AppUpdater? androidUpdater;
   final AppAccess? appAccess;
+  final AddFiles? addFiles;
   @override
   State<ClientHome> createState() => _ClientHomeState();
 }
@@ -1396,6 +1414,16 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                               call: controller.sharing,
                                             ),
                                           );
+                                        case 'addFiles':
+                                        case 'addFolder':
+                                          unawaited(
+                                            addFromPicker(
+                                              context,
+                                              widget.addFiles!,
+                                              path,
+                                              folder: action == 'addFolder',
+                                            ),
+                                          );
                                         case 'recover':
                                           unawaited(_recover(entry));
                                         case 'dismiss':
@@ -1498,6 +1526,17 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                             entry['status'] as String?,
                                           ))
                                         ..._fileStorageMenuItems(path, entry),
+                                      // Spec #43: copy from the phone.
+                                      if (widget.addFiles != null &&
+                                          addOffered(entry))
+                                        ...addMenuItems(
+                                          path,
+                                          addDestinationProblem(
+                                            entry,
+                                            ready: controller.canCreateFolder,
+                                            paused: controller.paused,
+                                          ),
+                                        ),
                                       if (manageSharingItem(
                                         entry,
                                         null,
