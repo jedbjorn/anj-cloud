@@ -567,6 +567,10 @@ class Registry:
         return {"added": {str(row["fileid"]): row["added_at"] for row in rows},
                 "cursor": rows[-1]["seq"] if rows else after, "more": more, "reset": False}
 
+    def fence_state(self):
+        """clear, dispatched (a write's outcome pending) or maintenance."""
+        return self.db.execute("SELECT state FROM mutation_fence WHERE singleton=1").fetchone()[0]
+
     def mutation_ready(self):
         return self.db.execute("SELECT state FROM mutation_fence WHERE singleton=1").fetchone()[0] == "clear"
 

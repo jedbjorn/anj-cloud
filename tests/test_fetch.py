@@ -40,61 +40,100 @@ class Clock:
 
 
 class FakeNextcloud:
-    """Files per account: {uid: {relative path: bytes or None for a folder}}."""
+    """Files per account: {uid: {path below anj-cloud/: bytes, or None for a folder}}, temporary
+    uploads at the user root per account ({uid: {name: bytes}}), PUT, MKCOL, MOVE, DELETE and a
+    maintenance switch (503 to everything)."""
 
     def __init__(self):
         self.files = {}
+        self.temps = {}
         self.next_id = 700
-        self.drop_put = False
-        self.puts = []
+        self.drop_move = False
+        self.puts = []          # (uid, temporary name) of every completed upload
+        self.moves = []         # (uid, target)
+        self.busy = 0           # answer this many requests with 503 (maintenance mode)
+        self.busy_methods = None
+        self.hold_put = None    # an asyncio.Event a PUT waits for (upload in progress)
+        self.put_started = asyncio.Event()
 
     def tree(self, uid):
         return self.files.setdefault(uid, {"": None})
 
+    def temp(self, uid):
+        return self.temps.setdefault(uid, {})
+
+    def multistatus(self, uid, entries, prefix):
+        body = '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+        for path, value in entries:
+            folder = value is None
+            href = "/remote.php/dav/files/%s/%s%s" % (uid, prefix + "/".join(p.replace(" ", "%20") for p in path.split("/")) if path else prefix,
+                                                     "/" if folder and path else "")
+            body += ("<d:response><d:href>%s</d:href><d:propstat><d:prop><d:resourcetype>%s</d:resourcetype>"
+                     "<d:getcontentlength>%s</d:getcontentlength><oc:fileid>%d</oc:fileid></d:prop></d:propstat></d:response>"
+                     % (href, "<d:collection/>" if folder else "", "" if folder else len(value), 1 + hash(path) % 999))
+        return web.Response(status=207, body=(body + "</d:multistatus>").encode())
+
+    def split(self, path):
+        uid, _, rest = path.split("/remote.php/dav/files/", 1)[1].partition("/")
+        rest = unquote(rest)
+        if rest.startswith("anj-cloud"):
+            return uid, "root", rest[len("anj-cloud/"):].strip("/") if rest.startswith("anj-cloud/") else ""
+        return uid, "user", rest.strip("/")
+
     async def handle(self, request):
-        parts = request.path.split("/remote.php/dav/files/", 1)[1].split("/", 1)
-        uid, rest = parts[0], unquote(parts[1])
-        assert rest.startswith("anj-cloud")
-        relative = rest[len("anj-cloud/"):].strip("/") if rest.startswith("anj-cloud/") else ""
-        tree = self.tree(uid)
+        if self.busy and (self.busy_methods is None or request.method in self.busy_methods):
+            self.busy -= 1
+            await request.read()
+            return web.Response(status=503)
+        uid, area, relative = self.split(request.path)
+        tree, temps = self.tree(uid), self.temp(uid)
         if request.method == "PROPFIND":
             await request.read()
+            if area == "user":
+                if relative == "":
+                    return self.multistatus(uid, [("", None)] + [(name, data) for name, data in temps.items()], "")
+                return self.multistatus(uid, [(relative, temps[relative])], "") if relative in temps else web.Response(status=404)
             if relative not in tree:
                 return web.Response(status=404)
-            entries = [relative]
+            entries = [(relative, tree[relative])]
             if request.headers.get("Depth") == "1" and tree[relative] is None:
                 prefix = relative + "/" if relative else ""
-                entries += [path for path in tree if path.startswith(prefix) and path != relative and "/" not in path[len(prefix):]]
-            body = '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
-            for path in entries:
-                folder = tree[path] is None
-                href = "/remote.php/dav/files/%s/anj-cloud/%s%s" % (uid, "/".join(p.replace(" ", "%20") for p in path.split("/")) if path else "",
-                                                                    "/" if folder and path else "")
-                body += ("<d:response><d:href>%s</d:href><d:propstat><d:prop><d:resourcetype>%s</d:resourcetype>"
-                         "<d:getcontentlength>%s</d:getcontentlength><oc:fileid>%d</oc:fileid></d:prop></d:propstat></d:response>"
-                         % (href, "<d:collection/>" if folder else "", "" if folder else len(tree[path]), 1 + hash(path) % 999))
-            return web.Response(status=207, body=(body + "</d:multistatus>").encode())
+                entries += [(path, tree[path]) for path in tree
+                            if path.startswith(prefix) and path != relative and "/" not in path[len(prefix):]]
+            return self.multistatus(uid, entries, "anj-cloud/")
         if request.method == "MKCOL":
+            assert area == "root"
             if relative in tree:
                 return web.Response(status=405)
             tree[relative] = None
             return web.Response(status=201)
         if request.method == "PUT":
-            data = await request.read()
-            assert request.headers.get("If-None-Match") == "*"
-            parent = relative.rpartition("/")[0]
+            assert area == "user" and "If-None-Match" not in request.headers  # only temporary uploads
+            self.put_started.set()
+            if self.hold_put is not None:
+                await self.hold_put.wait()
+            temps[relative] = await request.read()
+            self.puts.append((uid, relative))
+            return web.Response(status=201)
+        if request.method == "MOVE":
+            assert area == "user" and request.headers.get("Overwrite") == "F"
+            _, _, target = self.split(request.headers["Destination"])
+            if relative not in temps:
+                return web.Response(status=404)
+            parent = target.rpartition("/")[0]
             if parent not in tree or tree[parent] is not None:
                 return web.Response(status=409)
-            if relative in tree:
+            if target in tree:
                 return web.Response(status=412)
-            tree[relative] = data
-            self.puts.append((uid, relative))
-            self.next_id += 1
-            if self.drop_put:
-                self.drop_put = False
+            tree[target] = temps.pop(relative)
+            self.moves.append((uid, target))
+            if self.drop_move:
+                self.drop_move = False
                 request.transport.abort()
-                return web.Response(status=500)
-            return web.Response(status=201, headers={"OC-FileId": "%08docinstance1" % self.next_id})
+            return web.Response(status=201)
+        if request.method == "DELETE":
+            assert area == "user"
+            return web.Response(status=204 if temps.pop(relative, None) is not None else 404)
         return web.Response(status=405)
 
 
@@ -143,6 +182,11 @@ class FetchTestCase(unittest.IsolatedAsyncioTestCase):
         self.fetch = Fetch(self.gateway, self.directory / "spool", disk=lambda path: SimpleNamespace(total=100, free=self.free[0] * 100),
                            tick=0.01)
         self.fetch.wakeup = asyncio.Event()
+
+        async def sleep(seconds):  # waits in the import advance the fake clock
+            self.clock.advance(seconds)
+            await asyncio.sleep(0)
+        self.fetch.sleep = sleep
         add_device(self.gateway.registry, "alice-1", "alice")
         add_device(self.gateway.registry, "alice-read", "alice", rights="read")
         add_device(self.gateway.registry, "bob-1", "bob")
@@ -169,10 +213,11 @@ class FetchTestCase(unittest.IsolatedAsyncioTestCase):
 
     # The worker's side of the spool.
 
-    def beat(self, job=None, boot=None):
+    def beat(self, job=None, boot=None, updating=False):
         self.seq += 1
         path = self.fetch.worker_dir / "heartbeat.json"
-        path.write_text(json.dumps({"v": 1, "boot": boot or self.boot, "seq": self.seq, "job": job, "version": "2026.10.26"}))
+        path.write_text(json.dumps({"v": 1, "boot": boot or self.boot, "seq": self.seq, "job": job, "version": "2026.10.26",
+                                    "updating": updating}))
         self.fetch.read_heartbeat()
 
     def status(self, dispatch, state, boot=None, **fields):
@@ -566,7 +611,9 @@ class ImportTests(FetchTestCase):
         self.gateway.registry.disable("alice-1")
         row = await self.run_to(identity, "failed")
         self.assertEqual("This device no longer has access.", row["message"])
-        self.assertEqual([], self.nextcloud.puts)
+        await asyncio.sleep(0.05)
+        self.assertEqual(([], {}), (self.nextcloud.moves, self.nextcloud.temp("alice")))  # nothing placed, temporary copy removed
+        self.assertNotIn("Music/Song.m4a", self.nextcloud.tree("alice"))
         self.beat()
         await self.tick()
         self.assertEqual([], os.listdir(self.fetch.jobs))
@@ -595,11 +642,11 @@ class ImportTests(FetchTestCase):
         self.assertTrue(secret.exists())
 
     async def test_unknown_outcome_is_read_back(self):
-        self.nextcloud.drop_put = True
+        self.nextcloud.drop_move = True
         [identity] = await self.submit(["https://media.example/a"])
         row = await self.finish_item(identity, title="Song")
         self.assertEqual("Music/Song.m4a", row["destination"])
-        self.assertEqual(1, len(self.nextcloud.puts))  # read back found it: no second upload, no " (2)"
+        self.assertEqual([("alice", "Music/Song.m4a")], self.nextcloud.moves)  # read back found it: no second move, no " (2)"
         self.assertTrue(self.gateway.registry.mutation_ready())
 
     async def test_placing_cannot_be_cancelled(self):
@@ -613,6 +660,155 @@ class ImportTests(FetchTestCase):
         self.gateway.registry.recover()
 
 
+class ImportPhaseTests(FetchTestCase):
+    """Review fixes 1-3 and 7 (PR #29)."""
+
+    async def staged_job(self, title="Song"):
+        [identity] = await self.submit(["https://media.example/a"])
+        await self.tick()
+        dispatch = self.row(identity)["dispatch"]
+        self.status(dispatch, "staged", title=title, size=self.staged(dispatch))
+        return identity, dispatch
+
+    async def test_submit_during_an_import_is_accepted_and_only_maintenance_refuses(self):
+        self.gateway.registry.mutation_begin("alice-1", "Music/x.m4a")  # an import or upload in flight
+        self.assertEqual(202, (await self.call("POST", "/v1/fetch/jobs", body={"urls": ["https://media.example/a"], "kind": "audio"}))[0])
+        self.gateway.registry.mutation_finish()
+        self.gateway.registry.maintenance()
+        status, answer, _ = await self.call("POST", "/v1/fetch/jobs", body={"urls": ["https://media.example/a"], "kind": "audio"})
+        self.assertEqual((503, "The server is paused for maintenance. Try again later."), (status, answer["error"]))
+
+    async def test_upload_runs_without_the_lock_then_one_move_under_it(self):
+        self.nextcloud.hold_put = asyncio.Event()
+        identity, dispatch = await self.staged_job()
+        await self.tick()  # staged -> placing
+        await self.tick()  # the import starts
+        await asyncio.wait_for(self.nextcloud.put_started.wait(), 5)
+        # Uploading: no lock, no fence, so any device's write goes ahead meanwhile.
+        self.assertFalse(self.gateway.mutations.lock.locked())
+        self.assertEqual("clear", self.gateway.registry.fence_state())
+        async with self.gateway.mutations.lock:
+            pass
+        self.assertEqual("placing", self.row(identity)["state"])
+        self.nextcloud.hold_put.set()
+        row = await self.run_to(identity)
+        self.assertEqual("Music/Song.m4a", row["destination"])
+        self.assertEqual(([("alice", ".anj-fetch-%s.tmp" % dispatch)], [("alice", "Music/Song.m4a")], {}),
+                         (self.nextcloud.puts, self.nextcloud.moves, self.nextcloud.temp("alice")))
+        self.assertEqual(MP4, self.nextcloud.tree("alice")["Music/Song.m4a"])
+        self.assertEqual(1, len(self.gateway.registry.added_since("alice")["added"]))
+
+    async def test_restart_during_the_upload_leaves_no_fence_and_resumes(self):
+        self.nextcloud.hold_put = asyncio.Event()
+        identity, dispatch = await self.staged_job()
+        await self.tick()  # staged -> placing
+        await self.tick()  # the import starts
+        await asyncio.wait_for(self.nextcloud.put_started.wait(), 5)
+        self.fetch.import_task.cancel()  # the gateway stops mid-upload
+        try:
+            await self.fetch.import_task
+        except asyncio.CancelledError:
+            pass
+        self.assertEqual("clear", self.gateway.registry.fence_state())
+        self.nextcloud.hold_put.set()
+        self.nextcloud.temp("alice")[".anj-fetch-%s.tmp" % ("ab" * 12)] = b"left by an older run"
+        restarted = Fetch(self.gateway, self.directory / "spool", disk=self.fetch.disk, tick=0.01)
+        restarted.sleep, restarted.wakeup = self.fetch.sleep, asyncio.Event()
+        restarted.recover()
+        self.assertEqual("placing", self.row(identity)["state"])  # resumes from the staged file
+        await restarted.sweep_temps()
+        self.assertEqual([], [name for name in self.nextcloud.temp("alice") if "abab" in name])
+        self.fetch = restarted
+        row = await self.run_to(identity)
+        self.assertEqual("Music/Song.m4a", row["destination"])
+
+    async def test_nextcloud_maintenance_is_waited_out(self):
+        self.nextcloud.busy = 6
+        identity, _ = await self.staged_job()
+        row = await self.run_to(identity)
+        self.assertEqual(("done", "Music/Song.m4a"), (row["state"], row["destination"]))
+        self.assertTrue(self.gateway.registry.mutation_ready())
+
+    async def test_maintenance_longer_than_two_hours_gives_up_and_cleans_up(self):
+        self.nextcloud.busy = 10 ** 6
+        self.nextcloud.busy_methods = {"MOVE", "PROPFIND", "MKCOL"}
+        identity, _ = await self.staged_job()
+        started = self.clock()
+        row = await self.run_to(identity, "failed", steps=500)
+        self.assertEqual("The file could not be saved to the cloud.", row["message"])
+        self.assertGreaterEqual(self.clock() - started, fetch_module.BUSY_GIVE_UP)
+        self.assertLess(self.clock() - started, fetch_module.BUSY_GIVE_UP + 2 * fetch_module.BUSY_MAX)
+        await asyncio.sleep(0.05)
+        self.assertEqual({}, self.nextcloud.temp("alice"))
+        self.assertTrue(self.gateway.registry.mutation_ready())
+
+    async def test_a_503_on_the_move_clears_the_fence(self):
+        identity, _ = await self.staged_job()
+        self.nextcloud.busy, self.nextcloud.busy_methods = 1, {"MOVE"}
+        row = await self.run_to(identity)
+        self.assertEqual("done", row["state"])
+        self.assertTrue(self.gateway.registry.mutation_ready())
+
+    async def test_no_answer_and_an_inconclusive_read_back_keep_the_fence(self):
+        identity, _ = await self.staged_job()
+        self.nextcloud.drop_move = True
+        original = self.fetch.stat_url
+
+        async def unknown(device, url):
+            return None if url.endswith("Song.m4a") else await original(device, url)
+        self.fetch.stat_url = unknown
+        for _ in range(5):
+            await self.tick()
+            await asyncio.sleep(0.02)
+        self.assertEqual("dispatched", self.gateway.registry.fence_state())  # house rule: unknown outcome
+        self.assertEqual("placing", self.row(identity)["state"])
+        self.fetch.stat_url = original
+        self.gateway.registry.maintenance()
+        self.gateway.registry.recover()  # the operator's recovery
+        row = await self.run_to(identity)
+        self.assertEqual("Music/Song.m4a", row["destination"])  # read back: already there, no second copy
+        self.assertEqual(1, len(self.nextcloud.moves))
+
+    async def test_a_deeply_nested_status_fails_the_job_not_the_queue(self):
+        [identity] = await self.submit(["https://media.example/a"])
+        await self.tick()
+        (self.fetch.jobs / self.row(identity)["dispatch"] / "status.json").write_text("[" * 200000)
+        await self.tick()
+        self.assertEqual(("failed", "The Downloader stopped unexpectedly."), (self.row(identity)["state"], self.row(identity)["message"]))
+
+    async def test_disk_floor_stops_a_running_download(self):
+        [identity] = await self.submit(["https://media.example/a"])
+        await self.tick()
+        self.status(self.row(identity)["dispatch"], "downloading", percent=50.0, bytes=10)
+        await self.tick()
+        self.free[0] = 0.08
+        await self.tick()
+        self.assertEqual(("failed", "Server storage is almost full."), (self.row(identity)["state"], self.row(identity)["message"]))
+
+    async def test_no_stall_while_merging_or_while_the_worker_updates(self):
+        [identity] = await self.submit(["https://media.example/a"])
+        await self.tick()
+        dispatch = self.row(identity)["dispatch"]
+        # The worker is updating yt-dlp and has not taken the job yet: no stall clock.
+        for _ in range(4):
+            self.clock.advance(200)
+            self.beat(job=None, updating=True)
+            await self.fetch.tick()
+        self.assertEqual("checking", self.row(identity)["state"])
+        self.beat(job=None)
+        await self.fetch.tick()
+        self.status(dispatch, "downloading", percent=99.0, bytes=1000, tick=0)
+        await self.tick()
+        for tick in range(1, 30):  # merging: no byte progress, tick moves every 20 s
+            self.clock.advance(20)
+            self.status(dispatch, "downloading", percent=99.0, bytes=1000, tick=tick)
+            await self.tick()
+        self.assertEqual("downloading", self.row(identity)["state"])
+        self.clock.advance(fetch_module.STALL_SECONDS)
+        await self.tick()
+        self.assertEqual(("failed", "The download stopped making progress."), (self.row(identity)["state"], self.row(identity)["message"]))
+
+
 class NamingTests(unittest.TestCase):
     def test_portable_stem(self):
         self.assertEqual("a_b_c_d", portable_stem("a/b\\c:d", "x"))
@@ -622,6 +818,13 @@ class NamingTests(unittest.TestCase):
         self.assertLessEqual(len(portable_stem("😀" * 150, "x").encode()), fetch_module.NAME_BYTES)
         self.assertEqual("NUL_.txt", portable_stem("NUL.txt", "x"))
         self.assertEqual("tab sep", portable_stem("tab\tsep", "x"))
+        # Review fix 6: ZWNJ (Persian, Urdu, Indic) and ZWJ (joined emoji) are kept; bidi controls and the BOM go.
+        persian = "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645"
+        family = "Family \U0001f468\u200d\U0001f469\u200d\U0001f467"
+        self.assertEqual(persian, portable_stem(persian, "x"))
+        self.assertEqual(family, portable_stem(family, "x"))
+        self.assertEqual("\u0915\u094d\u200d\u0937", portable_stem("\u0915\u094d\u200d\u0937", "x"))
+        self.assertEqual("abc", portable_stem("\ufeffa\u202eb\u2066c\u2069", "x"))
 
     def test_unique_name(self):
         self.assertEqual("A.m4a", unique_name("A", ".m4a", []))

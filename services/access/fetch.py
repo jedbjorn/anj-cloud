@@ -74,12 +74,21 @@ MAX_HEARTBEAT = 4096
 MAX_BODY = 160 * 1024             # a submit: 50 links of 2 KiB with JSON overhead
 TICK = 1.0
 IMPORT_ATTEMPTS = 3
+BUSY_FIRST = 15.0                 # Nextcloud answering 503 (maintenance, the nightly backup): first wait
+BUSY_MAX = 300.0                  # ... doubling to at most this
+BUSY_GIVE_UP = 2 * 3600.0         # ... and the import fails after this long
+# The upload goes outside the synced root first (no client ever lists it), then one MOVE under the
+# lock places it: `files/<uid>/.anj-fetch-<dispatch>.tmp`.
+TEMP = re.compile(r"\.anj-fetch-([0-9a-f]{24})\.tmp")
 UNFINISHED = ("waiting", "checking", "downloading", "placing")
 WORKER_STATES = {"checking", "downloading", "staged", "playlist", "rejected", "failed", "cancelled"}
 BOOT = re.compile(r"[0-9a-f]{16}")
 DISPATCH = re.compile(r"[0-9a-f]{24}")
 MEDIA_ID = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}")
 INVALID = frozenset('<>:"/\\|?*')
+# Removed from titles: bidirectional embedding, override and isolate controls and the BOM. Other
+# format characters (ZWJ, ZWNJ in Persian, Urdu and Indic words, joined emoji) are kept.
+INVISIBLE = frozenset("\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\ufeff")
 
 STORAGE_FULL = "Server storage is almost full."
 NO_ACCESS = "This device no longer has access."
@@ -102,9 +111,15 @@ OUTCOMES = {
     "unavailable": ("failed", "This item is unavailable or private on the site."),
     "geo-blocked": ("failed", "This item isn't available where the server is."),
     "site-error": ("failed", "The site refused the download."),
+    # yt-dlp found no fitting format but warned of a site change, even after updating itself.
+    "site-changed": ("failed", "The site may have changed and the Downloader couldn't read it. It may work later."),
     "network": ("failed", "The site could not be reached."),
     "worker-error": ("failed", "The Downloader stopped unexpectedly."),
 }
+
+
+class BackendBusy(Exception):
+    """Nextcloud answered 503 (maintenance mode, e.g. the nightly backup): wait, then try again."""
 
 
 class FetchError(ShareError):
@@ -134,7 +149,7 @@ def portable_stem(text, fallback, limit=TITLE_CHARS):
     characters (and NAME_BYTES of UTF-8), a reserved device name avoided. Empty: `fallback`."""
     text = unicodedata.normalize("NFC", text) if isinstance(text, str) else ""
     text = "".join("_" if c in INVALID else " " if c.isspace() else c for c in text
-                   if c.isspace() or not (ord(c) < 32 or 127 <= ord(c) < 160 or unicodedata.category(c) in ("Cf", "Cs", "Co")))
+                   if c.isspace() or not (ord(c) < 32 or 127 <= ord(c) < 160 or c in INVISIBLE or unicodedata.category(c) == "Cs"))
     text = " ".join(text.split()).strip(". ")
     text = text[:limit]
     while len(text.encode()) > NAME_BYTES:
@@ -187,6 +202,9 @@ class Fetch:
         self.progress = None             # (dispatch, signature, since)
         self.stopping = {}               # dispatch -> deadline: runs told to stop, removed once the worker leaves them
         self.import_task = None
+        self.sweep_task = None
+        self.sleep = asyncio.sleep                 # injectable: tests drive waits with a fake clock
+        self.updating_since = None               # the worker said it is updating yt-dlp (no stall clock)
         self.task = None
         self.failures = 0
         self.prepare()
@@ -232,7 +250,7 @@ class Fetch:
             return None
         try:
             value = json.loads(data)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: a deeply nested document
             return None
         return value if isinstance(value, dict) else None
 
@@ -246,6 +264,8 @@ class Fetch:
         if current != self.heartbeat:
             self.heartbeat = current
             self.heartbeat_seen = self.clock()
+        # Updating yt-dlp between jobs: a job handed over meanwhile is not stalled, only waiting.
+        self.updating_since = (self.updating_since or self.clock()) if value.get("updating") is True else None
 
     def read_status(self, dispatch):
         """The worker's status for a run, validated; None when absent. Invalid: {"state": "invalid"}."""
@@ -257,7 +277,7 @@ class Fetch:
                 or not BOOT.fullmatch(value["boot"]):
             return {"state": "invalid"}
         status = {"state": value["state"], "boot": value["boot"]}
-        for name in ("bytes", "size", "height"):
+        for name in ("bytes", "size", "height", "tick"):
             number = value.get(name)
             if number is not None:
                 if type(number) is not int or not 0 <= number <= 2 ** 62:
@@ -379,7 +399,7 @@ class Fetch:
             data.append(chunk)
         try:
             body = json.loads(b"".join(data))
-        except ValueError:
+        except (ValueError, RecursionError):
             raise FetchError(400, "A JSON object is required") from None
         if not isinstance(body, dict) or not {"urls", "kind"} <= set(body) <= {"urls", "kind", "height"}:
             raise FetchError(400, "Expected urls, kind and height")
@@ -404,7 +424,9 @@ class Fetch:
         links = [check_link(url) for url in urls]
         if None in links:
             raise FetchError(400, "Only http and https links can be downloaded.")
-        if not self.registry.mutation_ready():
+        # Only a real maintenance fence refuses; an import or upload in flight (the fence briefly
+        # `dispatched`) does not: the new rows just wait their turn.
+        if self.registry.fence_state() == "maintenance":
             raise FetchError(503, "The server is paused for maintenance. Try again later.")
         if not self.worker_alive():
             raise FetchError(503, "The Downloader is not running. Try again later.")
@@ -442,13 +464,15 @@ class Fetch:
     def start(self):
         self.recover()
         self.wakeup = asyncio.Event()
-        self.task = asyncio.get_running_loop().create_task(self.run())
+        loop = asyncio.get_running_loop()
+        self.sweep_task = loop.create_task(self.sweep_temps())
+        self.task = loop.create_task(self.run())
 
     async def close(self):
-        for task in (self.task, self.import_task):
+        for task in (self.task, self.import_task, self.sweep_task):
             if task is not None:
                 task.cancel()
-        for task in (self.task, self.import_task):
+        for task in (self.task, self.import_task, self.sweep_task):
             if task is not None:
                 try:
                     await task
@@ -597,10 +621,15 @@ class Fetch:
         boot = self.heartbeat[1] if self.heartbeat else None
         if status is not None and boot is not None and status["boot"] != boot and status["state"] in ("checking", "downloading"):
             return self.interrupted(row)  # the worker restarted under this run
-        signature = None if status is None else (status["state"], status.get("bytes"), status.get("percent"))
+        if status is None and self.updating_since is not None:
+            self.progress = None  # the worker is updating yt-dlp before it takes this job: no stall clock
+        # `tick` moves while the worker merges, checks or updates (no byte progress then).
+        signature = None if status is None else (status["state"], status.get("bytes"), status.get("percent"), status.get("tick"))
         if self.progress is None or self.progress[0] != row["dispatch"] or self.progress[1] != signature:
             self.progress = (row["dispatch"], signature, now)
         if status is None or status["state"] in ("checking", "downloading"):
+            if self.disk_low():
+                return self.finish(row, "failed", STORAGE_FULL)  # one long item never fills the data disk
             if now - self.progress[2] >= STALL_SECONDS:
                 return self.finish(row, "failed", STALLED)
             if now - (row["started"] or now) >= RUN_SECONDS:
@@ -659,14 +688,19 @@ class Fetch:
         return self.finish(self.registry.fetch_job(row["id"]), "done", message, destination=KINDS[row["kind"]][0] + "/" + folder)
 
     # Import --------------------------------------------------------------------------------
+    #
+    # Two phases. The staged file is first uploaded, without the household's write lock, to a
+    # temporary name outside the synced root (`files/<uid>/.anj-fetch-<dispatch>.tmp`): the gateway
+    # serves only `files/<uid>/anj-cloud/`, so no client ever lists it, and other devices' writes go
+    # on meanwhile. Then, under the lock and the write fence, the final name is chosen and the
+    # temporary file is moved there with `Overwrite: F` (a rename on the same storage). A temporary
+    # file is removed on every failure path and swept when the gateway starts.
 
     async def place(self, identity):
         """Import a staged file as the submitting device's account (spec #42 Import). Waits while
-        writes are fenced; an unknown outcome is read back before the row settles."""
-        row = self.registry.fetch_job(identity)
-        if row is None or row["state"] != "placing":
-            return
-        attempts = 0
+        writes are fenced, and with a bounded backoff while Nextcloud answers 503 (maintenance);
+        an unknown outcome is read back before the row settles."""
+        attempts, busy_since, delay = 0, None, BUSY_FIRST
         while True:
             row = self.registry.fetch_job(identity)
             if row is None or row["state"] != "placing":
@@ -675,21 +709,40 @@ class Fetch:
                 outcome = await self.import_once(row)
             except asyncio.CancelledError:
                 raise
+            except BackendBusy:
+                outcome = "busy"
             except Exception as error:  # noqa: BLE001 - a failed import attempt; no detail logged
                 log.warning("Fetch import attempt failed (%s)", type(error).__name__)
                 outcome = "retry"
             if outcome == "wait":
-                await asyncio.sleep(self.tick_seconds * 5)
+                await self.sleep(self.tick_seconds * 5)
                 continue
+            if outcome == "busy":
+                now = self.clock()
+                busy_since = now if busy_since is None else busy_since
+                if now - busy_since >= BUSY_GIVE_UP:
+                    await self.give_up(identity)
+                    return
+                await self.sleep(delay)
+                delay = min(delay * 2, BUSY_MAX)
+                continue
+            busy_since, delay = None, BUSY_FIRST
+            if outcome == "failed":
+                await self.discard_temp(row)
+                return
             if outcome != "retry":
                 return
             attempts += 1
             if attempts >= IMPORT_ATTEMPTS:
-                row = self.registry.fetch_job(identity)
-                if row is not None and row["state"] == "placing":
-                    self.finish(row, "failed", SAVE_FAILED, stop=False)
+                await self.give_up(identity)
                 return
-            await asyncio.sleep(self.tick_seconds)
+            await self.sleep(self.tick_seconds)
+
+    async def give_up(self, identity):
+        row = self.registry.fetch_job(identity)
+        if row is not None and row["state"] == "placing":
+            await self.discard_temp(row)
+            self.finish(row, "failed", SAVE_FAILED, stop=False)
 
     def open_staged(self, row):
         """The staged file, opened without following a link: (fd, size). None when unusable."""
@@ -707,52 +760,38 @@ class Fetch:
         return fd, info.st_size
 
     async def import_once(self, row):
-        """'done', 'failed', 'wait' (writes fenced) or 'retry'."""
-        mutations = self.gateway.mutations
+        """'done', 'failed', 'wait' (writes fenced) or 'retry'; BackendBusy on a 503."""
         opened = self.open_staged(row)
         if opened is None:
             self.finish(row, "rejected", OUTCOMES["mismatch"][1], stop=False)
             return "failed"
         fd, size = opened
         try:
-            async with mutations.lock:
-                if not self.registry.mutation_ready():
-                    return "wait"
-                device = self.device(row)
-                if device is None:
-                    self.finish(row, "failed", NO_ACCESS, stop=False)
-                    return "failed"
-                top, extension = KINDS[row["kind"]]
-                if row["target"]:
-                    # An earlier attempt's outcome was unknown: read its target back first.
-                    found = await self.stat(device, row["target"])
-                    if found is None:
-                        return "retry"
-                    if found and found[0] == size:
-                        return self.placed(row, row["target"], found[1])
-                parent = top + "/"
-                await self.make_folder(device, top)
-                if row["folder"]:
-                    parent += await self.playlist_folder(device, top, row["folder"]) + "/"
-                children = await self.children(device, parent)
-                name = unique_name(portable_stem(row["title"], row["media_id"] or "download"), extension, list(children))
-                target = parent + name
-                self.registry.fetch_update(row["id"], target=target, target_size=size)
-                if self.device(row) is None:
-                    self.finish(row, "failed", NO_ACCESS, stop=False)
-                    return "failed"
-                return await self.put(row, device, target, fd, size)
+            device = self.device(row)
+            if device is None:
+                self.finish(row, "failed", NO_ACCESS, stop=False)
+                return "failed"
+            if not row["target"]:
+                uploaded = await self.upload_temp(row, device, fd, size)
+                if uploaded != "ok":
+                    return uploaded
+            async with self.gateway.mutations.lock:
+                return await self.move_into_place(self.registry.fetch_job(row["id"]), size)
         finally:
             os.close(fd)
+
+    def temp_url(self, uid, dispatch):
+        return self.gateway.backend + "/remote.php/dav/files/" + quote(uid, safe="") + "/.anj-fetch-" + dispatch + ".tmp"
 
     def url(self, device, relative):
         return self.gateway.backend + backend_root(device["uid"]) + "/".join(quote(part, safe="") for part in relative.strip("/").split("/"))
 
-    async def put(self, row, device, target, fd, size):
-        """One new-file PUT under the write fence; a lost answer is read back, never assumed."""
-        registry = self.registry
-        registry.mutation_begin(device["id"], target)
-        headers = {"If-None-Match": "*", "Content-Length": str(size), "Content-Type": "application/octet-stream"}
+    async def upload_temp(self, row, device, fd, size):
+        """Phase 1, without the lock or the fence: the staged bytes to the temporary name (an
+        earlier attempt's complete copy is kept). 'ok', 'failed' or 'retry'; BackendBusy on 503."""
+        found = await self.stat_url(device, self.temp_url(device["uid"], row["dispatch"]))
+        if found and found[0] == size:
+            return "ok"
 
         async def body():
             offset = 0
@@ -764,37 +803,90 @@ class Fetch:
                 yield chunk
 
         try:
-            async with self.gateway.session.request("PUT", self.url(device, target), data=body(), headers=headers,
+            async with self.gateway.session.request("PUT", self.temp_url(device["uid"], row["dispatch"]), data=body(),
+                                                    headers={"Content-Length": str(size), "Content-Type": "application/octet-stream"},
                                                     auth=BasicAuth(device["uid"], device["token"]), allow_redirects=False,
                                                     timeout=ClientTimeout(total=None, sock_connect=10, sock_read=900)) as response:
                 await response.read()
-                status, header = response.status, response.headers.get("OC-FileId")
+                status = response.status
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - outcome unknown: read back below
-            status, header = None, None
-        if status == 201:
-            registry.mutation_finish()
-            self.gateway.mutations.note_added(device["uid"], header)
-            return self.placed(row, target, None, noted=True)
-        if status is not None and status < 500:
-            registry.mutation_finish()
-            if status == 412:
-                return "retry"  # created meanwhile outside the gateway: another name next time
+        except Exception:  # noqa: BLE001 - nothing visible was written; try again
+            return "retry"
+        if status in (200, 201, 204):
+            return "ok"
+        if status == 503:
+            raise BackendBusy()
+        if status in (401, 403) and self.device(row) is None:
+            self.finish(row, "failed", NO_ACCESS, stop=False)
+            return "failed"
+        if status in (413, 507):
             self.finish(row, "failed", SAVE_FAILED, stop=False)
             return "failed"
-        found = await self.stat(device, target)
-        if found is None:
-            return "retry"  # the fence stays closed: operator recovery, then this read back again
-        registry.mutation_finish()
-        if found and found[0] == size:
-            return self.placed(row, target, found[1])
         return "retry"
 
-    def placed(self, row, target, fileid, noted=False):
-        if not noted and fileid:
+    async def move_into_place(self, row, size):
+        """Phase 2, under the single mutation lock: choose the final name and MOVE the temporary
+        file there under the write fence. Any completed backend answer clears the fence; it stays
+        closed only when no answer arrived and the read back is inconclusive (operator recovery)."""
+        if row is None or row["state"] != "placing":
+            return "failed"
+        if not self.registry.mutation_ready():
+            return "wait"
+        device = self.device(row)
+        if device is None:
+            self.finish(row, "failed", NO_ACCESS, stop=False)
+            return "failed"
+        if row["target"]:
+            # An earlier MOVE's outcome was never learned (no answer, or a restart): read it back.
+            found = await self.stat(device, row["target"])
+            if found and found[0] == size:
+                return self.placed(row, row["target"], found[1])
+            if found is None:
+                return "retry"
+            self.registry.fetch_update(row["id"], target=None)
+        top, extension = KINDS[row["kind"]]
+        parent = top + "/"
+        await self.make_folder(device, top)
+        if row["folder"]:
+            parent += await self.playlist_folder(device, top, row["folder"]) + "/"
+        children = await self.children(device, parent)
+        target = parent + unique_name(portable_stem(row["title"], row["media_id"] or "download"), extension, list(children))
+        self.registry.fetch_update(row["id"], target=target)
+        self.registry.mutation_begin(device["id"], target)
+        try:
+            async with self.gateway.session.request("MOVE", self.temp_url(device["uid"], row["dispatch"]),
+                                                    headers={"Destination": self.url(device, target), "Overwrite": "F"},
+                                                    auth=BasicAuth(device["uid"], device["token"]), allow_redirects=False,
+                                                    timeout=ClientTimeout(total=None, sock_connect=10, sock_read=900)) as response:
+                await response.read()
+                status = response.status
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - no answer: read back below
+            status = None
+        if status is not None:
+            self.registry.mutation_finish()  # a completed answer: the operation is over (as mutations.py)
+            if status in (201, 204):
+                found = await self.stat(device, target)
+                return self.placed(row, target, found[1] if found else None)
+            self.registry.fetch_update(row["id"], target=None)
+            if status == 503:
+                raise BackendBusy()
+            return "retry"  # 412: the name was taken meanwhile outside the gateway; a new name next time
+        found = await self.stat(device, target)
+        if found is None:
+            return "retry"  # unknown: the fence stays closed until the operator's recovery, then read back
+        self.registry.mutation_finish()
+        if found and found[0] == size:
+            return self.placed(row, target, found[1])
+        self.registry.fetch_update(row["id"], target=None)
+        return "retry"
+
+    def placed(self, row, target, fileid):
+        if fileid:
             try:
-                self.registry.record_added(row["uid"], fileid)
+                self.registry.record_added(row["uid"], fileid)  # added time (decision #56), as for an upload
             except Exception:  # noqa: BLE001 - best effort, as for an upload
                 pass
         top = KINDS[row["kind"]][0]
@@ -804,20 +896,73 @@ class Fetch:
         self.finish(row, "done", message, stop=False, destination=target)
         return "done"
 
+    async def discard_temp(self, row):
+        """Remove a job's temporary upload (best effort; the start-up sweep catches the rest)."""
+        device = self.device(row) or self.any_device(row["uid"])
+        if device is None or not row.get("dispatch"):
+            return
+        try:
+            async with self.gateway.session.request("DELETE", self.temp_url(device["uid"], row["dispatch"]),
+                                                    auth=BasicAuth(device["uid"], device["token"]), allow_redirects=False) as response:
+                await response.read()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - swept at the next start
+            pass
+
+    def any_device(self, uid):
+        for device in self.registry.active_devices(uid):
+            try:
+                return self.registry.admit(device["fingerprint"], device["certificate_id"])
+            except ValueError:
+                continue
+        return None
+
+    async def sweep_temps(self):
+        """At start: remove every account's temporary uploads that no import in progress owns."""
+        keep = {row["dispatch"] for row in self.registry.fetch_running() if row["state"] == "placing" and row["dispatch"]}
+        uids = [row[0] for row in self.registry.db.execute("SELECT DISTINCT uid FROM fetch_jobs")]
+        for uid in uids:
+            device = self.any_device(uid)
+            if device is None:
+                continue
+            try:
+                names = await self.children_url(device, self.gateway.backend + "/remote.php/dav/files/" + quote(uid, safe="") + "/")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - tried again at the next start
+                continue
+            for name in names:
+                match = TEMP.fullmatch(name)
+                if match and match.group(1) not in keep:
+                    try:
+                        async with self.gateway.session.request("DELETE", self.temp_url(uid, match.group(1)),
+                                                                auth=BasicAuth(device["uid"], device["token"]),
+                                                                allow_redirects=False) as response:
+                            await response.read()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        pass
+
     async def stat(self, device, relative):
-        """(size, fileid) of an existing file, False when absent, None when unknown."""
+        return await self.stat_url(device, self.url(device, relative))
+
+    async def stat_url(self, device, url):
+        """(size, fileid) of an existing item, False when absent, None when unknown; BackendBusy on 503."""
         body = (b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:getcontentlength/>'
                 b'<d:resourcetype/><oc:fileid/></d:prop></d:propfind>')
         try:
-            async with self.gateway.session.request("PROPFIND", self.url(device, relative), data=body,
-                                                    headers={"Depth": "0", "Content-Type": "application/xml"},
+            async with self.gateway.session.request("PROPFIND", url, data=body, headers={"Depth": "0", "Content-Type": "application/xml"},
                                                     auth=BasicAuth(device["uid"], device["token"]), allow_redirects=False) as response:
                 if response.status == 404:
                     return False
+                if response.status == 503:
+                    raise BackendBusy()
                 if response.status != 207:
                     return None
                 root = SafeET.fromstring(await bounded_body(response), forbid_dtd=True)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, BackendBusy):
             raise
         except Exception:  # noqa: BLE001 - unknown
             return None
@@ -828,12 +973,16 @@ class Fetch:
 
     async def children(self, device, parent):
         """{decoded name: is a folder} directly inside `parent`; empty when it is missing."""
-        url = self.url(device, parent) + "/"
+        return await self.children_url(device, self.url(device, parent) + "/")
+
+    async def children_url(self, device, url):
         body = b'<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
         async with self.gateway.session.request("PROPFIND", url, data=body, headers={"Depth": "1", "Content-Type": "application/xml"},
                                                 auth=BasicAuth(device["uid"], device["token"]), allow_redirects=False) as response:
             if response.status == 404:
                 return {}
+            if response.status == 503:
+                raise BackendBusy()
             if response.status != 207:
                 raise web.HTTPBadGateway(text="Could not read the target folder")
             content = await bounded_body(response, 8 * 1024 * 1024)
@@ -861,6 +1010,8 @@ class Fetch:
             await response.read()
             status = response.status
         self.registry.mutation_finish()
+        if status == 503:
+            raise BackendBusy()
         if status not in (201, 405):
             raise web.HTTPBadGateway(text="Could not create the folder")
 
