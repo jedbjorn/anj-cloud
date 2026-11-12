@@ -1,0 +1,86 @@
+{
+  "services": {
+    "fetch-fixture": {
+      "build": {
+        "context": "..",
+        "dockerfile": "services/fetch/Dockerfile"
+      },
+      "image": "${COMPOSE_PROJECT_NAME}-fetch:unit1",
+      "user": "0:0",
+      "command": [
+        "python",
+        "-I",
+        "/site/fetch_site.py",
+        "serve"
+      ],
+      "environment": {
+        "ANJ_FIXTURE_DATA": "/data"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "./fetch_site.py",
+          "target": "/site/fetch_site.py",
+          "read_only": true
+        },
+        {
+          "type": "bind",
+          "source": "${ANJ_FETCH_FIXTURE_DIR:?deploy/dev.py sets it}",
+          "target": "/data"
+        }
+      ],
+      "networks": [
+        "fetch"
+      ],
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:size=64m,mode=1777"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python",
+          "-I",
+          "-c",
+          "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/item/song.html',timeout=5).read()"
+        ],
+        "interval": "5s",
+        "timeout": "6s",
+        "start_period": "300s",
+        "start_interval": "2s",
+        "retries": 3
+      },
+      "mem_limit": "512m",
+      "cpus": 2,
+      "pids_limit": 64,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
+    },
+    "fetch-net": {
+      "environment": {
+        "ANJ_FETCH_FIXTURE_HOST": "fetch-fixture"
+      },
+      "depends_on": {
+        "fetch-fixture": {
+          "condition": "service_healthy"
+        }
+      }
+    },
+    "fetch": {
+      "environment": {
+        "ANJ_FETCH_FIXTURE_HOST": "fetch-fixture"
+      }
+    }
+  }
+}

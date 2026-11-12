@@ -81,6 +81,9 @@ def secret_file(path):
 
 class Stack:
     compose_file = ROOT / "compose.json"
+    # The media fetch fixture site (spec #42): a dev/review-only override that adds `fetch-fixture`
+    # and names it as the one host the worker may reach on a private address. Never in production.
+    fetch_fixture_file = ROOT / "compose.fetch-fixture.json"
 
     def __init__(self, project, port):
         if not PROJECT.fullmatch(project):
@@ -103,7 +106,24 @@ class Stack:
                                 # Console backend socket directory (spec #27), bind-mounted at /run/anj-console.
                                 ANJ_CONSOLE_DIR=str(self.local / "console"),
                                 ANJ_ADMIN_USER=self.profile["admin_user"],
-                                ANJ_TRUSTED_DOMAINS=" ".join(self.profile["trusted_domains"]))
+                                ANJ_TRUSTED_DOMAINS=" ".join(self.profile["trusted_domains"]),
+                                ANJ_FETCH_FIXTURE_DIR=str(self.local / "fetch-fixture"))
+
+    @property
+    def fetch_fixture(self):
+        """Whether this project runs the fetch fixture site (chosen once with --fetch-fixture)."""
+        return (self.local / "fetch-fixture.enabled").exists()
+
+    def enable_fetch_fixture(self):
+        if self.profile.get("production"):
+            raise RuntimeError("The fetch fixture site is for dev and review stacks only")
+        for path in (ROOT / ".local", self.local, self.local / "fetch-fixture"):
+            private_directory(path)
+        (self.local / "fetch-fixture.enabled").touch(mode=0o600)
+
+    def services(self):
+        files = [self.compose_file] + ([self.fetch_fixture_file] if self.fetch_fixture else [])
+        return sorted({name for path in files for name in json.loads(Path(path).read_text())["services"]})
 
     def setup(self):
         for path in (ROOT / ".local", self.local, self.secret_dir, self.local / "console"):
@@ -136,8 +156,7 @@ class Stack:
         match = REVIEW_PROJECT.fullmatch(self.project)
         if match is None:
             return None
-        services = json.loads(Path(self.compose_file).read_text())["services"]
-        content = json.dumps({"services": {name: {"labels": {"anj.owner": match.group(1)}} for name in sorted(services)}},
+        content = json.dumps({"services": {name: {"labels": {"anj.owner": match.group(1)}} for name in self.services()}},
                              indent=2) + "\n"
         private_directory(self.local)
         path = self.local / "owner-labels.json"
@@ -151,8 +170,9 @@ class Stack:
         if console.name == "console" and console.parent.is_dir() and not console.exists():
             private_directory(console)
         labels = self.owner_labels()
+        fixture = ["--file", str(self.fetch_fixture_file)] if self.fetch_fixture else []
         return ["docker", "compose", "--env-file", "/dev/null", "--project-name", self.project,
-                "--file", str(self.compose_file), *(["--file", str(labels)] if labels else []), *args]
+                "--file", str(self.compose_file), *fixture, *(["--file", str(labels)] if labels else []), *args]
 
     def compose(self, *args, data=None):
         return self.run(self.compose_argv(*args), data=data)
@@ -266,7 +286,7 @@ class Stack:
                 raise RuntimeError(f"Unexpected published ports for {service}")
             if not container["State"]["Running"]:
                 raise RuntimeError(f"Service is not running: {service}")
-        if services != {"access", "nextcloud", "db", "redis", "cron"}:
+        if services != set(self.services()):
             raise RuntimeError("Development service set is incomplete")
 
     def http(self, method, path, user=None, data=None, headers=None):
@@ -348,9 +368,13 @@ def main():
     parser.add_argument("--port", type=int, default=os.environ.get("SC_DEV_PORT", "8834"))
     parser.add_argument("command", choices=("deps", "setup", "doctor", "up", "stop", "check", "redeploy-access", "fixture", "cleanup-fixtures", "destroy"))
     parser.add_argument("--confirm-delete-project", help="Required exact project name for destroy")
+    parser.add_argument("--fetch-fixture", action="store_true",
+                        help="Add the media fetch fixture site to this dev/review project (remembered)")
     args = parser.parse_args()
     try:
         stack = Stack(args.project, args.port)
+        if args.fetch_fixture:
+            stack.enable_fetch_fixture()
         if args.command == "doctor":
             stack.run(["docker", "compose", "version"])
             stack.run(["docker", "info", "--format", "{{.ServerVersion}}"])

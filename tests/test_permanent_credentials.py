@@ -540,11 +540,14 @@ class CustodyTests(unittest.TestCase):
         self.assertEqual(["services/access/requirements.txt", "services/access"], sources)
         ignore = (ROOT / ".dockerignore").read_text().split()
         self.assertEqual("**", ignore[0])
-        self.assertTrue(all(line.startswith(("!services/access", "!services/", "services/access/__pycache__")) for line in ignore[1:]))
+        self.assertTrue(all(line.startswith(("!services/access", "!services/", "services/access/__pycache__",
+                                             "services/fetch/__pycache__")) for line in ignore[1:]))
         compose = json.loads((ROOT / "deploy/compose.json").read_text())
         access = compose["services"]["access"]
         # Spec #27: only the console backend's socket directory is bind-mounted, never operator state.
-        self.assertEqual(["access:/var/lib/anj", "${ANJ_CONSOLE_DIR:?Run deploy/dev.py setup}:/run/anj-console"], access["volumes"])
+        # Spec #42: plus the media fetch spool shared with the worker (never operator state).
+        self.assertEqual(["access:/var/lib/anj", "fetch-spool:/var/lib/anj-fetch", "${ANJ_CONSOLE_DIR:?Run deploy/dev.py setup}:/run/anj-console"],
+                         access["volumes"])
         self.assertNotIn("ANJ_OPERATOR_DIR", json.dumps(access["volumes"]))
         files = {secret: compose["secrets"][secret]["file"] for secret in access["secrets"]}
         self.assertTrue(files["issuer_crt"].endswith("/issuer.crt"))

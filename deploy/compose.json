@@ -90,7 +90,8 @@
         "NEXTCLOUD_TRUSTED_DOMAINS": "${ANJ_TRUSTED_DOMAINS:-localhost 127.0.0.1 nextcloud}",
         "REDIS_HOST": "redis",
         "PHP_MEMORY_LIMIT": "256M",
-        "PHP_UPLOAD_LIMIT": "64M"
+        "PHP_UPLOAD_LIMIT": "64M",
+        "APACHE_BODY_LIMIT": "8590983168"
       },
       "secrets": [
         "database",
@@ -169,6 +170,9 @@
       },
       "image": "${COMPOSE_PROJECT_NAME}-access:unit2",
       "user": "0:0",
+      "group_add": [
+        "10004"
+      ],
       "ports": [
         "127.0.0.1:${SC_DEV_PORT:-8834}:8443"
       ],
@@ -176,10 +180,12 @@
         "ANJ_ORIGIN": "https://127.0.0.1:${SC_DEV_PORT:-8834}",
         "ANJ_DEV_STREAM_DELAY": "${ANJ_DEV_STREAM_DELAY:-0}",
         "ANJ_MAX_TRANSFER_BYTES": "${ANJ_MAX_TRANSFER_BYTES:-67108864}",
-        "ANJ_STAGING_BYTES": "${ANJ_STAGING_BYTES:-134217728}"
+        "ANJ_STAGING_BYTES": "${ANJ_STAGING_BYTES:-134217728}",
+        "ANJ_FETCH_SPOOL": "/var/lib/anj-fetch"
       },
       "volumes": [
         "access:/var/lib/anj",
+        "fetch-spool:/var/lib/anj-fetch",
         "${ANJ_CONSOLE_DIR:?Run deploy/dev.py setup}:/run/anj-console"
       ],
       "secrets": [
@@ -228,6 +234,94 @@
           "max-file": "2"
         }
       }
+    },
+    "fetch-net": {
+      "build": {
+        "context": "..",
+        "dockerfile": "services/fetch/Dockerfile"
+      },
+      "image": "${COMPOSE_PROJECT_NAME}-fetch:unit1",
+      "user": "0:0",
+      "command": [
+        "python",
+        "-I",
+        "/opt/anj-fetch/guard.py"
+      ],
+      "networks": [
+        "fetch"
+      ],
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "cap_add": [
+        "NET_ADMIN"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python",
+          "-I",
+          "/opt/anj-fetch/guard.py",
+          "check"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "start_period": "5s",
+        "start_interval": "1s",
+        "retries": 3
+      },
+      "mem_limit": "32m",
+      "cpus": 0.1,
+      "pids_limit": 16,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
+    },
+    "fetch": {
+      "build": {
+        "context": "..",
+        "dockerfile": "services/fetch/Dockerfile"
+      },
+      "image": "${COMPOSE_PROJECT_NAME}-fetch:unit1",
+      "network_mode": "service:fetch-net",
+      "volumes": [
+        "fetch-spool:/spool",
+        "fetch-tools:/var/lib/anj-fetch-tools"
+      ],
+      "depends_on": {
+        "fetch-net": {
+          "condition": "service_healthy",
+          "restart": true
+        }
+      },
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:size=256m,mode=1777"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "mem_limit": "512m",
+      "cpus": 1,
+      "pids_limit": 128,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      }
     }
   },
   "networks": {
@@ -237,13 +331,16 @@
     },
     "proxy": {
       "internal": true
-    }
+    },
+    "fetch": {}
   },
   "volumes": {
     "nextcloud": {},
     "database": {},
     "redis": {},
-    "access": {}
+    "access": {},
+    "fetch-spool": {},
+    "fetch-tools": {}
   },
   "secrets": {
     "database": {

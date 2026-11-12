@@ -339,7 +339,7 @@ class ProdThroughPm2Tests(unittest.TestCase):
             with self.subTest(reason=reason), self.assertRaisesRegex(RuntimeError, "--reason"):
                 self.stack.emergency_stop(reason)
         # While flagged, up starts and expects only the other apps.
-        self.assertEqual(["db", "redis", "nextcloud", "cron"], self.stack.active_apps())
+        self.assertEqual(["db", "redis", "nextcloud", "cron", "fetch-net", "fetch"], self.stack.active_apps())
 
     def dispatcher(self, exit_code=0):
         log = Path(self.temporary.name) / "alerts.log"
@@ -438,7 +438,7 @@ class ProdThroughPm2Tests(unittest.TestCase):
             self.stack.up()
             self.stack.ensure_tls_fresh.assert_not_called()
         started = {call[-1] for call in self.pm2.calls if call[0] in ("start", "restart")}
-        self.assertEqual({"db", "redis", "nextcloud", "cron"}, started)
+        self.assertEqual({"db", "redis", "nextcloud", "cron", "fetch-net", "fetch"}, started)
 
     def test_stop_is_front_to_back_and_not_saved(self):
         with self.patched():
