@@ -320,7 +320,8 @@ class ProdThroughPm2Tests(unittest.TestCase):
         stack = self.stack
         patches = [patch.object(stack, "pm2", side_effect=self.pm2), patch.object(stack, "wait_ready"),
                    patch.object(stack, "ensure_tls_fresh"), patch.object(stack, "status", return_value={"apps": {}}),
-                   patch.object(stack, "check", return_value={"checked": True})]
+                   patch.object(stack, "check", return_value={"checked": True}),
+                   patch.object(stack, "apply_trash", return_value=7), patch.object(stack, "advertise_trash", return_value=7)]
         patches += [patch.object(stack, name, **value) for name, value in extra.items()]
         stack_context = contextlib.ExitStack()
         for item in patches:
