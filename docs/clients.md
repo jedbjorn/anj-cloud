@@ -186,6 +186,21 @@ The manager only accepts a download that lies in the profile folder it derives f
 path with spaces or non-ASCII letters was tried; a short (8.3) or redirected `LOCALAPPDATA` was not. If the two
 ever disagree the update is refused, nothing is installed, and updating by hand still works.
 
+## The Downloader tab
+
+When the server runs the fetch worker, every client shows a fourth tab, **Downloader**, after Conflict. Paste
+one or more links (one per line), choose **Audio** (an `.m4a` with AAC audio, tags and cover art) or **Video**
+(an `.mp4` with H.264 and AAC, **1080p** or **720p**), and press **Download**. The server downloads each item,
+one at a time for the whole household, and saves it to your `Music` or `Videos` (a playlist into a folder
+named after it, at most 200 items); your devices receive it by ordinary sync. Nothing is converted: a link
+without a stream in those formats is refused with "This link has no format the Downloader supports yet."
+
+Limits: an item longer than 4 hours or larger than 8 GiB is refused, at most 50 links per submit and 500
+unfinished downloads per account, and nothing is accepted while the server's disk has under 10% free. Sites
+that need a login, cookies or payment are not supported. Finished rows disappear after 7 days or with
+**Clear finished**. You are responsible for having the right to download what you request. A server without
+the worker shows no tab.
+
 ## First launch on any platform
 
 1. Open the app, choose **Pair device**, and enter your server address and pairing code ([pairing.md](pairing.md)).

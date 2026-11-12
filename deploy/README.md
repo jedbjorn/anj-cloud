@@ -40,6 +40,19 @@ Only `https://127.0.0.1:$SC_DEV_PORT` is published, by the access service. Nextc
 
 Use the same project name, port, checkout and retained private state for subsequent operations. Independent review can select another project/port with `--project anj-cloud-review --port 18834` on both management and operator commands. Compose prefixes durable volumes and containers with that project name. Do not reuse an existing project's name with different local secrets.
 
+### Media fetch worker (spec #42)
+
+Every stack runs the fetch worker (`fetch`, uid 10003, no capabilities) inside the network namespace of `fetch-net`, which holds only `CAP_NET_ADMIN` and loads the guard (`services/fetch/guard.py`): everything the namespace sends to loopback, private, link-local, carrier-grade NAT, multicast or reserved addresses is dropped, apart from DNS to the resolvers Docker names in its `resolv.conf`. The worker's network has internet egress and no other member; it shares only the `fetch-spool` volume with the gateway. A review stack can add a deterministic fixture site, the only private host the worker may then reach; production never names it:
+
+```bash
+python3 deploy/dev.py --project anj-cloud-review-<tag> --port <port> --fetch-fixture up   # remembered for later commands
+deploy/.local/access-venv/bin/python -m deploy.fetch_fixture --project anj-cloud-review-<tag> --port <port> --evidence <dir> \
+    [--case presets,tenancy,playlist,isolation,restart,revoke,update,memory,large]
+python3 deploy/dev.py --project anj-cloud-review-<tag> --port <port> destroy --confirm-delete-project anj-cloud-review-<tag>
+```
+
+`docker compose exec fetch python -I /opt/anj-fetch/worker.py version` prints the working yt-dlp; `... worker.py update` runs its updater now (stable channel; a failed update keeps the working copy).
+
 ## Pair and operate
 
 A pairing code carries the first 10 bytes (80 bits) of the issuer certificate's SHA-256 (decision #151, spec #35): the client fetches `GET /v1/ca` and accepts the CA only when it matches the code, so no CA file is copied. Never accept a CA the code does not pin, disable certificate validation or omit hostname checks. Certificate/key material stays outside the client's watched root.

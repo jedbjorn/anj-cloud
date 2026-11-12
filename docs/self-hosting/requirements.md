@@ -21,6 +21,18 @@ The OS disk and data disk have different jobs. The OS holds Debian and packages.
 at `/srv/anj-cloud` and holds household files, accounts, registry, keys, service state, release sources, and
 Docker data. It is a single point of failure unless you add a real backup.
 
+### Containers, memory and outbound access
+
+The stack runs eight containers. Their memory limits add up to 3,616 MiB: PostgreSQL 512, Redis 256,
+Nextcloud 1,536, its cron 384, the access service 256, HAProxy 128, the media fetch worker 512 and its
+network guard 32. 4 GiB of RAM covers them because they rarely all peak together.
+
+The media fetch worker (the clients' Downloader tab) needs **outbound HTTPS to the internet**: to the sites
+members download from, and to GitHub once a day for yt-dlp's own updates. It has no access to the household
+network or the other containers. Downloads are staged on the data disk (in Docker's data root) before they
+are saved into Nextcloud, so a large item needs its size free twice for a moment; the gateway refuses new
+downloads while the data disk has under 10% free. The staging volume is not backed up.
+
 For this initial path, attach only the OS disk and the one intended data disk. Extra unused disks make
 automatic selection ambiguous. A new virtual disk is the simplest choice for a VM.
 
