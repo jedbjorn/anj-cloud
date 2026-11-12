@@ -297,6 +297,37 @@ The native library keeps its C ABI: the `anj_*` exports of
 `libanj_rootfs.so` and the FFI symbol names bound in `native_root_fs.dart`,
 `eviction_native.dart`, `local_watcher.dart` and `profile_lifetime.dart`.
 
+## Media fetch (spec #42 F4)
+
+The Downloader's client core is shared code with no port.
+`core/gateway/fetch_api.dart` holds the job row (`FetchJob`, `FetchState`
+with `unknown` for states a newer gateway adds), the plain-language
+outcomes (`FetchError`) and the four `/v1/fetch/jobs` routes
+(`HttpFetchTransport`, which `DavCloud` and `RenewableCloud` expose as
+`FetchTransport`). Like Admin and the update feed, every request is sent by
+the sync worker over this device's certificate and skips the pause gate (not
+file sync). The worker answers a `fetch` command beside its queue
+(`answerFetchCommand`), so a poll neither waits for a pass nor makes the loop
+send library state. `core/app/fetch_jobs.dart` (`FetchJobs`, reached as
+`ClientController.fetchJobs`) holds availability (a 404 means absent),
+the rows, polling every 2 s only while the tab and the app are visible and a
+row is unfinished, a sync pass (`requestSyncPass`) when a poll sees rows
+turn done (never twice for one row), the remembered choice in `<profile>/downloader.json`, and the link
+parser.
+
+The tab (F5) is `ui/downloader_tab.dart`: one scrollable with the form and
+the job list, reading and calling `FetchJobs` only. `ClientHome` adds it as
+a fourth tab while `availability` is `available`, replacing its
+`TabController` when that changes (the selected library tab stays; a
+Downloader that went away returns to Home), and hides the library toolbar on
+it. It tells `FetchJobs` what is on screen: `setTabVisible` from the tab
+controller (false while the first-sync screen replaces the home),
+`setAppVisible` from `DesktopLifecycle.visible` on a desktop and
+from `AppLifecycleState` (resumed) where there is no window lifecycle
+(Android). Show in folder is the library's own reveal.
+A window that is minimized, not hidden in the tray, still counts as on
+screen: `DesktopLifecycle` knows only shown and hidden.
+
 ## How to add a platform
 
 1. Create `lib/platform/<os>/` with a class for each port and an

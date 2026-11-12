@@ -5,6 +5,7 @@ import 'dart:io';
 import 'admin_api.dart';
 import 'cloud_api.dart';
 import 'dav_api.dart';
+import 'fetch_api.dart';
 import 'releases_api.dart';
 import 'device_crypto.dart';
 import '../state/manifest.dart';
@@ -294,7 +295,7 @@ class CertificateRenewal {
 /// previous client; new requests use the renewed certificate.
 class RenewableCloud
     with ForwardSharing, ForwardAdmin
-    implements CloudApi, ReleaseTransport {
+    implements CloudApi, ReleaseTransport, FetchTransport {
   RenewableCloud(this._current);
   CloudApi _current;
   @override
@@ -376,6 +377,26 @@ class RenewableCloud
     progress: progress,
     cancel: cancel,
   );
+
+  /// Media fetch job routes (spec #42) over the current certificate.
+  FetchTransport get _fetch {
+    final target = _current;
+    if (target is FetchTransport) return target as FetchTransport;
+    throw const FetchFailure(FetchError.notConnected);
+  }
+
+  @override
+  Future<List<FetchJob>?> listFetchJobs() async => _fetch.listFetchJobs();
+  @override
+  Future<List<FetchJob>> submitFetchJobs(
+    List<String> urls,
+    FetchKind kind, {
+    FetchResolution? resolution,
+  }) async => _fetch.submitFetchJobs(urls, kind, resolution: resolution);
+  @override
+  Future<void> deleteFetchJob(String id) async => _fetch.deleteFetchJob(id);
+  @override
+  Future<void> clearFetchJobs() async => _fetch.clearFetchJobs();
   @override
   void close() => _current.close();
 }

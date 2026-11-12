@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:anj_cloud/core/gateway/cloud_api.dart';
+import 'package:anj_cloud/core/gateway/fetch_api.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/ports/secret_store.dart';
@@ -238,3 +240,68 @@ class MemorySecrets implements SecretStore {
     values.remove(key);
   }
 }
+
+/// A [FetchTransport] whose answers the test sets; records every call.
+class FakeFetch implements FetchTransport {
+  final calls = <String>[];
+  List<FetchJob>? rows = const [];
+  FetchError? listError;
+  FetchError? actionError;
+  List<FetchJob> submitted = const [];
+  ({List<String> urls, FetchKind kind, FetchResolution? resolution})?
+  lastSubmit;
+
+  /// When set, the list waits for it (a list under way).
+  Completer<void>? listGate;
+
+  /// When not empty, each list takes its answer from here when it is asked
+  /// (the server's rows at that moment), whenever it then answers.
+  final listAnswers = <List<FetchJob>?>[];
+
+  /// When set, the submit waits for it (a submit under way).
+  Completer<void>? submitGate;
+
+  @override
+  Future<List<FetchJob>?> listFetchJobs() async {
+    calls.add('list');
+    final asked = listAnswers.isEmpty ? null : [listAnswers.removeAt(0)];
+    final gate = listGate;
+    if (gate != null) await gate.future;
+    final error = listError;
+    if (error != null) throw FetchFailure(error);
+    return asked == null ? rows : asked.single;
+  }
+
+  @override
+  Future<List<FetchJob>> submitFetchJobs(
+    List<String> urls,
+    FetchKind kind, {
+    FetchResolution? resolution,
+  }) async {
+    calls.add('submit');
+    lastSubmit = (urls: urls, kind: kind, resolution: resolution);
+    final gate = submitGate;
+    if (gate != null) await gate.future;
+    final error = actionError;
+    if (error != null) throw FetchFailure(error);
+    return submitted;
+  }
+
+  @override
+  Future<void> deleteFetchJob(String id) async {
+    calls.add('delete $id');
+    final error = actionError;
+    if (error != null) throw FetchFailure(error);
+  }
+
+  @override
+  Future<void> clearFetchJobs() async {
+    calls.add('clear');
+    final error = actionError;
+    if (error != null) throw FetchFailure(error);
+  }
+}
+
+/// A job row in [state] (spec #42).
+FetchJob fetchJob(String id, FetchState state, {DateTime? finished}) =>
+    FetchJob(id: id, state: state, finished: finished);

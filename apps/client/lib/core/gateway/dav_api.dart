@@ -8,6 +8,7 @@ import 'package:xml/xml.dart';
 
 import 'admin_api.dart';
 import 'cloud_api.dart';
+import 'fetch_api.dart';
 import 'releases_api.dart';
 import '../state/model.dart';
 import '../sync/name_policy.dart';
@@ -58,7 +59,12 @@ const firstSyncPropfind =
     '</d:prop></d:propfind>';
 
 class DavCloud
-    implements CloudApi, SharingApi, AdminTransport, ReleaseTransport {
+    implements
+        CloudApi,
+        SharingApi,
+        AdminTransport,
+        ReleaseTransport,
+        FetchTransport {
   DavCloud(
     this.origin,
     SecurityContext context, {
@@ -968,6 +974,21 @@ class DavCloud
     progress: progress,
     cancel: cancel,
   );
+
+  /// Media fetch job routes (spec #42) over this device's certificate.
+  late final _fetch = HttpFetchTransport(client, origin);
+  @override
+  Future<List<FetchJob>?> listFetchJobs() => _fetch.listFetchJobs();
+  @override
+  Future<List<FetchJob>> submitFetchJobs(
+    List<String> urls,
+    FetchKind kind, {
+    FetchResolution? resolution,
+  }) => _fetch.submitFetchJobs(urls, kind, resolution: resolution);
+  @override
+  Future<void> deleteFetchJob(String id) => _fetch.deleteFetchJob(id);
+  @override
+  Future<void> clearFetchJobs() => _fetch.clearFetchJobs();
 
   @override
   void close() {

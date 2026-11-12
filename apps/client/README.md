@@ -576,6 +576,15 @@ ANJ_LIVE_GATEWAY_CONFIG=/private/path/config.json GDK_BACKEND=x11 \
   "$FLUTTER_SDK/bin/flutter" --suppress-analytics test integration_test/gateway_test.dart -d linux
 ```
 
+`integration_test/downloader_flow_test.dart` is the opt-in Downloader fixture
+(spec #42): the real app, worker and gateway on a throwaway review stack that
+runs the fetch worker and its fixture site. `ANJ_LIVE_FETCH_CONFIG` names a
+private JSON file (keys in the test's header). It pairs one device for a
+fixture account, submits links through the tab, waits for the rows and for
+the files in the synced folder, writes screenshots to `evidence`, then
+removes its rows and files and revokes its device. It needs a display; a
+headless nested compositor is enough.
+
 The receipt distinguishes actual controller/libsecret pairing, real mTLS DAV
 and two-profile reconciliation, and the paired app worker/window. Cases include
 nested space/Unicode and punctuation/literal-percent names, updates, conflict

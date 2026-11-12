@@ -10,6 +10,8 @@ import '../gateway/dav_api.dart';
 import '../../platform/adapters.dart';
 import '../gateway/identity.dart';
 import '../gateway/admin_api.dart';
+import '../gateway/fetch_api.dart';
+import 'fetch_jobs.dart';
 import 'icon_colors.dart';
 import 'pairing_inputs.dart';
 import '../state/manifest.dart';
@@ -41,6 +43,8 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     this.placement = const PickerOnlyPlacement(),
     this.pairingOptions = PairingOptions.desktop,
     this.defaultNetworkPolicy,
+    this.fetchTimeout = fetchReplyTimeout,
+    this.workerEntry = syncWorker,
   }) : secrets = secrets ?? platformAdapters().secretStore(),
        launcher =
            launcher ??
@@ -64,6 +68,12 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   String? secretsUnavailable;
   final String? nativeLibrary;
   final Duration folderCommandTimeout;
+
+  /// The wait for the worker's answer to one Downloader request.
+  final Duration fetchTimeout;
+
+  /// The sync worker isolate's entry point; tests pass a scripted one.
+  final Future<void> Function(Map<String, Object?> initial) workerEntry;
 
   /// Where a new profile's synced folder and desktop shortcut go (spec #34
   /// P1, P2). The default has no automatic root: only `main()` passes the
@@ -199,6 +209,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   final _adminRequests = <String, Completer<AdminResponse>>{};
   final _releaseRequests = <String, Completer<Map>>{};
   final _releaseProgress = <String, void Function(int)>{};
+  final _fetchRequests = <String, Completer<Map>>{};
 
   /// A Finish editing is still to complete (the worker's journal holds its
   /// request). An update waits for it (spec #37 rule 4).
@@ -266,6 +277,10 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     }
     _releaseRequests.clear();
     _releaseProgress.clear();
+    for (final request in _fetchRequests.values) {
+      request.complete({'ok': false, 'error': FetchError.network.name});
+    }
+    _fetchRequests.clear();
     for (final request in _documentsRequests.values) {
       request.completeError(
         const DocumentsFailure(
@@ -433,6 +448,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
             const Duration(minutes: 5),
             (_) => unawaited(refreshAdmin()),
           );
+          _probeFetch();
         case 'state':
           _storageReady = event['storageReady'] == true;
           entries = (event['entries'] as List)
@@ -447,6 +463,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
           transfersHeld = event['transfersHeld'] == true;
           status = SyncStatus.values.asNameMap()[event['status']] ?? status;
           notifyListeners();
+          _probeFetch();
         case 'backgroundDone':
           _backgroundRuns
               .remove(event['request'])
@@ -481,6 +498,8 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
           _releaseRequests.remove(event['request'])?.complete(event);
         case 'releaseProgress':
           _releaseProgress[event['request']]?.call(event['received'] as int);
+        case 'fetchResult':
+          _fetchRequests.remove(event['request'])?.complete(event);
         case 'sharingResult':
           final pending = _sharingRequests.remove(event['request']);
           if (event['ok'] == true) {
@@ -571,8 +590,8 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         notifyListeners();
       });
     _worker = await Isolate.spawn(
-      syncWorker,
-      {
+      workerEntry,
+      <String, Object?>{
         'output': _output!.sendPort,
         'profile': profile.path,
         'privateKey': key,
@@ -1047,6 +1066,58 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     adminNotice = 'Your admin role was removed.';
     notifyListeners();
   }
+
+  /// The Downloader's state and actions (spec #42 F4), created when the UI
+  /// first asks for it; from then on the gateway is probed once per session
+  /// (at the next worker start or state report, while paired).
+  FetchJobs get fetchJobs {
+    final existing = _fetchJobs;
+    if (existing != null) return existing;
+    final created = _fetchJobs = FetchJobs(
+      MessageFetchTransport(_fetchCommand),
+      requestSync: requestSyncPass,
+      preferences: FetchPreferences(profile),
+    );
+    // Not during the caller's build: the probe notifies.
+    scheduleMicrotask(_probeFetch);
+    return created;
+  }
+
+  FetchJobs? _fetchJobs;
+
+  /// Probes the Downloader's availability for the paired server; a
+  /// probe already answered for this server does nothing.
+  void _probeFetch() {
+    final jobs = _fetchJobs;
+    if (jobs == null || _input == null) return;
+    unawaited(jobs.probe(pairingState == 'paired' ? serverOrigin : null));
+  }
+
+  /// One fetch job request through the worker, which holds this device's
+  /// certificate. Answered with the worker's `fetchResult` event, or with a
+  /// failure made here when no worker can send it.
+  Future<Map> _fetchCommand(Map<String, Object?> command) {
+    final input = _input;
+    if (input == null || pairingState != 'paired') {
+      return Future.value({'ok': false, 'error': FetchError.notConnected.name});
+    }
+    final request = uniqueId();
+    final result = Completer<Map>();
+    _fetchRequests[request] = result;
+    input.send({...command, 'request': request});
+    return result.future.timeout(
+      fetchTimeout,
+      onTimeout: () {
+        _fetchRequests.remove(request);
+        return {'ok': false, 'error': FetchError.network.name};
+      },
+    );
+  }
+
+  /// Asks the worker for one sync pass that lists the cloud now (as when
+  /// the window is shown), so a file the server just placed appears without
+  /// waiting for the schedule. While paused it lists nothing.
+  void requestSyncPass() => _input?.send({'action': 'visible'});
 
   /// Why Manage sharing is unavailable right now, or null (spec #26).
   String? get sharingUnavailable => pairingState != 'paired'
@@ -1662,6 +1733,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   @override
   void dispose() {
     _adminPoll?.cancel();
+    _fetchJobs?.dispose();
     unawaited(stop());
     super.dispose();
   }
