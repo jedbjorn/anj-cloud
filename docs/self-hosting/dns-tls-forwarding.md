@@ -226,7 +226,7 @@ services persistently across reboots, run this **inside the server as `anj`, wit
 python3 /srv/anj-cloud/release/current/deploy/prod.py emergency-stop --reason "what you observed"
 ```
 
-The command writes an emergency-stop marker, stops `haproxy` and `gateway`, saves that stopped state, and
+The command writes an emergency-stop marker, stops `haproxy` and `gateway` (and the media fetch worker), saves that stopped state, and
 queues an alert. Only an intentional resume re-enables them:
 
 ```bash

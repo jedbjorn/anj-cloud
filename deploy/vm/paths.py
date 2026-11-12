@@ -125,7 +125,9 @@ COMPOSE_SERVICE = {"db": "db", "redis": "redis", "nextcloud": "nextcloud", "cron
 # An app starts only when these apps' services are healthy.
 DEPENDENCIES = {"db": (), "redis": (), "nextcloud": ("db", "redis"), "cron": ("nextcloud",),
                 "gateway": ("nextcloud",), "haproxy": ("gateway",), "fetch-net": (), "fetch": ("fetch-net",)}
-EMERGENCY_APPS = ("haproxy", "gateway")     # refused while EMERGENCY_STOP exists
+# Refused while EMERGENCY_STOP exists: ingress, and the media fetch worker with its guard (the
+# only containers that reach the internet).
+EMERGENCY_APPS = ("haproxy", "gateway", "fetch", "fetch-net")
 EMERGENCY_EXIT_CODE = 78                    # run-service exit while flagged; in PM2 stop_exit_codes
 STOP_GRACE_SECONDS = 30                     # run-service: docker compose stop --timeout
 # PM2 kill_timeout: above run-service's worst stop path (docker stop up to grace + 20 s, then the

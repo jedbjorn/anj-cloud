@@ -444,7 +444,7 @@ class CheckTests(unittest.TestCase):
         result = self.check(emergency=True)
         self.assertTrue(result["emergency_stop"])
         self.assertEqual(set(paths.STACK_APPS) - set(paths.EMERGENCY_APPS), set(result["apps"]))
-        self.assertEqual({"fetch": 10003}, result["process_uids"])  # the worker is not ingress
+        self.assertEqual({}, result["process_uids"])  # the media fetch worker is held stopped too
 
     def test_tls_refresh_is_a_pm2_restart_of_the_gateway(self):
         with tempfile.TemporaryDirectory() as directory:

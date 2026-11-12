@@ -25,13 +25,20 @@ Docker data. It is a single point of failure unless you add a real backup.
 
 The stack runs eight containers. Their memory limits add up to 3,616 MiB: PostgreSQL 512, Redis 256,
 Nextcloud 1,536, its cron 384, the access service 256, HAProxy 128, the media fetch worker 512 and its
-network guard 32. 4 GiB of RAM covers them because they rarely all peak together.
+network guard 32. On a 4 GiB VM that is more than remains once Debian, Docker and PM2 have their share, so
+the limits are ceilings, not reservations: in practice the containers use far less (a 1080p download
+measured about 72 MiB of process memory in the worker; most of its limit is reclaimable file cache), but if
+several reached their limits at once the kernel would have to stop one. Give the VM more memory if you can;
+the installer still accepts 4 GiB.
 
 The media fetch worker (the clients' Downloader tab) needs **outbound HTTPS to the internet**: to the sites
 members download from, and to GitHub once a day for yt-dlp's own updates. It has no access to the household
 network or the other containers. Downloads are staged on the data disk (in Docker's data root) before they
-are saved into Nextcloud, so a large item needs its size free twice for a moment; the gateway refuses new
-downloads while the data disk has under 10% free. The staging volume is not backed up.
+are saved into Nextcloud. At its peak an item takes **twice its size** on the data disk: while video and
+audio are merged (both parts and the merged file), and again while it is saved (the staged file and its
+copy in Nextcloud), so an item at the 8 GiB limit needs up to 16 GiB free for a while; once saved it takes
+its size once. The gateway refuses new downloads, and stops a running one, while the data disk has under
+10% free. The staging volume is not backed up.
 
 For this initial path, attach only the OS disk and the one intended data disk. Extra unused disks make
 automatic selection ambiguous. A new virtual disk is the simplest choice for a VM.
