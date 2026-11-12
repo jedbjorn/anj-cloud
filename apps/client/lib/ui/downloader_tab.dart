@@ -93,7 +93,7 @@ class _DownloaderTabState extends State<DownloaderTab> {
     super.dispose();
   }
 
-  String _text = '';
+  late String _text = widget.links.text;
 
   /// Typing clears the last submit's message and re-evaluates the button.
   void _edited() {
@@ -124,13 +124,17 @@ class _DownloaderTabState extends State<DownloaderTab> {
           _note = null;
         });
       case FetchLinksReady(:final links, :final ignored):
+        // The field is read-only until the answer, so it still holds what
+        // was sent; it belongs to the home screen and is cleared even when
+        // this tab was left meanwhile (or the links would be sent twice).
+        final field = widget.links;
         final error = await jobs.submit(links);
-        if (!mounted) return;
         if (error == null) {
           // Sent: only the lines that were not links stay.
           _text = ignored.join('\n');
-          widget.links.text = _text;
+          field.text = _text;
         }
+        if (!mounted) return;
         setState(() {
           _error = error?.message;
           _note = error == null && ignored.isNotEmpty
@@ -178,6 +182,8 @@ class _DownloaderTabState extends State<DownloaderTab> {
       child: TextField(
         key: const ValueKey('downloader-links'),
         controller: widget.links,
+        // Nothing typed during a submit could survive its answer.
+        readOnly: jobs.submitting,
         minLines: 2,
         maxLines: 5,
         keyboardType: TextInputType.multiline,
@@ -500,6 +506,8 @@ class _JobCard extends StatelessWidget {
                   Text(
                     job.message!,
                     key: ValueKey('job-message:${job.id}'),
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
                     style: small,
                   ),
               ],

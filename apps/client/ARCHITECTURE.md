@@ -321,9 +321,12 @@ a fourth tab while `availability` is `available`, replacing its
 `TabController` when that changes (the selected library tab stays; a
 Downloader that went away returns to Home), and hides the library toolbar on
 it. It tells `FetchJobs` what is on screen: `setTabVisible` from the tab
-controller, `setAppVisible` from `DesktopLifecycle.visible` on a desktop and
+controller (false while the first-sync screen replaces the home),
+`setAppVisible` from `DesktopLifecycle.visible` on a desktop and
 from `AppLifecycleState` (resumed) where there is no window lifecycle
 (Android). Show in folder is the library's own reveal.
+A window that is minimized, not hidden in the tray, still counts as on
+screen: `DesktopLifecycle` knows only shown and hidden.
 
 ## How to add a platform
 

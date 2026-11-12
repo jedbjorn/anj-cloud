@@ -401,6 +401,27 @@ void main() {
       expect(find.byKey(const ValueKey('selection-count')), findsNothing);
       await _tab(tester, 'Home');
       expect(find.byKey(const ValueKey('selection-count')), findsNothing);
+      // On the Downloader Ctrl+F does nothing: there is no search there.
+      await _tab(tester, 'Downloader');
+      await _paste(tester, 'https://media.example.com/a');
+      final focused = FocusManager.instance.primaryFocus;
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('library-search')), findsNothing);
+      expect(FocusManager.instance.primaryFocus, same(focused));
+      expect(find.byType(DownloaderTab), findsOneWidget);
+      expect(_field(tester), 'https://media.example.com/a');
+      await _tab(tester, 'Home');
+      expect(
+        tester
+            .widget<TextField>(find.byKey(const ValueKey('library-search')))
+            .focusNode!
+            .hasFocus,
+        isFalse,
+        reason: 'the shortcut was not kept for later',
+      );
       // Ctrl+F still reaches the library's search.
       await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
       await tester.sendKeyEvent(LogicalKeyboardKey.keyF);
@@ -417,6 +438,27 @@ void main() {
   });
 
   group('polling follows what is on screen', () {
+    testWidgets('not while the first-sync screen covers the home', (
+      tester,
+    ) async {
+      final home = await _open(tester);
+      await _tab(tester, 'Downloader');
+      expect(home.jobs.tabVisible, isTrue);
+      home.controller.firstSyncPending = true;
+      // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
+      home.controller.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(find.byType(TabBar), findsNothing);
+      expect(home.jobs.tabVisible, isFalse);
+      expect(home.jobs.visible, isFalse);
+      home.controller.firstSyncPending = false;
+      // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
+      home.controller.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(find.byType(DownloaderTab), findsOneWidget);
+      expect(home.jobs.tabVisible, isTrue);
+    });
+
     testWidgets('the tab being selected', (tester) async {
       final home = await _open(tester);
       expect(home.jobs.tabVisible, isFalse);
@@ -571,6 +613,43 @@ void main() {
       expect(find.text('Videos/Harbour at night.mp4'), findsOneWidget);
       expect(tester.takeException(), isNull);
     });
+
+    testWidgets('a long message is cut after three lines', (tester) async {
+      await _open(
+        tester,
+        size: const Size(360, 800),
+        rows: [
+          FetchJob(
+            id: 'f',
+            state: FetchState.failed,
+            title: 'Lecture',
+            message: 'The site did not answer. ' * 40,
+          ),
+          const FetchJob(
+            id: 'r',
+            state: FetchState.rejected,
+            message: 'Live streams are not supported.',
+          ),
+        ],
+        touch: true,
+      );
+      await _tab(tester, 'Downloader');
+      final long = find.byKey(const ValueKey('job-message:f'));
+      await _reveal(tester, long);
+      expect(tester.widget<Text>(long).maxLines, 3);
+      expect(tester.widget<Text>(long).overflow, TextOverflow.ellipsis);
+      expect(
+        tester.renderObject<RenderParagraph>(long).didExceedMaxLines,
+        isTrue,
+      );
+      final short = find.byKey(const ValueKey('job-message:r'));
+      await _reveal(tester, short);
+      expect(
+        tester.renderObject<RenderParagraph>(short).didExceedMaxLines,
+        isFalse,
+      );
+      expect(tester.takeException(), isNull);
+    }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
     testWidgets('a state this client does not know, once finished', (
       tester,
@@ -944,6 +1023,71 @@ void main() {
         expect(_field(tester), isEmpty);
       }, variant: TargetPlatformVariant.only(platform));
     }
+
+    testWidgets('the field cannot be typed in during a submit', (tester) async {
+      final home = await _open(tester);
+      await _tab(tester, 'Downloader');
+      TextField field() => tester.widget<TextField>(
+        find.byKey(const ValueKey('downloader-links')),
+      );
+      expect(field().readOnly, isFalse);
+      await _paste(tester, a);
+      home.fetch.submitGate = Completer<void>();
+      await _download(tester);
+      expect(home.jobs.submitting, isTrue);
+      expect(field().readOnly, isTrue);
+      // Typing now changes nothing, so the answer cannot overwrite it.
+      await tester.enterText(
+        find.byKey(const ValueKey('downloader-links')),
+        '$a\n$b',
+      );
+      await tester.pump();
+      expect(_field(tester), a);
+      home.fetch.submitGate!.complete();
+      await tester.pumpAndSettle();
+      expect(home.fetch.lastSubmit!.urls, [a]);
+      expect(_field(tester), isEmpty);
+      expect(field().readOnly, isFalse);
+      await _paste(tester, b);
+      expect(_field(tester), b);
+    });
+
+    testWidgets('leaving the tab during a submit still clears the field', (
+      tester,
+    ) async {
+      final home = await _open(tester);
+      await _tab(tester, 'Downloader');
+      await _paste(tester, 'a note\n$a');
+      home.fetch.submitGate = Completer<void>();
+      await _download(tester);
+      await _tab(tester, 'Home');
+      expect(find.byType(DownloaderTab), findsNothing);
+      home.fetch.submitGate!.complete();
+      home.fetch.submitGate = null;
+      await tester.pumpAndSettle();
+      await _tab(tester, 'Downloader');
+      // Only the line that was not a link is left: nothing to send twice.
+      expect(_field(tester), 'a note');
+      expect(_enabled(tester, 'downloader-submit'), isFalse);
+      expect(home.fetch.calls.where((call) => call == 'submit').length, 1);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('a failed submit left behind keeps the links', (tester) async {
+      final home = await _open(tester);
+      await _tab(tester, 'Downloader');
+      await _paste(tester, a);
+      home.fetch
+        ..submitGate = Completer<void>()
+        ..actionError = FetchError.busy;
+      await _download(tester);
+      await _tab(tester, 'Home');
+      home.fetch.submitGate!.complete();
+      await tester.pumpAndSettle();
+      await _tab(tester, 'Downloader');
+      expect(_field(tester), a);
+      expect(_enabled(tester, 'downloader-submit'), isTrue);
+    });
 
     testWidgets('the field survives a visit to another tab', (tester) async {
       await _open(tester);

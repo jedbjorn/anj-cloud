@@ -183,6 +183,10 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
   bool _hasDownloader = false;
   bool _downloader = false;
   final _fetchLinks = TextEditingController();
+
+  /// The home's own focus. The Downloader's field goes away with its tab;
+  /// focus then returns here, so the home's shortcuts keep working.
+  final _homeFocus = FocusNode(debugLabel: 'home');
   AppLifecycleListener? _appState;
 
   TabController _newTabs(int length, int index) =>
@@ -192,17 +196,26 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
   void _tabChanged() {
     final downloader = _tabs.index >= LibraryTab.values.length;
     final tab = downloader ? _active : LibraryTab.values[_tabs.index];
-    // The job list is polled only while its tab is the selected one.
-    _jobs.setTabVisible(downloader);
-    if (_active == tab && _downloader == downloader) return;
-    if (downloader && _selecting) _cancelSelection();
-    setState(() {
-      _active = tab;
-      _downloader = downloader;
-      _clearSelection();
-      _clearReveal();
-    });
+    if (_active != tab || _downloader != downloader) {
+      if (downloader && _selecting) _cancelSelection();
+      if (_downloader && !downloader) _homeFocus.requestFocus();
+      setState(() {
+        _active = tab;
+        _downloader = downloader;
+        _clearSelection();
+        _clearReveal();
+      });
+    }
+    _showTab();
   }
+
+  /// The job list is polled only while its tab is the selected one and on
+  /// screen: the first-sync screen replaces the home, tabs included.
+  void _showTab() => _jobs.setTabVisible(
+    _downloader &&
+        !(controller.firstSyncPending &&
+            controller.pairingOptions.firstSync != null),
+  );
 
   /// The tab appears and disappears with the server's answer. The selected
   /// library tab stays selected; a Downloader that went away returns to Home.
@@ -211,13 +224,14 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     if (show == _hasDownloader || !mounted) return;
     final old = _tabs;
     final index = old.index < LibraryTab.values.length ? old.index : 0;
+    if (_downloader) _homeFocus.requestFocus();
     setState(() {
       _hasDownloader = show;
       _downloader = false;
       _active = LibraryTab.values[index];
       _tabs = _newTabs(LibraryTab.values.length + (show ? 1 : 0), index);
     });
-    _jobs.setTabVisible(false);
+    _showTab();
     // After the tab bar has moved to the new controller.
     WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
   }
@@ -533,6 +547,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     _hasDownloader = _jobs.availability == FetchAvailability.available;
     _tabs = _newTabs(LibraryTab.values.length + (_hasDownloader ? 1 : 0), 0);
     _jobs.addListener(_fetchChanged);
+    controller.addListener(_showTab);
     // Whether the app is on screen: the window on a desktop, the foreground
     // on Android (which has no window lifecycle).
     if (lifecycle != null) {
@@ -554,8 +569,10 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     lifecycle?.removeListener(_windowVisibility);
     _appState?.dispose();
     _jobs.removeListener(_fetchChanged);
+    controller.removeListener(_showTab);
     _jobs.setTabVisible(false);
     _fetchLinks.dispose();
+    _homeFocus.dispose();
     if (lifecycle?.confirmQuitWithoutTray == _confirmQuitWithoutTray) {
       lifecycle?.confirmQuitWithoutTray = null;
     }
@@ -799,6 +816,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
           if (!_downloader) AppShortcuts.search: _searchFocus.requestFocus,
         },
         child: Focus(
+          focusNode: _homeFocus,
           autofocus: true,
           child: Scaffold(
             appBar: AppBar(
