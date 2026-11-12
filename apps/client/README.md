@@ -427,6 +427,44 @@ siblings that differ only by normalization remain a clash (#120).
 `tool/case_move_fixture.dart`, driven by
 `deploy/case_move_fixture.py`, proves this against a review stack.
 
+## Trash
+
+Spec #44. Delete is one step: the rows leave the library at once (a delete
+queued here hides its row and, for a folder, every row below it) and a
+snackbar says "Moved to Trash" with **Undo** and **View** for about 8 seconds.
+The only confirmations left are Delete now and Empty Trash in the Trash view
+(app menu, **Trash**), which lists, one entry per deletion and newest first,
+the account's server trash below `anj-cloud/` (the gateway's `/trash/`
+routes, [access protocol](../../services/access/README.md#trash)) and this
+device's own trash.
+
+- **Device trash** (`lib/core/sync/device_trash.dart`). A copy a completed
+  deletion leaves in private staging that the server cannot be shown to hold
+  (spec #12's release rules are unchanged: a copy whose bytes equal the
+  deleted version is still released) becomes a `trash` record instead of a
+  Recovery row: original path, when it entered the trash, size and every
+  staging name of the file. It is no row's copy any more. The same pass
+  converts rows left by earlier versions (their clock starts then). Conflict,
+  upload-recovery and eviction copies of live rows keep Recover and Dismiss.
+  A copy is purged at the first pass more than `trash_days` (as the server
+  last advertised it, else 7) after it entered the trash, and released early
+  when the live file at its path holds the same bytes again (a restore).
+- **Restore** of an entry restores the server item; the menu's "Restore this
+  device's copy" (and Restore of a device-only entry) uses spec #25's
+  crash-safe write: original path, else `name (restored).ext`, missing
+  folders created again, never replacing anything.
+- **Undo** cancels a delete not yet sent (the local item never left);
+  otherwise it restores the server's trash item for that path deleted since
+  the delete was made, else the device copy. A name taken meanwhile gets
+  `(restored)`; an item that cannot come back stays in Trash and the snackbar
+  says so.
+- While paused or offline only this device's trash is shown, with "Can't
+  reach the server: showing only this device's trash".
+
+`tool/trash_fixture.dart`, driven by `deploy/trash_client_fixture.py`,
+proves one-step delete, both trashes and Undo against a review stack;
+`tool/android/emu_trash.py` does the same through the phone UI.
+
 ## Temporary file exclusions
 
 The sync boundary excludes exactly these case-sensitive basenames at any depth:
