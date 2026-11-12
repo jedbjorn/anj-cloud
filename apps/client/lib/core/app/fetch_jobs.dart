@@ -121,7 +121,7 @@ class FetchJobs extends ChangeNotifier {
   Timer? _poll;
   bool _disposed = false;
 
-  /// Ids seen in a state other than done, and ids a sync pass was already
+  /// Each row's state when last seen, and the rows a sync pass was already
   /// asked for.
   final Map<String, FetchState> _seen = {};
   final Set<String> _synced = {};
