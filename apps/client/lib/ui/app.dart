@@ -9,7 +9,6 @@ import 'admin_section.dart';
 import '../core/app/add_files.dart';
 import '../core/app/controller.dart';
 import '../core/app/fetch_jobs.dart';
-import '../core/sync/bulk_targets.dart';
 import 'recovery_actions.dart';
 import 'create_folder_dialog.dart';
 import 'downloader_tab.dart';
@@ -24,6 +23,7 @@ import 'apps_access_page.dart';
 import 'library_toolbar.dart';
 import 'library_view.dart';
 import 'shortcuts.dart';
+import 'trash_page.dart';
 import 'library_entry_card.dart';
 import 'library_list.dart';
 import 'manage_sharing_dialog.dart';
@@ -63,6 +63,7 @@ String localRecoveryDetails(Map<String, dynamic> entry) {
 
 enum _AppAction {
   pause,
+  trash,
   autostart,
   wifiOnly,
   notifications,
@@ -353,49 +354,20 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
         )
         .toList();
     if (targets.isEmpty || _bulkBusy) return;
-    final effectiveTargets = action == 'delete'
-        ? canonicalDeleteTargets(
-            targets,
-            pathOf: (entry) => entry['path'] as String,
-            isDirectory: (entry) => entry['kind'] == 'directory',
-          )
-        : targets;
     final epoch = _selectionEpoch;
     if (action == 'delete') {
-      final yes = await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) {
-          _deleteDialog = dialogContext;
-          return CallbackShortcuts(
-            bindings: {AppShortcuts.cancel: _cancelSelection},
-            child: Focus(
-              autofocus: true,
-              child: AlertDialog(
-                title: const Text('Delete selected items everywhere?'),
-                scrollable: true,
-                content: Text(
-                  'Delete ${effectiveTargets.length} ${effectiveTargets.length == 1 ? 'item' : 'items'} from the cloud and other devices? Selected folders include all descendants, including hidden or filtered items. Overlapping folders are deleted once.\n\n${effectiveTargets.map((entry) => entry['path']).join('\n')}\n\nNextcloud trash may help recover them, subject to retention and storage.',
-                ),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(dialogContext, false),
-                    child: const Text('Cancel'),
-                  ),
-                  FilledButton(
-                    key: const ValueKey('confirm-bulk-delete'),
-                    onPressed: () => Navigator.pop(dialogContext, true),
-                    child: const Text('Delete Everywhere'),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      );
-      _deleteDialog = null;
-      if (yes != true || !mounted || !_selecting || epoch != _selectionEpoch) {
-        return;
+      // One step (spec #44): no confirmation; Undo and Trash replace it.
+      setState(() => _bulkBusy = true);
+      try {
+        if (await _deleteToTrash(_selected.values.toList()) &&
+            mounted &&
+            epoch == _selectionEpoch) {
+          setState(_clearSelection);
+        }
+      } finally {
+        if (mounted) setState(() => _bulkBusy = false);
       }
+      return;
     }
     if (!mounted || !_selecting || epoch != _selectionEpoch) {
       return;
@@ -407,7 +379,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
       final errors = (result['errors'] as List? ?? []).join('\n');
       showError(
         context,
-        '${result['accepted']} accepted; ${result['failed']} failed.${(result['covered'] as int? ?? 0) > 0 ? ' ${result['covered']} selected descendants covered by their folder.' : ''}${errors.isEmpty ? '' : '\n$errors'}${action == 'delete' && result['accepted'] != 0 ? '\nDeletion is queued; synchronization may report conflicts or pending work.' : ''}',
+        '${result['accepted']} accepted; ${result['failed']} failed.${(result['covered'] as int? ?? 0) > 0 ? ' ${result['covered']} selected descendants covered by their folder.' : ''}${errors.isEmpty ? '' : '\n$errors'}',
       );
       if (epoch == _selectionEpoch) {
         setState(_clearSelection);
@@ -702,29 +674,92 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
 
   void showError(BuildContext context, String text) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
-  Future<void> delete(BuildContext context, Map<String, dynamic> entry) async {
-    final yes = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete everywhere?'),
-        scrollable: compactLayout(context),
-        content: Text(
-          'Delete ${entry['path']} from the cloud and other devices${entry['kind'] == 'directory' ? ', including its descendants' : ''}? Nextcloud trash may help recover it, subject to retention and storage.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Delete everywhere'),
-          ),
-        ],
-      ),
-    );
-    if (yes == true) controller.command('delete', entry['path'] as String);
+
+  /// Delete (spec #44): one step, no confirmation. The rows leave the
+  /// library at once and the snackbar offers Undo and the Trash.
+  Future<void> delete(BuildContext context, Map<String, dynamic> entry) =>
+      _deleteToTrash([entry]);
+
+  /// Returns true when the items were moved to Trash.
+  Future<bool> _deleteToTrash(List<Map<String, dynamic>> entries) async {
+    final targets = [
+      for (final entry in entries)
+        <String, dynamic>{
+          'path': entry['path'],
+          'kind': entry['kind'],
+          'selectionVersion': entry['selectionVersion'],
+        },
+    ];
+    if (targets.isEmpty) return false;
+    try {
+      final result = await controller.bulkCommand('delete', targets);
+      if (!mounted) return false;
+      final paths = (result['paths'] as List? ?? const []).cast<String>();
+      if (paths.isEmpty || result['at'] is! int) {
+        final errors = (result['errors'] as List? ?? const []).join('\n');
+        showError(context, errors.isEmpty ? 'Nothing was deleted.' : errors);
+        return false;
+      }
+      _showMovedToTrash(paths, result['at'] as int);
+      return true;
+    } catch (error) {
+      if (mounted) showError(context, '$error');
+      return false;
+    }
   }
+
+  /// "Moved to Trash · Undo": about 8 seconds, or until the next delete
+  /// replaces it; View opens the Trash.
+  void _showMovedToTrash(List<String> paths, int at) {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          key: const ValueKey('moved-to-trash'),
+          duration: const Duration(seconds: 8),
+          persist: false,
+          content: Row(
+            children: [
+              Expanded(child: Text(movedToTrashText(paths.length))),
+              TextButton(
+                key: const ValueKey('moved-to-trash-view'),
+                onPressed: () {
+                  messenger.hideCurrentSnackBar();
+                  _openTrash();
+                },
+                child: Text(
+                  'View',
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.inversePrimary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          action: SnackBarAction(
+            key: const ValueKey('moved-to-trash-undo'),
+            label: 'Undo',
+            onPressed: () => unawaited(_undo(paths, at)),
+          ),
+        ),
+      );
+  }
+
+  Future<void> _undo(List<String> paths, int at) async {
+    try {
+      final result = await controller.trash('undo', {'paths': paths, 'at': at});
+      if (mounted) showError(context, undoMessage(result));
+    } catch (error) {
+      if (mounted) {
+        showError(context, "Couldn't undo: $error. The items stay in Trash.");
+      }
+    }
+  }
+
+  void _openTrash() => Navigator.of(context).push(
+    MaterialPageRoute<void>(builder: (_) => TrashPage(controller: controller)),
+  );
 
   /// Rename for an item whose name is not allowed on other devices
   /// (decision #120).
@@ -936,6 +971,8 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                     switch (value) {
                       case _AppAction.pause:
                         controller.setPaused(!controller.paused);
+                      case _AppAction.trash:
+                        _openTrash();
                       case _AppAction.appsAccess:
                         Navigator.of(context).push(
                           MaterialPageRoute<void>(
@@ -963,6 +1000,11 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                       child: Text(
                         controller.paused ? 'Resume sync' : 'Pause sync',
                       ),
+                    ),
+                    const PopupMenuItem(
+                      key: ValueKey('open-trash'),
+                      value: _AppAction.trash,
+                      child: Text('Trash'),
                     ),
                     if (widget.autostart != null && _autostart != null)
                       CheckedPopupMenuItem(

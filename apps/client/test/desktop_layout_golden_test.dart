@@ -89,7 +89,8 @@ void main() {
     await _golden('pairing-1280');
   }, variant: _linux);
 
-  testWidgets('delete everywhere confirmation at 1280', (tester) async {
+  // Spec #44: no confirmation; the snackbar offers Undo and View.
+  testWidgets('delete everywhere moves to Trash at 1280', (tester) async {
     await _pumpHome(tester, const Size(1280, 720));
     // Photos: Documents, Music and Videos offer no Delete everywhere
     // (spec #34 P7).

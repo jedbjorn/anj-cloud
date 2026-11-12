@@ -23,6 +23,22 @@ class _DirectoryController extends ClientController {
   @override
   bool get canCreateFolder => ready;
 
+  final deletes = <List<Map<String, dynamic>>>[];
+  @override
+  Future<Map<String, dynamic>> bulkCommand(
+    String action,
+    List<Map<String, dynamic>> targets,
+  ) async {
+    deletes.add(targets);
+    return {
+      'accepted': targets.length,
+      'failed': 0,
+      'errors': <String>[],
+      'paths': [for (final target in targets) target['path']],
+      'at': 1000,
+    };
+  }
+
   @override
   Future<String> createFolder({
     required String parent,
@@ -335,7 +351,7 @@ void main() {
   );
 
   testWidgets(
-    'storage actions appear on directories, file delete retains confirmation',
+    'storage actions appear on directories, file delete is one step into Trash',
     (tester) async {
       final controller = _DirectoryController()
         ..root = '/synthetic/anj-cloud'
@@ -354,11 +370,14 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('Local and cloud'), findsNothing);
       await tester.tap(find.text('Delete everywhere'));
-      await tester.pumpAndSettle();
-      expect(find.text('Delete everywhere?'), findsOneWidget);
-      expect(controller.action, isNull);
-      await tester.tap(find.text('Cancel'));
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump();
+      // Spec #44 T1: no confirmation; the snackbar offers Undo and View.
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(controller.deletes.single.single['path'], 'note.txt');
+      expect(find.text('Moved to Trash'), findsOneWidget);
+      expect(find.text('Undo'), findsOneWidget);
+      expect(find.text('View'), findsOneWidget);
       expect(controller.action, isNull);
       await _close(tester, controller);
     },

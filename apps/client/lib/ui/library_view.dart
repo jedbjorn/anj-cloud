@@ -271,6 +271,8 @@ Iterable<String> ancestors(String path) sync* {
 
 bool visibleInLibrary(Map<String, dynamic> entry) {
   final status = entry['status'];
+  // Deleted and not yet sent (spec #44): gone from the library at once.
+  if (entry['deleteQueued'] == true && !hasConflict(entry)) return false;
   final completedDeletion = [
     'deleted',
     'deleted remotely',
