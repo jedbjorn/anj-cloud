@@ -30,6 +30,7 @@ from .edge import KEEPALIVE_TIMEOUT, Edge, peer_source
 from .observe import EnrollmentGuard, Events
 from .sharing import OPERATOR_RIGHTS, ShareError, Sharing, owner_of
 from .console import Console
+from .fetch import Fetch
 from .releases import Releases
 
 REQUEST_HEADERS = {"content-type", "content-length", "if-match", "if-none-match", "if-modified-since",
@@ -88,7 +89,7 @@ SHARING_INTENTS = {"share", "share-update", "unshare", "leave", "share-rename"}
 
 
 class Gateway:
-    def __init__(self, state, backend, origin, issuer, *, clock=time.time, events=None, guard=None):
+    def __init__(self, state, backend, origin, issuer, *, clock=time.time, events=None, guard=None, fetch_spool=None):
         self.registry = Registry(state, clock=clock)
         self.backend = backend.rstrip("/")
         self.origin = origin.rstrip("/")
@@ -108,6 +109,9 @@ class Gateway:
         self.session = None
         self.throttle = float(os.environ.get("ANJ_DEV_STREAM_DELAY", "0"))
         self.mutations = Mutations(self)
+        # Media fetch (spec #42): configured by the spool shared with the fetch worker; without it
+        # the /v1/fetch/ routes do not exist (404) and clients show no Downloader tab.
+        self.fetch = Fetch(self, fetch_spool) if fetch_spool else None
 
     @property
     def sharing(self):
@@ -154,6 +158,8 @@ class Gateway:
                 pass                             # refused storage: every publish and download says so
         self.session = ClientSession(auto_decompress=False, trust_env=False, cookie_jar=DummyCookieJar(), headers={"Accept-Encoding": "identity"},
                                      timeout=ClientTimeout(total=None, sock_connect=10, sock_read=120))
+        if self.__dict__.get("fetch") is not None:
+            self.fetch.start()
 
     async def close(self, app):
         console = self.__dict__.get("_console")
@@ -162,6 +168,8 @@ class Gateway:
                      self.__dict__.get("alert_pass_task"), *self.__dict__.get("alerts_sending", {}).values()]:
             if task is not None:
                 task.cancel()
+        if self.__dict__.get("fetch") is not None:
+            await self.fetch.close()
         await self.session.close()
         self.registry.db.close()
 
@@ -915,6 +923,8 @@ class Gateway:
         public.router.add_post("/v1/shares/incoming/{share_id}/rename", self.share_rename_for_all)
         self.console.add_routes(public.router)
         self.releases.add_routes(public.router)
+        if self.__dict__.get("fetch") is not None:
+            self.fetch.add_routes(public.router)
         public.router.add_route("*", "/dav/{path:.*}", self.dav)
         public.on_response_prepare.append(self.advertise_limit)
         return public
@@ -960,7 +970,8 @@ async def serve():
     listener = os.environ.get("ANJ_LISTENER", "tcp")
     if listener not in LISTENERS:
         raise SystemExit("ANJ_LISTENER must be tcp or proxy-unix")
-    gateway = Gateway(state, os.environ.get("ANJ_BACKEND", "http://nextcloud"), os.environ["ANJ_ORIGIN"], tls / "issuer_crt")
+    gateway = Gateway(state, os.environ.get("ANJ_BACKEND", "http://nextcloud"), os.environ["ANJ_ORIGIN"], tls / "issuer_crt",
+                      fetch_spool=os.environ.get("ANJ_FETCH_SPOOL") or None)
     public = gateway.public_app()
     admin = operator_app(gateway)
     context = tls_context(tls / "server_crt", tls / "server_key", tls / "issuer_crt")

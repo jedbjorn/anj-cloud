@@ -56,6 +56,20 @@ def own_state(state=None, uid=UID, gid=GID, root=0):
     return True
 
 
+def own_spool(spool=None, uid=UID, gid=10004, root=0):
+    """Hand the media fetch spool (spec #42), created root-owned by Docker, to the gateway user and
+    the spool group shared with the worker; the gateway lays out the rest (access.fetch). Only the
+    top directory: anything below it is the gateway's own or swept."""
+    spool = spool or os.environ.get("ANJ_FETCH_SPOOL")
+    if not spool:
+        return False
+    spool = Path(spool)
+    if spool.stat().st_uid != root:
+        return False
+    os.chmod(spool, 0o2750)  # while root still owns it: no CAP_FOWNER is held
+    os.chown(spool, uid, gid)
+    return True
+
 
 if __name__ == "__main__":
     # `docker exec … python -m access.install_tls`: report the loaded copies' digests.

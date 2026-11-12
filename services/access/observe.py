@@ -49,6 +49,9 @@ def route_class(request):
     if path == "/v1/household/users" or path == "/v1/shares" or path.startswith("/v1/shares/"):
         # Directory sharing (spec #26): never the path, folder or display name.
         return "share"
+    if path.startswith("/v1/fetch/"):
+        # Media fetch (spec #42): never a link, a title or a path.
+        return "fetch"
     if path.startswith("/v1/client/releases/"):
         # Client update feed (spec #28 G1): never a package or file name.
         return "release"
