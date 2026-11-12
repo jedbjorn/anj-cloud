@@ -1,4 +1,5 @@
 import '../design/badge_palette.dart';
+import '../core/sync/entry_projection.dart' show releaseWaitsForUpload;
 import '../core/sync/sync_schedule.dart';
 
 /// Presentation-only projections. They never dispatch synchronization actions.
@@ -184,6 +185,10 @@ String libraryStatus(Map<String, dynamic> entry) {
   final status = entry['status'] as String? ?? '';
   if (status.startsWith('Cloud pending: editor working copies')) {
     return 'Editor copies remain until Finish editing. Saved changes sync automatically.';
+  }
+  // Its note says it: "Frees space after upload" (spec #45 R5).
+  if (entry['releaseNote'] != null && releaseWaitsForUpload.contains(status)) {
+    return '';
   }
   return status;
 }

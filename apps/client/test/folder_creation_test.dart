@@ -102,18 +102,15 @@ void main() {
     expect(local('root.txt').readAsStringSync(), 'root');
     expect(local('Cloud/cloud.txt').existsSync(), false);
     expect(local('Cloud/Local/Cloud again/again.txt').existsSync(), false);
-    expect(
-      () => engine.setRetention('root.txt', Retention.cloud),
-      throwsA(isA<FileSystemException>()),
-    );
-    store.entries['root.txt']!.override = Retention.cloud;
-    store.entries['Cloud/Local/local.txt']!.override = Retention.cloud;
-    store.save();
+    // A file's own choice (spec #45, superseding decision #29) beats its
+    // folder's, also in the root, and is kept across a restart.
+    engine.setRetention('root.txt', Retention.cloud);
+    engine.setRetention('Cloud/Local/local.txt', Retention.cloud);
     reopen();
-    expect(engine.retention('root.txt'), Retention.local);
-    expect(engine.retention('Cloud/Local/local.txt'), Retention.local);
-    expect(store.entries['root.txt']!.override, isNull);
-    expect(store.entries['Cloud/Local/local.txt']!.override, isNull);
+    expect(engine.retention('root.txt'), Retention.cloud);
+    expect(engine.retention('Cloud/Local/local.txt'), Retention.cloud);
+    expect(store.entries['root.txt']!.override, Retention.cloud);
+    expect(store.entries['Cloud/Local/local.txt']!.override, Retention.cloud);
   });
 
   test('rejects collisions, traversal, excluded names and unsupported parents without changing policy', () async {

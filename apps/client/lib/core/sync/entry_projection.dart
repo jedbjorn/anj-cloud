@@ -4,6 +4,42 @@ import 'name_policy.dart';
 import 'top_folders.dart';
 import 'sync_engine.dart';
 
+/// A Cloud-only file still on this device because a release guard holds it
+/// (spec #45 R5): the pass releases it once the condition clears.
+const freesWhenClosed = 'Frees space when closed';
+const freesAfterUpload = 'Frees space after upload';
+
+/// The statuses the release guards leave on a file waiting for its upload.
+const releaseWaitsForUpload = {
+  'Cloud pending: pending work is retained.',
+  'Cloud pending: local bytes are not yet clean and synchronized.',
+};
+
+String? releaseNote(
+  SyncEngine engine,
+  Entry entry,
+  List<Operation> operations,
+) {
+  final here =
+      entry.expectedPresent || engine.localIdentities[entry.path] != null;
+  if (entry.kind != ItemKind.file ||
+      !here ||
+      engine.retention(entry.path) != Retention.cloud) {
+    return null;
+  }
+  if (isBusyStatus(entry.status) ||
+      entry.status.contains('filesystem guard refused')) {
+    return freesWhenClosed;
+  }
+  if (entry.conflict != null ||
+      entry.etag == null ||
+      releaseWaitsForUpload.contains(entry.status) ||
+      operations.any((o) => const {'upload', 'preserve'}.contains(o.kind))) {
+    return freesAfterUpload;
+  }
+  return null;
+}
+
 /// Current sync facts supplied to every library tab, without mutating policy.
 Future<Map<String, Object?>> projectEntry(
   SyncEngine engine,
@@ -25,6 +61,7 @@ Future<Map<String, Object?>> projectEntry(
           operation.data['presentationError'] is String)
         operation.data['presentationError'] as String,
   ];
+  final release = releaseNote(engine, entry, operations);
   return (entry.toJson()
       ..removeWhere((key, _) => Entry.indexKeys.contains(key)))
     ..['selectionVersion'] = engine.selectionVersion(entry)
@@ -52,9 +89,11 @@ Future<Map<String, Object?>> projectEntry(
         )
     ..['presentationErrors'] = errors
     // Information only: it syncs as any other row.
+    ..['releaseNote'] = release
     ..['presentationNotes'] = [
       // The cloud's name won over a rename here (spec #33).
       ?entry.movedNote,
+      ?release,
       if (engine.notesLongPaths &&
           engine.tree.root.path.length + 1 + entry.path.length > win32MaxPath)
         longPathNote,
