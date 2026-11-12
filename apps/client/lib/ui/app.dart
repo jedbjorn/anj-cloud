@@ -839,9 +839,14 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
             (dismissOnly(current) && !hasRecoveryCopies(current));
       });
       if (_selected.length != selectedCount) _selectionEpoch++;
-      final allDirectories =
+      // Files, folders or a mix take a storage choice (spec #45 R4).
+      final storageChoosable =
           _selected.isNotEmpty &&
-          _selected.values.every((entry) => entry['kind'] == 'directory');
+          _selected.values.every(
+            (entry) =>
+                (entry['kind'] == 'directory' || entry['kind'] == 'file') &&
+                !dismissOnly(entry),
+          );
       // Documents, Music and Videos: never Cloud-only, never deleted
       // (spec #34 P7).
       final topSelected = _selected.keys.any(isTopFolder);
@@ -1182,7 +1187,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                           ),
                           FilledButton(
                             key: const ValueKey('bulk-local'),
-                            onPressed: allDirectories && !_bulkBusy
+                            onPressed: storageChoosable && !_bulkBusy
                                 ? () => _applyBulk('local')
                                 : null,
                             child: const Text('Local and Cloud'),
@@ -1190,7 +1195,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                           FilledButton(
                             key: const ValueKey('bulk-cloud'),
                             onPressed:
-                                allDirectories && !topSelected && !_bulkBusy
+                                storageChoosable && !topSelected && !_bulkBusy
                                 ? () => _applyBulk('cloud')
                                 : null,
                             child: const Text('Cloud Only'),
@@ -1221,8 +1226,6 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                             const Text(
                               'Recovery copies can only be dismissed; select them on their own.',
                             ),
-                          if (_selected.isNotEmpty && !allDirectories)
-                            const Text('Storage choices require folders only.'),
                         ],
                       ),
                     ),
@@ -1490,7 +1493,11 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                             'Cloud-only / free up space',
                                           ),
                                         ),
-                                      ],
+                                      ] else if (file &&
+                                          !deletedSelectionStatus(
+                                            entry['status'] as String?,
+                                          ))
+                                        ..._fileStorageMenuItems(path, entry),
                                       if (manageSharingItem(
                                         entry,
                                         null,
@@ -1606,6 +1613,32 @@ class _RankedPager extends StatelessWidget {
       ],
     ),
   );
+}
+
+/// A file's storage choice in its ⋮ menu (spec #45 R3): the current one
+/// checked, "(as folder)" when the file follows its folder.
+List<PopupMenuEntry<String>> _fileStorageMenuItems(
+  String path,
+  Map<String, dynamic> entry,
+) {
+  final cloud = entry['effectiveRetention'] == 'cloud';
+  final inherited = entry['override'] == null;
+  return [
+    for (final (value, label) in const [
+      ('cloud', 'Cloud-only / free up space'),
+      ('local', 'Keep on this device'),
+    ])
+      CheckedPopupMenuItem<String>(
+        key: ValueKey('file-$value:$path'),
+        value: value,
+        checked: cloud == (value == 'cloud'),
+        child: Text(
+          cloud == (value == 'cloud') && inherited
+              ? '$label (as folder)'
+              : label,
+        ),
+      ),
+  ];
 }
 
 /// "Manage sharing…" in a folder's ⋮ menu (spec #26); when disabled, the

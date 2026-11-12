@@ -108,10 +108,7 @@ void main() {
         'NO MATCH',
       );
       await tester.pump();
-      expect(
-        find.text('No files match your search.'),
-        findsOneWidget,
-      );
+      expect(find.text('No files match your search.'), findsOneWidget);
       await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       await tester.pump();
       expect(find.text('cloud.txt'), findsOneWidget);
@@ -356,7 +353,6 @@ void main() {
       await tester.tap(find.byTooltip('File actions'));
       await tester.pumpAndSettle();
       expect(find.text('Local and cloud'), findsNothing);
-      expect(find.text('Cloud-only / free up space'), findsNothing);
       await tester.tap(find.text('Delete everywhere'));
       await tester.pumpAndSettle();
       expect(find.text('Delete everywhere?'), findsOneWidget);
@@ -364,6 +360,52 @@ void main() {
       await tester.tap(find.text('Cancel'));
       await tester.pumpAndSettle();
       expect(controller.action, isNull);
+      await _close(tester, controller);
+    },
+  );
+
+  testWidgets(
+    "a file's menu offers both storage choices, the current one checked, "
+    '"(as folder)" when it follows its folder (spec #45 R3)',
+    (tester) async {
+      final controller = _DirectoryController()
+        ..root = '/synthetic/anj-cloud'
+        ..entries = [
+          _entry('song.mp3'),
+          _entry(
+            'video.mp4',
+            policy: 'cloud',
+            extra: {'override': 'cloud', 'status': 'cloud-only'},
+          ),
+        ];
+      await tester.pumpWidget(CloudApp(controller: controller));
+      CheckedPopupMenuItem<String> item(String key) => tester
+          .widget<CheckedPopupMenuItem<String>>(find.byKey(ValueKey(key)));
+
+      await tester.tap(find.byTooltip('File actions').first);
+      await tester.pumpAndSettle();
+      expect(item('file-local:song.mp3').checked, isTrue);
+      expect(item('file-cloud:song.mp3').checked, isFalse);
+      expect(find.text('Keep on this device (as folder)'), findsOneWidget);
+      expect(find.text('Cloud-only / free up space'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('file-cloud:song.mp3')));
+      await tester.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(controller.action, 'retention');
+      expect(controller.actionPath, 'song.mp3');
+      expect(controller.actionValue, 'cloud');
+
+      await tester.tap(find.byTooltip('File actions').last);
+      await tester.pumpAndSettle();
+      expect(item('file-cloud:video.mp4').checked, isTrue);
+      expect(item('file-local:video.mp4').checked, isFalse);
+      // Its own choice: no "(as folder)".
+      expect(find.text('Cloud-only / free up space'), findsOneWidget);
+      expect(find.text('Keep on this device'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('file-local:video.mp4')));
+      await tester.pumpAndSettle();
+      expect(controller.actionPath, 'video.mp4');
+      expect(controller.actionValue, 'local');
       await _close(tester, controller);
     },
   );
