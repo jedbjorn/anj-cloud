@@ -442,7 +442,12 @@ class ScriptSafety(unittest.TestCase):
         self.assertIn("ip daddr 10.77.10.10 tcp dport 443 accept", text)
         self.assertIn("ip saddr 10.77.10.1 tcp dport 22 accept", text)
         self.assertIn("table inet anj_cloud {}\ndelete table inet anj_cloud\n", text)
-        self.assertEqual(len(re.findall(r"dport", text)), 4)    # 68, 546, 443, 22: nothing else is opened
+        inbound, _, forward = text.partition("\tchain forward {")
+        self.assertEqual(len(re.findall(r"dport", inbound)), 4)    # 68, 546, 443, 22: nothing else is opened
+        # The media fetch worker's bridge (spec #42): nothing to the VM, nothing private but DNS forwarded.
+        self.assertIn('iif "lo" accept\n\t\tiifname "anj-fetch" drop', inbound)
+        self.assertIn('iifname "anj-fetch" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8', forward)
+        self.assertEqual(1, len(re.findall(r"dport", forward)))
         with self.assertRaises(ValueError):
             bootstrap.render_firewall("10.77.10.10; flush ruleset", "10.77.10.1")
         if shutil.which("nft"):

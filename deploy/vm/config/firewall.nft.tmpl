@@ -3,6 +3,7 @@
 # Only this table is (re)loaded: never `flush ruleset`, never /etc/nftables.conf, so Docker's own
 # tables stay intact. Inbound: loopback, established, ICMP, DHCP replies, TCP 443 to the bind
 # address, TCP 22 from the admin SSH source (The VM host, #89 (5)); everything else is dropped.
+# Forwarded: the media fetch worker's bridge reaches public addresses only (chain forward).
 # `nft -f` applies this whole file as one transaction: the old table is replaced atomically.
 table inet anj_cloud {}
 delete table inet anj_cloud
@@ -10,6 +11,7 @@ table inet anj_cloud {
 	chain input {
 		type filter hook input priority filter; policy drop;
 		iif "lo" accept
+		iifname "anj-fetch" drop
 		ct state established,related accept
 		ct state invalid drop
 		meta l4proto { icmp, ipv6-icmp } accept
@@ -17,5 +19,17 @@ table inet anj_cloud {
 		udp sport 547 udp dport 546 accept
 		ip daddr {{BIND_ADDRESS}} tcp dport 443 accept
 		ip saddr {{ADMIN_SOURCE}} tcp dport 22 accept
+	}
+	# The media fetch worker's network (spec #42, bridge anj-fetch): it reaches the internet and
+	# nothing else. The VM itself accepts nothing from it (input above, whatever the VM's address);
+	# nothing it sends to a loopback, private, link-local, carrier-grade NAT, multicast or reserved
+	# address is forwarded, except DNS, which Docker 26 forwards from the worker's own namespace to
+	# the VM's resolver. The worker's guard (services/fetch/guard.py) narrows that to Docker's
+	# resolvers inside its namespace as well.
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		iifname "anj-fetch" meta l4proto { tcp, udp } th dport 53 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept
+		iifname "anj-fetch" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 } drop
+		iifname "anj-fetch" meta nfproto ipv6 drop
 	}
 }

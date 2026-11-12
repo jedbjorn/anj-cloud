@@ -78,19 +78,23 @@ class FoundationTests(unittest.TestCase):
             if "build" not in service:
                 self.assertRegex(service["image"], r":\d+\.\d+(?:\.\d+)?[^@]*@sha256:[a-f0-9]{64}$")
             self.assertNotIn("privileged", service)
-            self.assertNotIn("network_mode", service)
+            if name == "fetch":
+                # Spec #42: the worker joins only fetch-net's namespace, where the network guard lives.
+                self.assertEqual("service:fetch-net", service["network_mode"])
+            else:
+                self.assertNotIn("network_mode", service)
             self.assertNotIn("container_name", service)
             self.assertGreater(service["pids_limit"], 0)
             self.assertIn("mem_limit", service)
             self.assertIn("cpus", service)
             self.assertNotIn("restart", service)  # Explicit opt-in development lifecycle.
-            for volume in service["volumes"]:
+            for volume in service.get("volumes", []):
                 if name == "access" and volume == "${ANJ_CONSOLE_DIR:?Run deploy/dev.py setup}:/run/anj-console":
                     continue  # spec #27: the console backend's socket directory only
                 self.assertIn(volume.split(":")[0], config["volumes"])
             if name != "access":
                 self.assertNotIn("ports", service)
-                self.assertNotIn("frontend", service["networks"])
+                self.assertNotIn("frontend", service.get("networks", []))
         self.assertEqual(["127.0.0.1:${SC_DEV_PORT:-8834}:8443"], services["access"]["ports"])
         self.assertEqual({"issuer_crt", "server_crt", "server_key"}, set(services["access"]["secrets"]))
         self.assertNotIn("issuer.key", json.dumps(services["access"]))

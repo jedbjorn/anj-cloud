@@ -270,6 +270,10 @@ class ProdStack(Stack):
     def image(self, commit):
         return f"{self.image_repository}:{commit[:12]}"
 
+    def fetch_image(self, commit):
+        """The media fetch worker's image for a release (spec #42), beside the gateway's."""
+        return stackenv.fetch_image(dict(self.config, release=commit, image_repository=self.image_repository), self.project)
+
     def require_setup(self):
         if not self.host or not self.release:
             raise RuntimeError("State root has no recorded production setup; run deploy/prod.py setup --host <host>")
@@ -325,10 +329,10 @@ class ProdStack(Stack):
             raise RuntimeError(f"Command failed (exit {result.returncode}); output withheld: {argv[0]} {argv[1]}")
         return result.stdout
 
-    def image_revision(self, commit):
+    def image_revision(self, commit, image=None):
         try:
             output = self.run(["docker", "image", "inspect", "--format",
-                               '{{ index .Config.Labels "org.opencontainers.image.revision" }}', self.image(commit)])
+                               '{{ index .Config.Labels "org.opencontainers.image.revision" }}', image or self.image(commit)])
         except RuntimeError:
             return None
         return output.strip()
@@ -446,21 +450,23 @@ class ProdStack(Stack):
         for member in BIN_FILES:
             if not (self.source_root / commit[:12] / member).is_file():
                 raise RuntimeError(f"Release {commit[:12]} source lacks {member}")
-        if self.image_revision(commit) != commit:
+        if self.image_revision(commit) != commit or self.image_revision(commit, self.fetch_image(commit)) != commit:
             raise RuntimeError(f"Release {commit[:12]} image is not built")
         config = dict(self.config, release=commit, socket_dir=self.socket_dir, image_repository=self.image_repository)
         self.run([*stackenv.compose_command(self.local, config, self.project), "config", "--quiet"])
         return True
 
     def build(self, commit):
-        """Build the gateway image from the release's source.tar; nothing is mounted."""
-        if self.image_revision(commit) == commit:
-            return self.image(commit)
-        archive = self.source_tar(commit).read_bytes()
-        self.run_bytes(["docker", "build", "--quiet", "--label", "org.opencontainers.image.revision=" + commit,
-                        "--tag", self.image(commit), "--file", "services/access/Dockerfile", "-"], data=archive)
-        if self.image_revision(commit) != commit:
-            raise RuntimeError("Built image does not carry the requested commit")
+        """Build the gateway and fetch worker images from the release's source.tar; nothing is mounted."""
+        for image, dockerfile in ((self.image(commit), "services/access/Dockerfile"),
+                                  (self.fetch_image(commit), "services/fetch/Dockerfile")):
+            if self.image_revision(commit, image) == commit:
+                continue
+            archive = self.source_tar(commit).read_bytes()
+            self.run_bytes(["docker", "build", "--quiet", "--label", "org.opencontainers.image.revision=" + commit,
+                            "--tag", image, "--file", dockerfile, "-"], data=archive)
+            if self.image_revision(commit, image) != commit:
+                raise RuntimeError("Built image does not carry the requested commit")
         return self.image(commit)
 
     def export_release(self, commit):
@@ -1043,6 +1049,19 @@ class ProdStack(Stack):
             stale = self.tls_stale()
             if stale:
                 raise RuntimeError("Gateway serves stale TLS material (" + ", ".join(stale) + "); run deploy/prod.py up")
+        if "fetch" in running:
+            # The media fetch worker (spec #42): uid 10003 without capabilities, in fetch-net's
+            # namespace (the guard), on no other network, from this release's image.
+            uid, capabilities = self.process_identity(services["fetch"])
+            if uid != paths.FETCH_UID or capabilities != 0:
+                raise RuntimeError("fetch process is not uid 10003 without capabilities")
+            identities["fetch"] = uid
+            if not services["fetch"]["HostConfig"]["NetworkMode"].startswith("container:"):
+                raise RuntimeError("The fetch worker must share fetch-net's network namespace")
+            if "fetch-net" in services and set(services["fetch-net"]["NetworkSettings"]["Networks"]) != {self.project + "_fetch"}:
+                raise RuntimeError("fetch-net must join only the fetch network")
+            if services["fetch"]["Config"]["Image"] != self.fetch_image(self.release):
+                raise RuntimeError("Fetch worker image does not match the recorded release")
         if "haproxy" in running:
             if services["haproxy"]["HostConfig"]["NetworkMode"] != "host":
                 raise RuntimeError("HAProxy must use the VM's host network")

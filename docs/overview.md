@@ -22,6 +22,11 @@ certificate that was issued when the device paired, and it speaks WebDAV to the 
 - **Files:** a Nextcloud instance (with PostgreSQL and Redis) that holds the household's files. Neither is
   reachable except through the access service.
 - **HAProxy** terminates TLS and enforces connection limits in front of the access service.
+- **Fetch worker** (`services/fetch/`): downloads media a household member asks for (the client's Downloader
+  tab) with yt-dlp and ffmpeg, one item at a time, and hands the checked file back to the access service,
+  which saves it into that member's `Music` or `Videos` like an upload. It is the only container with
+  outbound internet access; a network guard drops everything it sends to private, local or VM addresses, it
+  runs without privileges, and it shares nothing with the other services except a spool volume.
 - **PM2** supervises the services inside the VM; systemd handles boot and scheduled jobs.
 - **Backups:** nightly encrypted backups to an attached drive, with a restore drill.
 - **DDNS:** an optional updater keeps a Cloudflare DNS record pointing at your home address.

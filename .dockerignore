@@ -3,3 +3,6 @@
 !services/access/
 !services/access/**
 services/access/__pycache__/
+!services/fetch/
+!services/fetch/**
+services/fetch/__pycache__/

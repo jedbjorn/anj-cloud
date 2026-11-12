@@ -34,6 +34,13 @@ def image(config, project=paths.PROJECT):
     return f"{config.get('image_repository') or project + '-access'}:{config['release'][:12]}"
 
 
+def fetch_image(config, project=paths.PROJECT):
+    """The media fetch worker's image (spec #42): built from the same release beside the gateway's."""
+    repository = config.get("image_repository") or project + "-access"
+    repository = (repository[:-len("-access")] if repository.endswith("-access") else repository) + "-fetch"
+    return f"{repository}:{config['release'][:12]}"
+
+
 def environment(state_root, config, project=paths.PROJECT, base=None):
     """The variables compose.prod.json interpolates; inherited ANJ_/COMPOSE_ values are dropped."""
     state_root = Path(state_root)
@@ -47,7 +54,7 @@ def environment(state_root, config, project=paths.PROJECT, base=None):
     if config.get("host"):
         result.update(ANJ_HOST=config["host"], ANJ_ADMIN_USER=ADMIN_USER, ANJ_TRUSTED_DOMAINS=" ".join(TRUSTED_DOMAINS))
     if config.get("release"):
-        result.update(ANJ_ACCESS_IMAGE=image(config, project),
+        result.update(ANJ_ACCESS_IMAGE=image(config, project), ANJ_FETCH_IMAGE=fetch_image(config, project),
                       ANJ_HAPROXY_CFG=str(release_dir(state_root, config) / "haproxy.cfg"))
     return result
 

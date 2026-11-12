@@ -333,8 +333,8 @@ class ProdThroughPm2Tests(unittest.TestCase):
         flag = self.stack.local / "run" / "emergency-stop"
         self.assertEqual(0o600, stat.S_IMODE(flag.stat().st_mode))
         self.assertEqual("Port 8080 answered from outside", json.loads(flag.read_text())["reason"])
-        self.assertEqual([("stop", "haproxy"), ("stop", "gateway"), ("save",)], self.pm2.calls)
-        self.assertEqual(["haproxy", "gateway"], result["stopped"])
+        self.assertEqual([("stop", "haproxy"), ("stop", "gateway"), ("stop", "fetch"), ("stop", "fetch-net"), ("save",)], self.pm2.calls)
+        self.assertEqual(["haproxy", "gateway", "fetch", "fetch-net"], result["stopped"])
         for reason in ("", "x" * 201, "line\nbreak"):
             with self.subTest(reason=reason), self.assertRaisesRegex(RuntimeError, "--reason"):
                 self.stack.emergency_stop(reason)
@@ -410,7 +410,8 @@ class ProdThroughPm2Tests(unittest.TestCase):
             self.pm2.calls.clear()
             self.stack.resume()
         self.assertFalse((self.stack.local / "run" / "emergency-stop").exists())
-        self.assertEqual([("jlist",), ("restart", "gateway"), ("restart", "haproxy"), ("save",)], self.pm2.calls)
+        self.assertEqual([("jlist",), ("restart", "gateway"), ("restart", "haproxy"), ("restart", "fetch-net"), ("restart", "fetch"),
+                          ("save",)], self.pm2.calls)
         self.assertEqual(list(paths.STACK_APPS), self.stack.active_apps())
 
     def test_up_starts_backend_first_then_the_rest_and_saves(self):
@@ -562,7 +563,8 @@ class ProdThroughPm2Tests(unittest.TestCase):
                 patch.object(self.stack, "alert", side_effect=lambda key, *a, **k: order.append(("alert", key)) or "dispatcher"):
             self.stack.emergency_stop("drill")
         self.assertTrue((self.stack.local / "run" / "emergency-stop").exists())
-        self.assertEqual([("alert", "emergency-stop"), ("pm2", "stop", "haproxy"), ("pm2", "stop", "gateway"), ("pm2", "save")], order)
+        self.assertEqual([("alert", "emergency-stop"), ("pm2", "stop", "haproxy"), ("pm2", "stop", "gateway"), ("pm2", "stop", "fetch"),
+                          ("pm2", "stop", "fetch-net"), ("pm2", "save")], order)
 
     def test_status_shape_has_every_app_with_fixed_keys(self):
         self.pm2.states = {"db": "online", "redis": "online", "nextcloud": "online", "cron": "online", "gateway": "stopped"}

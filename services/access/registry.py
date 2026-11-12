@@ -32,6 +32,14 @@ class CodeReused(Rejection):
         self.invitation, self.label, self.fingerprint = invitation, label, fingerprint
 
 
+class FetchCap(Rejection):
+    """The account already holds the most unfinished fetch jobs it may (spec #42): 429."""
+
+    def __init__(self, room):
+        super().__init__("Too many downloads are waiting")
+        self.room = max(0, room)
+
+
 class LastAdmin(Rejection):
     """The change would leave no enabled admin (decision #87): 409 `last-admin`."""
 
@@ -136,6 +144,21 @@ class Registry:
             CREATE TABLE IF NOT EXISTS audit_imported (entry_id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS token_cleanup (
               device TEXT PRIMARY KEY, uid TEXT NOT NULL, token_id TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0);
+            -- Media fetch (spec #42 F2): one row per media item, or per submitted link until the worker
+            -- says whether it is a playlist (`expand`). Owned by one account and the device that
+            -- submitted it. The link and title are kept only here, never in a log line. `dispatch`
+            -- names the job's spool directory while it runs; `target`/`target_size` record an import
+            -- in flight so an unknown outcome is read back. `interrupted` counts restarts (once only).
+            CREATE TABLE IF NOT EXISTS fetch_jobs (
+              seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, uid TEXT NOT NULL, device TEXT NOT NULL,
+              kind TEXT NOT NULL CHECK(kind IN ('audio','video')), height INTEGER, url TEXT NOT NULL,
+              expand INTEGER NOT NULL DEFAULT 1, folder TEXT, state TEXT NOT NULL, title TEXT, media_id TEXT,
+              obtained INTEGER, percent REAL, destination TEXT, message TEXT, submitted REAL NOT NULL, started REAL,
+              finished REAL, interrupted INTEGER NOT NULL DEFAULT 0, dispatch TEXT, target TEXT, target_size INTEGER);
+            CREATE INDEX IF NOT EXISTS fetch_jobs_by_uid ON fetch_jobs(uid, seq);
+            CREATE INDEX IF NOT EXISTS fetch_jobs_by_state ON fetch_jobs(state, seq);
+            -- When each account's last job left the running slot: the queue's turn order (decision #180).
+            CREATE TABLE IF NOT EXISTS fetch_turns (uid TEXT PRIMARY KEY, served REAL NOT NULL);
         """)
         self._upgrade_devices()
         self._upgrade_invitation_labels()
@@ -544,6 +567,10 @@ class Registry:
         return {"added": {str(row["fileid"]): row["added_at"] for row in rows},
                 "cursor": rows[-1]["seq"] if rows else after, "more": more, "reset": False}
 
+    def fence_state(self):
+        """clear, dispatched (a write's outcome pending) or maintenance."""
+        return self.db.execute("SELECT state FROM mutation_fence WHERE singleton=1").fetchone()[0]
+
     def mutation_ready(self):
         return self.db.execute("SELECT state FROM mutation_fence WHERE singleton=1").fetchone()[0] == "clear"
 
@@ -851,6 +878,93 @@ class Registry:
         return [{"uid": row["uid"], "display_name": row["display_name"] or row["uid"]}
                 for row in self.db.execute("SELECT uid,display_name FROM account_cleanup "
                                            "WHERE uid NOT IN (SELECT uid FROM accounts) ORDER BY uid")]
+
+    # Media fetch jobs (spec #42 F2). Every read is scoped to one account except the queue's own.
+
+    FETCH_UNFINISHED = ("waiting", "checking", "downloading", "placing")
+    FETCH_COLUMNS = frozenset({"state", "title", "media_id", "obtained", "percent", "destination", "message", "started",
+                               "finished", "interrupted", "dispatch", "target", "target_size", "folder", "expand"})
+
+    def fetch_add(self, uid, device, kind, height, urls, *, cap, folder=None, expand=True):
+        """Queue one waiting row per link in one transaction, or none: FetchCap when the account
+        would hold more than `cap` unfinished rows."""
+        now = self.clock()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            unfinished = self.db.execute("SELECT count(*) FROM fetch_jobs WHERE uid=? AND state IN (?,?,?,?)",
+                                         (uid, *self.FETCH_UNFINISHED)).fetchone()[0]
+            if unfinished + len(urls) > cap:
+                raise FetchCap(cap - unfinished)
+            ids = []
+            for url in urls:
+                identity = str(uuid.uuid4())
+                self.db.execute("INSERT INTO fetch_jobs(id,uid,device,kind,height,url,expand,folder,state,submitted) "
+                                "VALUES(?,?,?,?,?,?,?,?,'waiting',?)", (identity, uid, device, kind, height, url, int(expand), folder, now))
+                ids.append(identity)
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        return [self.fetch_job(identity) for identity in ids]
+
+    def fetch_unfinished(self, uid):
+        return self.db.execute("SELECT count(*) FROM fetch_jobs WHERE uid=? AND state IN (?,?,?,?)",
+                               (uid, *self.FETCH_UNFINISHED)).fetchone()[0]
+
+    def fetch_job(self, identity):
+        row = self.db.execute("SELECT * FROM fetch_jobs WHERE id=?", (identity,)).fetchone()
+        return None if row is None else dict(row)
+
+    def fetch_jobs(self, uid):
+        """The account's rows, newest first."""
+        return [dict(row) for row in self.db.execute("SELECT * FROM fetch_jobs WHERE uid=? ORDER BY seq DESC", (uid,))]
+
+    def fetch_update(self, identity, **fields):
+        if not fields or set(fields) - self.FETCH_COLUMNS:
+            raise ValueError("Unknown fetch job field")
+        with self.db:
+            self.db.execute("UPDATE fetch_jobs SET " + ",".join(name + "=?" for name in fields) + " WHERE id=?",
+                            (*fields.values(), identity))
+        return self.fetch_job(identity)
+
+    def fetch_remove(self, uid, identity):
+        with self.db:
+            self.db.execute("DELETE FROM fetch_jobs WHERE uid=? AND id=? AND state NOT IN (?,?,?,?)",
+                            (uid, identity, *self.FETCH_UNFINISHED))
+            return self.db.execute("SELECT changes()").fetchone()[0] == 1
+
+    def fetch_clear(self, uid):
+        with self.db:
+            self.db.execute("DELETE FROM fetch_jobs WHERE uid=? AND state NOT IN (?,?,?,?)", (uid, *self.FETCH_UNFINISHED))
+            return self.db.execute("SELECT changes()").fetchone()[0]
+
+    def fetch_prune(self, before):
+        """Finished rows older than `before` (retention, decision #180)."""
+        with self.db:
+            self.db.execute("DELETE FROM fetch_jobs WHERE finished IS NOT NULL AND finished<? AND state NOT IN (?,?,?,?)",
+                            (before, *self.FETCH_UNFINISHED))
+
+    def fetch_running(self):
+        """Rows holding the single running slot (normally at most one), oldest first."""
+        return [dict(row) for row in self.db.execute(
+            "SELECT * FROM fetch_jobs WHERE state IN ('checking','downloading','placing') ORDER BY seq")]
+
+    def fetch_next(self):
+        """The next waiting row: from the account whose oldest waiting row has waited longest,
+        counting its wait from when the account's previous job left the running slot, so accounts
+        alternate between a long playlist's items (decision #180). FIFO within an account."""
+        heads = self.db.execute(
+            "SELECT uid, min(seq) AS head, min(submitted) AS oldest, (SELECT served FROM fetch_turns WHERE fetch_turns.uid=j.uid) AS served "
+            "FROM fetch_jobs j WHERE state='waiting' GROUP BY uid").fetchall()
+        if not heads:
+            return None
+        best = min(heads, key=lambda row: (max(row["oldest"], row["served"] or 0), row["head"]))
+        return dict(self.db.execute("SELECT * FROM fetch_jobs WHERE seq=?", (best["head"],)).fetchone())
+
+    def fetch_served(self, uid, when=None):
+        with self.db:
+            self.db.execute("INSERT INTO fetch_turns(uid,served) VALUES(?,?) ON CONFLICT(uid) DO UPDATE SET served=excluded.served",
+                            (uid, self.clock() if when is None else when))
 
     def audit_import_entry(self, entry_id, action, result, *, time, target_uid=None, target_device=None, target_invitation=None):
         """One recovery-CLI entry, once per entry id. Returns whether it was new."""

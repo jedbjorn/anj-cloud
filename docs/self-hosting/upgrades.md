@@ -89,6 +89,13 @@ If your terminal disconnects, the detached switch continues in the VM and either
 Check `anj-cloud-setup status` and read `/var/log/anj-cloud-setup/upgrade-<UTC>.out` and
 `/var/log/anj-cloud-setup/upgrade-<UTC>.err`. Do not start a second upgrade while one is active.
 
+> **The release with the media fetch worker** adds two containers (`fetch-net` and `fetch`, 544 MiB of
+> memory limits), two volumes (the fetch spool and the worker's tools; neither is backed up), a `forward`
+> chain in the VM firewall for the worker's bridge `anj-fetch`, and raises Nextcloud's internal request-body
+> limit to 8 GiB for the server's own imports (clients keep the 64 MiB upload limit). Setup's converge
+> step applies the firewall change during the upgrade. The worker needs outbound HTTPS (see
+> [requirements.md](requirements.md)); without it, downloads fail and nothing else is affected.
+
 > **Data migrations are not reversible by a release rollback.** A newer Nextcloud image or gateway registry
 > migration can make data incompatible with the previous release. Neither automatic fallback nor
 > `upgrade --rollback` can undo that data change. Review the target release for such migrations and make a

@@ -6,7 +6,8 @@ crash, docker start/restart), so freshness never depends on a restart policy. As
 CAP_CHOWN, CAP_DAC_READ_SEARCH, CAP_SETUID and CAP_SETGID (under the VM's rootful Docker container root
 is not the owner of the 0600 secrets, so it reads them with CAP_DAC_READ_SEARCH; it never writes them):
 
-1. hands a root-owned state volume (fresh or restored) to the gateway user;
+1. hands a root-owned state volume (fresh or restored) to the gateway user, and the media fetch
+   spool (spec #42) to the gateway user and the spool group;
 2. copies the issuer certificate, server certificate and server key from the compose secrets
    (0600, host-owned; Compose ignores secret uid/mode outside Swarm) into a tmpfs as 0400
    copies for the gateway user, so a renewed certificate is always loaded and no second copy
@@ -21,7 +22,7 @@ The issuer key is never mounted. Nothing here logs file contents.
 import os
 import sys
 
-from .install_tls import NAMES, SOURCE, digests, install, own_state
+from .install_tls import NAMES, SOURCE, digests, install, own_spool, own_state
 from .privileges import drop
 
 
@@ -37,6 +38,7 @@ def main():
         raise SystemExit("access.start must run as container root to refresh the TLS copies")
     uid = int(os.environ["ANJ_RUN_AS"])
     own_state(uid=uid, gid=uid)
+    own_spool(uid=uid)
     expected = digests(SOURCE)  # sources are readable only by container root
     install(uid=uid, gid=uid)
     drop()

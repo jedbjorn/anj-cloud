@@ -92,7 +92,8 @@
         "NEXTCLOUD_TRUSTED_DOMAINS": "${ANJ_TRUSTED_DOMAINS:?Run deploy/prod.py setup}",
         "REDIS_HOST": "redis",
         "PHP_MEMORY_LIMIT": "256M",
-        "PHP_UPLOAD_LIMIT": "64M"
+        "PHP_UPLOAD_LIMIT": "64M",
+        "APACHE_BODY_LIMIT": "8590983168"
       },
       "secrets": [
         "database",
@@ -183,7 +184,8 @@
         "ANJ_MAX_TRANSFER_BYTES": "67108864",
         "ANJ_STAGING_BYTES": "134217728",
         "ANJ_RUN_AS": "10001",
-        "ANJ_RUN_GROUPS": "10002"
+        "ANJ_RUN_GROUPS": "10002,10004",
+        "ANJ_FETCH_SPOOL": "/var/lib/anj-fetch"
       },
       "secrets": [
         "issuer_crt",
@@ -192,6 +194,7 @@
       ],
       "volumes": [
         "access:/var/lib/anj",
+        "fetch-spool:/var/lib/anj-fetch",
         {
           "type": "bind",
           "source": "${ANJ_SOCKET_DIR:?Run deploy/prod.py setup}",
@@ -333,6 +336,90 @@
           "max-file": "2"
         }
       }
+    },
+    "fetch-net": {
+      "image": "${ANJ_FETCH_IMAGE:?Run deploy/prod.py up}",
+      "pull_policy": "never",
+      "user": "0:0",
+      "command": [
+        "python",
+        "-I",
+        "/opt/anj-fetch/guard.py"
+      ],
+      "networks": [
+        "fetch"
+      ],
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "cap_add": [
+        "NET_ADMIN"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python",
+          "-I",
+          "/opt/anj-fetch/guard.py",
+          "check"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "start_period": "5s",
+        "start_interval": "1s",
+        "retries": 3
+      },
+      "mem_limit": "32m",
+      "cpus": 0.1,
+      "pids_limit": 16,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      },
+      "restart": "no"
+    },
+    "fetch": {
+      "image": "${ANJ_FETCH_IMAGE:?Run deploy/prod.py up}",
+      "pull_policy": "never",
+      "network_mode": "service:fetch-net",
+      "volumes": [
+        "fetch-spool:/spool",
+        "fetch-tools:/var/lib/anj-fetch-tools"
+      ],
+      "depends_on": {
+        "fetch-net": {
+          "condition": "service_healthy",
+          "restart": true
+        }
+      },
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:size=256m,mode=1777"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "mem_limit": "512m",
+      "cpus": 1,
+      "pids_limit": 128,
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "2"
+        }
+      },
+      "restart": "no"
     }
   },
   "networks": {
@@ -341,13 +428,20 @@
     },
     "proxy": {
       "internal": true
+    },
+    "fetch": {
+      "driver_opts": {
+        "com.docker.network.bridge.name": "anj-fetch"
+      }
     }
   },
   "volumes": {
     "nextcloud": {},
     "database": {},
     "redis": {},
-    "access": {}
+    "access": {},
+    "fetch-spool": {},
+    "fetch-tools": {}
   },
   "secrets": {
     "database": {

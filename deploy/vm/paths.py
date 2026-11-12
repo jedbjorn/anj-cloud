@@ -17,11 +17,15 @@ import sys
 # Identity -------------------------------------------------------------------------------
 PROJECT = "anj-cloud-prod"                  # Compose project
 IMAGE_REPOSITORY = PROJECT + "-access"      # gateway image, tagged <commit12>
+FETCH_IMAGE_REPOSITORY = PROJECT + "-fetch" # media fetch worker image (spec #42), tagged <commit12>
 VM_USER = "anj"                             # runs prod.py and PM2 (passwordless sudo, #89 (5))
 VM_GROUP = "anj"                            # group of the HAProxy admin socket
 GATEWAY_UID = 10001                         # services/access/Dockerfile USER
 GATEWAY_GROUP = "anj-gw"                    # owns the gateway socket directory
 GATEWAY_GID = 10002                         # fixed; HAProxy's container gets it as supplementary group
+FETCH_UID = 10003                           # services/fetch/Dockerfile USER (media fetch worker, spec #42)
+SPOOL_GID = 10004                           # the fetch spool's group: the worker's and the gateway's (ANJ_RUN_GROUPS)
+FETCH_BRIDGE = "anj-fetch"                  # the worker network's bridge; the VM firewall drops its private traffic
 
 # Data disk ------------------------------------------------------------------------------
 DATA_LABEL = "ANJ_DATA"                     # ext4 label of the data disk
@@ -113,14 +117,17 @@ RESTIC_REPOSITORY = BACKUP_MOUNT / "restic"
 
 # PM2 ------------------------------------------------------------------------------------
 # Stack apps in start (dependency) order; each runs `deploy/vm/run-service <app>` attached.
-STACK_APPS = ("db", "redis", "nextcloud", "cron", "gateway", "haproxy")
+# fetch-net holds the media fetch worker's network namespace and guard; fetch is the worker (spec #42).
+STACK_APPS = ("db", "redis", "nextcloud", "cron", "gateway", "haproxy", "fetch-net", "fetch")
 # PM2 app name -> Compose service name.
 COMPOSE_SERVICE = {"db": "db", "redis": "redis", "nextcloud": "nextcloud", "cron": "cron",
-                   "gateway": "access", "haproxy": "haproxy"}
+                   "gateway": "access", "haproxy": "haproxy", "fetch-net": "fetch-net", "fetch": "fetch"}
 # An app starts only when these apps' services are healthy.
 DEPENDENCIES = {"db": (), "redis": (), "nextcloud": ("db", "redis"), "cron": ("nextcloud",),
-                "gateway": ("nextcloud",), "haproxy": ("gateway",)}
-EMERGENCY_APPS = ("haproxy", "gateway")     # refused while EMERGENCY_STOP exists
+                "gateway": ("nextcloud",), "haproxy": ("gateway",), "fetch-net": (), "fetch": ("fetch-net",)}
+# Refused while EMERGENCY_STOP exists: ingress, and the media fetch worker with its guard (the
+# only containers that reach the internet).
+EMERGENCY_APPS = ("haproxy", "gateway", "fetch", "fetch-net")
 EMERGENCY_EXIT_CODE = 78                    # run-service exit while flagged; in PM2 stop_exit_codes
 STOP_GRACE_SECONDS = 30                     # run-service: docker compose stop --timeout
 # PM2 kill_timeout: above run-service's worst stop path (docker stop up to grace + 20 s, then the

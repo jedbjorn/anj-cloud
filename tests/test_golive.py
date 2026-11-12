@@ -409,6 +409,8 @@ class EmergencyStop(unittest.TestCase):
                 for i, app in enumerate(paths.STACK_APPS)}
         apps["gateway"].update(status=gateway, pid=None, service=None)
         apps["haproxy"].update(status=haproxy, pid=None, service=None)
+        for app in ("fetch", "fetch-net"):  # the media fetch worker stops with ingress (spec #42 review)
+            apps[app].update(status="stopped", pid=None, service=None)
         return {"project": "anj-cloud-prod", "host": "gateway.example.com", "release": "0123456789ab",
                 "emergency_stop": flag, "apps": apps, "healthcheck": {"ready": False}}
 
@@ -438,7 +440,7 @@ class EmergencyStop(unittest.TestCase):
         self.assertIn("not observable from the VM host", result["alert"])
         self.assertIs(result["emergency_stop_flag"], True)
         self.assertFalse(any(word in call[-1] for call in self.calls for word in ("resume", "start", "restart", "docker")))
-        self.assertEqual(result["app_states"], {"haproxy": "stopped", "gateway": "stopped"})
+        self.assertEqual(result["app_states"], {"haproxy": "stopped", "gateway": "stopped", "fetch": "stopped", "fetch-net": "stopped"})
         self.assertIn("halo-vm.sh --forward off", result["root_stop"])
         self.assertFalse(self.alerts.exists())  # the VM's prod.py sends the ntfy message
 
@@ -541,7 +543,7 @@ class EmergencyStop(unittest.TestCase):
         for label, status in cases.items():
             with self.subTest(label), self.assertRaises(golive.CheckFailed) as caught:
                 self.stop(status=status)
-            expected = "six stack apps" if label in ("missing app", "extra app") else "published shape"
+            expected = "exactly the stack apps" if label in ("missing app", "extra app") else "published shape"
             self.assertIn(expected, json.loads(str(caught.exception))["status_error"])
 
     def test_other_apps_may_report_any_pm2_status(self):

@@ -46,7 +46,9 @@ class World:
         self.containers = {service: {"running": True, "started": T0 - 7200, "health": "healthy"}
                            for service in ("db", "redis", "nextcloud", "access")}
         self.containers.update(cron={"running": True, "started": T0 - 7200, "health": None},
-                               haproxy={"running": True, "started": T0 - 7200, "health": None})
+                               haproxy={"running": True, "started": T0 - 7200, "health": None},
+                               fetch={"running": True, "started": T0 - 7200, "health": None})
+        self.containers["fetch-net"] = {"running": True, "started": T0 - 7200, "health": "healthy"}
         self.gateway_ready = True
         self.console_answers = True            # the console backend's socket (spec #27)
         self.maintenance = False

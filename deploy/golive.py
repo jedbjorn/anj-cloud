@@ -402,7 +402,7 @@ APP_STATUSES = {"online", "stopped", "stopping", "launching", "errored", "missin
 
 def app_states(status):
     """{app: status} from A's `prod.py status` JSON, accepting exactly its published shape:
-    {"project","host","release","emergency_stop": bool, "apps": {<each of the six stack apps>:
+    {"project","host","release","emergency_stop": bool, "apps": {<each stack app>:
     {"status", "restarts", "pid", "service": {...}|null}}, "healthcheck"}. The status of gateway
     and haproxy must be one of A's statuses; other apps may report any PM2 status string
     (for example "waiting restart" or "one-launch-status"). Anything else raises CheckFailed."""
@@ -410,7 +410,7 @@ def app_states(status):
         raise CheckFailed("prod.py status is not the published shape")
     apps = status["apps"]
     if not isinstance(apps, dict) or set(apps) != set(paths.STACK_APPS):
-        raise CheckFailed("prod.py status does not list exactly the six stack apps")
+        raise CheckFailed("prod.py status does not list exactly the stack apps")
     states = {}
     for name, app in apps.items():
         if (not isinstance(app, dict) or set(app) != APP_KEYS or not isinstance(app["status"], str)

@@ -359,11 +359,14 @@ class CheckTests(unittest.TestCase):
     """`prod.py check`: PM2 online, restart policy no, limits, no ports, non-root, health, fresh TLS."""
 
     def container(self, service, **overrides):
+        networks = {"access": {"anj-cloud-test-prod_proxy": {}}, "fetch-net": {"anj-cloud-test-prod_fetch": {}}}.get(service, {})
+        mode = {"haproxy": "host", "fetch": "container:" + "f" * 64}.get(service, "bridge")
+        image = "anj-cloud-test-prod-%s:aaaaaaaaaaaa" % ("fetch" if service in ("fetch", "fetch-net") else "access")
         container = {"Config": {"Labels": {"com.docker.compose.project": "anj-cloud-test-prod", "com.docker.compose.service": service},
-                                "User": "0:0", "Image": "anj-cloud-test-prod-access:aaaaaaaaaaaa"},
-                     "NetworkSettings": {"Ports": {}, "Networks": {"anj-cloud-test-prod_proxy": {}} if service == "access" else {}},
+                                "User": "0:0", "Image": image},
+                     "NetworkSettings": {"Ports": {}, "Networks": networks},
                      "HostConfig": {"PortBindings": {}, "RestartPolicy": {"Name": "no"}, "LogConfig": {"Type": "journald"},
-                                    "Memory": 268435456, "PidsLimit": 64, "NetworkMode": "host" if service == "haproxy" else "bridge"},
+                                    "Memory": 268435456, "PidsLimit": 64, "NetworkMode": mode},
                      "Mounts": [{"Type": "bind", "Source": "/run/anj-cloud-gw"}],
                      "State": {"Running": True, "Status": "running", "Pid": 4242, "ExitCode": 0, "Health": {"Status": "healthy"}}}
         for path, value in overrides.items():
@@ -386,7 +389,7 @@ class CheckTests(unittest.TestCase):
             services = [paths.COMPOSE_SERVICE[app] for app in paths.STACK_APPS if app not in stopped]
             containers = [self.container(service, **(overrides if service == broken else {})) for service in services]
             outputs = {"dbtype": "pgsql\n", "memcache.locking": "\\OC\\Memcache\\Redis\n", "user:list": json.dumps({"sam": "Sam", "alex": "Alex"})}
-            identities = identities or {"access": (10001, 0), "haproxy": (99, 0)}
+            identities = {"fetch": (10003, 0), **(identities or {"access": (10001, 0), "haproxy": (99, 0)})}
             states = apps or {app: {"status": "stopped" if app in stopped else "online", "restarts": 0, "pid": 1} for app in paths.STACK_APPS}
             with patch.object(stack, "containers", return_value=containers), \
                     patch.object(stack, "pm2_apps", return_value=states), \
@@ -401,7 +404,7 @@ class CheckTests(unittest.TestCase):
 
     def test_healthy_stack_passes_and_each_violation_is_refused(self):
         result = self.check()
-        self.assertEqual((["alex", "sam"], "pm2", {"access": 10001, "haproxy": 99}),
+        self.assertEqual((["alex", "sam"], "pm2", {"access": 10001, "haproxy": 99, "fetch": 10003}),
                          (result["accounts"], result["supervisor"], result["process_uids"]))
         violations = {
             ("access", "NetworkSettings.Ports"): {"8443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8834"}]},
@@ -415,6 +418,10 @@ class CheckTests(unittest.TestCase):
             ("haproxy", "HostConfig.NetworkMode"): "bridge",
             ("access", "Config.Image"): "anj-cloud-test-prod-access:bbbbbbbbbbbb",
             ("access", "State.Running"): False,
+            # The media fetch worker (spec #42): in fetch-net's namespace, fetch-net on the fetch network only.
+            ("fetch", "HostConfig.NetworkMode"): "bridge",
+            ("fetch-net", "NetworkSettings.Networks"): {"anj-cloud-test-prod_fetch": {}, "anj-cloud-test-prod_proxy": {}},
+            ("fetch", "Config.Image"): "anj-cloud-test-prod-fetch:bbbbbbbbbbbb",
         }
         for (service, path), value in violations.items():
             with self.subTest(service=service, path=path), self.assertRaises(RuntimeError):
@@ -424,6 +431,9 @@ class CheckTests(unittest.TestCase):
                            {"access": (1000, 0), "haproxy": (99, 0)}):
             with self.subTest(identities=identities), self.assertRaisesRegex(RuntimeError, "non-root|10001"):
                 self.check(identities=identities)
+        for worker in ((0, 0), (10003, 0x1000), (10001, 0)):
+            with self.subTest(worker=worker), self.assertRaisesRegex(RuntimeError, "fetch process"):
+                self.check(identities={"access": (10001, 0), "haproxy": (99, 0), "fetch": worker})
         with self.assertRaisesRegex(RuntimeError, "stale TLS"):
             self.check(stale=["server_crt", "server_key"])
         offline = {app: {"status": "errored" if app == "db" else "online"} for app in paths.STACK_APPS}
@@ -434,7 +444,7 @@ class CheckTests(unittest.TestCase):
         result = self.check(emergency=True)
         self.assertTrue(result["emergency_stop"])
         self.assertEqual(set(paths.STACK_APPS) - set(paths.EMERGENCY_APPS), set(result["apps"]))
-        self.assertEqual({}, result["process_uids"])
+        self.assertEqual({}, result["process_uids"])  # the media fetch worker is held stopped too
 
     def test_tls_refresh_is_a_pm2_restart_of_the_gateway(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -482,17 +492,18 @@ class StackConfigurationTests(unittest.TestCase):
     def test_production_compose(self):
         services = self.compose["services"]
         self.assertEqual(set(prod.SERVICES), set(services))
-        self.assertEqual({"access", "nextcloud", "db", "redis", "cron", "haproxy"}, set(services))
+        self.assertEqual({"access", "nextcloud", "db", "redis", "cron", "haproxy", "fetch-net", "fetch"}, set(services))
         limits = {"db": ("512m", 128), "redis": ("256m", 64), "nextcloud": ("1536m", 256), "cron": ("384m", 64),
-                  "access": ("256m", 64), "haproxy": ("128m", 64)}
+                  "access": ("256m", 64), "haproxy": ("128m", 64), "fetch-net": ("32m", 16), "fetch": ("512m", 128)}
         for name, service in services.items():
             self.assertNotIn("ports", service, name)
             self.assertNotIn("build", service, name)
             self.assertEqual("no", service["restart"], name)  # PM2 is the only supervisor (#85)
             self.assertEqual(limits[name], (service["mem_limit"], service["pids_limit"]), name)
             self.assertNotIn("privileged", service, name)
-        # 3 GiB of container limits leaves 1 GiB of the 4 GiB VM for the OS, PM2 and Docker.
-        self.assertLessEqual(sum(int(memory[:-1]) for memory, _ in limits.values()), 3072)
+        # 3 GiB of limits for the file stack plus 544 MiB for the media fetch worker (spec #42) and its
+        # guard; the 4 GiB VM relies on them not all peaking at once (see docs/self-hosting/requirements.md).
+        self.assertLessEqual(sum(int(memory[:-1]) for memory, _ in limits.values()), 3616)
         access = services["access"]
         self.assertEqual(["proxy"], access["networks"])
         self.assertTrue(self.compose["networks"]["proxy"]["internal"] and self.compose["networks"]["backend"]["internal"])
@@ -503,8 +514,9 @@ class StackConfigurationTests(unittest.TestCase):
                          (access["user"], access["command"], access["cap_add"]))
         environment = access["environment"]
         self.assertEqual({"ANJ_ORIGIN": "https://${ANJ_HOST:?Run deploy/prod.py setup}", "ANJ_LISTENER": "proxy-unix", "ANJ_RUN_AS": "10001",
-                          "ANJ_RUN_GROUPS": "10002", "ANJ_SOCKET": "/run/anj-cloud-gw/gateway.sock", "ANJ_TLS_DIR": "/run/anj-tls",
-                          "ANJ_MAX_TRANSFER_BYTES": str(64 * 2 ** 20), "ANJ_STAGING_BYTES": str(128 * 2 ** 20)}, environment)
+                          "ANJ_RUN_GROUPS": "10002,10004", "ANJ_SOCKET": "/run/anj-cloud-gw/gateway.sock", "ANJ_TLS_DIR": "/run/anj-tls",
+                          "ANJ_MAX_TRANSFER_BYTES": str(64 * 2 ** 20), "ANJ_STAGING_BYTES": str(128 * 2 ** 20),
+                          "ANJ_FETCH_SPOOL": "/var/lib/anj-fetch"}, environment)
         self.assertEqual(["CMD", "python", "-m", "access.health"], access["healthcheck"]["test"])
         self.assertEqual("journald", access["logging"]["driver"])
         self.assertTrue(access["read_only"])

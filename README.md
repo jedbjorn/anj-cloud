@@ -23,6 +23,9 @@ say who and which devices may connect.
   signed with a key you own; Android releases must carry your Android signing certificate.
 - **Administer from the app.** Users, invitations, devices, settings, health and activity are in the Admin
   section for household admins.
+- **Download media to the cloud.** Paste links in the Downloader tab, pick Audio or Video, and the server saves
+  the files into your `Music` or `Videos`. You are responsible for having the right to download what you
+  request.
 
 | Library, search and filters | Sharing |
 |---|---|

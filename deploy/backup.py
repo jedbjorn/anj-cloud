@@ -1837,8 +1837,9 @@ def in_blackout(moment):
 
 
 # The drill VM runs the stack without its ingress: no haproxy, no forward, no DDNS (coordinator
-# ruling on A's #39). Derived from spec #20's app list, never redefined.
-DRILL_APPS = tuple(app for app in paths.STACK_APPS if app != "haproxy")
+# ruling on A's #39). Derived from spec #20's app list, never redefined. Nor the media fetch worker
+# (spec #42): a drill makes no downloads; restored waiting jobs just wait.
+DRILL_APPS = tuple(app for app in paths.STACK_APPS if app not in ("haproxy", "fetch-net", "fetch"))
 # Where the drill puts the password inside anj-qual (tmpfs; gone with the VM, decision #95).
 DRILL_PASSWORD_DIR = "/run/anj-drill"
 DRILL_PASSWORD = DRILL_PASSWORD_DIR + "/" + paths.RESTIC_PASSWORD.name
