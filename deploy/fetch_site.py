@@ -56,6 +56,10 @@ MEDIA = {
     "muxed720.mp4": ["-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25", "-f", "lavfi", "-i", "sine=frequency=330:duration=60",
                      "-t", "60", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M", "-pix_fmt", "yuv420p", "-c:a", "aac",
                      "-movflags", "+faststart"],
+    "p1080.mp4": ["-f", "lavfi", "-i", "testsrc2=size=1080x1920:rate=25", "-t", "4", "-c:v", "libx264", "-preset", "ultrafast",
+                  "-pix_fmt", "yuv420p", "-an"],
+    "p720.mp4": ["-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=25", "-t", "4", "-c:v", "libx264", "-preset", "ultrafast",
+                 "-pix_fmt", "yuv420p", "-an"],
     "l1080.mp4": ["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=25", "-t", "120", "-c:v", "libx264", "-preset", "ultrafast",
                   "-pix_fmt", "yuv420p", "-an"],
     "l1080.m4a": ["-f", "lavfi", "-i", "sine=frequency=220:duration=120", "-c:a", "aac", "-b:a", "128k", "-vn"],
@@ -85,6 +89,13 @@ ITEMS = {
     "escape": ("../../Escape: <try>/x\\y?.", 4, [("v720", "video/mp4", "avc1.64001f", 720, 6500000, "v720.mp4"),
                                                   ("aac", "audio/mp4", "mp4a.40.2", None, 100000, "a.m4a")]),
     "con": ("CON", 4, [("aac", "audio/mp4", "mp4a.40.2", None, 100000, "a.m4a")]),
+    "portrait": ("Fixture Portrait", 4, [("p1080", "video/mp4", "avc1.640028", (1080, 1920), 14800000, "p1080.mp4"),
+                                         ("p720", "video/mp4", "avc1.64001f", (720, 1280), 6500000, "p720.mp4"),
+                                         ("aac", "audio/mp4", "mp4a.40.2", None, 100000, "a.m4a")]),
+    # Non-Latin titles: Persian with a zero-width non-joiner, and a family emoji joined by ZWJ.
+    "persian": ("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645 \u0622\u0647\u0646\u06af", 4,
+                [("aac", "audio/mp4", "mp4a.40.2", None, 100000, "a.m4a")]),
+    "emoji": ("Family \U0001f468\u200d\U0001f469\u200d\U0001f467 song", 4, [("aac", "audio/mp4", "mp4a.40.2", None, 100000, "a.m4a")]),
 }
 
 
@@ -129,7 +140,9 @@ def mpd(name):
     sets = {}
     for ident, mime, codecs, height, bandwidth, path in streams:
         attributes = 'id="%s" codecs="%s" bandwidth="%d"' % (ident, codecs, bandwidth)
-        if height:
+        if isinstance(height, tuple):
+            attributes += ' width="%d" height="%d"' % height
+        elif height:
             attributes += ' width="%d" height="%d"' % (height * 16 // 9, height)
         else:
             attributes += ' audioSamplingRate="44100"'
@@ -144,8 +157,8 @@ def page(base, name):
     data = {"@context": "https://schema.org", "@type": "VideoObject", "name": title, "description": "Synthetic fixture.",
             "thumbnailUrl": base + "/media/cover.png", "uploadDate": "2026-11-01", "duration": "PT%dS" % duration,
             "contentUrl": base + "/dash/" + name + ".mpd", "author": {"@type": "Person", "name": "Fixture Artist"}}
-    return ('<!DOCTYPE html><html><head><title>fixture</title><script type="application/ld+json">%s</script></head>'
-            '<body><p>fixture</p></body></html>' % json.dumps(data))
+    return ('<!DOCTYPE html><html><head><meta charset="utf-8"><title>fixture</title><script type="application/ld+json">%s'
+            '</script></head><body><p>fixture</p></body></html>' % json.dumps(data))
 
 
 def feed(base, count):
@@ -176,7 +189,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parts.path
         base = "http://" + (self.headers.get("Host") or "fetch-fixture:8080")
         if path.startswith("/item/") and path.endswith(".html") and path[6:-5] in ITEMS:
-            return self.send(page(base, path[6:-5]), "text/html")
+            return self.send(page(base, path[6:-5]), "text/html; charset=utf-8")
         if path.startswith("/dash/") and path.endswith(".mpd") and path[6:-4] in ITEMS:
             return self.send(mpd(path[6:-4]), "application/dash+xml")
         if path.startswith("/list/") and path.endswith(".rss") and path[6:-4].isdigit():

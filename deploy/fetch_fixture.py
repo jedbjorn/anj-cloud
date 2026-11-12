@@ -29,7 +29,8 @@ from deploy.dev import FIXTURE_USERS, Stack, private_directory
 
 SITE = "http://fetch-fixture:8080"
 TERMINAL = {"done", "rejected", "failed", "cancelled"}
-CASES = ("presets", "tenancy", "playlist", "isolation", "restart", "revoke", "update", "memory", "large")
+CASES = ("presets", "tenancy", "playlist", "isolation", "restart", "revoke", "update", "memory", "large", "titles", "maintenance",
+         "upload-restart")
 OLD_YTDLP = ("2025.10.22", "fd99687645340163094d8b21390c59102900f3e7bcdd1fc0112622bf72989d4f")
 SPOOL = "/var/lib/anj-fetch"
 
@@ -415,34 +416,167 @@ async def case_memory(run):
            "process memory (anon) peak %.1f MiB sampled each second; limit %s bytes" % (peak / 2 ** 20, anon / 2 ** 20, limit))
 
 
+async def client_write(run, actor, label):
+    """A client-style upload to the same account through the gateway: (seconds, status)."""
+    name = "Documents/fetch-concurrent-%s-%s.txt" % (run.nonce, label)
+    started = time.monotonic()
+    _, _ = await actor.request("PUT", href(name), data=b"written while an import runs\n", headers={"If-None-Match": "*"},
+                               expected=(201,))
+    run.remember(actor, name)
+    return round(time.monotonic() - started, 3)
+
+
+async def huge(run, size):
+    return json.loads(run.compose("exec", "-T", "fetch-fixture", "python", "-I", "/site/fetch_site.py", "make-huge",
+                                  str(size)).strip().splitlines()[-1])
+
+
+def fence(run):
+    return json.loads(run.compose("exec", "-T", "access", "python", "-m", "access.admin", data=json.dumps({"action": "activity"})))
+
+
 async def case_large(run, size=5 * 2 ** 30 + 123456789):
+    """Above 5 GiB: size and SHA-256 equal; while it is uploaded, another device's write and a new
+    submit go through promptly (the upload holds neither the write lock nor the fence)."""
     alice = await run.device(FIXTURE_USERS[0], "alice-large")
-    made = json.loads(run.compose("exec", "-T", "fetch-fixture", "python", "-I", "/site/fetch_site.py", "make-huge", str(size)).strip().splitlines()[-1])
+    other = await run.device(FIXTURE_USERS[0], "alice-large-other")
+    made = await huge(run, size)
     try:
         job = (await run.submit(alice, [item("huge")], "video", 720))["jobs"][0]
-        staged = None
+        staged, during = None, None
         deadline = time.monotonic() + 1800
         while True:
             row = next(r for r in await run.jobs(alice) if r["id"] == job["id"])
-            if row["state"] == "placing" and staged is None:
+            if row["state"] == "placing" and during is None:
+                activity = fence(run)
+                seconds = await client_write(run, other, "large")
+                submitted = await run.submit(other, [item("song", "?during=import")], "audio")
+                after = next(r for r in await run.jobs(alice) if r["id"] == job["id"])
+                during = {"fence_when_placing": activity["write_fence"], "lock_when_placing": activity["mutation_lock"],
+                          "client_put_seconds": seconds, "submit_status": 202, "submitted": submitted["jobs"][0]["id"],
+                          "import_state_after_write": after["state"]}
                 staged = run.compose("exec", "-T", "access", "sh", "-c",
                                      "for f in %s/jobs/*/media.mp4; do stat -c %%s \"$f\"; sha256sum \"$f\" | cut -c1-64; done" % SPOOL).split()
             if row["state"] in TERMINAL or time.monotonic() > deadline:
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
         assert row["state"] == "done", row
         run.remember(alice, row["path"])
         _, got, sha = await run.readback(alice, row["path"], "huge.mp4")
         (run.evidence / "huge.mp4").unlink()
+        extra = (await run.wait(other, [during["submitted"]]))[0]
+        run.remember(other, extra["path"])
         await run.spool_empty()
-        run.note("large.json", {"row": row, "fixture": made, "staged_while_placing": staged, "nextcloud_size": got, "nextcloud_sha256": sha})
+        temps = [n for n in user_root(run, FIXTURE_USERS[0]) if n.startswith(".anj-fetch-")]
+        run.note("large.json", {"row": row, "fixture": made, "staged_while_placing": staged, "nextcloud_size": got,
+                                "nextcloud_sha256": sha, "during_upload": during, "temporary_files_left": temps})
         assert got == made["size"] and sha == made["sha256"], (got, sha, made)
-        if staged:
-            assert int(staged[0]) == got and staged[1] == sha, staged
-        run.ok("large import: a %d-byte item reaches done; size and SHA-256 read back from Nextcloud equal the staged file%s; "
-               "the spool is empty afterwards" % (got, "" if staged else " (fixture source; staged file not caught while placing)"))
+        assert staged and int(staged[0]) == got and staged[1] == sha, staged
+        assert during["import_state_after_write"] == "placing" and during["client_put_seconds"] < 5, during
+        assert not temps, temps
+        run.ok("large import: a %d-byte item reaches done; size and SHA-256 read back from Nextcloud equal the staged file; "
+               "while it was uploaded (still placing afterwards) another device's PUT took %.2f s and a new submit answered 202; "
+               "no temporary file and an empty spool afterwards" % (got, during["client_put_seconds"]))
     finally:
         run.compose("exec", "-T", "fetch-fixture", "rm", "-f", "/data/media/huge.mp4")
+
+
+def user_root(run, uid):
+    status, body = run.stack.backend_http("PROPFIND", "/remote.php/dav/files/%s/" % uid, uid, None, {"Depth": "1"})
+    hrefs = [node.text for node in ET.fromstring(body).iter("{DAV:}href")] if status == 207 else []
+    return [href.rstrip("/").rsplit("/", 1)[-1] for href in hrefs]
+
+
+async def case_upload_restart(run, size=3 * 2 ** 30 + 4321):
+    """A gateway restart during the upload phase leaves no fence and the import resumes. Nextcloud is
+    paused the moment the job is placing, so the gateway is certainly cut off mid-upload."""
+    alice = await run.device(FIXTURE_USERS[0], "alice-upload-restart")
+    made = await huge(run, size)
+    nextcloud = run.stack.project + "-nextcloud-1"
+    try:
+        job = (await run.submit(alice, [item("huge", "?restart=upload")], "video", 720))["jobs"][0]
+        deadline = time.monotonic() + 900
+        while (state := next(r for r in await run.jobs(alice) if r["id"] == job["id"])["state"]) != "placing":
+            assert state not in TERMINAL and time.monotonic() < deadline, state
+            await asyncio.sleep(0.2)
+        run.stack.run(["docker", "pause", nextcloud])
+        try:
+            before = fence(run)
+            run.compose("restart", "--timeout", "10", "access")  # the gateway dies mid-upload
+        finally:
+            run.stack.run(["docker", "unpause", nextcloud])
+        run.compose("up", "--detach", "--no-deps", "--wait", "--wait-timeout", "180", "access")
+        after = fence(run)
+        state_after = next(r for r in await run.jobs(alice) if r["id"] == job["id"])["state"]
+        row = (await run.wait(alice, [job["id"]], timeout=1200))[0]
+        run.remember(alice, row["path"])
+        _, got, sha = await run.readback(alice, row["path"], "upload-restart.mp4")
+        (run.evidence / "upload-restart.mp4").unlink()
+        temps = [n for n in user_root(run, FIXTURE_USERS[0]) if n.startswith(".anj-fetch-")]
+        videos = [n for n in await listing(alice, "Videos/") if n.startswith("Fixture Huge")]
+        run.note("upload-restart.json", {"fence_before_restart": before["write_fence"], "fence_after_restart": after["write_fence"],
+                                         "state_after_restart": state_after, "row": row, "size": got, "sha256": sha, "fixture": made,
+                                         "temporary_files_left": temps, "videos_named_fixture_huge": videos})
+        assert before["write_fence"] == "clear" and after["write_fence"] == "clear", (before, after)
+        assert state_after == "placing" and row["state"] == "done" and (got, sha) == (made["size"], made["sha256"]), row
+        assert not temps and len(videos) == 1 and fence(run)["write_fence"] == "clear", (temps, videos)
+        run.ok("gateway restart during the upload phase (Nextcloud paused mid-upload): fence clear before and after, the job "
+               "stayed placing, resumed from the staged file and placed one complete copy (%d bytes, SHA-256 equal); no "
+               "temporary file left" % got)
+    finally:
+        run.stack.run(["docker", "unpause", nextcloud]) if "Paused" in run.stack.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", nextcloud]) else None
+        run.compose("exec", "-T", "fetch-fixture", "rm", "-f", "/data/media/huge.mp4")
+
+
+async def listing(actor, folder):
+    body, _ = await actor.request("PROPFIND", href(folder), headers={"Depth": "1"}, expected=(207,))
+    from urllib.parse import unquote
+    return [unquote(node.text.rstrip("/").rsplit("/", 1)[-1]) for node in ET.fromstring(body).iter("{DAV:}href")]
+
+
+async def case_maintenance(run):
+    """Nextcloud maintenance mode (the nightly backup's window) while a finished download waits to be
+    saved: the job stays placing, then is saved once maintenance ends; the fence ends clear."""
+    alice = await run.device(FIXTURE_USERS[0], "alice-maintenance")
+    job = (await run.submit(alice, [item("slow", "?maintenance=1")], "video", 720))["jobs"][0]
+    await run.wait(alice, [job["id"]], states={"downloading"}, timeout=120)
+    run.stack.occ("maintenance:mode", "--on")
+    try:
+        await run.wait(alice, [job["id"]], states={"placing"}, timeout=300)
+        await asyncio.sleep(90)  # several 503 answers and backoffs while maintenance lasts
+        during = next(r for r in await run.jobs(alice) if r["id"] == job["id"])["state"]
+    finally:
+        run.stack.occ("maintenance:mode", "--off")
+    row = (await run.wait(alice, [job["id"]], timeout=600))[0]
+    run.remember(alice, row["path"])
+    after = fence(run)
+    run.note("maintenance.json", {"state_during_maintenance": during, "row": row, "fence_after": after["write_fence"]})
+    assert during == "placing" and row["state"] == "done" and after["write_fence"] == "clear", (during, row, after)
+    run.ok("Nextcloud maintenance during an import: the job stayed placing for 90 s of 503 answers, was saved after "
+           "maintenance ended (%s), and the write fence is clear" % row["path"])
+
+
+async def case_titles(run):
+    """Non-Latin and emoji titles come through intact; a portrait source is 1080p by its short side."""
+    alice = await run.device(FIXTURE_USERS[0], "alice-titles")
+    ids = [(await run.submit(alice, [item(name)], "audio"))["jobs"][0]["id"] for name in ("persian", "emoji")]
+    ids.append((await run.submit(alice, [item("portrait")], "video", 1080))["jobs"][0]["id"])
+    rows = await run.wait(alice, ids, timeout=600)
+    for row in rows:
+        run.remember(alice, row["path"])
+    run.note("titles.json", rows)
+    persian = "Music/\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645 \u0622\u0647\u0646\u06af.m4a"
+    emoji = "Music/Family \U0001f468\u200d\U0001f469\u200d\U0001f467 song.m4a"
+    assert [row["path"] for row in rows[:2]] == [persian, emoji], [row["path"] for row in rows]
+    for row, name in zip(rows[:2], ("persian.m4a", "emoji.m4a")):
+        probe, _, _ = await run.readback(alice, row["path"], name)
+        assert ("audio", "aac", None, 0) in streams(probe)
+    probe, _, _ = await run.readback(alice, rows[2]["path"], "portrait.mp4")
+    video = [s for s in probe["streams"] if s["codec_type"] == "video"][0]
+    assert (rows[2]["height"], video["codec_name"], video["width"], video["height"]) == (1080, "h264", 1080, 1920), (rows[2], video)
+    run.ok("titles: a Persian title with ZWNJ and an emoji title with ZWJ are saved with their names intact (%s, %s); a "
+           "1080x1920 portrait source is taken at 1080p (height reported 1080)" % (persian, emoji))
 
 
 async def scenario(stack, evidence, cases):
@@ -450,7 +584,7 @@ async def scenario(stack, evidence, cases):
     run = Run(stack, evidence)
     try:
         for case in cases:
-            await globals()["case_" + case](run)
+            await globals()["case_" + case.replace("-", "_")](run)
     finally:
         await run.cleanup()
         print("Fixture files deleted and devices revoked", flush=True)
