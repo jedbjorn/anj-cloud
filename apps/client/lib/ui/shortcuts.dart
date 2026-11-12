@@ -10,6 +10,7 @@ import 'package:flutter/widgets.dart';
 /// | Action | Linux, Windows | macOS |
 /// |---|---|---|
 /// | Search the library | Ctrl+F | Cmd+F |
+/// | Download the pasted links (in the Downloader's field) | Ctrl+Enter | Cmd+Enter |
 /// | Leave Select mode, close a confirmation | Esc | Esc |
 /// | Open the focused row | Enter or Space | Enter or Space |
 /// | Icon colour of the focused row | Shift+F10 or the Menu key | Shift+F10 or the Menu key (where the keyboard has one) |
@@ -31,6 +32,9 @@ class AppShortcuts {
   static String get primaryLabel => usesCommandKey ? 'Cmd' : 'Ctrl';
 
   static SingleActivator get search => primary(LogicalKeyboardKey.keyF);
+
+  /// Sends a multi-line field, where Enter alone starts a new line.
+  static SingleActivator get submit => primary(LogicalKeyboardKey.enter);
 
   static const cancel = SingleActivator(LogicalKeyboardKey.escape);
 

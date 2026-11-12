@@ -6,9 +6,11 @@ import 'package:path/path.dart' as p;
 import '../design/badge_palette.dart';
 import 'admin_section.dart';
 import '../core/app/controller.dart';
+import '../core/app/fetch_jobs.dart';
 import '../core/sync/bulk_targets.dart';
 import 'recovery_actions.dart';
 import 'create_folder_dialog.dart';
+import 'downloader_tab.dart';
 import 'rename_dialog.dart';
 import 'root_setup_dialog.dart';
 import '../core/app/lifecycle.dart';
@@ -170,11 +172,58 @@ class ClientHome extends StatefulWidget {
   State<ClientHome> createState() => _ClientHomeState();
 }
 
-class _ClientHomeState extends State<ClientHome>
-    with SingleTickerProviderStateMixin {
+class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
   ClientController get controller => widget.controller;
-  late final TabController _tabs;
+  late TabController _tabs;
   LibraryTab _active = LibraryTab.home;
+
+  /// The Downloader (spec #42 F5): a fourth tab, present only while the
+  /// server offers it. [_downloader] is whether it is the selected tab.
+  late final FetchJobs _jobs = controller.fetchJobs;
+  bool _hasDownloader = false;
+  bool _downloader = false;
+  final _fetchLinks = TextEditingController();
+  AppLifecycleListener? _appState;
+
+  TabController _newTabs(int length, int index) =>
+      TabController(length: length, initialIndex: index, vsync: this)
+        ..addListener(_tabChanged);
+
+  void _tabChanged() {
+    final downloader = _tabs.index >= LibraryTab.values.length;
+    final tab = downloader ? _active : LibraryTab.values[_tabs.index];
+    // The job list is polled only while its tab is the selected one.
+    _jobs.setTabVisible(downloader);
+    if (_active == tab && _downloader == downloader) return;
+    if (downloader && _selecting) _cancelSelection();
+    setState(() {
+      _active = tab;
+      _downloader = downloader;
+      _clearSelection();
+      _clearReveal();
+    });
+  }
+
+  /// The tab appears and disappears with the server's answer. The selected
+  /// library tab stays selected; a Downloader that went away returns to Home.
+  void _fetchChanged() {
+    final show = _jobs.availability == FetchAvailability.available;
+    if (show == _hasDownloader || !mounted) return;
+    final old = _tabs;
+    final index = old.index < LibraryTab.values.length ? old.index : 0;
+    setState(() {
+      _hasDownloader = show;
+      _downloader = false;
+      _active = LibraryTab.values[index];
+      _tabs = _newTabs(LibraryTab.values.length + (show ? 1 : 0), index);
+    });
+    _jobs.setTabVisible(false);
+    // After the tab bar has moved to the new controller.
+    WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+  }
+
+  /// Desktop: the window is shown, not hidden in the tray.
+  void _windowVisibility() => _jobs.setAppVisible(lifecycle!.visible);
   final _collapsed = {for (final tab in LibraryTab.values) tab: <String>{}};
   final _homeDirectories = <String>{};
   final _search = TextEditingController();
@@ -199,7 +248,11 @@ class _ClientHomeState extends State<ClientHome>
     _highlightedPath = null;
   }
 
-  void _showInFolder(String path) {
+  void _showInFolder(
+    String path, {
+    String missing =
+        'That file changed or is no longer in the library. Search again.',
+  }) {
     if (_selecting) return;
     final exists = controller.entries.any(
       (entry) =>
@@ -208,10 +261,7 @@ class _ClientHomeState extends State<ClientHome>
           visibleInLibrary(entry),
     );
     if (!exists) {
-      showError(
-        context,
-        'That file changed or is no longer in the library. Search again.',
-      );
+      showError(context, missing);
       return;
     }
     _tabs.index = LibraryTab.home.index;
@@ -480,22 +530,32 @@ class _ClientHomeState extends State<ClientHome>
     lifecycle?.confirmQuitWithoutTray = _confirmQuitWithoutTray;
     lifecycle?.addListener(_announceAutostart);
     unawaited(_loadAutostart());
-    _tabs = TabController(length: 3, vsync: this)
-      ..addListener(() {
-        final tab = LibraryTab.values[_tabs.index];
-        if (_active != tab) {
-          setState(() {
-            _active = tab;
-            _clearSelection();
-            _clearReveal();
-          });
-        }
-      });
+    _hasDownloader = _jobs.availability == FetchAvailability.available;
+    _tabs = _newTabs(LibraryTab.values.length + (_hasDownloader ? 1 : 0), 0);
+    _jobs.addListener(_fetchChanged);
+    // Whether the app is on screen: the window on a desktop, the foreground
+    // on Android (which has no window lifecycle).
+    if (lifecycle != null) {
+      lifecycle!.addListener(_windowVisibility);
+      _windowVisibility();
+    } else {
+      final state = WidgetsBinding.instance.lifecycleState;
+      _jobs.setAppVisible(state == null || state == AppLifecycleState.resumed);
+      _appState = AppLifecycleListener(
+        onStateChange: (state) =>
+            _jobs.setAppVisible(state == AppLifecycleState.resumed),
+      );
+    }
   }
 
   @override
   void dispose() {
     lifecycle?.removeListener(_announceAutostart);
+    lifecycle?.removeListener(_windowVisibility);
+    _appState?.dispose();
+    _jobs.removeListener(_fetchChanged);
+    _jobs.setTabVisible(false);
+    _fetchLinks.dispose();
     if (lifecycle?.confirmQuitWithoutTray == _confirmQuitWithoutTray) {
       lifecycle?.confirmQuitWithoutTray = null;
     }
@@ -736,7 +796,7 @@ class _ClientHomeState extends State<ClientHome>
       return CallbackShortcuts(
         bindings: {
           if (_selecting) AppShortcuts.cancel: _cancelSelection,
-          AppShortcuts.search: _searchFocus.requestFocus,
+          if (!_downloader) AppShortcuts.search: _searchFocus.requestFocus,
         },
         child: Focus(
           autofocus: true,
@@ -867,6 +927,16 @@ class _ClientHomeState extends State<ClientHome>
                 final compact = compactLayout(context);
                 final short =
                     MediaQuery.sizeOf(context).height < compactHeightBreakpoint;
+                final tabLabels = [
+                  'Home',
+                  'Editing',
+                  'Conflict',
+                  if (_hasDownloader) 'Downloader',
+                ];
+                // Three tabs lay out as they always have.
+                final tabLayout = _hasDownloader
+                    ? homeTabLayout(context, tabLabels, body.maxWidth)
+                    : (scrollable: false, labelPadding: null);
                 final top = <Widget>[
                   if (KeyUnavailableNotice.shown(controller))
                     Padding(
@@ -982,44 +1052,48 @@ class _ClientHomeState extends State<ClientHome>
                   ),
                   TabBar(
                     controller: _tabs,
-                    tabs: const [
-                      Tab(text: 'Home'),
-                      Tab(text: 'Editing'),
-                      Tab(text: 'Conflict'),
-                    ],
-                  ),
-                  LibraryToolbar(
-                    policy: _policy,
-                    onPolicyChanged: (value) => setState(() {
-                      if (_policy != value) {
-                        _clearSelection();
-                        _shown = libraryPageSize;
-                      }
-                      _policy = value;
-                      _clearReveal();
-                    }),
-                    search: _search,
-                    searchFocus: _searchFocus,
-                    onSearchChanged: (_) => setState(() {
-                      _clearSelection();
-                      _clearReveal();
-                    }),
-                    selecting: _selecting,
-                    onEscape: _selecting ? _cancelSelection : null,
-                    onSelect: () {
-                      if (_selecting) {
-                        _cancelSelection();
-                      } else {
-                        setState(() {
-                          _selecting = true;
-                          _selectionEpoch++;
-                        });
-                      }
-                    },
-                    onCreateFolder: controller.canCreateFolder
-                        ? () => createFolder(context)
+                    isScrollable: tabLayout.scrollable,
+                    tabAlignment: tabLayout.scrollable
+                        ? TabAlignment.start
                         : null,
+                    labelPadding: tabLayout.labelPadding,
+                    tabs: [for (final label in tabLabels) Tab(text: label)],
                   ),
+                  // The library's filters and search do not apply to the
+                  // Downloader.
+                  if (!_downloader)
+                    LibraryToolbar(
+                      policy: _policy,
+                      onPolicyChanged: (value) => setState(() {
+                        if (_policy != value) {
+                          _clearSelection();
+                          _shown = libraryPageSize;
+                        }
+                        _policy = value;
+                        _clearReveal();
+                      }),
+                      search: _search,
+                      searchFocus: _searchFocus,
+                      onSearchChanged: (_) => setState(() {
+                        _clearSelection();
+                        _clearReveal();
+                      }),
+                      selecting: _selecting,
+                      onEscape: _selecting ? _cancelSelection : null,
+                      onSelect: () {
+                        if (_selecting) {
+                          _cancelSelection();
+                        } else {
+                          setState(() {
+                            _selecting = true;
+                            _selectionEpoch++;
+                          });
+                        }
+                      },
+                      onCreateFolder: controller.canCreateFolder
+                          ? () => createFolder(context)
+                          : null,
+                    ),
                 ];
                 final selection = <Widget>[
                   if (_selecting)
@@ -1092,7 +1166,21 @@ class _ClientHomeState extends State<ClientHome>
                       ),
                     ),
                 ];
-                final Widget list = items.isEmpty
+                final Widget list = _downloader
+                    ? TickerMode(
+                        // Hidden in the tray: no progress bar animates.
+                        enabled: lifecycle?.visible ?? true,
+                        child: DownloaderTab(
+                          jobs: _jobs,
+                          links: _fetchLinks,
+                          touchInput: widget.touchInput,
+                          onShowInFolder: (path) => _showInFolder(
+                            path,
+                            missing: 'That file is not in the library yet. It appears after the next sync.',
+                          ),
+                        ),
+                      )
+                    : items.isEmpty
                     ? Center(
                         child: Text(
                           controller.root == null

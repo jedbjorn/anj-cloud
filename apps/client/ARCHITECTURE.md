@@ -315,6 +315,16 @@ row is unfinished, a sync pass (`requestSyncPass`) when a poll sees rows
 turn done (never twice for one row), the remembered choice in `<profile>/downloader.json`, and the link
 parser.
 
+The tab (F5) is `ui/downloader_tab.dart`: one scrollable with the form and
+the job list, reading and calling `FetchJobs` only. `ClientHome` adds it as
+a fourth tab while `availability` is `available`, replacing its
+`TabController` when that changes (the selected library tab stays; a
+Downloader that went away returns to Home), and hides the library toolbar on
+it. It tells `FetchJobs` what is on screen: `setTabVisible` from the tab
+controller, `setAppVisible` from `DesktopLifecycle.visible` on a desktop and
+from `AppLifecycleState` (resumed) where there is no window lifecycle
+(Android). Show in folder is the library's own reveal.
+
 ## How to add a platform
 
 1. Create `lib/platform/<os>/` with a class for each port and an
