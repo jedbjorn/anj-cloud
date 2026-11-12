@@ -13,7 +13,7 @@ import '../local/root_tree.dart';
 /// The status of a row whose only working copies are unchanged opened
 /// copies (decision #184): kept, not released automatically from here.
 const openedCopyKept =
-    'An opened copy is kept on this device. Remove it in Details to free space.';
+    'An opened copy is kept on this device. Close the app using it, then remove it in Details to free space.';
 
 /// No network awaits occur after the first lease is acquired. Test barriers are
 /// synchronous and absent in the application; they exercise exact crash/order

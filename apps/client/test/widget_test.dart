@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:anj_cloud/core/app/controller.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
+import 'package:anj_cloud/core/sync/evictions.dart' show openedCopyKept;
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:anj_cloud/ui/app.dart';
@@ -334,6 +335,63 @@ void main() {
       expect(controller.action, 'finishEditing');
       expect(controller.sessions!.map((v) => v['id']), ['shown-session']);
       expect(controller.entries.single['effectiveRetention'], 'cloud');
+      await tester.pumpWidget(const SizedBox());
+      controller.dispose();
+    },
+  );
+  testWidgets(
+    'Remove opened copy asks for every app to be closed first (decision #184)',
+    (tester) async {
+      final controller =
+          _FinishController(
+              Directory('/unused-opened-profile'),
+              secrets: MemorySecrets(),
+            )
+            ..root = '/synthetic/anj-cloud'
+            ..entries = [
+              {
+                'path': 'song.mp3',
+                'kind': 'file',
+                'status': openedCopyKept,
+                'effectiveRetention': 'cloud',
+                'expectedPresent': false,
+                'workingCopies': [
+                  {
+                    'id': 'opened-session',
+                    'path': '/synthetic/working-song.mp3',
+                    'size': 40,
+                    'edited': false,
+                  },
+                ],
+              },
+            ];
+      await tester.pumpWidget(CloudApp(controller: controller));
+      await tester.pumpAndSettle();
+      // Unchanged: no Editing badge, no Finish editing.
+      expect(find.widgetWithText(Chip, 'Editing'), findsNothing);
+      expect(find.text('Finish editing'), findsNothing);
+      Future<void> askToRemove() async {
+        await tester.tap(find.byTooltip('File actions'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Details and preserved copies'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Remove opened copy'));
+        await tester.pumpAndSettle();
+        expect(
+          find.textContaining('Close every app using this copy first'),
+          findsOneWidget,
+        );
+      }
+
+      await askToRemove();
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(controller.action, isNull, reason: 'nothing without confirming');
+      await askToRemove();
+      await tester.tap(find.text('Apps closed — remove'));
+      await tester.pumpAndSettle();
+      expect(controller.action, 'removeOpenedCopy');
+      expect(controller.sessions!.map((v) => v['id']), ['opened-session']);
       await tester.pumpWidget(const SizedBox());
       controller.dispose();
     },

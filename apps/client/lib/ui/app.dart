@@ -629,6 +629,47 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     }
   }
 
+  /// Remove opened copy (decision #184), after the user confirms every app
+  /// using it is closed: an editor that read and closed the copy and saves
+  /// later would write a file nothing syncs.
+  Future<void> removeOpenedCopy(
+    BuildContext context,
+    Map<String, dynamic> entry,
+  ) async {
+    final sessions = [
+      for (final copy in openedCopies(entry)) {'id': copy['id']},
+    ];
+    if (sessions.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Remove opened copy of ${entry['path']}'),
+        scrollable: compactLayout(context),
+        content: const Text(
+          'Close every app using this copy first. Changes saved to it after removal will not sync. The file stays in the cloud.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            key: const ValueKey('removeOpenedConfirm'),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Apps closed — remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      controller.command(
+        'removeOpenedCopy',
+        entry['path'] as String,
+        sessions: sessions,
+      );
+    }
+  }
+
   Future<void> pairing(BuildContext context) =>
       showPairing(context, controller);
 
@@ -1378,16 +1419,11 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                                     ),
                                                     onPressed: () {
                                                       Navigator.pop(context);
-                                                      controller.command(
-                                                        'removeOpenedCopy',
-                                                        path,
-                                                        sessions: [
-                                                          for (final copy
-                                                              in openedCopies(
-                                                                entry,
-                                                              ))
-                                                            {'id': copy['id']},
-                                                        ],
+                                                      unawaited(
+                                                        removeOpenedCopy(
+                                                          this.context,
+                                                          entry,
+                                                        ),
                                                       );
                                                     },
                                                     child: const Text(
