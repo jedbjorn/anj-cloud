@@ -199,11 +199,15 @@ class Evictions {
         return;
       }
     }
-    if (manifest.operations.values.any(
-      (o) => o.path == entry.path && o.kind == 'working',
-    )) {
-      entry.status =
-          'Cloud pending: editor working copies stay pinned in this prototype.';
+    final working = manifest.operations.values
+        .where((o) => o.path == entry.path && o.kind == 'working')
+        .toList();
+    if (working.isNotEmpty) {
+      // Decision #183: only an edited copy pins the row as an edit; an
+      // unchanged one waits, status untouched, for its reclamation.
+      if (working.any(artifacts.workingEdited)) {
+        entry.status = 'Cloud pending: editor working copies stay pinned in this prototype.';
+      }
       return;
     }
     if (manifest.operations.values.any(

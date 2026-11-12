@@ -177,4 +177,26 @@ class Artifacts {
   }
 
   File resolve(String path) => tree.stagedFile(path);
+
+  /// Opening is not editing (decision #183): a `working` session counts as
+  /// an edit only once its copy may differ from the version it was
+  /// downloaded from. The signal is the one the reuse of an unchanged copy
+  /// already trusts, the staged file's stamp against the stamp its owning
+  /// record took when the download completed, plus the `edited` mark the
+  /// pass keeps once a difference was seen (a later upload or adoption may
+  /// re-align stamps; the session stays an edit). Anything unknown (no
+  /// record, unreadable copy) counts as an edit, so it is never discarded.
+  bool workingEdited(Operation work) {
+    if (work.data['edited'] == true) return true;
+    final staged = work.staged;
+    if (staged == null) return true;
+    final owner = record(resolve(staged));
+    if (owner == null || owner.data['stamp'] == null) return true;
+    try {
+      return native.info(tree.stageFd, p.basename(staged)).stamp !=
+          owner.data['stamp'];
+    } on FileSystemException {
+      return true;
+    }
+  }
 }

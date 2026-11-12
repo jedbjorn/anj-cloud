@@ -184,7 +184,10 @@ void main() {
     expect(engine.workingCopies(path), hasLength(1));
     expect(engine.workingCopies(path).single['path'], later.path);
     expect(later.readAsStringSync(), 'initial bytes');
-    expect(store.entries[path]!.status, contains('pinned'));
+    // Decision #183: the later, unchanged copy is not an edit and pins
+    // nothing; it waits for reclamation, not for Finish editing.
+    expect(engine.workingCopies(path).single['edited'], isFalse);
+    expect(store.entries[path]!.status, isNot(contains('pinned')));
   });
 
   test('offline request remains durable and uploads before cleanup', () async {

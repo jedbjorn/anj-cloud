@@ -4617,6 +4617,14 @@ class SyncEngine {
         work.data['presentationError'] = entry.status;
         continue;
       }
+      if (hash != work.hash || artifacts.workingEdited(work)) {
+        // Decision #183: from here on the session is an edit (Editing,
+        // Finish editing), whatever later re-aligns its stamp or hash.
+        if (work.data['edited'] != true) {
+          work.data['edited'] = true;
+          manifest.save();
+        }
+      }
       if (hash == work.hash) continue;
       if (viewOnly(work.path)) {
         conflict(entry, viewOnlyConflict);
@@ -5529,6 +5537,97 @@ class SyncEngine {
     return paths.length;
   }
 
+  /// Opening is not editing (decision #183, narrowing #108 Q10): a working
+  /// copy no app changed is a downloaded copy, released once no app holds it
+  /// open, without Finish editing. It goes through the guarded staging
+  /// release (the lease, and on Android the open-descriptor registry, refuse
+  /// a copy an app holds open; the bytes must still hash to the version that
+  /// was downloaded), so an open copy is retried by a later pass and a
+  /// changed one is never discarded. A copy handed out within
+  /// [workingCopyGrace] is left for its app to open first. Busy copies are
+  /// not reported as pending releases: a song playing is not a sync problem.
+  void reclaimUnchangedWorkingCopies() {
+    for (final work
+        in manifest.operations.values
+            .where((o) => o.kind == 'working')
+            .toList()) {
+      final staged = work.staged;
+      final entry = manifest.entries[work.path];
+      if (staged == null || work.hash == null) continue;
+      final record = artifacts.record(artifacts.resolve(staged));
+      final name = p.basename(staged);
+      bool present() {
+        try {
+          artifacts.native.info(tree.stageFd, name);
+          return true;
+        } on FileSystemException catch (error) {
+          return error.osError?.errorCode != 2;
+        }
+      }
+
+      if (work.data['reclaiming'] == true) {
+        // Interrupted after the guarded unlink: the durable release intent
+        // (or its already finalized record) proves the bytes were these.
+        if (!present() &&
+            (record == null || record.data['releasing'] == work.hash)) {
+          if (record != null) manifest.operations.remove(record.id);
+          _workingReclaimed(work, entry);
+          continue;
+        }
+        work.data.remove('reclaiming');
+        manifest.save();
+      }
+      final since = _workingOpenedAt[work.id];
+      if (artifacts.workingEdited(work) ||
+          (since != null && _elapsed - since < workingCopyGrace) ||
+          record == null ||
+          record.data['role'] != 'working' ||
+          entry?.conflict != null ||
+          editing.requests.any((o) => o.path == work.path) ||
+          manifest.operations.values.any(
+            (o) => o.id != work.id && o.id != record.id && o.staged == staged,
+          )) {
+        continue;
+      }
+      work.data['reclaiming'] = true;
+      manifest.save();
+      ReleaseOutcome outcome;
+      try {
+        outcome = releases.release(record, work.hash!);
+      } on FileSystemException {
+        outcome = ReleaseOutcome.busy;
+      }
+      if (outcome == ReleaseOutcome.released) {
+        _workingReclaimed(work, entry);
+        continue;
+      }
+      work.data.remove('reclaiming');
+      // Bytes that no longer hash to the downloaded version are an edit.
+      if (outcome == ReleaseOutcome.differs) work.data['edited'] = true;
+      manifest.save();
+    }
+  }
+
+  void _workingReclaimed(Operation work, Entry? entry) {
+    manifest.operations.remove(work.id);
+    _workingOpenedAt.remove(work.id);
+    if (entry != null) {
+      if (entry.workingCopy == work.staged) entry.workingCopy = null;
+      final status = entry.status;
+      // The pinned status an earlier version (or an interrupted reclaim)
+      // left on a Cloud-only row reads as Cloud-only again.
+      if (!entry.expectedPresent &&
+          retention(entry.path) == Retention.cloud &&
+          !manifest.operationsAt(entry.path).any((o) => o.kind == 'working') &&
+          (status.startsWith('Cloud pending: editor working copies') ||
+              status == 'Working copy missing; root/cloud retained')) {
+        entry.status = 'cloud-only';
+      }
+      markDirty(entry.path);
+    }
+    manifest.save();
+  }
+
   /// A deletion copy made by an earlier version is recognised only when it is
   /// the entry's last preservation, made from the same baseline that the
   /// terminal deletion recorded. Anything else stays an ordinary recovery copy.
@@ -5550,6 +5649,7 @@ class SyncEngine {
     }
 
     releases.recoverInterrupted();
+    reclaimUnchangedWorkingCopies();
     // Rule 2: a copy preserved when our deletion was acknowledged is released
     // only when its bytes equal the hash recorded for the deleted version.
     for (final retained
@@ -6288,13 +6388,24 @@ class SyncEngine {
     markDirty(path);
     artifacts.complete(copy, hash: hash, etag: entry.etag);
     entry.workingCopy = tree.durablePath(copy);
-    if (retention(path) == Retention.cloud) {
-      entry.status =
-          'Cloud pending: editor working copies stay pinned in this prototype.';
-    }
+    // Opening is not editing (decision #183): the row keeps its status until
+    // the copy is changed (Evictions pins it then).
+    workingCopyOpened(op);
     manifest.save();
     return tree.durablePath(copy);
   }
+
+  /// When each working session was last handed to an app (engine clock).
+  final Map<String, Duration> _workingOpenedAt = {};
+
+  /// How long an unchanged working copy is kept after it was handed out
+  /// before it may be reclaimed: the app it was launched for may not have
+  /// opened it yet, and the guard can only see an app that holds it open.
+  Duration workingCopyGrace = const Duration(minutes: 1);
+
+  /// [work] was just handed to an app (an Open, or a provider open).
+  void workingCopyOpened(Operation work) =>
+      _workingOpenedAt[work.id] = _elapsed;
 
   List<Map<String, Object?>> workingCopies(String path) {
     return [
@@ -6307,6 +6418,9 @@ class SyncEngine {
             'id': op.id,
             'path': op.staged,
             'size': null,
+            // Only an edited copy reads as Editing and offers Finish editing
+            // (decision #183); an unchanged one is reclaimed by a later pass.
+            'edited': artifacts.workingEdited(op),
           };
           try {
             final file = artifacts.resolve(op.staged!);
@@ -6367,7 +6481,17 @@ class SyncEngine {
           tree.stageFd,
           record.data['name'] as String,
         );
-        final kind = artifactKind(record.data['role'] as String?);
+        var kind = artifactKind(record.data['role'] as String?);
+        if (record.data['role'] == 'working') {
+          // An unchanged working copy is a downloaded copy (decision #183).
+          final session = manifest
+              .operationsAt(path)
+              .where((o) => o.kind == 'working' && o.staged == record.staged)
+              .firstOrNull;
+          if (session != null && !artifacts.workingEdited(session)) {
+            kind = 'download';
+          }
+        }
         count++;
         kinds[kind] = (kinds[kind] ?? 0) + 1;
         // Hard-linked names (download-* installs) share one inode's bytes.
