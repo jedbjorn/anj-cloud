@@ -8,7 +8,9 @@ tests/name_policy_vectors.json, so they cannot drift. RULE_VERSION moves when th
   Leading and trailing whitespace is trimmed, an empty result becomes `Untitled`, `\\`, C0
   controls and DEL get lookalikes, a name over MAX_BYTES has its stem cut, and a folder ending in
   `.part` or `.filepart` gets `_` appended (decision #195). A changed name that meets a
-  sibling by case or accents gets ` (2)`, ` (3)`, ... before the extension.
+  sibling by case or accents gets ` (2)`, ` (3)`, ... before the extension. When no free ` (n)`
+  fits in MAX_BYTES beside the extension, `name` comes back unchanged: `cloud_check` reports it,
+  the residual error row.
 - `cloud_check(name)` (R2): why the cloud cannot or must not hold `name`, else None. MAX_BYTES and
   the forbidden names and extensions were measured on Nextcloud 33.0.10 through the gateway path
   (task D1). A file still reported `forbiddenExtension` is a local temporary that clients do not
@@ -17,6 +19,8 @@ tests/name_policy_vectors.json, so they cannot drift. RULE_VERSION moves when th
   Windows maps characters, trailing dots and device names, then resolves case and normalization
   clashes by `oc:fileid` (oldest keeps its name). macOS resolves clashes only. Linux and Android
   keep cloud names. It depends only on the folder's listing, so it is recomputed, never stored.
+  A suffix fits the device's own component limit (LOCAL_LIMITS); an item whose ` (n)` cannot fit
+  beside its extension has no local name (None), the residual error row, never a taken one.
 - `cloud_name(local, entries, os)`: the reverse. A local name is a known item's only when that
   item's local name is exactly it; otherwise the local name is literal.
 
@@ -31,6 +35,19 @@ from .portable_names import RESERVED, fold_key
 RULE_VERSION = 1
 # Nextcloud 33 refuses a name over 250 UTF-8 bytes (FilenameValidator; measured in task D1).
 MAX_BYTES = 250
+
+
+def _size(text):
+    return len(text.encode("utf-8"))
+
+
+def _units(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+# The longest name component each device holds, for R3 suffixes: (limit, measure). NTFS counts
+# UTF-16 code units; APFS's 255 is read as UTF-8 bytes, the stricter of its two readings.
+LOCAL_LIMITS = {"windows": (255, _units), "macos": (255, _size)}
 # Unicode White_Space: trimmed from both ends of every name (R1).
 WHITESPACE = frozenset([*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x2000, 0x200B),
                         0x2028, 0x2029, 0x202F, 0x205F, 0x3000])
@@ -51,7 +68,7 @@ REASONS = ("empty", "untrimmed", "forbiddenCharacter", "forbiddenName", "forbidd
 
 Entry = namedtuple("Entry", "name fileid folder", defaults=(None, False))
 
-__all__ = ["CLOUD_LOOKALIKES", "Entry", "MAX_BYTES", "OPERATING_SYSTEMS", "REASONS", "RULE_VERSION", "UNTITLED",
+__all__ = ["CLOUD_LOOKALIKES", "Entry", "LOCAL_LIMITS", "MAX_BYTES", "OPERATING_SYSTEMS", "REASONS", "RULE_VERSION", "UNTITLED",
            "WHITESPACE", "WINDOWS_LOOKALIKES", "cleanup", "cloud_check", "cloud_name", "local_name", "local_names", "split"]
 
 
@@ -80,30 +97,26 @@ def _lower(name):
     return "".join(char.lower() if char.isascii() else char for char in name)
 
 
-def _size(text):
-    return len(text.encode("utf-8"))
-
-
-def _fit(stem, extension, tail=""):
+def _fit(stem, extension, tail="", limit=MAX_BYTES, size=_size):
     """`stem + tail` before the extension, the stem cut at a code point boundary so the name fits
-    MAX_BYTES; a cut leaves no whitespace at the stem's end. None when no stem would be left."""
-    budget = MAX_BYTES - _size(tail) - (_size(extension) + 1 if extension else 0)
-    if _size(stem) > budget:
-        while stem and _size(stem) > budget:
+    `limit` by `size` (default: the cloud's); a cut leaves no whitespace at the stem's end. None
+    when no stem would be left."""
+    budget = limit - size(tail) - (size(extension) + 1 if extension else 0)
+    if size(stem) > budget:
+        while stem and size(stem) > budget:
             stem = stem[:-1]
         stem = _strip(stem)
     return _join(stem + tail, extension) if stem else None
 
 
-def _suffixed(name, folder, taken):
-    """`name` with the first ` (n)`, n >= 2, whose fold key is not in `taken`."""
+def _suffixed(name, folder, taken, limit=MAX_BYTES, size=_size):
+    """`name` with the first ` (n)`, n >= 2, whose fold key is not in `taken`, fitted to `limit`.
+    None when the next ` (n)` leaves no room for the stem: never a taken name."""
     stem, extension = split(name, folder)
     n = 2
     while True:
-        candidate = _fit(stem, extension, " (%d)" % n)
-        if candidate is None:
-            return name
-        if fold_key(candidate) not in taken:
+        candidate = _fit(stem, extension, " (%d)" % n, limit, size)
+        if candidate is None or fold_key(candidate) not in taken:
             return candidate
         n += 1
 
@@ -111,7 +124,7 @@ def _suffixed(name, folder, taken):
 def cleanup(name, siblings=(), folder=False):
     """The cloud name for an item named `name` (R1, R2): unchanged when nothing needs fixing.
     `siblings` are the other names in its folder; a changed name that meets one by case or accents
-    gets the next free ` (n)`."""
+    gets the next free ` (n)`; `name` itself when none fits (the residual row)."""
     trimmed = _strip(name)
     stem, extension = split(name, folder)
     if not trimmed:
@@ -129,7 +142,9 @@ def cleanup(name, siblings=(), folder=False):
     if result == name:
         return name
     taken = {fold_key(sibling) for sibling in siblings}
-    return _suffixed(result, folder, taken) if fold_key(result) in taken else result
+    if fold_key(result) not in taken:
+        return result
+    return _suffixed(result, folder, taken) or name
 
 
 def cloud_check(name):
@@ -167,8 +182,9 @@ def _order(entry):
 
 
 def local_names(entries, os):
-    """{cloud name: local name} for the cloud items of one folder on `os` (R3).
-    `entries` are Entry(name, fileid, folder); the result does not depend on their order."""
+    """{cloud name: local name} for the cloud items of one folder on `os` (R3), None for an item
+    with no local name. `entries` are Entry(name, fileid, folder); the result does not depend on
+    their order."""
     if os not in OPERATING_SYSTEMS:
         raise ValueError("Unknown operating system: %r" % os)
     entries = sorted(entries, key=_order)
@@ -187,16 +203,18 @@ def local_names(entries, os):
         result[keeper.name] = base[keeper.name]
         later += [member for member in members if member is not keeper]
     taken = {fold_key(name) for name in result.values()}
+    limit, size = LOCAL_LIMITS[os]
     for entry in sorted(later, key=_order):  # Oldest first, the next ` (n)` free of every other name.
-        local = _suffixed(base[entry.name], entry.folder, taken)
-        taken.add(fold_key(local))
+        local = _suffixed(base[entry.name], entry.folder, taken, limit, size)
+        if local is not None:
+            taken.add(fold_key(local))
         result[entry.name] = local
     return result
 
 
 def local_name(cloud_name, entries, os, folder=False):
-    """The local name of the item `cloud_name` among `entries`, its folder's cloud items. An item
-    missing from `entries` is placed after them, as the newest."""
+    """The local name of the item `cloud_name` among `entries`, its folder's cloud items, or None
+    (see `local_names`). An item missing from `entries` is placed after them, as the newest."""
     entries = list(entries)
     if all(entry.name != cloud_name for entry in entries):
         entries.append(Entry(cloud_name, None, folder))

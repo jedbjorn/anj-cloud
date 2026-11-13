@@ -110,36 +110,64 @@ abstract final class NameRule {
 
   static int _size(String text) => utf8.encode(text).length;
 
+  static int _units(String text) => text.length;
+
+  /// The longest name component each device holds, for R3 suffixes: (limit,
+  /// measure). NTFS counts UTF-16 code units; APFS's 255 is read as UTF-8
+  /// bytes, the stricter of its two readings.
+  static const Map<NameOs, (int, int Function(String))> localLimits = {
+    NameOs.windows: (255, _units),
+    NameOs.macos: (255, _size),
+  };
+
   /// `stem + tail` before the extension, the stem cut at a code point
-  /// boundary so the name fits [maxBytes]; a cut leaves no whitespace at the
-  /// stem's end. Null when no stem would be left.
-  static String? _fit(String stem, String extension, [String tail = '']) {
+  /// boundary so the name fits [limit] by [size] (default: the cloud's); a
+  /// cut leaves no whitespace at the stem's end. Null when no stem would be
+  /// left.
+  static String? _fit(
+    String stem,
+    String extension, [
+    String tail = '',
+    int limit = maxBytes,
+    int Function(String) size = _size,
+  ]) {
     final budget =
-        maxBytes - _size(tail) - (extension.isEmpty ? 0 : _size(extension) + 1);
-    if (_size(stem) > budget) {
+        limit - size(tail) - (extension.isEmpty ? 0 : size(extension) + 1);
+    if (size(stem) > budget) {
       final runes = stem.runes.toList();
-      var size = _size(stem);
-      while (runes.isNotEmpty && size > budget) {
-        size -= _size(String.fromCharCode(runes.removeLast()));
+      var length = size(stem);
+      while (runes.isNotEmpty && length > budget) {
+        length -= size(String.fromCharCode(runes.removeLast()));
       }
       stem = _strip(String.fromCharCodes(runes));
     }
     return stem.isEmpty ? null : _join(stem + tail, extension);
   }
 
-  /// [name] with the first ` (n)`, n >= 2, whose fold key is not in [taken].
-  static String _suffixed(String name, bool folder, Set<String> taken) {
+  /// [name] with the first ` (n)`, n >= 2, whose fold key is not in [taken],
+  /// fitted to [limit]. Null when the next ` (n)` leaves no room for the
+  /// stem: never a taken name.
+  static String? _suffixed(
+    String name,
+    bool folder,
+    Set<String> taken, [
+    int limit = maxBytes,
+    int Function(String) size = _size,
+  ]) {
     final (stem, extension) = split(name, folder: folder);
     for (var n = 2; ; n++) {
-      final candidate = _fit(stem, extension, ' ($n)');
-      if (candidate == null) return name;
-      if (!taken.contains(NamePolicy.foldKey(candidate))) return candidate;
+      final candidate = _fit(stem, extension, ' ($n)', limit, size);
+      if (candidate == null || !taken.contains(NamePolicy.foldKey(candidate))) {
+        return candidate;
+      }
     }
   }
 
   /// The cloud name for an item named [name] (R1, R2): unchanged when nothing
   /// needs fixing. [siblings] are the other names in its folder; a changed
-  /// name that meets one by case or accents gets the next free ` (n)`.
+  /// name that meets one by case or accents gets the next free ` (n)`, and
+  /// when none fits beside the extension, [name] comes back unchanged:
+  /// [cloudCheck] reports it, the residual error row.
   static String cleanup(
     String name, {
     Iterable<String> siblings = const [],
@@ -167,9 +195,8 @@ abstract final class NameRule {
     }
     if (result == name) return name;
     final taken = {for (final sibling in siblings) NamePolicy.foldKey(sibling)};
-    return taken.contains(NamePolicy.foldKey(result))
-        ? _suffixed(result, folder, taken)
-        : result;
+    if (!taken.contains(NamePolicy.foldKey(result))) return result;
+    return _suffixed(result, folder, taken) ?? name;
   }
 
   /// Why the cloud cannot or must not hold [name], else null.
@@ -225,8 +252,11 @@ abstract final class NameRule {
   }
 
   /// {cloud name: local name} for the cloud items of one folder on [os]
-  /// (R3). The result does not depend on the order of [entries].
-  static Map<String, String> localNames(
+  /// (R3). The result does not depend on the order of [entries]. A suffix
+  /// fits the device's own component limit ([localLimits]); an item whose
+  /// ` (n)` cannot fit beside its extension maps to null, the residual error
+  /// row, never to a taken name.
+  static Map<String, String?> localNames(
     Iterable<NameEntry> entries,
     NameOs os,
   ) {
@@ -244,7 +274,7 @@ abstract final class NameRule {
           .putIfAbsent(NamePolicy.foldKey(base[entry.name]!), () => [])
           .add(entry);
     }
-    final result = <String, String>{};
+    final result = <String, String?>{};
     final later = <NameEntry>[];
     for (final members in groups.values) {
       // Step 4: the oldest keeps its result. Step 5: unless its name changed
@@ -260,20 +290,27 @@ abstract final class NameRule {
       result[keeper.name] = base[keeper.name]!;
       later.addAll(members.where((m) => !identical(m, keeper)));
     }
-    final taken = {for (final name in result.values) NamePolicy.foldKey(name)};
+    final taken = {for (final name in result.values) NamePolicy.foldKey(name!)};
+    final (limit, size) = localLimits[os]!;
     // Oldest first, the next ` (n)` free of every other name.
     for (final entry in later..sort(_order)) {
-      final local = _suffixed(base[entry.name]!, entry.folder, taken);
-      taken.add(NamePolicy.foldKey(local));
+      final local = _suffixed(
+        base[entry.name]!,
+        entry.folder,
+        taken,
+        limit,
+        size,
+      );
+      if (local != null) taken.add(NamePolicy.foldKey(local));
       result[entry.name] = local;
     }
     return result;
   }
 
   /// The local name of the item [cloudName] among [entries], its folder's
-  /// cloud items. An item missing from [entries] is placed after them, as
-  /// the newest.
-  static String localName(
+  /// cloud items, or null (see [localNames]). An item missing from [entries]
+  /// is placed after them, as the newest.
+  static String? localName(
     String cloudName,
     Iterable<NameEntry> entries,
     NameOs os, {
@@ -283,7 +320,7 @@ abstract final class NameRule {
     if (all.every((entry) => entry.name != cloudName)) {
       all.add(NameEntry(cloudName, folder: folder));
     }
-    return localNames(all, os)[cloudName]!;
+    return localNames(all, os)[cloudName];
   }
 
   /// The cloud name for the local name [local] in a folder whose cloud items

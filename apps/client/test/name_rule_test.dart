@@ -24,8 +24,8 @@ void main() {
       NameEntry(e[0] as String, fileId: e[1] as int?, folder: e[2] as bool),
   ];
   NameOs os(Map vector) => NameOs.values.byName(vector['os'] as String);
-  Map<String, String> local(Map vector) =>
-      (vector['local'] as Map).cast<String, String>();
+  Map<String, String?> local(Map vector) =>
+      (vector['local'] as Map).cast<String, String?>();
 
   test('version and constants match the vectors', () {
     expect(rule['version'], NameRule.version);
@@ -51,6 +51,14 @@ void main() {
         result,
         reason: 'idempotent: ${jsonEncode(vector)}',
       );
+      if (result != vector['name']) {
+        // A rename never lands on a sibling's name.
+        expect(
+          siblings.map(NamePolicy.foldKey),
+          isNot(contains(NamePolicy.foldKey(result))),
+          reason: jsonEncode(vector),
+        );
+      }
       if (folder) {
         // Decision #195: only a file may stay a .part/.filepart temporary.
         expect(
@@ -103,18 +111,20 @@ void main() {
       final items = entries(vector);
       final mapped = NameRule.localNames(items, os(vector));
       final folds = os(vector) == NameOs.windows || os(vector) == NameOs.macos;
+      // Null is no local name: the residual row.
+      final named = [
+        for (final item in items)
+          if (mapped[item.name] case final local?) (item.name, local),
+      ];
       expect(
-        {for (final n in mapped.values) folds ? NamePolicy.foldKey(n) : n},
-        hasLength(items.length),
+        {for (final (_, n) in named) folds ? NamePolicy.foldKey(n) : n},
+        hasLength(named.length),
         reason: jsonEncode(vector['entries']),
       );
-      for (final item in items) {
-        expect(
-          NameRule.cloudName(mapped[item.name]!, items, os(vector)),
-          item.name,
-        );
+      for (final (name, local) in named) {
+        expect(NameRule.cloudName(local, items, os(vector)), name);
         if (os(vector) == NameOs.windows) {
-          expect(NamePolicy.check(mapped[item.name]!), isNull);
+          expect(NamePolicy.check(local), isNull);
         }
       }
     }

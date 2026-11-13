@@ -38,6 +38,8 @@ class NameRuleVectorTests(unittest.TestCase):
                 result = name_rule.cleanup(vector["name"], vector["siblings"], vector["folder"])
                 self.assertEqual(vector["result"], result)
                 self.assertEqual(result, name_rule.cleanup(result, vector["siblings"], vector["folder"]))
+                if result != vector["name"]:  # A rename never lands on a sibling's name.
+                    self.assertNotIn(portable_names.fold_key(result), {portable_names.fold_key(s) for s in vector["siblings"]})
 
     def test_cloud_check(self):
         for vector in RULE["cloudCheck"]:
@@ -47,11 +49,13 @@ class NameRuleVectorTests(unittest.TestCase):
 
     def test_cleanup_leaves_only_residual_problems(self):
         # What cleanup cannot fix is the residual error row (no lookalike, or no room for the stem), or a
-        # .part/.filepart file, which clients keep as a local temporary.
+        # .part/.filepart file, which clients keep as a local temporary. No room for a ` (n)` leaves the
+        # name as it was, untrimmed included.
         residual = {"forbiddenCharacter", "forbiddenName", "forbiddenExtension", "tooLong"}
         for vector in RULE["cleanup"]:
             with self.subTest(name=vector["name"]):
-                self.assertIn(name_rule.cloud_check(vector["result"]), residual | {None})
+                unchanged = {"untrimmed"} if vector["result"] == vector["name"] else set()
+                self.assertIn(name_rule.cloud_check(vector["result"]), residual | unchanged | {None})
                 if vector["folder"]:  # Decision #195: only a file may stay a .part/.filepart temporary.
                     self.assertNotEqual("forbiddenExtension", name_rule.cloud_check(vector["result"]))
 
@@ -69,9 +73,11 @@ class NameRuleVectorTests(unittest.TestCase):
             items, os = entries(vector), vector["os"]
             with self.subTest(os=os, entries=vector["entries"]):
                 local = name_rule.local_names(items, os)
-                keys = {portable_names.fold_key(name) if os in ("windows", "macos") else name for name in local.values()}
-                self.assertEqual(len(items), len(keys))
-                for item in items:
+                named = [item for item in items if local[item.name] is not None]  # None: the residual row.
+                keys = {portable_names.fold_key(local[item.name]) if os in ("windows", "macos") else local[item.name]
+                        for item in named}
+                self.assertEqual(len(named), len(keys))
+                for item in named:
                     self.assertEqual(item.name, name_rule.cloud_name(local[item.name], items, os))
                     if os == "windows":
                         self.assertIsNone(portable_names.check(local[item.name]))

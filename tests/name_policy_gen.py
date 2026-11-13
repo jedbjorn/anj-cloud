@@ -212,6 +212,12 @@ CLEANUP = [
     ("a" * 245 + " " + "b" * 10 + ".txt", [], False, "a" * 245 + ".txt"), (" " + "a" * 250 + " ", [], True, "a" * 250),
     ("a" * 300 + ".pdf", ["A" * 246 + ".PDF"], False, "a" * 242 + " (2).pdf"), ("a." + "x" * 260, [], False, "a." + "x" * 260),
     ("a" * 246 + ".txt", [], False, "a" * 246 + ".txt"),
+    # A ` (n)` that just fits beside a long extension; one that does not leaves the name as it was (the
+    # residual row), never a sibling's name.
+    (" a." + "x" * 244, ["a." + "x" * 244], False, "a (2)." + "x" * 244),
+    (" a." + "x" * 245, ["a." + "x" * 245], False, " a." + "x" * 245),
+    (" A." + "x" * 245, ["a." + "X" * 245], False, " A." + "x" * 245),
+    ("aaa." + "x" * 247, ["AA." + "x" * 247], False, "aaa." + "x" * 247),
 ]
 
 # (name, reason): None means the cloud holds it.
@@ -229,10 +235,15 @@ CLOUD_CHECK = [
     ("\U0001F600.txt", None), ("雪の日.txt", None),
 ]
 
-# (os, [(name, fileid, folder)], {cloud name: local name})
+# (os, [(name, fileid, folder)], {cloud name: local name}); None: no local name, the residual row.
 AC4 = [("a:b?.txt", 1, False), ("CON.txt", 2, False), ("x.", 3, False), ("Report.pdf", 4, False), ("report.pdf", 5, False)]
 NON_LATIN = ["雪の日.txt", "Привет мир.docx", "한국어.hwp",
              "Ελληνικά", "emoji \U0001F600.png", "עברית", "café.txt"]
+LONG_COLON = [("a:." + "x" * 245, 1, False), ("a：." + "x" * 245, 2, False)]  # 248 and 250 UTF-8 bytes
+LONG_CASE = [("a." + "x" * 248, 1, False), ("A." + "x" * 248, 2, False)]  # 250 bytes each
+# Past the cloud's limit, so no ` (n)` fits a device's 255: it stands in for 100+ case variants of a
+# 250-byte name, which run a suffix out of room the same way.
+NO_ROOM = [("a." + "x" * 253, 1, False), ("A." + "x" * 253, 2, False)]
 LOCAL_NAMES = [
     ("windows", AC4, {"a:b?.txt": "a：b？.txt", "CON.txt": "CON_.txt", "x.": "x", "Report.pdf": "Report.pdf",
                       "report.pdf": "report (2).pdf"}),
@@ -274,6 +285,14 @@ LOCAL_NAMES = [
     ("macos", [(name, index + 1, False) for index, name in enumerate(NON_LATIN)], {name: name for name in NON_LATIN}),
     ("linux", [("Report.pdf", 1, False), ("report.pdf", 2, False), ("a:b", 3, False)],
      {"Report.pdf": "Report.pdf", "report.pdf": "report.pdf", "a:b": "a:b"}),
+    # A suffix fits the device's limit (Windows 255 UTF-16 code units, macOS 255 UTF-8 bytes), not the cloud's
+    # 250 bytes: `a： (2).x…` is 252 units and 254 bytes.
+    ("windows", LONG_COLON, {"a：." + "x" * 245: "a：." + "x" * 245, "a:." + "x" * 245: "a： (2)." + "x" * 245}),
+    ("windows", LONG_CASE, {"a." + "x" * 248: "a." + "x" * 248, "A." + "x" * 248: "A (2)." + "x" * 248}),
+    ("macos", LONG_CASE, {"a." + "x" * 248: "a." + "x" * 248, "A." + "x" * 248: "A (2)." + "x" * 248}),
+    # No room for a suffix: no local name, never a taken one.
+    ("windows", NO_ROOM, {"a." + "x" * 253: "a." + "x" * 253, "A." + "x" * 253: None}),
+    ("macos", NO_ROOM, {"a." + "x" * 253: "a." + "x" * 253, "A." + "x" * 253: None}),
 ]
 
 # (os, entries, local name, cloud name): the reverse direction.
@@ -285,6 +304,9 @@ REVERSE = [
     ("linux", AC4, "report.pdf", "report.pdf"), ("linux", AC4, "report (2).pdf", "report (2).pdf"),
     ("windows", [("a:b.txt", 1, False), ("a：b.txt", 2, False)], "a：b.txt", "a：b.txt"),
     ("windows", [("a:b.txt", 1, False), ("a：b.txt", 2, False)], "a：b (2).txt", "a:b.txt"),
+    ("windows", LONG_COLON, "a：." + "x" * 245, "a：." + "x" * 245),
+    ("windows", LONG_COLON, "a： (2)." + "x" * 245, "a:." + "x" * 245),
+    ("macos", LONG_CASE, "A (2)." + "x" * 248, "A." + "x" * 248),
 ]
 
 
