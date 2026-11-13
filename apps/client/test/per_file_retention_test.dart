@@ -229,6 +229,52 @@ void main() {
     expect(fileBadge(await row('Music/one.mp3')), 'Local');
   });
 
+  group("a deleted file's choice ends with it", () {
+    test(
+      'deleted here: a new file at the same path follows its folder',
+      () async {
+        await synced({'Library/song.mp3': 'old song'});
+        engine.setRetention('Library/song.mp3', Retention.cloud);
+        await engine.tick();
+        expect(local('Library/song.mp3').existsSync(), isFalse);
+        engine.requestDelete('Library/song.mp3');
+        await engine.tick();
+        expect(store.entries['Library/song.mp3']!.status, 'deleted');
+        expect(own('Library/song.mp3'), isNull);
+
+        write('Library/song.mp3', 'new song');
+        await engine.tick();
+        await engine.tick();
+        expect(
+          String.fromCharCodes(cloud.files['Library/song.mp3']!),
+          'new song',
+        );
+        expect(local('Library/song.mp3').readAsStringSync(), 'new song');
+        expect(engine.retention('Library/song.mp3'), Retention.local);
+        reopen();
+        expect(own('Library/song.mp3'), isNull);
+      },
+    );
+
+    test('deleted in the cloud: a new file there downloads under a Local '
+        'folder', () async {
+      await synced({'Library/song.mp3': 'old song'});
+      engine.setRetention('Library/song.mp3', Retention.cloud);
+      await engine.tick();
+      expect(local('Library/song.mp3').existsSync(), isFalse);
+      cloud.remove('Library/song.mp3');
+      await engine.tick();
+      expect(store.entries['Library/song.mp3']!.status, 'deleted remotely');
+      expect(own('Library/song.mp3'), isNull);
+
+      cloud.put('Library/song.mp3', 'new song');
+      await engine.tick();
+      await engine.tick();
+      expect(local('Library/song.mp3').readAsStringSync(), 'new song');
+      expect(engine.retention('Library/song.mp3'), Retention.local);
+    });
+  });
+
   group('the release guards hold (F3)', () {
     test('a file held open is released only after it is closed', () async {
       await synced({'Library/song.mp3': 'song'});
@@ -280,7 +326,7 @@ void main() {
       engine.setRetention('Library/doc.txt', Retention.cloud);
       await engine.tick();
       expect(local('Library/doc.txt').readAsStringSync(), 'local edit');
-      expect((await row('Library/doc.txt'))['releaseNote'], freesAfterUpload);
+      expect((await row('Library/doc.txt'))['releaseNote'], freesAfterConflict);
 
       await engine.keepBoth('Library/doc.txt');
       await engine.tick();

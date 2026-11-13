@@ -8,6 +8,7 @@ import 'sync_engine.dart';
 /// (spec #45 R5): the pass releases it once the condition clears.
 const freesWhenClosed = 'Frees space when closed';
 const freesAfterUpload = 'Frees space after upload';
+const freesAfterConflict = 'Frees space once the conflict is resolved';
 
 /// The statuses the release guards leave on a file waiting for its upload.
 const releaseWaitsForUpload = {
@@ -31,8 +32,8 @@ String? releaseNote(
       entry.status.contains('filesystem guard refused')) {
     return freesWhenClosed;
   }
-  if (entry.conflict != null ||
-      entry.etag == null ||
+  if (entry.conflict != null) return freesAfterConflict;
+  if (entry.etag == null ||
       releaseWaitsForUpload.contains(entry.status) ||
       operations.any((o) => const {'upload', 'preserve'}.contains(o.kind))) {
     return freesAfterUpload;

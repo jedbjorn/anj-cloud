@@ -94,8 +94,10 @@ storage clears the own choices of the files that follow it (for Documents,
 Music and Videos: their loose files); explicit nested folder choices survive
 changes to their parent. Cloud-only remains synchronized and guarded release
 follows verified upload: a file that is open, not yet uploaded or in conflict
-stays on the device, its row says **Frees space when closed** or **Frees space
-after upload**, and a later pass releases it. File-manager deletion still deletes synchronized content.
+stays on the device, its row says **Frees space when closed**, **Frees space
+after upload** or **Frees space once the conflict is resolved**, and a later
+pass releases it. A file's own choice ends with the file: a new file that later
+takes a deleted file's path follows its folder. File-manager deletion still deletes synchronized content.
 The app creates `anj-cloud/Music`, `Videos` and `Documents`, and keeps them
 (spec #34 P7, decision #150): the three are always Local (Cloud-only and Delete
 everywhere are not offered and are refused; a Cloud-only choice an earlier
