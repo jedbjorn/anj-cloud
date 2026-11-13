@@ -4437,6 +4437,23 @@ class SyncEngine {
             !_temporary(v.value),
       ),
     );
+    // A temporary file keeps no row (decision #195), even while it stays on
+    // disk: a row an earlier client left for it (a #120 hold) ends on the
+    // first pass (spec #49 AC8). Local bookkeeping only: the file is never
+    // uploaded, deleted, or sent to the cloud.
+    for (final item in rawLocal.values.where(_temporary)) {
+      final entry = manifest.entries[item.path];
+      if (entry == null || entry.etag != null || entry.conflict != null) {
+        continue;
+      }
+      _settleUnsyncedRemoval(entry);
+      if (entry.preservedCopies.isEmpty &&
+          manifest.operationsAt(entry.path).isEmpty) {
+        manifest.entries.remove(entry.path);
+        _dirty.remove(entry.path);
+        manifest.save();
+      }
+    }
     // Candidate detection: any local path whose type, identity, stamp or
     // content differs from the previous pass, or that appeared/disappeared.
     final seenLocal = {

@@ -185,6 +185,32 @@ void main() {
     expect(entry('Documents/F/c.rfa').status, 'current local');
   }, skip: notOnWindows('a folder name that ends in a space'));
 
+  test('AC8: a row an earlier client held for a .part or .filepart file '
+      'ends on the first pass and stays gone; the file stays, unsent '
+      '(decision #195)', () async {
+    const held = 'Name not allowed on other devices: rename to sync';
+    const paths = ['Documents/download.part', 'Documents/setup.exe.filepart'];
+    for (final path in paths) {
+      write(path, 'partial');
+      store.entries[path] = Entry(path, ItemKind.file)..status = held;
+    }
+    store.save();
+    await engine.tick();
+    for (final path in paths) {
+      expect(store.entries.containsKey(path), isFalse, reason: path);
+    }
+    await engine.tick();
+    await engine.tick();
+    for (final path in paths) {
+      expect(store.entries.containsKey(path), isFalse, reason: path);
+      expect(store.operationsAt(path), isEmpty, reason: path);
+      expect(local(path).readAsStringSync(), 'partial', reason: path);
+      expect(cloud.attemptsBy[path], isNull, reason: path);
+      expect(cloud.files.containsKey(path), isFalse, reason: path);
+    }
+    expect(overall(), isNot(SyncStatus.attention));
+  });
+
   test('ordinary names and dotfiles upload unchanged', () async {
     final names = [
       'report.txt',
