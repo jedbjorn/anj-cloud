@@ -771,13 +771,14 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     bool folder = false,
   }) async {
     final parent = p.posix.dirname(path);
+    // The typed name is a cloud name: it is checked against cloud names.
     final siblings = {
       for (final entry in controller.entries)
         if (entry['path'] case final String other
             when other != path &&
                 p.posix.dirname(other) == parent &&
                 !terminalDeletionStatuses.contains(entry['status']))
-          p.posix.basename(other),
+          p.posix.basename((entry['cloudPath'] ?? other) as String),
     };
     final renamed = await showDialog<String>(
       context: context,
@@ -790,9 +791,8 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
       ),
     );
     if (renamed != null && context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Renamed to ${p.posix.basename(renamed)}')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Renamed to $renamed')));
     }
   }
 
@@ -1492,7 +1492,10 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                           showDialog<void>(
                                             context: context,
                                             builder: (context) => AlertDialog(
-                                              title: Text(path),
+                                              title: Text(
+                                                (entry['cloudPath'] ?? path)
+                                                    as String,
+                                              ),
                                               scrollable: compactLayout(
                                                 context,
                                               ),

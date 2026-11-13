@@ -4,6 +4,8 @@ import '../core/app/controller.dart';
 import '../core/state/model.dart';
 
 /// Creation is exclusively a worker action. The dialog never accesses the root.
+/// Parents are listed and the result is popped under their cloud spelling
+/// (decision #193); the local path stays the worker's key.
 class CreateFolderDialog extends StatefulWidget {
   const CreateFolderDialog({super.key, required this.controller});
   final ClientController controller;
@@ -19,25 +21,26 @@ class _CreateFolderDialogState extends State<CreateFolderDialog> {
   Retention _retention = Retention.local;
   bool _busy = false;
   String? _error;
-  late final List<String> _parents;
+
+  /// Local path (the worker's key) -> cloud path (shown), by cloud path.
+  late final Map<String, String> _parents;
 
   @override
   void initState() {
     super.initState();
     // Snapshot choices when opening. The worker rechecks the selected parent;
     // a failed operation must not remove its still-selected dropdown item.
-    _parents =
-        widget.controller.entries
-            .where(
-              (entry) =>
-                  entry['kind'] == 'directory' &&
-                  entry['localDirectoryAvailable'] == true &&
-                  entry['conflict'] == null,
-            )
-            .map((entry) => entry['path'] as String)
-            .toSet()
-            .toList()
-          ..sort();
+    final parents = {
+      for (final entry in widget.controller.entries)
+        if (entry['kind'] == 'directory' &&
+            entry['localDirectoryAvailable'] == true &&
+            entry['conflict'] == null)
+          entry['path'] as String:
+              (entry['cloudPath'] ?? entry['path']) as String,
+    };
+    _parents = Map.fromEntries(
+      parents.entries.toList()..sort((a, b) => a.value.compareTo(b.value)),
+    );
   }
 
   @override
@@ -53,12 +56,19 @@ class _CreateFolderDialogState extends State<CreateFolderDialog> {
       _error = null;
     });
     try {
-      final path = await widget.controller.createFolder(
+      await widget.controller.createFolder(
         parent: _parent,
         name: _name.text,
         retention: _retention,
       );
-      if (mounted) Navigator.pop(context, path);
+      // The typed name is the cloud name, under the parent's cloud path.
+      final shown = _parents[_parent];
+      if (mounted) {
+        Navigator.pop(
+          context,
+          shown == null ? _name.text : '$shown/${_name.text}',
+        );
+      }
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -115,10 +125,11 @@ class _CreateFolderDialogState extends State<CreateFolderDialog> {
                       value: '',
                       child: Text('anj-cloud (root)'),
                     ),
-                    for (final path in _parents)
+                    for (final MapEntry(key: path, value: shown)
+                        in _parents.entries)
                       DropdownMenuItem(
                         value: path,
-                        child: Text(path, overflow: TextOverflow.ellipsis),
+                        child: Text(shown, overflow: TextOverflow.ellipsis),
                       ),
                   ],
                   onChanged: _busy

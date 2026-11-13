@@ -5,7 +5,8 @@ import '../core/app/controller.dart';
 import '../core/sync/name_rule.dart';
 
 /// Renames a local item whose name cannot sync (spec #49 residual row). The rename is a worker action; the dialog never touches
-/// the root. Pops with the new path.
+/// the root. Pops with the typed name: the cloud name, which a message shows
+/// (decision #193), never this device's spelling of it.
 class RenameDialog extends StatefulWidget {
   const RenameDialog({
     super.key,
@@ -59,8 +60,8 @@ class _RenameDialogState extends State<RenameDialog> {
       _error = null;
     });
     try {
-      final path = await widget.controller.renameLocal(widget.path, _name.text);
-      if (mounted) Navigator.pop(context, path);
+      await widget.controller.renameLocal(widget.path, _name.text);
+      if (mounted) Navigator.pop(context, _name.text);
     } catch (error) {
       if (!mounted) return;
       setState(() {

@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:anj_cloud/core/app/controller.dart';
+import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/ui/app.dart';
@@ -11,11 +12,13 @@ final residual = cantSyncNameStatus(CloudNameProblem.forbiddenName);
 
 Map<String, dynamic> _row(
   String path, {
+  String? cloudPath,
   String kind = 'file',
   String status = 'current local',
   bool refused = false,
 }) => {
   'path': path,
+  'cloudPath': ?cloudPath,
   'kind': kind,
   'selectionVersion': '1',
   'status': status,
@@ -28,13 +31,31 @@ Map<String, dynamic> _row(
 class _Controller extends ClientController {
   _Controller(super.profile);
   final renames = <String>[];
+  final creates = <String>[];
   Object? failure;
+
+  /// This device's spelling of a typed name (a Windows device, spec #49 R3).
+  static String _spelled(String name) =>
+      const {'aux.txt': 'aux_.txt', 'aux': 'aux_'}[name] ?? name;
 
   @override
   Future<String> renameLocal(String path, String name) async {
     renames.add('$path -> $name');
     if (failure case final error?) throw error;
-    return '${path.substring(0, path.lastIndexOf('/') + 1)}$name';
+    return '${path.substring(0, path.lastIndexOf('/') + 1)}${_spelled(name)}';
+  }
+
+  @override
+  bool get canCreateFolder => true;
+
+  @override
+  Future<String> createFolder({
+    required String parent,
+    required String name,
+    required Retention retention,
+  }) async {
+    creates.add('$parent -> $name');
+    return '$parent/${_spelled(name)}';
   }
 }
 
@@ -55,6 +76,16 @@ void main() {
           refused: true,
         ),
         _row('Documents/readme.txt'),
+        // Held here under local aliases of their cloud names (spec #49 R3).
+        _row('Documents/report (2).pdf', cloudPath: 'Documents/report.pdf'),
+        {
+          ..._row(
+            'Documents/CON_',
+            cloudPath: 'Documents/CON',
+            kind: 'directory',
+          ),
+          'localDirectoryAvailable': true,
+        },
         _row('Documents/.bashrc'),
         _row('Documents/old.txt', status: 'removed locally'),
         // A cloud item no local name fits (spec #49 R3, decision #198).
@@ -228,5 +259,81 @@ void main() {
     expect(find.byKey(const ValueKey('rename-error')), findsOneWidget);
     expect(find.textContaining('changed or is gone'), findsOneWidget);
     expect(find.text('Rename .htaccess'), findsOneWidget);
+  });
+
+  group('no prompt or confirmation shows a local alias (decision #193)', () {
+    testWidgets('Details is titled with the cloud path', (tester) async {
+      await open(tester);
+      await tester.tap(
+        inCard('Documents/report (2).pdf', find.byTooltip('File actions')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Details and preserved copies'));
+      await tester.pumpAndSettle();
+      final details = find.byType(AlertDialog);
+      expect(
+        find.descendant(
+          of: details,
+          matching: find.text('Documents/report.pdf'),
+        ),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+          of: details,
+          matching: find.textContaining('report (2)'),
+        ),
+        findsNothing,
+      );
+    });
+
+    testWidgets('Rename confirms the typed cloud name, checked against the '
+        'cloud names beside it', (tester) async {
+      await open(tester);
+      await tester.tap(
+        find.byKey(const ValueKey('rename:Documents/.htaccess')),
+      );
+      await tester.pumpAndSettle();
+      final field = find.byKey(const ValueKey('rename-name'));
+      await tester.enterText(field, 'report.pdf');
+      await tester.pumpAndSettle();
+      expect(find.textContaining('already uses'), findsOneWidget);
+      // A local alias is not a cloud name: it is free.
+      await tester.enterText(field, 'report (2).pdf');
+      await tester.pumpAndSettle();
+      expect(find.textContaining('already uses'), findsNothing);
+      await tester.enterText(field, 'aux.txt');
+      await tester.tap(find.byKey(const ValueKey('confirm-rename')));
+      await tester.pumpAndSettle();
+      expect(controller.renames, ['Documents/.htaccess -> aux.txt']);
+      expect(find.text('Renamed to aux.txt'), findsOneWidget);
+      expect(find.textContaining('aux_'), findsNothing);
+    });
+
+    testWidgets('Create folder lists parents and confirms under their cloud '
+        'path; the local path stays the command key', (tester) async {
+      await open(tester);
+      await tester.tap(find.byKey(const ValueKey('create-folder-button')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('folder-parent')));
+      await tester.pumpAndSettle();
+      final menu = find.byType(DropdownMenuItem<String>);
+      expect(
+        find.descendant(of: menu, matching: find.text('Documents/CON')),
+        findsWidgets,
+      );
+      expect(
+        find.descendant(of: menu, matching: find.textContaining('CON_')),
+        findsNothing,
+      );
+      await tester.tap(find.text('Documents/CON').last);
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(const ValueKey('folder-name')), 'aux');
+      await tester.tap(find.byKey(const ValueKey('confirm-create-folder')));
+      await tester.pumpAndSettle();
+      expect(controller.creates, ['Documents/CON_ -> aux']);
+      expect(find.text('Created folder: Documents/CON/aux'), findsOneWidget);
+      expect(find.textContaining('_'), findsNothing);
+    });
   });
 }
