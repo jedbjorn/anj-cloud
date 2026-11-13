@@ -13,6 +13,7 @@ import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
+import 'test_platform.dart';
 
 /// Per-device local names at the sync boundary (spec #49 R3, Sync Boundary;
 /// decision #199): a Windows or macOS device holds every cloud item under a
@@ -275,7 +276,7 @@ void main() {
     // The fileid-paired row moved to the new local name.
     expect(store.entries.containsKey('Documents/report (2).pdf'), isFalse);
     expect(store.entries['Documents/report.pdf']!.fileId, isNotNull);
-    expect(onDisk('Documents/Report.pdf'), isFalse);
+    expect(onDiskIn('Documents'), isNot(contains('Report.pdf')));
   });
 
   test('macOS resolves clashes only (AC5)', () async {
@@ -307,7 +308,7 @@ void main() {
       'x.',
     ]);
     expect(store.entries.values.where((e) => e.cloudName != null), isEmpty);
-  });
+  }, skip: linuxOnly('Report.pdf and report.pdf are two items on disk'));
 
   test('a cloud item no ` (n)` fits beside its extension is the one '
       'residual row, Cloud-only (decision #198)', () async {
@@ -326,7 +327,7 @@ void main() {
     // ` (2)` to ` (99)` fit; ` (100)` leaves no stem, for the last two.
     for (final name in variants.skip(99)) {
       expect(status('Documents/$name'), unplaceableStatus);
-      expect(onDisk('Documents/$name'), isFalse);
+      expect(onDiskIn('Documents'), isNot(contains(name)));
     }
     final last = 'Documents/${variants.last}';
     expect(onDiskIn('Documents'), hasLength(99));
@@ -370,7 +371,7 @@ void main() {
 
   test('this Linux volume is case-sensitive', () {
     expect(engine.tree.native.caseInsensitive(engine.tree.root.path), isFalse);
-  });
+  }, skip: linuxOnly('a case-sensitive volume'));
 
   test('10,000 siblings are named once per folder (time bound)', () {
     final entries = [

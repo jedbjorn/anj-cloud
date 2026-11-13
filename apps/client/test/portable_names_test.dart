@@ -281,14 +281,17 @@ void main() {
 
   test('a name no rule resolves is the one residual row; a folder of that '
       'name keeps its contents local', () async {
+    // The folder sits apart from the file so a case-folding volume holds
+    // both.
     write('Documents/.htaccess', 'rules');
-    Directory('${tree.root.path}/Documents/.HTACCESS').createSync();
-    write('Documents/.HTACCESS/inside.txt', 'inside');
+    Directory('${tree.root.path}/Documents/Site/.HTACCESS')
+        .createSync(recursive: true);
+    write('Documents/Site/.HTACCESS/inside.txt', 'inside');
     await engine.tick();
     await engine.tick();
     expect(cloud.attemptsBy.keys.where((k) => k.contains('htaccess')), isEmpty);
     expect(cloud.attemptsBy.keys.where((k) => k.contains('HTACCESS')), isEmpty);
-    for (final path in ['Documents/.htaccess', 'Documents/.HTACCESS']) {
+    for (final path in ['Documents/.htaccess', 'Documents/Site/.HTACCESS']) {
       expect(entry(path).status, residual, reason: path);
       final row = await projected(path);
       expect(row['cantSyncName'], isTrue);
@@ -298,7 +301,7 @@ void main() {
     }
     expect(local('Documents/.htaccess').readAsStringSync(), 'rules');
     expect(
-      local('Documents/.HTACCESS/inside.txt').readAsStringSync(),
+      local('Documents/Site/.HTACCESS/inside.txt').readAsStringSync(),
       'inside',
     );
     expect(overall(), SyncStatus.attention);
@@ -308,8 +311,9 @@ void main() {
     'Rename renames in place; the new name syncs and the old row ends',
     () async {
       write('Documents/.htaccess', 'bytes');
-      Directory('${tree.root.path}/Documents/.HTACCESS').createSync();
-      write('Documents/.HTACCESS/child.txt', 'child');
+      Directory('${tree.root.path}/Documents/Site/.HTACCESS')
+          .createSync(recursive: true);
+      write('Documents/Site/.HTACCESS/child.txt', 'child');
       await engine.tick();
       expect(entry('Documents/.htaccess').status, residual);
       expect(
@@ -317,20 +321,20 @@ void main() {
         'Documents/htaccess.txt',
       );
       expect(
-        await engine.renameLocal('Documents/.HTACCESS', 'Rules'),
-        'Documents/Rules',
+        await engine.renameLocal('Documents/Site/.HTACCESS', 'Rules'),
+        'Documents/Site/Rules',
       );
       await engine.tick();
       await engine.tick();
       expect(local('Documents/.htaccess').existsSync(), isFalse);
       expect(local('Documents/htaccess.txt').readAsStringSync(), 'bytes');
       expect(cloud.files['Documents/htaccess.txt'], 'bytes'.codeUnits);
-      expect(cloud.directories, contains('Documents/Rules'));
-      expect(cloud.files['Documents/Rules/child.txt'], 'child'.codeUnits);
+      expect(cloud.directories, contains('Documents/Site/Rules'));
+      expect(cloud.files['Documents/Site/Rules/child.txt'], 'child'.codeUnits);
       for (final old in [
         'Documents/.htaccess',
-        'Documents/.HTACCESS',
-        'Documents/.HTACCESS/child.txt',
+        'Documents/Site/.HTACCESS',
+        'Documents/Site/.HTACCESS/child.txt',
       ]) {
         final row = await projected(old);
         expect(visibleInLibrary(row), isFalse, reason: old);
