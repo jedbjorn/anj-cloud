@@ -191,9 +191,16 @@ document; or any other app by `getCallingPackage()`) and sends the call over
   and the platform tree grants the app can no longer use are withdrawn
   (`revokeUriPermission(package, uri, flags)`). A descriptor already handed
   out stays open until the app closes it (A1 R2).
-- Document ids (`n:<id>`) are allocated once per path, never reused, and
-  follow rename and move. They live in `<profile>/app-access.sqlite` with
-  the approvals, beside the manifest, never in it. `w:<name>` ids are editor
+- File document ids are `n:<id>/<display name>`; folder ids stay `n:<id>` and
+  the root id is `root`. The number is allocated once per path, never reused,
+  and follows rename and move; resolution uses that number alone, so bare,
+  current, stale-name and empty-name ids reach the same item. Rename returns
+  the requested id (Android reports no id change), while the next listing,
+  move and create use the current form. Single-file usage and grant rows are
+  keyed by `n:<id>`; revocation covers every persisted name form plus the
+  current and bare ids. Platform per-document grants still authorize only
+  their exact URI. Ids live in `<profile>/app-access.sqlite` with the
+  approvals, beside the manifest, never in it. `w:<name>` ids are editor
   working copies and are reachable only with a per-document grant.
 - Listings come from the engine's projection. Every open and change is a
   sync-worker command (`DocumentsOps`): a confined read-only descriptor

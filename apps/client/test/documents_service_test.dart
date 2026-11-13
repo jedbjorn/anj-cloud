@@ -173,6 +173,72 @@ void main() {
     expect(cloud['cloudOnly'], isTrue);
   });
 
+  test('file ids carry names and resolve by their number only', () {
+    final track = id('Music/Album/track.mp3');
+    final bare = track.split('/').first;
+    expect(track, '$bare/track.mp3');
+    expect(id('Music/Album'), matches(r'^n:[0-9]+$'));
+    expect(id(''), DocumentsService.rootId);
+
+    for (final accepted in [
+      bare,
+      track,
+      '$bare/Old.mp3',
+      '$bare/',
+      '$bare/Sigur Rós - Hoppípolla.mp3',
+      '$bare/周杰伦 - 晴天.flac',
+      '$bare/100% #1? mix.v2.mp3',
+    ]) {
+      expect(
+        service.resolve(accepted).path,
+        'Music/Album/track.mp3',
+        reason: accepted,
+      );
+    }
+    for (final malformed in ['n:', 'n:42x', 'n:-1', 'n:+4']) {
+      expect(
+        () => service.resolve(malformed),
+        throwsA(
+          isA<DocumentsFailure>().having((e) => e.code, 'code', 'notFound'),
+        ),
+        reason: malformed,
+      );
+    }
+    expect(service.document('$bare/stale.mp3', system)['id'], track);
+  });
+
+  test(
+    'rename returns the requested id; move and create return current ids',
+    () async {
+      final original = id('Music/Album/track.mp3');
+      final requested = '${original.split('/').first}/Before.mp3';
+      final renamed = await service.rename(
+        requested,
+        'Sigur Rós - Hoppípolla.mp3',
+        system,
+      );
+      expect(renamed, requested);
+      expect(
+        service.resolve(requested).path,
+        'Music/Album/Sigur Rós - Hoppípolla.mp3',
+      );
+
+      final moved = await service.move(requested, id('Music'), system);
+      expect(moved, id('Music/Sigur Rós - Hoppípolla.mp3'));
+      expect(moved, endsWith('/Sigur Rós - Hoppípolla.mp3'));
+
+      host.answer = (op, args) => {'path': 'Music/track (1).mp3'};
+      final created = await service.create(
+        id('Music'),
+        'track.mp3',
+        false,
+        system,
+      );
+      expect(created, id('Music/track (1).mp3'));
+      expect(created, endsWith('/track (1).mp3'));
+    },
+  );
+
   test('Files app navigation resolves root, folder and file ancestry', () {
     expect(service.findPath(null, 'root', system), ['root']);
     expect(service.findPath(null, id('Music/Album'), system), [
@@ -376,6 +442,22 @@ void main() {
     );
   });
 
+  test('a named per-document grant does not authorize another name', () async {
+    final track = id('Music/Album/track.mp3');
+    final bare = track.split('/').first;
+    final granted = DocumentsCaller(
+      CallerKind.document,
+      package: g1.package,
+      documentRead: true,
+    );
+    expect(service.document('$bare/A.mp3', granted)['id'], track);
+    expect(() => service.document('$bare/B.mp3', g1), denied());
+    expect(service.requests.single.package, g1.package);
+    expect(service.requests.single.folder, 'Music/Album');
+    await service.approve(g1.package!, 'Music/Album', AccessMode.read);
+    expect(service.document('$bare/B.mp3', g1)['id'], track);
+  });
+
   test(
     'every provider change asks for prompt background work (review M1)',
     () async {
@@ -425,16 +507,22 @@ void main() {
         documentRead: true,
       );
       final secret = id('Private/secret.txt');
+      final bareSecret = secret.split('/').first;
+      final oldSecret = '$bareSecret/Old.txt';
+      final newSecret = '$bareSecret/New.txt';
       final track = id('Music/Album/track.mp3');
+      final bareTrack = track.split('/').first;
       revoker.documents = [
-        (id: secret, read: true, write: false),
-        (id: secret, read: true, write: true), // a second app, never seen
+        (id: oldSecret, read: true, write: false),
+        (id: newSecret, read: true, write: true),
         (id: track, read: true, write: false),
         (id: 'n:9999', read: true, write: false),
       ];
       // The platform's list names no app: the provider records who uses it.
-      await service.open(secret, 'r', viewer);
+      await service.open(oldSecret, 'r', viewer);
       service.document(track, viewer);
+      expect(store.fileUsers()[bareSecret], ['viewer']);
+      expect(store.fileUsers()[bareTrack], ['viewer']);
       // An app reaching the file through a folder approval is not a file user.
       await service.approve(g1.package!, 'Music', AccessMode.read);
       service.document(track, g1);
@@ -448,13 +536,14 @@ void main() {
         ],
       );
       final row = files.last;
-      expect(row.documentId, secret);
+      expect(row.documentId, bareSecret);
       expect(row.holders, 2);
       expect(row.write, isTrue);
       expect(row.packages, ['viewer']);
+      expect(files[1].documentId, bareTrack);
       expect(files[1].packages, ['viewer']);
       expect(files[1].write, isFalse);
-      // A rename keeps the id, so the row follows the file.
+      // A rename keeps the number, so the row follows the file.
       service.localRenamed('Private/secret.txt', 'Private/renamed.txt');
       host.set([
         for (final e in library())
@@ -469,14 +558,19 @@ void main() {
       );
       var notified = 0;
       service.addListener(() => notified++);
-      await service.revokeFile(secret);
-      expect(revoker.revokedDocuments, [secret]);
+      await service.revokeFile(bareSecret);
+      expect(revoker.revokedDocuments, [
+        oldSecret,
+        newSecret,
+        id('Private/renamed.txt'),
+        bareSecret,
+      ]);
       expect(notified, greaterThan(0));
-      expect(store.fileUsers().containsKey(secret), isFalse);
-      expect(store.fileUsers()[track], ['viewer']);
+      expect(store.fileUsers().containsKey(bareSecret), isFalse);
+      expect(store.fileUsers()[bareTrack], ['viewer']);
       expect(
         (await service.fileGrants()).map((f) => f.documentId),
-        isNot(contains(secret)),
+        isNot(contains(bareSecret)),
       );
     },
   );
@@ -595,14 +689,17 @@ void main() {
     'a deleted item ends its id and approvals; its name gets a new id',
     () async {
       final album = id('Music/Album');
+      final track = id('Music/Album/track.mp3');
       await service.approve(g1.package!, 'Music/Album', AccessMode.read);
       revoker.trees = [album];
       await service.delete(album, system);
       expect(service.approvals, isEmpty);
       expect(revoker.revoked, [(g1.package!, album)]);
       expect(() => service.resolve(album), throwsA(isA<DocumentsFailure>()));
+      expect(() => service.resolve(track), throwsA(isA<DocumentsFailure>()));
       host.set(library());
       expect(id('Music/Album'), isNot(album));
+      expect(id('Music/Album/track.mp3'), isNot(track));
     },
   );
 

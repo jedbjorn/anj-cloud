@@ -266,18 +266,33 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
   }
 
   String? _existingId(String path) {
-    if (path.isEmpty) return rootId;
     if (!_byPath.containsKey(path)) return null;
-    return 'n:${store.idFor(path)}';
+    return idOf(path);
   }
 
-  String idOf(String path) => path.isEmpty ? rootId : 'n:${store.idFor(path)}';
+  String idOf(String path) {
+    if (path.isEmpty) return rootId;
+    final id = 'n:${store.idFor(path)}';
+    return _byPath[path]?['kind'] == 'file'
+        ? '$id/${p.posix.basename(path)}'
+        : id;
+  }
+
+  static int? _numberOf(String id) {
+    final match = RegExp(r'^n:([0-9]+)(?:/|$)').firstMatch(id);
+    return match == null ? null : int.tryParse(match.group(1)!);
+  }
+
+  static String _grantKey(String id) {
+    final number = _numberOf(id);
+    return number == null ? id : 'n:$number';
+  }
 
   /// The library path of [id], or a working-copy reference.
   ({String? path, String? working}) resolve(String id) {
     if (id == rootId) return (path: '', working: null);
     if (id.startsWith('n:')) {
-      final number = int.tryParse(id.substring(2));
+      final number = _numberOf(id);
       final path = number == null ? null : store.pathOf(number);
       if (path == null || !_byPath.containsKey(path)) {
         throw const DocumentsFailure('notFound', 'This item no longer exists.');
@@ -371,7 +386,8 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
   void _fileUsed(String id, DocumentsCaller caller) {
     final package = caller.package;
     if (caller.kind != CallerKind.document || package == null) return;
-    final key = '$id\n$package';
+    final grant = _grantKey(id);
+    final key = '$grant\n$package';
     final now = clock();
     final previous = _lastFileUse[key];
     if (previous != null &&
@@ -380,7 +396,7 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     }
     _lastFileUse[key] = now;
     try {
-      store.fileUsed(id, package, now);
+      store.fileUsed(grant, package, now);
     } catch (_) {
       // A label is a nicety; the call itself goes on.
     }
@@ -675,7 +691,8 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
       'path': path,
       'name': name,
     });
-    return _moved(path, result['path'] as String);
+    _moved(path, result['path'] as String);
+    return id;
   }
 
   Future<String> move(
@@ -860,7 +877,7 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     final users = store.fileUsers();
     final byId = <String, List<({String id, bool read, bool write})>>{};
     for (final grant in grants) {
-      (byId[grant.id] ??= []).add(grant);
+      (byId[_grantKey(grant.id)] ??= []).add(grant);
     }
     final rows = [
       for (final MapEntry(key: id, value: held) in byId.entries)
@@ -869,7 +886,10 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
           name: _fileName(id),
           holders: held.length,
           write: held.any((g) => g.write),
-          packages: users[id] ?? const [],
+          packages: <String>{
+            for (final grant in held) ...?users[grant.id],
+            ...?users[id],
+          }.toList()..sort(),
         ),
     ];
     rows.sort((a, b) => a.name.compareTo(b.name));
@@ -894,9 +914,28 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
   Future<void> revokeFile(String documentId) async {
     final revoker = this.revoker;
     if (revoker == null) return;
-    await revoker.revokeDocument(documentId);
-    store.forgetFileUsers(documentId);
-    _lastFileUse.removeWhere((key, _) => key.startsWith('$documentId\n'));
+    final key = _grantKey(documentId);
+    final ids = <String>{};
+    if (key.startsWith('n:')) {
+      final grants = await revoker.persistedDocuments();
+      ids.addAll(
+        grants.map((grant) => grant.id).where((id) => _grantKey(id) == key),
+      );
+      try {
+        ids.add(idOf(resolve(key).path!));
+      } on DocumentsFailure {
+        // A departed file has no current id to revoke.
+      }
+      ids.add(key);
+    } else {
+      ids.add(documentId);
+    }
+    for (final id in ids) {
+      await revoker.revokeDocument(id);
+      store.forgetFileUsers(id);
+    }
+    store.forgetFileUsers(key);
+    _lastFileUse.removeWhere((entryKey, _) => entryKey.startsWith('$key\n'));
     notifyListeners();
   }
 

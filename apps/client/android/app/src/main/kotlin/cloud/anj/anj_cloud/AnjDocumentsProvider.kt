@@ -28,8 +28,12 @@ import java.io.FileNotFoundException
  * [getCallingPackage]) and the shared Dart DocumentsService decides. An app the user has not
  * approved for a folder is refused even if it picked that folder in the system picker.
  *
- * Document ids are "root", "n:<id>" (a stable id that follows rename and move) and "w:<name>"
- * (an editor working copy, reached only through a per-document grant). Descriptors are opened by
+ * Document ids are "root", "n:<id>" for folders and "n:<id>/<display name>" for files. The
+ * never-reused number is the identity and follows rename and move; the name is only a label, so
+ * resolution accepts bare, current, stale-name and empty-name ids by number alone. Rename returns
+ * the requested id (and therefore null here), while listings, move and create return current-form
+ * ids. "w:<name>" ids are editor working copies, reached only through a per-document grant.
+ * Descriptors are opened by
  * the sync worker through the descriptor-relative boundary; this class reopens the worker's
  * read-only descriptor through /proc/self/fd with the app's mode (the same inode) and reports
  * the app's close back, so the registry and the release guard see every open descriptor.
