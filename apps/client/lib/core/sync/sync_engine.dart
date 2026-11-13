@@ -824,7 +824,22 @@ class SyncEngine {
   }
 
   Retention get defaultRetention => Retention.local;
+
+  /// A file's own storage choice when it has one (spec #45 R1), otherwise
+  /// its nearest folder's.
   Retention retention(String path) {
+    if (path.isEmpty || path == '.') return defaultRetention;
+    validateRelative(path);
+    final entry = manifest.entries[path];
+    if (entry?.kind == ItemKind.file && entry?.override != null) {
+      return entry!.override!;
+    }
+    return folderRetention(path);
+  }
+
+  /// The choice the folders give [path]: its own when it is a folder, else
+  /// its nearest folder's. A file's own choice is not consulted.
+  Retention folderRetention(String path) {
     if (path.isEmpty || path == '.') return defaultRetention;
     validateRelative(path);
     var current = path;
@@ -6304,11 +6319,6 @@ class SyncEngine {
             'Local item changed; select it again.',
           );
         }
-        if (action != 'delete' && entry.kind != ItemKind.directory) {
-          throw const FileSystemException(
-            'Files inherit their folder storage choice.',
-          );
-        }
         if (isTopFolder(path) && action == 'cloud') {
           throw const FileSystemException(topFolderCloudOnlyRefusal);
         }
@@ -6334,12 +6344,22 @@ class SyncEngine {
             pathOf: (entry) => entry.path,
             isDirectory: (entry) => entry.kind == ItemKind.directory,
           )
-        : checked;
+        // Folders first, outermost first, then files: a folder's choice
+        // never clears the one a selected file is given in the same batch.
+        : ([...checked]..sort((a, b) {
+            final kind =
+                (a.kind == ItemKind.directory ? 0 : 1) -
+                (b.kind == ItemKind.directory ? 0 : 1);
+            return kind != 0
+                ? kind
+                : a.path.split('/').length - b.path.split('/').length;
+          }));
     final entriesBefore = {
       for (final entry in roots)
         entry.path: Entry.fromJson(Map<String, dynamic>.from(entry.toJson())),
     };
     final addedOperations = <String>[];
+    final choicesBefore = <Entry, Retention?>{};
     try {
       for (final entry in roots) {
         if (action == 'delete') {
@@ -6353,7 +6373,7 @@ class SyncEngine {
           if (existing == null) addedOperations.add(queued.id);
           entry.status = 'delete queued';
         } else {
-          entry.override = Retention.values.byName(action);
+          _choose(entry, Retention.values.byName(action), choicesBefore);
         }
       }
       manifest.save();
@@ -6361,6 +6381,9 @@ class SyncEngine {
         markDirty(entry.path, descendants: true);
       }
     } catch (_) {
+      for (final MapEntry(key: entry, value: choice) in choicesBefore.entries) {
+        entry.override = choice;
+      }
       manifest.entries.addAll(entriesBefore);
       for (final id in addedOperations) {
         manifest.operations.remove(id);
@@ -6383,30 +6406,84 @@ class SyncEngine {
     }
     final entry = manifest.entries[path];
     if (entry == null) throw const FileSystemException('Unknown item');
-    if (entry.kind != ItemKind.directory) {
-      throw const FileSystemException(
-        'Files inherit their folder storage choice. Choose a folder.',
-      );
+    if (entry.kind != ItemKind.directory && entry.kind != ItemKind.file) {
+      throw const FileSystemException('Choose a file or folder.');
     }
+    _choose(entry, value);
+    manifest.save();
+    markDirty(path, descendants: true);
+  }
+
+  /// Records [value] as [entry]'s storage choice (spec #45, superseding
+  /// decision #29), without saving. Each row changed is first recorded in
+  /// [previous] with its former choice.
+  ///
+  /// A file's choice equal to what its folders give it is no choice of its
+  /// own: it follows the folder again ("as folder").
+  ///
+  /// A folder's choice clears the own choices of the files that inherit
+  /// from it (R2): those whose nearest folder with a choice is this one, so
+  /// Cloud-only on a folder means everything in it. Nested folder choices
+  /// stay. For a top folder those are its loose files only.
+  void _choose(
+    Entry entry,
+    Retention value, [
+    Map<Entry, Retention?>? previous,
+  ]) {
+    void set(Entry row, Retention? choice) {
+      previous?.putIfAbsent(row, () => row.override);
+      row.override = choice;
+    }
+
+    final path = entry.path;
+    if (entry.kind == ItemKind.file) {
+      set(entry, value == folderRetention(path) ? null : value);
+      return;
+    }
+    final top = isTopFolder(path);
     // A top folder's row is the choice for what is inside it (decision
     // #163, M1): new and loose files. The folder itself stays (retention).
     // Switching it changes only loose files and folders added later: each
     // folder already inside without a choice of its own first gets one that
     // keeps its current state, so nothing already there is evicted or
     // downloaded by the switch (#97 re-review N2).
-    if (isTopFolder(path) && value != retention('$path/_')) {
-      final current = retention('$path/_');
+    if (top && value != folderRetention('$path/_')) {
+      final current = folderRetention('$path/_');
       for (final child in manifest.entries.values) {
         if (child.kind == ItemKind.directory &&
             child.override == null &&
             p.posix.dirname(child.path) == path) {
-          child.override = current;
+          set(child, current);
         }
       }
     }
-    entry.override = value;
-    manifest.save();
-    markDirty(path, descendants: true);
+    set(entry, value);
+    for (final file in manifest.entries.values) {
+      if (file.kind != ItemKind.file ||
+          file.override == null ||
+          !p.posix.isWithin(path, file.path)) {
+        continue;
+      }
+      if (top
+          ? p.posix.dirname(file.path) == path
+          : _choosingFolder(file.path) == path) {
+        set(file, null);
+      }
+    }
+  }
+
+  /// The nearest folder above [path] holding a storage choice; null when
+  /// only the root's applies.
+  String? _choosingFolder(String path) {
+    var current = p.posix.dirname(path);
+    while (current != '.') {
+      final entry = manifest.entries[current];
+      if (entry?.kind == ItemKind.directory && entry?.override != null) {
+        return current;
+      }
+      current = p.posix.dirname(current);
+    }
+    return null;
   }
 
   void requestDelete(String path) {

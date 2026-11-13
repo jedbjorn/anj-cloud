@@ -136,47 +136,59 @@ void main() {
         expect(find.text('1 selected'), findsOneWidget);
       },
     );
-    testWidgets(
-      'files disable both retention buttons; delete cancel and confirm use exact targets',
-      (tester) async {
-        await select(tester);
-        await tester.tap(find.byKey(const ValueKey('select-card:Folder')));
-        await tester.tap(find.byKey(const ValueKey('select-card:note.txt')));
-        await tester.pump();
-        expect(
-          tester
-              .widget<FilledButton>(find.byKey(const ValueKey('bulk-local')))
-              .onPressed,
-          isNull,
-        );
-        expect(
-          tester
-              .widget<FilledButton>(find.byKey(const ValueKey('bulk-cloud')))
-              .onPressed,
-          isNull,
-        );
-        await tester.tap(find.byKey(const ValueKey('bulk-delete')));
-        await tester.pumpAndSettle();
-        expect(
-          find.textContaining('including hidden or filtered items'),
-          findsOneWidget,
-        );
-        await tester.tap(find.widgetWithText(TextButton, 'Cancel').last);
-        await tester.pumpAndSettle();
-        expect(controller.batches, isEmpty);
-        expect(find.text('2 selected'), findsOneWidget);
-        await tester.tap(find.byKey(const ValueKey('bulk-delete')));
-        await tester.pumpAndSettle();
-        await tester.tap(find.byKey(const ValueKey('confirm-bulk-delete')));
-        await tester.pumpAndSettle();
-        expect(controller.batches.single.$1, 'delete');
-        expect(controller.batches.single.$2.map((e) => e['path']), [
-          'Folder',
-          'note.txt',
-        ]);
-        expect(find.text('0 selected'), findsOneWidget);
-      },
-    );
+    testWidgets('a mix of files and folders takes both storage choices without '
+        'confirmation; delete cancel and confirm use exact targets', (
+      tester,
+    ) async {
+      await select(tester);
+      await tester.tap(find.byKey(const ValueKey('select-card:Folder')));
+      await tester.tap(find.byKey(const ValueKey('select-card:note.txt')));
+      await tester.pump();
+      expect(
+        tester
+            .widget<FilledButton>(find.byKey(const ValueKey('bulk-local')))
+            .onPressed,
+        isNotNull,
+      );
+      await tester.tap(find.byKey(const ValueKey('bulk-cloud')));
+      await tester.pumpAndSettle();
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(controller.batches.single.$1, 'cloud');
+      expect(controller.batches.single.$2.map((e) => e['path']), [
+        'Folder',
+        'note.txt',
+      ]);
+      controller.batches.clear();
+      expect(find.text('0 selected'), findsOneWidget);
+      // The result line covers the lower card until it goes.
+      ScaffoldMessenger.of(
+        tester.element(find.text('0 selected')),
+      ).removeCurrentSnackBar();
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('select-card:Folder')));
+      await tester.tap(find.byKey(const ValueKey('select-card:note.txt')));
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('bulk-delete')));
+      await tester.pumpAndSettle();
+      expect(
+        find.textContaining('including hidden or filtered items'),
+        findsOneWidget,
+      );
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel').last);
+      await tester.pumpAndSettle();
+      expect(controller.batches, isEmpty);
+      expect(find.text('2 selected'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('bulk-delete')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('confirm-bulk-delete')));
+      await tester.pumpAndSettle();
+      expect(controller.batches.single.$1, 'delete');
+      expect(controller.batches.single.$2.map((e) => e['path']), [
+        'Folder',
+        'note.txt',
+      ]);
+      expect(find.text('0 selected'), findsOneWidget);
+    });
     testWidgets('Escape overrides focused search and cancels modal plus mode', (
       tester,
     ) async {
@@ -383,16 +395,20 @@ void main() {
         expect(store.entries['Projects/Child/note.txt']!.override, isNull);
       },
     );
-    test('mixed file policy, stale version and unknown paths reject all before mutation', () {
+    test('stale version and unknown paths reject all before mutation', () {
       for (final bad in [
-        target('Projects/Child/note.txt'),
         {...target('Projects/Child'), 'selectionVersion': 'stale'},
         {'path': 'missing', 'kind': 'directory', 'selectionVersion': 'x'},
       ]) {
-        final result = engine.applyBulk('cloud', [target('Projects'), bad]);
+        final result = engine.applyBulk('cloud', [
+          target('Projects'),
+          target('Projects/Child/note.txt'),
+          bad,
+        ]);
         expect(result['accepted'], 0);
-        expect(result['failed'], 2);
+        expect(result['failed'], 3);
         expect(store.entries['Projects']!.override, isNull);
+        expect(store.entries['Projects/Child/note.txt']!.override, isNull);
       }
     });
     test('unchanged refresh retains version; same-content inode replacement changes it', () async {

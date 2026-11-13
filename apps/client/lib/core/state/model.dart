@@ -244,9 +244,22 @@ class Entry {
   set status(String v) {
     if (v != _status) {
       _status = v;
+      // A file's own storage choice (spec #45) ends with the file: a row
+      // kept as the record of its deletion never passes it to a new file
+      // that later takes the same path, here or in the cloud.
+      if (_kind == ItemKind.file && deletedRecordStatuses.contains(v)) {
+        _override = null;
+      }
       _changed();
     }
   }
+
+  /// The statuses of a row kept as the record of a file that is gone.
+  static const deletedRecordStatuses = {
+    'deleted',
+    'deleted remotely',
+    'removed locally',
+  };
 
   String? _conflict;
   String? get conflict => _conflict;
@@ -503,7 +516,11 @@ class Entry {
         ..expectedPresent = j['expectedPresent'] as bool
         ..refreshRemote = j['refreshRemote'] as bool? ?? false
         ..awaitingFolderUpload = j['awaitingFolderUpload'] as bool? ?? false
-        ..override = j['kind'] != 'directory' || j['override'] == null
+        // Folders and files hold a storage choice (spec #45, superseding
+        // decision #29); any other kind never does.
+        ..override =
+            !const {'directory', 'file'}.contains(j['kind']) ||
+                j['override'] == null
             ? null
             : Retention.values.byName(j['override'] as String)
         ..status = j['status'] as String
