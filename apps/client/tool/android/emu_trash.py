@@ -101,10 +101,15 @@ def main():
 
     def delete(name):
         row_menu(name)
-        u.tap(r"^Delete everywhere$")
+        u.tap(exact("Delete everywhere"))
 
     def text():
         return u.screen_text()
+
+    def exact(words):
+        """A node whose text or description is exactly `words` (Flutter may set both, which the label joins)."""
+        word = re.escape(words)
+        return rf"^{word}( {word})?$"
 
     for name, data in content.items():
         stack.dav("PUT", UID, f"anj-cloud/{name}", data=data, headers=u.OCTETS, expected=(201, 204))
@@ -137,15 +142,24 @@ def main():
     # 1. Delete is one step; 2. Undo after the server applied it.
     name = names["undo"]
     delete(name)
-    snack = u.find(r"^Moved to Trash$", timeout=10)
-    shown = text()
-    u.step("Delete: no dialog, the row goes, Moved to Trash with Undo and View",
-           snack is not None and "Undo" in shown and "View" in shown and "Delete everywhere?" not in shown
-           and not any(re.fullmatch(re.escape(name) + r"(\s.*)?", line or "") for line in shown.splitlines()),
-           screen=shown[:600])
-    # The snackbar stays about 8 seconds: Undo is tapped within them.
-    applied = wait(lambda: on_server(name) is None and in_trash(name), timeout=5)
-    u.tap(r"^Undo$", timeout=3)
+    # The snackbar stays about 8 seconds and a UI dump takes one or two: one dump serves every check.
+    deadline, dump, undo = time.time() + 20, [], None
+
+    def first(words):
+        return next((n for n in dump if re.fullmatch(exact(words), u.label(n)) and len(n["bounds"]) == 4), None)
+    while undo is None and time.time() < deadline:
+        dump = u.nodes()
+        undo = first("Undo")
+    snack, view = first("Moved to Trash"), first("View")
+    shown = "\n".join(u.label(n) for n in dump)
+    applied = in_trash(name)
+    if undo is None:
+        (u.OUT / "delete-screen.txt").write_text(shown)
+        raise RuntimeError("no Undo on the snackbar")
+    u.tap_node(undo)
+    (u.OUT / "delete-screen.txt").write_text(shown)
+    u.step("Delete: no dialog, the row went, Moved to Trash with Undo and View",
+           snack is not None and view is not None and "Delete everywhere?" not in shown and name not in shown)
     u.step("the server had deleted it into Alice's trash before Undo", bool(applied))
     back = wait(lambda: on_server(name), timeout=90)
     u.step("Undo: back on the server with the same bytes",
@@ -156,8 +170,8 @@ def main():
     # 3. Delete, then View: Trash lists it; Restore.
     name = names["view"]
     delete(name)
-    wait(lambda: on_server(name) is None and in_trash(name), timeout=5)
-    u.tap(r"^View$", timeout=3)
+    u.find(exact("Moved to Trash"), timeout=6)
+    u.tap(exact("View"), timeout=3)
     listed = u.find(re.escape(name), timeout=10)
     if listed is None:  # Opened before the server applied it: pull to refresh.
         wait(lambda: in_trash(name), timeout=60)
@@ -167,7 +181,7 @@ def main():
     u.step("View opens Trash: the item with its expiry", listed is not None and "Deleted permanently in 7 days" in shown
            and "Empty Trash" in shown, screen=shown[:800])
     y1, y2 = listed["bounds"][1], listed["bounds"][3]
-    restore = [n for n in u.nodes() if u.label(n) == "Restore" and len(n["bounds"]) == 4
+    restore = [n for n in u.nodes() if re.fullmatch(exact("Restore"), u.label(n)) and len(n["bounds"]) == 4
                and y1 <= (n["bounds"][1] + n["bounds"][3]) // 2 <= y2]
     if not restore:
         raise RuntimeError("no Restore on the Trash row")
@@ -184,15 +198,15 @@ def main():
     # 4. Paused (offline for the app): Delete, Undo cancels the pending delete.
     name = names["paused"]
     u.tap(r"AnJ Cloud menu|Show menu", timeout=30)
-    u.tap(r"^Pause sync$")
+    u.tap(exact("Pause sync"))
     delete(name)
-    u.find(r"^Moved to Trash$", timeout=10)
-    u.tap(r"^Undo$", timeout=5)
-    u.find(r"^Restored\.$", timeout=20)
+    u.find(exact("Moved to Trash"), timeout=10)
+    u.tap(exact("Undo"), timeout=5)
+    u.find(exact("Restored."), timeout=20)
     u.step("paused: Undo of the pending delete answers Restored and the row returns", row(name, timeout=20) is not None,
            screen=text()[:400])
     u.tap(r"AnJ Cloud menu|Show menu", timeout=30)
-    u.tap(r"^Resume sync$")
+    u.tap(exact("Resume sync"))
     time.sleep(20)
     data = on_server(name)
     u.step("after Resume the file was never deleted on the server",
