@@ -7,8 +7,9 @@ One generator feeds both implementations of the name policy, so they cannot drif
   taken from this Python's `unicodedata`. The gateway and the clients use these tables, never
   their runtime's own Unicode library, so a Python or Dart upgrade cannot change a fold key.
 - `tests/name_policy_vectors.json` holds the vectors both test suites run: name checks with
-  their expected reasons, fold keys computed independently with `unicodedata`, and sibling
-  clashes. Its NFC vectors are run by the clients, which upload and move names in NFC
+  their expected reasons, fold keys computed independently with `unicodedata`, sibling
+  clashes, and the versioned name rule of spec #49 (`rule`: cleanup, cloud check, local names
+  and their reverse). Its NFC vectors are run by the clients, which upload and move names in NFC
   (decision #138) with the primary composites of the Dart tables.
 
     python3 tests/name_policy_gen.py           # rewrite the three files
@@ -173,6 +174,155 @@ CLASHES = [
 ]
 
 
+# The name rule (spec #49): expectations written by hand from R1-R3 and the D1 measurement of
+# Nextcloud 33.0.10, run by tests/test_name_rule.py and apps/client/test/name_rule_test.dart.
+RULE_VERSION = 1
+MAX_BYTES = 250
+WHITESPACE = [*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000]
+
+# (name, siblings, folder, result)
+CLEANUP = [
+    ("report.txt", [], False, "report.txt"), ("name .pdf", [], False, "name .pdf"),
+    ("Furniture Families ", [], True, "Furniture Families"), (" leading.txt", [], False, "leading.txt"),
+    ("name.pdf ", [], False, "name.pdf"), (" nbsp　", [], False, "nbsp"), ("\tTab.txt\n", [], False, "Tab.txt"),
+    (" a ", [], False, "a"), ("​zero width", [], False, "​zero width"),
+    ("in\tside.txt", [], False, "in␉side.txt"), ("a\\b.txt", [], False, "a＼b.txt"), ("x\x01y\x1f", [], False, "x␁y␟"),
+    ("   ", [], False, "Untitled"), ("  ", [], True, "Untitled"), ("  .pdf", [], False, "Untitled.pdf"),
+    (" .bashrc", [], False, "Untitled.bashrc"), (".bashrc", [], False, ".bashrc"), ("  .git ", [], True, ".git"),
+    ("draft ", ["Draft"], False, "draft (2)"), ("draft.txt ", ["DRAFT.TXT", "draft (2).txt"], False, "draft (3).txt"),
+    ("draft.txt ", ["draft.txt"], False, "draft (2).txt"), ("Café.txt ", ["CAFÉ.TXT"], False, "Café (2).txt"),
+    ("My.Photos ", ["my.photos"], True, "My.Photos (2)"), ("clean.txt", ["CLEAN.TXT"], False, "clean.txt"),
+    ("   ", ["untitled"], False, "Untitled (2)"), ("a ", ["b", "c"], False, "a"),
+    ("Song: Live?.m4a", [], False, "Song: Live?.m4a"), ("CON.txt", [], False, "CON.txt"), ("x.", [], False, "x."),
+    ("a\x7fb", [], False, "a\u2421b"), (".htaccess", [], False, ".htaccess"), (".HTACCESS", [], True, ".HTACCESS"),
+    # Decision #195: a .part/.filepart file is a local temporary and keeps its name (cloud_check still says
+    # forbiddenExtension); a folder gets `_` appended, then the suffix rule.
+    ("x.part", [], False, "x.part"), ("x.FILEPART", [], False, "x.FILEPART"), ("Disc.part", [], True, "Disc.part_"),
+    ("Disc.PART", [], True, "Disc.PART_"), (".part", [], True, ".part_"), (" Disc.filepart ", [], True, "Disc.filepart_"),
+    ("Disc.part", ["disc.PART_"], True, "Disc.part_ (2)"), ("x.part.txt", [], True, "x.part.txt"),
+    ("a" * 245 + ".part", [], True, "a" * 245 + ".par_"), ("x\x7f.part", [], True, "x\u2421.part_"),
+    ("雪の日.txt", [], False, "雪の日.txt"), ("Ελληνικά", [], True, "Ελληνικά"),
+    ("עברית.docx", [], False, "עברית.docx"),
+    ("한국어 문서.hwp", [], False, "한국어 문서.hwp"),
+    ("Привет:мир?.txt", [], False, "Привет:мир?.txt"),
+    ("emoji \U0001F600.png", [], False, "emoji \U0001F600.png"), (" 雪 ", [], False, "雪"),
+    # R2 too long: cut the stem at a code point boundary to 250 bytes, keep the extension.
+    ("a" * 300 + ".pdf", [], False, "a" * 246 + ".pdf"), ("é" * 200, [], True, "é" * 125),
+    ("雪" * 100 + ".txt", [], False, "雪" * 82 + ".txt"), ("\U0001F600" * 70 + ".png", [], False, "\U0001F600" * 61 + ".png"),
+    ("a" * 245 + " " + "b" * 10 + ".txt", [], False, "a" * 245 + ".txt"), (" " + "a" * 250 + " ", [], True, "a" * 250),
+    ("a" * 300 + ".pdf", ["A" * 246 + ".PDF"], False, "a" * 242 + " (2).pdf"), ("a." + "x" * 260, [], False, "a." + "x" * 260),
+    ("a" * 246 + ".txt", [], False, "a" * 246 + ".txt"),
+    # A ` (n)` that just fits beside a long extension; one that does not leaves the name as it was (the
+    # residual row), never a sibling's name.
+    (" a." + "x" * 244, ["a." + "x" * 244], False, "a (2)." + "x" * 244),
+    (" a." + "x" * 245, ["a." + "x" * 245], False, " a." + "x" * 245),
+    (" A." + "x" * 245, ["a." + "X" * 245], False, " A." + "x" * 245),
+    ("aaa." + "x" * 247, ["AA." + "x" * 247], False, "aaa." + "x" * 247),
+]
+
+# (name, reason): None means the cloud holds it.
+CLOUD_CHECK = [
+    ("report.txt", None), ("", "empty"), (" a", "untrimmed"), ("a ", "untrimmed"), ("a　", "untrimmed"), ("\u0085x", "untrimmed"),
+    ("a\\b", "forbiddenCharacter"), ("a\x01", "forbiddenCharacter"), ("a\x1f", "forbiddenCharacter"), ("a\tb", "forbiddenCharacter"),
+    ("a\x7fb", "forbiddenCharacter"), ("a/b", "forbiddenCharacter"), ("a\u0085b", None),
+    (".htaccess", "forbiddenName"), (".HTACCESS", "forbiddenName"), (".HtAccess", "forbiddenName"), (".", "forbiddenName"),
+    ("..", "forbiddenName"), (".htaccess.txt", None), ("x.htaccess", None),
+    ("x.part", "forbiddenExtension"), ("x.PART", "forbiddenExtension"), (".part", "forbiddenExtension"), ("x.pArT", "forbiddenExtension"),
+    ("x.filepart", "forbiddenExtension"), ("x.FILEPART", "forbiddenExtension"), ("x.ocTransferId123.part", "forbiddenExtension"),
+    ("İ.part", "forbiddenExtension"), ("x.part.txt", None), ("x.ＰＡＲＴ", None), ("xpart", None),
+    ("a" * 246 + ".txt", None), ("a" * 247 + ".txt", "tooLong"), ("é" * 125, None), ("é" * 126, "tooLong"),
+    ("雪" * 84, "tooLong"), ("CON", None), ("a:b?.txt", None), ("x.", None), ("...", None), ("desktop.ini", None),
+    ("\U0001F600.txt", None), ("雪の日.txt", None),
+]
+
+# (os, [(name, fileid, folder)], {cloud name: local name}); None: no local name, the residual row.
+AC4 = [("a:b?.txt", 1, False), ("CON.txt", 2, False), ("x.", 3, False), ("Report.pdf", 4, False), ("report.pdf", 5, False)]
+NON_LATIN = ["雪の日.txt", "Привет мир.docx", "한국어.hwp",
+             "Ελληνικά", "emoji \U0001F600.png", "עברית", "café.txt"]
+LONG_COLON = [("a:." + "x" * 245, 1, False), ("a：." + "x" * 245, 2, False)]  # 248 and 250 UTF-8 bytes
+LONG_CASE = [("a." + "x" * 248, 1, False), ("A." + "x" * 248, 2, False)]  # 250 bytes each
+# Past the cloud's limit, so no ` (n)` fits a device's 255: it stands in for 100+ case variants of a
+# 250-byte name, which run a suffix out of room the same way.
+NO_ROOM = [("a." + "x" * 253, 1, False), ("A." + "x" * 253, 2, False)]
+LOCAL_NAMES = [
+    ("windows", AC4, {"a:b?.txt": "a：b？.txt", "CON.txt": "CON_.txt", "x.": "x", "Report.pdf": "Report.pdf",
+                      "report.pdf": "report (2).pdf"}),
+    ("macos", AC4, {"a:b?.txt": "a:b?.txt", "CON.txt": "CON.txt", "x.": "x.", "Report.pdf": "Report.pdf", "report.pdf": "report (2).pdf"}),
+    ("linux", AC4, {name: name for name, _, _ in AC4}),
+    ("android", AC4, {name: name for name, _, _ in AC4}),
+    # Suffix ordering by fileid: the older item keeps its name, whatever its case.
+    ("windows", [("Report.pdf", 9, False), ("report.pdf", 5, False)], {"report.pdf": "report.pdf", "Report.pdf": "Report (2).pdf"}),
+    ("macos", [("Report.pdf", 9, False), ("report.pdf", 5, False)], {"report.pdf": "report.pdf", "Report.pdf": "Report (2).pdf"}),
+    ("windows", [("a.txt", 3, False), ("A.txt", 1, False), ("A.TXT", 2, False)], {"A.txt": "A.txt", "A.TXT": "A (2).TXT", "a.txt": "a (3).txt"}),
+    ("windows", [("CAFÉ.txt", 2, False), ("café.txt", 1, False)], {"café.txt": "café.txt", "CAFÉ.txt": "CAFÉ (2).txt"}),
+    ("macos", [("Straße", 1, True), ("STRASSE", 2, True)], {"Straße": "Straße", "STRASSE": "STRASSE (2)"}),
+    ("windows", [("Song: Live?.m4a", 1, False), ("c\x1f.txt", 2, False), ('q"<>|*.txt', 3, False), ("a\\b", 4, False)],
+     {"Song: Live?.m4a": "Song： Live？.m4a", "c\x1f.txt": "c␟.txt", 'q"<>|*.txt': "q＂＜＞｜＊.txt",
+      "a\\b": "a＼b"}),
+    ("windows", [("report.", 1, False), ("a. .", 2, False), ("...", 3, True), ("draft..", 4, False)],
+     {"report.": "report", "a. .": "a", "...": "Untitled", "draft..": "draft"}),
+    ("windows", [("Untitled", 1, True), ("...", 2, True)], {"Untitled": "Untitled", "...": "Untitled (2)"}),
+    ("windows", [("nul", 1, False), ("CON .txt", 2, False), ("con.tar.gz", 3, False), ("Aux", 4, True), ("PRN.", 5, False),
+                 ("lpt9.log", 6, False), ("COM10", 7, False), ("CONSOLE", 8, False), ("ＣＯＮ", 9, False), ("COM¹", 10, False),
+                 (".CON", 11, False), ("CON_", 12, False), ("CON", 13, False)],
+     {"nul": "nul_", "CON .txt": "CON_ .txt", "con.tar.gz": "con_.tar.gz", "Aux": "Aux_", "PRN.": "PRN_", "lpt9.log": "lpt9_.log",
+      "COM10": "COM10", "CONSOLE": "CONSOLE", "ＣＯＮ": "ＣＯＮ", "COM¹": "COM¹", ".CON": ".CON",
+      "CON_": "CON_", "CON": "CON_ (2)"}),
+    # Step 5: a suffix never lands on another item's name.
+    ("windows", [("Report.pdf", 1, False), ("report.pdf", 2, False), ("report (2).pdf", 3, False)],
+     {"Report.pdf": "Report.pdf", "report.pdf": "report (3).pdf", "report (2).pdf": "report (2).pdf"}),
+    ("windows", [("a.txt", 1, False), ("A.txt", 2, False), ("A (2).TXT", 3, False)],
+     {"a.txt": "a.txt", "A.txt": "A (3).txt", "A (2).TXT": "A (2).TXT"}),
+    # Step 5: a name that changed never takes the exact name of an item whose name did not.
+    ("windows", [("a:b.txt", 1, False), ("a：b.txt", 2, False)], {"a：b.txt": "a：b.txt", "a:b.txt": "a：b (2).txt"}),
+    # Step 4 when the names differ by case: the oldest keeps.
+    ("windows", [("A:b.txt", 1, False), ("a：b.txt", 2, False)], {"A:b.txt": "A：b.txt", "a：b.txt": "a：b (2).txt"}),
+    ("windows", [("Photos", 1, True), ("photos", 2, True), ("My.Docs", 3, True), ("my.docs", 4, True), ("notes", 5, True), ("Notes", 6, False)],
+     {"Photos": "Photos", "photos": "photos (2)", "My.Docs": "My.Docs", "my.docs": "my.docs (2)", "notes": "notes", "Notes": "Notes (2)"}),
+    # An item without a fileid (not yet listed) sorts after every listed one.
+    ("windows", [("readme", None, False), ("README", 50, False)], {"README": "README", "readme": "readme (2)"}),
+    ("windows", [(name, index + 1, False) for index, name in enumerate(NON_LATIN)], {name: name for name in NON_LATIN}),
+    ("macos", [(name, index + 1, False) for index, name in enumerate(NON_LATIN)], {name: name for name in NON_LATIN}),
+    ("linux", [("Report.pdf", 1, False), ("report.pdf", 2, False), ("a:b", 3, False)],
+     {"Report.pdf": "Report.pdf", "report.pdf": "report.pdf", "a:b": "a:b"}),
+    # A suffix fits the device's limit (Windows 255 UTF-16 code units, macOS 255 UTF-8 bytes), not the cloud's
+    # 250 bytes: `a： (2).x…` is 252 units and 254 bytes.
+    ("windows", LONG_COLON, {"a：." + "x" * 245: "a：." + "x" * 245, "a:." + "x" * 245: "a： (2)." + "x" * 245}),
+    ("windows", LONG_CASE, {"a." + "x" * 248: "a." + "x" * 248, "A." + "x" * 248: "A (2)." + "x" * 248}),
+    ("macos", LONG_CASE, {"a." + "x" * 248: "a." + "x" * 248, "A." + "x" * 248: "A (2)." + "x" * 248}),
+    # No room for a suffix: no local name, never a taken one.
+    ("windows", NO_ROOM, {"a." + "x" * 253: "a." + "x" * 253, "A." + "x" * 253: None}),
+    ("macos", NO_ROOM, {"a." + "x" * 253: "a." + "x" * 253, "A." + "x" * 253: None}),
+]
+
+# (os, entries, local name, cloud name): the reverse direction.
+REVERSE = [
+    ("windows", AC4, "a：b？.txt", "a:b?.txt"), ("windows", AC4, "report (2).pdf", "report.pdf"),
+    ("windows", AC4, "Report.pdf", "Report.pdf"), ("windows", AC4, "x", "x."), ("windows", AC4, "CON_.txt", "CON.txt"),
+    ("windows", AC4, "c.txt", "c.txt"), ("windows", AC4, "a：b.txt", "a：b.txt"), ("windows", AC4, "REPORT.PDF", "REPORT.PDF"),
+    ("windows", AC4, "a:b?.txt", "a:b?.txt"), ("macos", AC4, "report (2).pdf", "report.pdf"), ("macos", AC4, "a:b?.txt", "a:b?.txt"),
+    ("linux", AC4, "report.pdf", "report.pdf"), ("linux", AC4, "report (2).pdf", "report (2).pdf"),
+    ("windows", [("a:b.txt", 1, False), ("a：b.txt", 2, False)], "a：b.txt", "a：b.txt"),
+    ("windows", [("a:b.txt", 1, False), ("a：b.txt", 2, False)], "a：b (2).txt", "a:b.txt"),
+    ("windows", LONG_COLON, "a：." + "x" * 245, "a：." + "x" * 245),
+    ("windows", LONG_COLON, "a： (2)." + "x" * 245, "a:." + "x" * 245),
+    ("macos", LONG_CASE, "A (2)." + "x" * 248, "A." + "x" * 248),
+]
+
+
+def rule_vectors():
+    entry = lambda entries: [[name, fileid, folder] for name, fileid, folder in entries]
+    return {
+        "version": RULE_VERSION,
+        "maxBytes": MAX_BYTES,
+        "whitespace": WHITESPACE,
+        "cleanup": [{"name": n, "siblings": s, "folder": f, "result": r} for n, s, f, r in CLEANUP],
+        "cloudCheck": [{"name": n, "reason": r} for n, r in CLOUD_CHECK],
+        "localNames": [{"os": os, "entries": entry(e), "local": local} for os, e, local in LOCAL_NAMES],
+        "reverse": [{"os": os, "entries": entry(e), "local": local, "cloud": cloud} for os, e, local, cloud in REVERSE],
+    }
+
+
 def vectors(decomposition, combining, casefold):
     special = sorted(set(decomposition) | set(combining) | set(casefold))
     pool = special + list(range(0x20, 0x7F)) + [0xAC00, 0xAC01, 0xD7A3, 0x1100, 0x1161, 0x11A8, 0x11C2, 0x0345, 0x0301, 0x0323]
@@ -189,12 +339,14 @@ def vectors(decomposition, combining, casefold):
            for name in samples + [unicodedata.normalize("NFD", name) for name in samples]]
     return {
         "about": "Generated by tests/name_policy_gen.py. Run by tests/test_portable_names.py and "
-                 "apps/client/test/name_policy_test.dart. Fold keys come from unicodedata: NFD(casefold(NFD(name))).",
+                 "apps/client/test/name_policy_test.dart. Fold keys come from unicodedata: NFD(casefold(NFD(name))). "
+                 "'rule' is the versioned name rule of spec #49, run by tests/test_name_rule.py and apps/client/test/name_rule_test.dart.",
         "unicode": unicodedata.unidata_version,
         "check": [{"name": name, "reason": reason} for name, reason in CHECKS],
         "fold": fold,
         "clash": [{"name": name, "siblings": siblings, "clash": clash} for name, siblings, clash in CLASHES],
         "nfc": nfc,
+        "rule": rule_vectors(),
     }
 
 
