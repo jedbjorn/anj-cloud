@@ -252,6 +252,7 @@ class Stack:
         self.check()
         if not self.profile.get("production"):
             self.accounts()
+        self.migrate_names()
 
     def trash_days(self):
         """Days deleted items stay in the trash (spec #44 T2): ANJ_TRASH_DAYS, else 7."""
@@ -261,7 +262,7 @@ class Stack:
         """Sets Nextcloud's trash retention to exactly `trash_days` (minimum and maximum, `7, 7`) and
         returns the days read back. Expiry is Nextcloud's own background job in the cron container."""
         days = self.trash_days()
-        self.occ("config:system:set", "trashbin_retention_obligation", f"--value={days}, {days}")
+        self.occ("config:system:set", "trashbin_retention_obligation", "--value=" + f"{days}, {days}")
         current = self.occ("config:system:get", "trashbin_retention_obligation").strip()
         if current != f"{days}, {days}":
             raise RuntimeError("Nextcloud did not keep the trash retention setting")
@@ -279,6 +280,25 @@ class Stack:
             print("WARNING: the gateway did not take trash_days; it advertises its default (7 days)", file=sys.stderr)
             return None
         return days
+
+    def name_migration(self):
+        """One `access_operator.py migrate-names` run's totals, in the access venv (the operator CLI needs it)."""
+        return json.loads(self.run([str(self.venv_python), "-m", "deploy.access_operator", "--project", self.project,
+                                    "--port", str(self.port), "migrate-names"]))
+
+    def migrate_names(self):
+        """The one-time name migration every deploy runs (spec #49 Gateway; Operator.migrate_names).
+        Idempotent, so running it on each deploy renames only what is still untrimmed or over-long.
+        Best effort: a failure warns and the next deploy runs it again; it never fails the deploy."""
+        try:
+            counts = self.name_migration()
+        except (RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+            print(f"WARNING: the name migration did not complete ({error}); the next deploy runs it again", file=sys.stderr)
+            return None
+        print("Name migration: " + json.dumps(counts, separators=(",", ":")), file=sys.stderr)
+        if counts["accounts_failed"]:
+            print("WARNING: the name migration failed for some accounts; the next deploy runs it again", file=sys.stderr)
+        return counts
 
     def trusted_domains(self):
         domains = self.profile["trusted_domains"]

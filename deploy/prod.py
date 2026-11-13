@@ -664,7 +664,15 @@ class ProdStack(Stack):
             self.ensure_tls_fresh()
             self.advertise_trash()
         self.pm2("save")
-        return self.check()
+        result = self.check()
+        if "gateway" in apps:
+            result["name_migration"] = self.migrate_names()
+        return result
+
+    def name_migration(self):
+        """The operator's migrate-names in process: prod.py already runs where the operator CLI does."""
+        from deploy.access_operator import Operator
+        return Operator(self).migrate_names()
 
     def tls_stale(self):
         """Names whose gateway copy differs from the operator file (renewal not yet loaded)."""
@@ -758,6 +766,9 @@ class ProdStack(Stack):
                                f"{previous[:12]}, {rollback} (alert: {via})") from None
         result["operations"] = self.restart_release_ops()
         self.pm2("save")
+        # After the switch: the migration never rolls back a healthy release (spec #49 Gateway).
+        if "gateway" in self.active_apps():
+            result["name_migration"] = self.migrate_names()
         result["previous_release"] = previous[:12] if previous else None
         return result
 

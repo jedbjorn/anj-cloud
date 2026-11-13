@@ -460,12 +460,20 @@ class SharingTests(unittest.IsolatedAsyncioTestCase):
         await self.incoming(self.as_bob())
         self.assertEqual("/anj-cloud/Shared/Plans", self.cloud.shares["3"]["file_target"])
 
-    async def test_an_owner_name_another_device_cannot_hold_falls_back_to_the_account_id(self):
+    async def test_an_owner_name_the_cloud_cannot_hold_falls_back_to_the_account_id(self):
+        self.gateway.registry.account_set("alice", "Al\\The Best")
+        self.private("alice", "Documents/Taxes")
+        self.private("bob", "Documents/Taxes")
+        await self.share("Documents/Taxes")
+        self.assertEqual([("Documents/Taxes (alice)", "Al\\The Best")], await self.incoming(self.as_bob()))
+
+    async def test_an_owner_name_other_devices_could_not_hold_is_used_as_it_is(self):
+        # Spec #49 Gateway: Windows clients give it a local name; the cloud name keeps the colon.
         self.gateway.registry.account_set("alice", "Al: The Best")
         self.private("alice", "Documents/Taxes")
         self.private("bob", "Documents/Taxes")
         await self.share("Documents/Taxes")
-        self.assertEqual([("Documents/Taxes (alice)", "Al: The Best")], await self.incoming(self.as_bob()))
+        self.assertEqual([("Documents/Taxes (Al: The Best)", "Al: The Best")], await self.incoming(self.as_bob()))
 
     async def test_a_recipient_without_a_device_is_placed_at_their_first_incoming_read(self):
         self.private("alice", "Documents/Taxes")
@@ -788,16 +796,16 @@ class SharingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.gateway.registry.mount_renames("carol"))
         self.assertTrue(self.gateway.registry.mutation_ready())
 
-    async def test_rename_for_everyone_refuses_a_name_the_owner_has_and_names_others_cannot_hold(self):
+    async def test_rename_for_everyone_refuses_a_name_the_owner_has_and_names_the_cloud_refuses(self):
         self.private("alice", "Documents/Taxes", "Documents/Other")
         self.private("bob")
         await self.share("Documents/Taxes")
         await self.share("Docs")
-        for name in ("Other", "OTHER"):
+        status, body, _ = await self.everyone("rename", "1", body={"name": "Other"})
+        self.assertEqual((409, "The owner already has a folder with this name"), (status, body["error"]))
+        for name, reason in (("Other ", "untrimmed"), (" a", "untrimmed"), ("Disc.part", "forbiddenExtension")):
             status, body, _ = await self.everyone("rename", "1", body={"name": name})
-            self.assertEqual((409, "The owner already has a folder with this name"), (status, body["error"]), name)
-        status, body, _ = await self.everyone("rename", "1", body={"name": "a:b"})
-        self.assertEqual((422, "name-not-portable"), (status, body["code"]))
+            self.assertEqual((422, "name-not-portable", reason), (status, body["code"], body["reason"]), name)
         for name in ("", "a/b", "..", 7):
             self.assertEqual(400, (await self.everyone("rename", "1", body={"name": name}))[0], name)
         # A folder at the root may not take a top folder's name.
@@ -809,6 +817,10 @@ class SharingTests(unittest.IsolatedAsyncioTestCase):
         status, body, _ = await self.everyone("rename", "2", body={"name": "Papers"})
         self.assertEqual((200, "Shared/Papers"), (status, body["path"]))
         self.assertIn("Papers", self.cloud.folders["alice"])
+        # A name differing from another of the owner's folders only by case is another name (spec #49).
+        status, body, _ = await self.everyone("rename", "1", body={"name": "OTHER"})
+        self.assertEqual((200, "Documents/OTHER"), (status, body["path"]))
+        self.assertIn("Documents/Other", self.cloud.folders["alice"])
 
     # Serialization and fences.
 

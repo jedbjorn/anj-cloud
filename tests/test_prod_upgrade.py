@@ -133,6 +133,7 @@ class RedeploySourceTests(unittest.TestCase):
                         restart_release_ops={"return_value": {"console": "restarted", "watchdog": "restarted"}},
                         pm2={"return_value": ""},
                         apply_trash={"return_value": 7}, advertise_trash={"return_value": 7},
+                        migrate_names={"return_value": {"renamed": 0}},
                         alert={"side_effect": lambda key, *a, **k: self.alerts.append((key, a[1])) or "dispatcher"})
         defaults.update(extra)
         context = contextlib.ExitStack()
@@ -175,6 +176,8 @@ class RedeploySourceTests(unittest.TestCase):
         self.assertEqual(self.commits["b"], self.stack.release)
         self.assertEqual(self.commits["a"], self.stack.config["previous_release"])
         self.assertEqual(self.commits["a"][:12], result["previous_release"])
+        # The name migration runs once the new release is live (spec #49 D4).
+        self.assertEqual({"renamed": 0}, result["name_migration"])
         self.assertEqual([], self.alerts)
 
     def test_failed_health_check_does_not_switch_and_alerts_once(self):

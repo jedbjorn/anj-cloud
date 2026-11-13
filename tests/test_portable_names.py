@@ -1,4 +1,4 @@
-"""Portable file names (decision #120, seam S1): the shared rule and the gateway's enforcement.
+"""File names: the #120 shared vectors, and what the gateway accepts (spec #49 Gateway, AC9).
 
 The vectors in name_policy_vectors.json are also run by the client's NamePolicy
 (apps/client/test/name_policy_test.dart). The gateway tests run the real Gateway.dav and
@@ -21,7 +21,7 @@ from aiohttp import ClientSession, DummyCookieJar, web
 from aiohttp.test_utils import TestServer
 
 from services.access import name_tables, portable_names
-from services.access.mutations import Mutations, SIBLING_XML, split_leaf
+from services.access.mutations import Mutations, split_leaf
 from services.access.registry import Registry
 from services.access.server import Gateway, safe_errors
 from services.access.sharing import ShareError, Sharing
@@ -192,16 +192,20 @@ class GatewayNameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(422, status)
         self.assertEqual({"error", "reason", "message"}, set(body))
         self.assertEqual(("name-not-portable", reason), (body["error"], body["reason"]))
-        self.assertTrue(body["message"].startswith("Name not allowed on other devices."))
+        self.assertTrue(body["message"].startswith("Name not allowed in the cloud."))
         self.assertNotIn("Documents", body["message"])
         self.assertTrue(self.registry.mutation_ready())
         self.assertEqual(set(), self.gateway.mutations.tasks)
 
-    async def test_blocked_new_names_are_refused_before_any_backend_request(self):
-        cases = {"CON": "reserved", "nul.txt": "reserved", "Lpt9.log": "reserved", "report.": "trailingDotOrSpace",
-                 "report ": "trailingDotOrSpace", "a:b.txt": "invalidCharacter", 'quote".txt': "invalidCharacter",
-                 "star*.txt": "invalidCharacter", "pipe|.txt": "invalidCharacter", "lt<.txt": "invalidCharacter",
-                 "gt>.txt": "invalidCharacter"}
+    def move(self, source, target):
+        etag = self.nextcloud.items[source]["etag"]
+        return self.send("MOVE", source, Destination=target, Overwrite="F", **{"If-Match": etag})
+
+    async def test_untrimmed_and_unstorable_new_names_are_refused_before_any_backend_request(self):
+        cases = {" leading.txt": "untrimmed", "trailing.txt ": "untrimmed", "Folder ": "untrimmed",
+                 "\u00a0nbsp.txt": "untrimmed", "ideographic\u3000": "untrimmed", ".htaccess": "forbiddenName",
+                 ".HTACCESS": "forbiddenName", "movie.part": "forbiddenExtension", "Disc.FilePart": "forbiddenExtension",
+                 "e" * 247 + ".txt": "tooLong", "é" * 126: "tooLong"}
         for name, reason in cases.items():
             with self.subTest(name=name):
                 self.assert_refused(await self.create("Documents/" + name), reason)
@@ -209,91 +213,71 @@ class GatewayNameTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.nextcloud.calls)
         self.assertEqual([], list(self.gateway.mutations.directory.iterdir()))
 
-    async def test_question_mark_name_is_refused_as_encoded_filename_data(self):
-        self.assert_refused(await self.create("Documents/what?.txt"), "invalidCharacter")
-        self.assertEqual([], self.nextcloud.calls)
-
-    async def test_ordinary_names_and_dotfiles_are_created_unchanged(self):
-        for name in ("report.txt", ".bashrc", ".env", ".config", "雪 #1 100%.txt", "CONSOLE.log", "COM10", " leading", "a.b.c"):
+    async def test_formerly_blocked_names_are_accepted_exactly(self):
+        names = ["a:b?.txt", "CON.txt", "CON", "nul", "Lpt9.log", "x.", "report.", 'quote".txt', "star*.txt", "pipe|.txt",
+                 "lt<.txt", "gt>.txt", "Report.pdf", "report.pdf", "REPORT.PDF", "caf\u00e9.txt", "cafe\u0301.txt",
+                 "e" * 246 + ".txt", "雪 #1 100%.txt", ".bashrc", "name .pdf", "a.b.c"]
+        for name in names:
             with self.subTest(name=name):
-                status, _ = await self.create("Documents/" + name)
-                self.assertEqual(201, status)
-                self.assertIn("Documents/" + name, self.nextcloud.items)
-        status, _ = await self.send("MKCOL", "Documents/.git", **{"If-None-Match": "*"})
-        self.assertEqual(201, status)
-
-    async def test_case_and_normalization_clashes_are_refused_under_the_lock(self):
-        await self.create("Documents/Notes.txt")
-        await self.create("Documents/café.txt")
-        writes = len(self.writes())
-        self.assert_refused(await self.create("Documents/notes.txt"), "clash")
-        self.assert_refused(await self.create("Documents/NOTES.TXT"), "clash")
-        self.assert_refused(await self.create("Documents/café.txt"), "clash")
-        self.assert_refused(await self.create("Documents/CAFÉ.txt"), "clash")
-        self.assert_refused(await self.send("MKCOL", "Documents/notes.TXT", **{"If-None-Match": "*"}), "clash")
-        self.assertEqual(writes, len(self.writes()))
-        listings = [call for call in self.nextcloud.calls if call[:2] == ("PROPFIND", "1")]
-        self.assertTrue(listings and all(call[2] == "Documents" for call in listings))
-        # The same name elsewhere is no clash, and an exact name is an overwrite, not a clash.
-        self.assertEqual(201, (await self.create("notes.txt"))[0])
-        etag = self.nextcloud.items["Documents/Notes.txt"]["etag"]
-        self.assertEqual(204, (await self.send("PUT", "Documents/Notes.txt", b"v2", **{"If-Match": etag}))[0])
-
-    async def test_existing_blocked_names_stay_readable_writable_and_deletable(self):
-        self.nextcloud.store("Documents/CON", False)
-        self.nextcloud.store("Documents/a.txt", False)
-        self.nextcloud.store("Documents/A.txt", False)
-        etag = self.nextcloud.items["Documents/CON"]["etag"]
-        self.assertEqual(200, (await self.send("GET", "Documents/CON"))[0])
-        self.assertEqual(207, (await self.send("PROPFIND", "Documents", Depth="1"))[0])
-        self.assertEqual(204, (await self.send("PUT", "Documents/CON", b"edit", **{"If-Match": etag}))[0])
-        etag = self.nextcloud.items["Documents/A.txt"]["etag"]
-        self.assertEqual(204, (await self.send("PUT", "Documents/A.txt", b"edit", **{"If-Match": etag}))[0])
-        etag = self.nextcloud.items["Documents/CON"]["etag"]
-        self.assertEqual(204, (await self.send("DELETE", "Documents/CON", **{"If-Match": etag}))[0])
-        self.assertNotIn("Documents/CON", self.nextcloud.items)
-        self.assertEqual({"Documents", "Documents/a.txt", "Documents/A.txt"}, set(self.nextcloud.items))
+                self.assertEqual(201, (await self.create("Documents/" + name))[0])
+        for name in ("AUX", "trip.", "Notes", "notes"):
+            with self.subTest(name=name):
+                self.assertEqual(201, (await self.send("MKCOL", "Documents/" + name, **{"If-None-Match": "*"}))[0])
+        expected = {"Documents/" + name for name in names + ["AUX", "trip.", "Notes", "notes"]}
+        self.assertEqual(expected | {"Documents"}, set(self.nextcloud.items))
+        # Nothing compares a new name with its siblings any more: no folder listing.
+        self.assertEqual([], [call for call in self.nextcloud.calls if call[:2] == ("PROPFIND", "1")])
 
     async def test_move_destinations_follow_the_same_rule(self):
         await self.create("Documents/draft.txt")
         await self.create("Documents/Other.txt")
         await self.send("MKCOL", "Archive", **{"If-None-Match": "*"})
         await self.create("Archive/Draft.txt")
-
-        def move(source, target):
-            etag = self.nextcloud.items[source]["etag"]
-            return self.send("MOVE", source, Destination=target, Overwrite="F", **{"If-Match": etag})
-
-        self.assert_refused(await move("Documents/draft.txt", "Documents/PRN.txt"), "reserved")
-        self.assert_refused(await move("Documents/draft.txt", "Documents/draft."), "trailingDotOrSpace")
-        self.assert_refused(await move("Documents/draft.txt", "Documents/other.txt"), "clash")
-        self.assert_refused(await move("Documents/draft.txt", "Archive/draft.txt"), "clash")
+        self.assert_refused(await self.move("Documents/draft.txt", "Documents/draft.txt "), "untrimmed")
+        self.assert_refused(await self.move("Documents/draft.txt", "Documents/ draft.txt"), "untrimmed")
+        self.assert_refused(await self.move("Documents/draft.txt", "Documents/draft.part"), "forbiddenExtension")
         self.assertIn("Documents/draft.txt", self.nextcloud.items)
-        # A case-only rename in place leaves no sibling behind, so it is allowed.
-        self.assertEqual(201, (await move("Documents/draft.txt", "Documents/Draft.txt"))[0])
-        self.assertEqual(201, (await move("Documents/Draft.txt", "Documents/final.txt"))[0])
-        self.assertIn("Documents/final.txt", self.nextcloud.items)
+        for source, target in (("Documents/draft.txt", "Documents/PRN.txt"), ("Documents/PRN.txt", "Documents/draft."),
+                               ("Documents/draft.", "Documents/other.txt"), ("Documents/other.txt", "Archive/draft.txt"),
+                               ("Archive/draft.txt", "Archive/a:b?.txt")):
+            with self.subTest(target=target):
+                self.assertEqual(201, (await self.move(source, target))[0])
+        self.assertEqual({"Documents", "Documents/Other.txt", "Archive", "Archive/Draft.txt", "Archive/a:b?.txt"},
+                         set(self.nextcloud.items))
 
-    async def test_concurrent_creates_differing_by_case_admit_exactly_one(self):
-        names = ["Documents/report.txt", "Documents/Report.txt", "Documents/REPORT.txt", "Documents/report́.txt"]
-        results = await asyncio.gather(*(self.create(name) for name in names[:3]))
-        self.assertEqual([201, 422, 422], sorted(status for status, _ in results))
-        self.assertEqual(1, len([path for path in self.nextcloud.items if path.lower() == "documents/report.txt"]))
-        self.assertEqual(201, (await self.create(names[3]))[0])  # A different letter, not a clash.
+    async def test_existing_untrimmed_names_stay_readable_writable_movable_and_deletable(self):
+        self.nextcloud.store("Documents/old ", False)
+        self.nextcloud.store("Documents/ older", False)
+        etag = self.nextcloud.items["Documents/old "]["etag"]
+        self.assertEqual(200, (await self.send("GET", "Documents/old "))[0])
+        self.assertEqual(207, (await self.send("PROPFIND", "Documents", Depth="1"))[0])
+        self.assertEqual(204, (await self.send("PUT", "Documents/old ", b"edit", **{"If-Match": etag}))[0])
+        self.assertEqual(201, (await self.move("Documents/old ", "Documents/old"))[0])  # The cleanup rename.
+        etag = self.nextcloud.items["Documents/ older"]["etag"]
+        self.assertEqual(204, (await self.send("DELETE", "Documents/ older", **{"If-Match": etag}))[0])
+        self.assertEqual({"Documents", "Documents/old"}, set(self.nextcloud.items))
 
-    async def test_missing_parent_and_oversized_listing(self):
+    async def test_concurrent_creates_differing_by_case_are_all_accepted(self):
+        names = ["Documents/report.txt", "Documents/Report.txt", "Documents/REPORT.txt"]
+        results = await asyncio.gather(*(self.create(name) for name in names))
+        self.assertEqual([201, 201, 201], [status for status, _ in results])
+        self.assertEqual(set(names), {path for path in self.nextcloud.items if path.lower() == "documents/report.txt"})
+
+    async def test_missing_parent_is_the_backends_answer(self):
         status, _ = await self.create("Missing/a.txt")
-        self.assertEqual(409, status)  # The backend's own answer: no sibling to clash with.
-        self.nextcloud.listing_padding = SIBLING_XML
-        status, _ = await self.create("Documents/new.txt")
-        self.assertEqual(503, status)
-        self.assertNotIn("Documents/new.txt", self.nextcloud.items)
+        self.assertEqual(409, status)
         self.assertTrue(self.registry.mutation_ready())
 
     async def test_read_only_and_root_rules_are_unchanged(self):
         self.device = {**self.device, "rights": "read"}
         self.assertEqual(403, (await self.create("Documents/CON"))[0])
+        self.assertEqual(403, (await self.create("Documents/ x"))[0])
         self.assertEqual([], self.nextcloud.calls)
+
+    def test_refused_is_cloud_check_on_the_final_name(self):
+        self.assertEqual("untrimmed", Mutations.refused("Documents%20/x%20"))
+        self.assertIsNone(Mutations.refused("Documents%20/x"))
+        self.assertIsNone(Mutations.refused("a/CON.txt"))
 
     def test_split_leaf(self):
         self.assertEqual(("", "a b"), split_leaf("a%20b"))
@@ -302,21 +286,24 @@ class GatewayNameTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ShareNameTests(unittest.TestCase):
-    def test_a_folder_whose_name_is_blocked_is_not_shared(self):
-        for path, reason in (("CON", "reserved"), ("Photos/aux.d", "reserved"), ("Trips.", "trailingDotOrSpace"),
-                             ("a/b:c", "invalidCharacter")):
+    def test_a_folder_whose_name_the_cloud_refuses_is_not_shared(self):
+        for path, reason in (("Trips ", "untrimmed"), ("Photos/ aux", "untrimmed"), ("a/Disc.part", "forbiddenExtension")):
             with self.subTest(path=path), self.assertRaises(ShareError) as caught:
                 Sharing.directory(path)
             self.assertEqual((422, "name-not-portable", reason), (caught.exception.status, caught.exception.detail["code"],
                                                                  caught.exception.detail["reason"]))
             self.assertNotIn(path, caught.exception.message)
-        self.assertEqual(("/anj-cloud/Photos/.trip", "Photos/.trip"), Sharing.directory("Photos/.trip"))
-        # A blocked parent does not block a portable child: only the mount's own name matters.
-        self.assertEqual("/anj-cloud/CON/Photos", Sharing.directory("CON/Photos")[0])
+        # Formerly blocked names are shared (spec #49 Gateway).
+        for path in ("CON", "Photos/aux.d", "Trips.", "a/b:c", "Photos/.trip"):
+            with self.subTest(path=path):
+                self.assertEqual(("/anj-cloud/" + path, "/".join(quote(p, safe="-._~") for p in path.split("/"))),
+                                 Sharing.directory(path))
+        # An untrimmed parent does not block a clean child: only the mount's own name matters.
+        self.assertEqual("/anj-cloud/Trips /Photos", Sharing.directory("Trips /Photos")[0])
 
     def test_the_error_body_carries_the_code_and_reason(self):
         async def handler(request):
-            Sharing.directory("NUL")
+            Sharing.directory("Trips ")
 
         async def run():
             app = web.Application(middlewares=[safe_errors])
@@ -331,8 +318,8 @@ class ShareNameTests(unittest.TestCase):
 
         status, body = asyncio.run(run())
         self.assertEqual(422, status)
-        self.assertEqual(("name-not-portable", "reserved"), (body["code"], body["reason"]))
-        self.assertIn("not allowed on other devices", body["error"])
+        self.assertEqual(("name-not-portable", "untrimmed"), (body["code"], body["reason"]))
+        self.assertIn("not allowed in the cloud", body["error"])
 
 
 if __name__ == "__main__":

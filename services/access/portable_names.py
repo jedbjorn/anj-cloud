@@ -11,7 +11,10 @@ Blocked, per path component:
 - `clash`: a name that differs from a sibling only by case or Unicode normalization, compared
   by fold key (canonical caseless matching, Unicode D145: NFD(casefold(NFD(name)))).
 
-Existing names are never changed: the rule applies when a name is created or renamed.
+The gateway no longer refuses these names (spec #49 Gateway, decision #193): it refuses only what
+name_rule.cloud_check reports (mutations.Mutations.refused). `check` stays for the released
+clients' NamePolicy vectors and for names the gateway makes itself (fetch titles, share mounts);
+`fold_key` and `clash` serve the name rule and the gateway's own automatic suffixing.
 """
 
 from .name_tables import CASEFOLD, COMBINING, DECOMPOSITION, UNICODE_VERSION

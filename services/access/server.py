@@ -24,8 +24,8 @@ from defusedxml import ElementTree as SafeET
 from .protocol import (MAX_XML, METHODS, READ_METHODS, UPLOAD_LIMIT_HEADER, UPLOAD_LIMIT_MAX, UPLOAD_LIMIT_MIN, Rejection, backend_root, ca_pin, canonical_path,
                        encode_filename_path, gateway_reference, key_fingerprint, move_destination, rewrite_multistatus)
 from .registry import AccountDisabled, CodeReused, Registry
-from .mutations import Mutations, name_refusal, split_leaf
-from . import portable_names
+from .mutations import Mutations, name_refusal
+from . import name_migration
 from .edge import KEEPALIVE_TIMEOUT, Edge, peer_source
 from .observe import EnrollmentGuard, Events
 from .sharing import OPERATOR_RIGHTS, ShareError, Sharing, owner_of
@@ -593,13 +593,14 @@ class Gateway:
             if not destination:
                 raise Rejection("Cannot replace enrolled root")
             headers["Destination"] = self.backend + backend_root(device["uid"]) + destination
-        # Portable names (decision #120): a create or rename to a name Windows or macOS cannot
-        # hold is refused before any body byte is read or anything is queued. A PUT with
-        # If-None-Match: * is a create; an overwrite of an existing item keeps its name.
+        # Names (spec #49 Gateway): a create or rename to a name the cloud must not hold (empty,
+        # untrimmed, unstorable) is refused before any body byte is read or anything is queued.
+        # Every other name is accepted. A PUT with If-None-Match: * is a create; an overwrite of
+        # an existing item keeps its name.
         created = (destination if request.method == "MOVE" else relative
                    if request.method == "MKCOL" or (request.method == "PUT" and request.headers.get("If-None-Match") == "*") else None)
         if created is not None:
-            reason = portable_names.check(split_leaf(created)[1])
+            reason = Mutations.refused(created)
             if reason is not None:
                 return await self.refuse_name(request, reason)
         task = asyncio.current_task()
@@ -848,6 +849,13 @@ class Gateway:
                 async with self.mutations.lock:
                     return await self._account_set(body)
             return await self._account_set(body)
+        if action == "migrate-names":
+            # The one-time name migration (spec #49 Gateway), one account at a time through an
+            # operator-minted temporary owner token (deploy/access_operator.py migrate-names).
+            if set(body) - {"action", "owner_uid", "token"}:
+                raise Rejection("Unexpected migration field")
+            principal = await self.sharing.token_principal(body.get("owner_uid"), body.get("token"))
+            return web.json_response(await name_migration.migrate(self, principal))
         if action == "share-fences":
             return web.json_response(self.registry.share_fences())
         if action == "share-fence-clear":

@@ -21,8 +21,8 @@ from urllib.parse import unquote, urlencode, urlsplit
 from aiohttp import BasicAuth
 from defusedxml import ElementTree as SafeET
 
-from . import portable_names
-from .mutations import bounded_body
+from . import name_rule, portable_names
+from .mutations import NAME_ERROR, bounded_body
 from .protocol import Rejection, backend_root, encode_filename_path
 
 OCS_SHARES = "/ocs/v2.php/apps/files_sharing/api/v1/shares"
@@ -238,14 +238,13 @@ class Sharing:
         # keeps working and can still be changed or removed.
         if decoded in PRIVATE_FOLDERS:
             raise ShareError(422, "Documents, Music and Videos are private")
-        # The recipient's mount is named after the folder (decision #120): a name another device
-        # cannot hold is not shared. Nextcloud chooses the mount name itself when it collides
-        # with an exact name ("Photos (2)"); a case-only collision in the recipient's Shared/ is
-        # outside what the owner's request can see.
-        reason = portable_names.check(decoded.rsplit("/", 1)[-1])
+        # The recipient's mount is named after the folder: a name the cloud must not hold (spec #49
+        # Gateway: untrimmed or unstorable) is not shared. Nextcloud chooses the mount name itself
+        # when it collides with an exact name ("Photos (2)").
+        reason = name_rule.cloud_check(decoded.rsplit("/", 1)[-1])
         if reason is not None:
-            raise ShareError(422, "This folder's name is not allowed on other devices. Rename it to share it.",
-                             code=portable_names.ERROR, reason=reason)
+            raise ShareError(422, "This folder's name is not allowed in the cloud. Rename it to share it.",
+                             code=NAME_ERROR, reason=reason)
         return ROOT + decoded, encoded
 
     def recipient(self, principal, value):
@@ -577,7 +576,7 @@ class Sharing:
         """The mount names to try: the folder's own, then `<name> (<Owner>)` (decision #149)."""
         owner = self.registry.account(row["owner_uid"])
         suffixed = "%s (%s)" % (row["name"], owner["display_name"] if owner else row["owner_uid"])
-        if portable_names.check(suffixed) is not None:
+        if name_rule.cloud_check(suffixed) is not None:
             suffixed = "%s (%s)" % (row["name"], row["owner_uid"])
         return [row["name"], suffixed]
 
@@ -808,15 +807,16 @@ class Sharing:
         """The recipient renames a folder shared with them for everyone (decision #155): the owner's
         source folder is renamed in place on the owner's side, then this recipient's mount; other
         recipients' mounts follow at their next incoming read. A name the owner already has there
-        (exactly, or apart from case and accents) is refused (409), never suffixed."""
+        is refused (409), never suffixed; a name differing only by case or accents is another name
+        (spec #49 Gateway), except a top folder's at the root."""
         share_id = self.share_id(share_id)
         if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
             raise ShareError(400, "A folder name is required")
         if len(name.encode("utf-8")) > self.NAME_BYTES:
             raise ShareError(422, "This folder name is too long")
-        reason = portable_names.check(name)
+        reason = name_rule.cloud_check(name)
         if reason is not None:
-            raise ShareError(422, "This folder's name is not allowed on other devices.", code=portable_names.ERROR, reason=reason)
+            raise ShareError(422, "This folder's name is not allowed in the cloud.", code=NAME_ERROR, reason=reason)
         scope = "share:" + share_id
         async with self.gateway.mutations.lock:
             self._ready(principal, scope)
@@ -833,7 +833,7 @@ class Sharing:
             if siblings is None:
                 raise ShareError(502, "The sharing service is unavailable")
             others = [sibling for sibling in siblings if sibling != posixpath.basename(relative)]
-            if name in others or portable_names.clash(name, others) is not None:
+            if name in others:
                 raise ShareError(409, "The owner already has a folder with this name")
             # Every path is built before anything is recorded (review F-M1).
             try:

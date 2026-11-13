@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlsplit
 from aiohttp import BasicAuth, web
 from defusedxml import ElementTree as SafeET
 
-from . import portable_names
+from . import name_rule
 from .protocol import (MAX_XML, UPLOAD_LIMIT, UPLOAD_LIMIT_HEADER, UPLOAD_LIMIT_MAX, UPLOAD_LIMIT_MIN, Rejection, backend_root,
                        size_label, gateway_reference, rewrite_multistatus)
 
@@ -23,8 +23,8 @@ CONCRETE_ETAG = re.compile(r'"[^"\r\n]{1,256}"\Z')
 # Nextcloud's OC-FileId: the zero-padded numeric file ID followed by the instance ID.
 OC_FILE_ID = re.compile(r"([0-9]{1,19})oc[0-9a-z]{1,64}\Z")
 FILE_ID = re.compile(r"([0-9]{1,19})\Z")
-# The sibling listing a create or rename is checked against (decision #120): resource types only,
-# streamed through a bounded parse. About 37,000 entries fit; a larger folder refuses with 503.
+# A folder listing (names only, Mutations.siblings): resource types only, streamed through a
+# bounded parse. About 37,000 entries fit; a larger folder refuses with 503.
 SIBLING_XML = 8 * 1024 * 1024
 SIBLINGS_PROPFIND = b'<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
 # Nextcloud keeps a file's ETag when it is overwritten within the whole second of its previous
@@ -65,10 +65,22 @@ def settle_delay(modified, now):
     return 0
 
 
+# The gateway accepts every name except these (spec #49 Gateway): name_rule.cloud_check's reasons.
+# New clients never send them; the refusal is the backstop.
+NAME_ERROR = "name-not-portable"
+NAME_TEXT = {
+    "empty": "A name is required.",
+    "untrimmed": "Names cannot start or end with a space.",
+    "forbiddenCharacter": "Names cannot contain / or \\ or control characters.",
+    "forbiddenName": "The cloud does not accept this name.",
+    "forbiddenExtension": "Names ending in .part or .filepart are unfinished downloads and are not stored.",
+    "tooLong": "Names are limited to %d bytes." % name_rule.MAX_BYTES,
+}
+
+
 def name_refusal(reason):
-    """422 `name-not-portable` (decision #120): the name, never the path, is the problem."""
-    return web.json_response({"error": portable_names.ERROR, "reason": reason,
-                              "message": "Name not allowed on other devices. " + portable_names.TEXT[reason]},
+    """422 `name-not-portable` (spec #49): the name, never the path, is the problem."""
+    return web.json_response({"error": NAME_ERROR, "reason": reason, "message": "Name not allowed in the cloud. " + NAME_TEXT[reason]},
                              status=422, headers={"Cache-Control": "no-store"})
 
 
@@ -231,27 +243,11 @@ class Mutations:
                 node.clear()
         return names
 
-    async def portable(self, device, target, source=None):
-        """Why creating `target` (or renaming `source` to it) is refused, or None.
-
-        Gateway.dav refuses a blocked name before queueing; it is checked again here for every
-        caller, then the name is compared with its siblings.
-
-        Runs under the mutation lock with the backend's completed listing: every create and
-        rename through this gateway, for any account or share alias, is serialized behind it, so
-        no other writer can add a clashing sibling between this check and the mutation.
-        """
-        parent, name = split_leaf(target)
-        reason = portable_names.check(name)
-        if reason is not None:
-            return reason
-        siblings = await self.siblings(device, parent)
-        if source is not None:
-            source_parent, source_name = split_leaf(source)
-            if source_parent == parent:
-                # The item being renamed leaves this folder: a case-only rename is allowed.
-                siblings = [sibling for sibling in siblings if sibling != source_name]
-        return "clash" if portable_names.clash(name, siblings) is not None else None
+    @staticmethod
+    def refused(target):
+        """Why creating or renaming to the encoded relative path `target` is refused, or None.
+        Gateway.dav refuses before queueing; Mutations.run checks again for every other caller."""
+        return name_rule.cloud_check(split_leaf(target)[1])
 
     async def run(self, request, device, relative, headers, limit=None, destination=None):
         """`limit` is the upload limit in force when the request started (spec #27). `destination`
@@ -295,8 +291,8 @@ class Mutations:
                     raise web.HTTPBadRequest(text="This mutation does not accept a body")
                 gateway.registry.admit(device["fingerprint"], device["certificate_id"])
                 current = await self.compare(request, device, relative, headers)
-                # A new name must not clash with a sibling (decision #120); overwriting or deleting
-                # an existing item, whatever its name, is never refused for its name.
+                # Only a new name is checked (spec #49 Gateway); overwriting or deleting an existing
+                # item, whatever its name, is never refused for its name.
                 if request.method == "MOVE":
                     if destination is None:
                         # A caller that only forwarded the backend Destination (Gateway.dav passes it).
@@ -305,9 +301,9 @@ class Mutations:
                         if not target.startswith(prefix) or not target[len(prefix):]:
                             raise Rejection("MOVE destination must stay beneath the enrolled root")
                         destination = target[len(prefix):]
-                    refused = await self.portable(device, destination, source=relative)
+                    refused = self.refused(destination)
                 elif request.method in {"PUT", "MKCOL"} and current is None:
-                    refused = await self.portable(device, relative)
+                    refused = self.refused(relative)
                 else:
                     refused = None
                 if refused is not None:
