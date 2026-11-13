@@ -4004,7 +4004,12 @@ class SyncEngine {
     }
     _moveCloudRows(from, to, local);
     if (renamedHere != null) {
-      final name = p.posix.dirname(from) == parent ? p.posix.basename(to) : to;
+      // Shown to the user: the cloud's spelling, never this device's local
+      // alias (spec #49, decision #193).
+      final shown = names.cloudPath(to);
+      final name = p.posix.dirname(from) == parent
+          ? p.posix.basename(shown)
+          : shown;
       manifest.entries[to]?.movedNote = 'Renamed on another device to $name';
       manifest.save();
     }
@@ -6816,7 +6821,8 @@ class SyncEngine {
     final result = deviceTrash.restore(deviceId);
     final destination = result['destination'] as String;
     return {
-      'path': destination,
+      // Shown to the user: the cloud spelling (spec #49, decision #193).
+      'path': names.cloudPath(destination),
       'renamed': destination != result['path'],
       if (result['kept'] == true) 'kept': true,
     };
@@ -6903,6 +6909,9 @@ class SyncEngine {
     bool server = true,
   }) async {
     requireStorageReady();
+    // Results are read by the user: every path in its cloud spelling, never
+    // this device's local alias (spec #49, decision #193).
+    String shown(String local) => names.cloudPath(local);
     final results = <Map<String, Object?>>[];
     final remote = <String>[];
     for (final path in paths) {
@@ -6916,7 +6925,11 @@ class SyncEngine {
           manifest.save();
         }
         markDirty(path, descendants: true);
-        results.add({'path': path, 'result': 'restored', 'to': path});
+        results.add({
+          'path': shown(path),
+          'result': 'restored',
+          'to': shown(path),
+        });
       } else {
         remote.add(path);
       }
@@ -6929,9 +6942,9 @@ class SyncEngine {
       final result = deviceTrash.restore(copy.id);
       final destination = result['destination'] as String;
       return {
-        'path': path,
+        'path': shown(path),
         'result': destination == path ? 'restored' : 'renamed',
-        'to': destination,
+        'to': shown(destination),
       };
     }
 
@@ -6958,7 +6971,7 @@ class SyncEngine {
         results.add(deviceResult(path, edited));
       } on FileSystemException catch (error) {
         results.add({
-          'path': path,
+          'path': shown(path),
           'result': 'failed',
           'message': error.message,
         });
@@ -7008,14 +7021,18 @@ class SyncEngine {
         if (result?.restored case final done?) {
           _restoredFromServer(names.localPath(done.path));
           results.add({
-            'path': path,
+            'path': shown(path),
             'result': done.renamed ? 'renamed' : 'restored',
             'to': done.path,
           });
           continue;
         }
         if (result?.error case final error?) {
-          results.add({'path': path, 'result': 'failed', 'message': error});
+          results.add({
+            'path': shown(path),
+            'result': 'failed',
+            'message': error,
+          });
           continue;
         }
         final copy = copyOf(path);
@@ -7034,17 +7051,21 @@ class SyncEngine {
             manifest.save();
           }
           markDirty(path, descendants: true);
-          results.add({'path': path, 'result': 'restored', 'to': path});
+          results.add({
+            'path': shown(path),
+            'result': 'restored',
+            'to': shown(path),
+          });
           continue;
         }
         results.add({
-          'path': path,
+          'path': shown(path),
           'result': 'failed',
           'message': unreachable ?? 'No longer in Trash',
         });
       } on Exception catch (error) {
         results.add({
-          'path': path,
+          'path': shown(path),
           'result': 'failed',
           'message': error is FileSystemException ? error.message : '$error',
         });

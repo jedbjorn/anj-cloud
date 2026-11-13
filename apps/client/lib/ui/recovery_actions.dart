@@ -76,14 +76,19 @@ String dismissPrompt(List<Map<String, dynamic>> entries) {
   final size = sizeLabel(recoveryTotalBytes(entries));
   if (entries.length == 1) {
     final entry = entries.single;
-    final name = p.posix.basename(entry['path'] as String);
+    final name = p.posix.basename(_shown(entry));
     final count = recoveryCount(entry);
     return count <= 1
         ? 'Delete the recovery copy of $name ($size)? It is the only copy and cannot be undone.'
         : 'Delete the $count recovery copies of $name ($size)? They are the only copies and cannot be undone.';
   }
-  return 'Delete the recovery copies of ${entries.length} files ($size)? They are the only copies and cannot be undone.\n\n${entries.map((e) => e['path']).join('\n')}';
+  return 'Delete the recovery copies of ${entries.length} files ($size)? They are the only copies and cannot be undone.\n\n${entries.map(_shown).join('\n')}';
 }
+
+/// The name a row is shown under: its cloud spelling, never this device's
+/// local alias (spec #49, decision #193).
+String _shown(Map<String, dynamic> entry) =>
+    (entry['cloudPath'] ?? entry['path']) as String;
 
 Future<bool> confirmDismiss(
   BuildContext context,

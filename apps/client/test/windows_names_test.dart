@@ -10,6 +10,8 @@ import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/core/sync/sync_schedule.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
+import 'package:anj_cloud/ui/recovery_actions.dart';
+import 'package:anj_cloud/ui/trash_page.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
@@ -447,6 +449,109 @@ void main() {
       store.entries.values.where((entry) => entry.cloudName != null),
       hasLength(pairs),
     );
+  });
+
+  // No detail line names a local alias (spec #49 Overview, decision #193):
+  // every fixture below differs between its cloud and local spelling.
+  group('user-facing messages name the cloud spelling', () {
+    test('Dismiss confirms under the cloud name', () {
+      Map<String, dynamic> row(String path, String cloudPath) => {
+        'path': path,
+        'cloudPath': cloudPath,
+        'recoveryCopies': {
+          'paths': ['copy'],
+          'count': 1,
+          'bytes': 1,
+          'files': <Object>[],
+        },
+      };
+      final one = dismissPrompt([
+        row('Documents/report (2).pdf', 'Documents/report.pdf'),
+      ]);
+      expect(one, contains('recovery copy of report.pdf '));
+      expect(one, isNot(contains('(2)')));
+      final two = dismissPrompt([
+        row('Documents/report (2).pdf', 'Documents/report.pdf'),
+        row('Documents/a：b？.txt', 'Documents/a:b?.txt'),
+      ]);
+      expect(two, contains('Documents/report.pdf\nDocuments/a:b?.txt'));
+      expect(two, isNot(contains('(2)')));
+      expect(two, isNot(contains('？')));
+    });
+
+    test('Undo reports the cloud name', () async {
+      ac3Items();
+      await engine.tick();
+      await engine.tick();
+      const path = 'Documents/a：b？.txt';
+      cloud.online = false;
+      final at =
+          engine.applyBulk('delete', [
+                {
+                  'path': path,
+                  'kind': 'file',
+                  'selectionVersion': engine.selectionVersion(
+                    store.entries[path]!,
+                  ),
+                },
+              ])['at']
+              as int;
+      final undo = await engine.undoDelete([path], at, server: false);
+      expect((undo['results'] as List).single, {
+        'path': 'Documents/a:b?.txt',
+        'result': 'restored',
+        'to': 'Documents/a:b?.txt',
+      });
+      expect(undoMessage(undo), 'Restored.');
+    });
+
+    test('a device-trash restore reports the cloud name', () async {
+      // An older gateway has no trash to restore from: the device keeps the
+      // deleted file's copy.
+      cloud.trashRoutes = false;
+      ac3Items();
+      await engine.tick();
+      await engine.tick();
+      const path = 'Documents/a：b？.txt';
+      engine.applyBulk('delete', [
+        {
+          'path': path,
+          'kind': 'file',
+          'selectionVersion': engine.selectionVersion(store.entries[path]!),
+        },
+      ]);
+      await engine.tick();
+      final copy = engine.deviceTrash.items().singleWhere(
+        (c) => c.path == path,
+      );
+      final listed = await engine.trashListing(server: false);
+      expect(listed.toString(), isNot(contains('？')));
+      final restored = await engine.trashRestore(deviceId: copy.id);
+      expect(restored, {'path': 'Documents/a:b?.txt', 'renamed': false});
+      expect(local(path).readAsStringSync(), 'colon');
+    });
+
+    test('a both-sides rename is announced under the cloud name', () async {
+      cloud.put('Documents/trip.txt', 'trip');
+      await engine.tick();
+      await engine.tick();
+      local('Documents/trip.txt')
+          .renameSync('${engine.tree.root.path}/Documents/here.txt');
+      await cloud.move(
+        'Documents/trip.txt',
+        'Documents/Trip?.txt',
+        etag: cloud.versions['Documents/trip.txt']!,
+      );
+      for (var pass = 0; pass < 3; pass++) {
+        await engine.tick();
+      }
+      expect(onDiskIn('Documents'), ['Trip？.txt']);
+      final row = store.entries['Documents/Trip？.txt']!;
+      expect(row.movedNote, 'Renamed on another device to Trip?.txt');
+      expect((await projectEntry(engine, row))['presentationNotes'], [
+        'Renamed on another device to Trip?.txt',
+      ]);
+    });
   });
 }
 
