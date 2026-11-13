@@ -19137,7 +19137,7 @@
     "name": "a\u007fb",
     "siblings": [],
     "folder": false,
-    "result": "a\u007fb"
+    "result": "a\u2421b"
    },
    {
     "name": ".htaccess",
@@ -19146,10 +19146,72 @@
     "result": ".htaccess"
    },
    {
+    "name": ".HTACCESS",
+    "siblings": [],
+    "folder": true,
+    "result": ".HTACCESS"
+   },
+   {
     "name": "x.part",
     "siblings": [],
     "folder": false,
     "result": "x.part"
+   },
+   {
+    "name": "x.FILEPART",
+    "siblings": [],
+    "folder": false,
+    "result": "x.FILEPART"
+   },
+   {
+    "name": "Disc.part",
+    "siblings": [],
+    "folder": true,
+    "result": "Disc.part_"
+   },
+   {
+    "name": "Disc.PART",
+    "siblings": [],
+    "folder": true,
+    "result": "Disc.PART_"
+   },
+   {
+    "name": ".part",
+    "siblings": [],
+    "folder": true,
+    "result": ".part_"
+   },
+   {
+    "name": " Disc.filepart ",
+    "siblings": [],
+    "folder": true,
+    "result": "Disc.filepart_"
+   },
+   {
+    "name": "Disc.part",
+    "siblings": [
+     "disc.PART_"
+    ],
+    "folder": true,
+    "result": "Disc.part_ (2)"
+   },
+   {
+    "name": "x.part.txt",
+    "siblings": [],
+    "folder": true,
+    "result": "x.part.txt"
+   },
+   {
+    "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.part",
+    "siblings": [],
+    "folder": true,
+    "result": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.par_"
+   },
+   {
+    "name": "x\u007f.part",
+    "siblings": [],
+    "folder": true,
+    "result": "x\u2421.part_"
    },
    {
     "name": "\u96ea\u306e\u65e5.txt",

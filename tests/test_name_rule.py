@@ -46,11 +46,14 @@ class NameRuleVectorTests(unittest.TestCase):
         self.assertEqual(set(name_rule.REASONS), {vector["reason"] for vector in RULE["cloudCheck"]} - {None})
 
     def test_cleanup_leaves_only_residual_problems(self):
-        # What cleanup cannot fix is the residual error row: no lookalike, or no room for the stem.
+        # What cleanup cannot fix is the residual error row (no lookalike, or no room for the stem), or a
+        # .part/.filepart file, which clients keep as a local temporary.
         residual = {"forbiddenCharacter", "forbiddenName", "forbiddenExtension", "tooLong"}
         for vector in RULE["cleanup"]:
             with self.subTest(name=vector["name"]):
                 self.assertIn(name_rule.cloud_check(vector["result"]), residual | {None})
+                if vector["folder"]:  # Decision #195: only a file may stay a .part/.filepart temporary.
+                    self.assertNotEqual("forbiddenExtension", name_rule.cloud_check(vector["result"]))
 
     def test_local_names_are_stable_under_sibling_reordering(self):
         for vector in RULE["localNames"]:

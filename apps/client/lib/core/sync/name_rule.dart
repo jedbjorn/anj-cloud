@@ -52,6 +52,10 @@ abstract final class NameRule {
     'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
   };
   static const _forbiddenNames = {'.', '..', '.htaccess'};
+
+  /// Compared in ASCII lower case. A file with one is a local temporary
+  /// (decision #195): it is never uploaded. A folder with one gets `_`
+  /// appended.
   static const _forbiddenExtensions = ['.part', '.filepart'];
 
   /// Windows characters to fullwidth forms, C0 controls to Control Pictures
@@ -63,11 +67,19 @@ abstract final class NameRule {
   }
 
   /// What the cloud cannot store but a lookalike fixes, for every client
-  /// (R2): `\` and C0 controls.
-  static int _cloudLookalike(int rune) =>
-      rune == 0x5C || (rune >= 0x01 && rune < 0x20)
-      ? _windowsLookalike(rune)
-      : rune;
+  /// (R2): `\`, C0 controls, and DEL (refused by the gateway path check;
+  /// decision #195) mapped to its Control Picture.
+  static int _cloudLookalike(int rune) {
+    if (rune == 0x7F) return 0x2421;
+    if (rune == 0x5C || (rune >= 0x01 && rune < 0x20)) {
+      return _windowsLookalike(rune);
+    }
+    return rune;
+  }
+
+  static String _lower(String name) => String.fromCharCodes(
+    name.codeUnits.map((u) => u >= 0x41 && u <= 0x5A ? u + 0x20 : u),
+  );
 
   /// Refused by Nextcloud or the gateway's path check.
   static bool _forbiddenCharacter(int rune) =>
@@ -150,6 +162,9 @@ abstract final class NameRule {
       final (stem, extension) = split(result, folder: folder);
       result = _fit(stem, extension) ?? result;
     }
+    if (folder && _forbiddenExtensions.any(_lower(result).endsWith)) {
+      result = _fit(result, '', '_') ?? result;
+    }
     if (result == name) return name;
     final taken = {for (final sibling in siblings) NamePolicy.foldKey(sibling)};
     return taken.contains(NamePolicy.foldKey(result))
@@ -164,9 +179,7 @@ abstract final class NameRule {
     if (name.runes.any(_forbiddenCharacter)) {
       return CloudNameProblem.forbiddenCharacter;
     }
-    final lower = String.fromCharCodes(
-      name.codeUnits.map((u) => u >= 0x41 && u <= 0x5A ? u + 0x20 : u),
-    );
+    final lower = _lower(name);
     if (_forbiddenNames.contains(lower)) return CloudNameProblem.forbiddenName;
     if (_forbiddenExtensions.any(lower.endsWith)) {
       return CloudNameProblem.forbiddenExtension;

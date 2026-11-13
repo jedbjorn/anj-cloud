@@ -5,12 +5,14 @@ apps/client/lib/core/sync/name_rule.dart. Both run the `rule` section of
 tests/name_policy_vectors.json, so they cannot drift. RULE_VERSION moves when the rule changes.
 
 - `cleanup(name, siblings, folder)` (R1 + R2): the name every client gives an item in the cloud.
-  Leading and trailing whitespace is trimmed, an empty result becomes `Untitled`, `\\` and C0
-  controls get lookalikes, a name over MAX_BYTES has its stem cut. A changed name that meets a
+  Leading and trailing whitespace is trimmed, an empty result becomes `Untitled`, `\\`, C0
+  controls and DEL get lookalikes, a name over MAX_BYTES has its stem cut, and a folder ending in
+  `.part` or `.filepart` gets `_` appended (decision #195). A changed name that meets a
   sibling by case or accents gets ` (2)`, ` (3)`, ... before the extension.
 - `cloud_check(name)` (R2): why the cloud cannot or must not hold `name`, else None. MAX_BYTES and
   the forbidden names and extensions were measured on Nextcloud 33.0.10 through the gateway path
-  (task D1).
+  (task D1). A file still reported `forbiddenExtension` is a local temporary that clients do not
+  upload; anything else reported after cleanup is the residual error row.
 - `local_names(entries, os)` (R3): the name each cloud item of one folder has on this device.
   Windows maps characters, trailing dots and device names, then resolves case and normalization
   clashes by `oc:fileid` (oldest keeps its name). macOS resolves clashes only. Linux and Android
@@ -35,12 +37,15 @@ WHITESPACE = frozenset([*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x2
 UNTITLED = "Untitled"
 # Lookalikes: Windows characters to their fullwidth forms, C0 controls to Control Pictures (R3 step 1).
 WINDOWS_LOOKALIKES = {**{ord(c): ord(c) + 0xFEE0 for c in '<>:"\\|?*'}, **{cp: 0x2400 + cp for cp in range(0x01, 0x20)}}
-# What the cloud cannot store but a lookalike fixes, for every client (R2): `\` and C0 controls.
-CLOUD_LOOKALIKES = {cp: WINDOWS_LOOKALIKES[cp] for cp in [ord("\\"), *range(0x01, 0x20)]}
-# Refused by Nextcloud or the gateway's path check, with no lookalike: DEL (gateway path).
+# What the cloud cannot store but a lookalike fixes, for every client (R2): `\`, C0 controls, and DEL
+# (refused by the gateway path check; decision #195) mapped to its Control Picture.
+CLOUD_LOOKALIKES = {**{cp: WINDOWS_LOOKALIKES[cp] for cp in [ord("\\"), *range(0x01, 0x20)]}, 0x7F: 0x2421}
+# Refused by Nextcloud or the gateway's path check.
 FORBIDDEN_CHARACTERS = frozenset([0x00, 0x2F, 0x5C, *range(0x01, 0x20), 0x7F])
 FORBIDDEN_NAMES = frozenset([".", "..", ".htaccess"])  # compared in ASCII lower case
-FORBIDDEN_EXTENSIONS = (".part", ".filepart")  # compared in ASCII lower case
+# Compared in ASCII lower case. A file with one is a local temporary (decision #195): it is never
+# uploaded. A folder with one gets `_` appended.
+FORBIDDEN_EXTENSIONS = (".part", ".filepart")
 OPERATING_SYSTEMS = ("windows", "macos", "linux", "android")
 REASONS = ("empty", "untrimmed", "forbiddenCharacter", "forbiddenName", "forbiddenExtension", "tooLong")
 
@@ -69,6 +74,10 @@ def _strip(text):
     while end > start and ord(text[end - 1]) in WHITESPACE:
         end -= 1
     return text[start:end]
+
+
+def _lower(name):
+    return "".join(char.lower() if char.isascii() else char for char in name)
 
 
 def _size(text):
@@ -115,6 +124,8 @@ def cleanup(name, siblings=(), folder=False):
     if _size(result) > MAX_BYTES:
         stem, extension = split(result, folder)
         result = _fit(stem, extension) or result
+    if folder and _lower(result).endswith(FORBIDDEN_EXTENSIONS):
+        result = _fit(result, "", "_") or result
     if result == name:
         return name
     taken = {fold_key(sibling) for sibling in siblings}
@@ -129,7 +140,7 @@ def cloud_check(name):
         return "untrimmed"
     if any(ord(char) in FORBIDDEN_CHARACTERS for char in name):
         return "forbiddenCharacter"
-    lower = "".join(char.lower() if char.isascii() else char for char in name)
+    lower = _lower(name)
     if lower in FORBIDDEN_NAMES:
         return "forbiddenName"
     if lower.endswith(FORBIDDEN_EXTENSIONS):

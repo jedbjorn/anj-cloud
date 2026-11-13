@@ -51,6 +51,14 @@ void main() {
         result,
         reason: 'idempotent: ${jsonEncode(vector)}',
       );
+      if (folder) {
+        // Decision #195: only a file may stay a .part/.filepart temporary.
+        expect(
+          NameRule.cloudCheck(result),
+          isNot(CloudNameProblem.forbiddenExtension),
+          reason: jsonEncode(vector),
+        );
+      }
     }
   });
 

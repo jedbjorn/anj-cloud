@@ -194,7 +194,13 @@ CLEANUP = [
     ("My.Photos ", ["my.photos"], True, "My.Photos (2)"), ("clean.txt", ["CLEAN.TXT"], False, "clean.txt"),
     ("   ", ["untitled"], False, "Untitled (2)"), ("a ", ["b", "c"], False, "a"),
     ("Song: Live?.m4a", [], False, "Song: Live?.m4a"), ("CON.txt", [], False, "CON.txt"), ("x.", [], False, "x."),
-    ("a\x7fb", [], False, "a\x7fb"), (".htaccess", [], False, ".htaccess"), ("x.part", [], False, "x.part"),
+    ("a\x7fb", [], False, "a\u2421b"), (".htaccess", [], False, ".htaccess"), (".HTACCESS", [], True, ".HTACCESS"),
+    # Decision #195: a .part/.filepart file is a local temporary and keeps its name (cloud_check still says
+    # forbiddenExtension); a folder gets `_` appended, then the suffix rule.
+    ("x.part", [], False, "x.part"), ("x.FILEPART", [], False, "x.FILEPART"), ("Disc.part", [], True, "Disc.part_"),
+    ("Disc.PART", [], True, "Disc.PART_"), (".part", [], True, ".part_"), (" Disc.filepart ", [], True, "Disc.filepart_"),
+    ("Disc.part", ["disc.PART_"], True, "Disc.part_ (2)"), ("x.part.txt", [], True, "x.part.txt"),
+    ("a" * 245 + ".part", [], True, "a" * 245 + ".par_"), ("x\x7f.part", [], True, "x\u2421.part_"),
     ("雪の日.txt", [], False, "雪の日.txt"), ("Ελληνικά", [], True, "Ελληνικά"),
     ("עברית.docx", [], False, "עברית.docx"),
     ("한국어 문서.hwp", [], False, "한국어 문서.hwp"),
