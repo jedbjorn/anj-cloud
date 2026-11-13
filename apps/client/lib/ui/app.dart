@@ -762,8 +762,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     MaterialPageRoute<void>(builder: (_) => TrashPage(controller: controller)),
   );
 
-  /// Rename for an item whose name is not allowed on other devices
-  /// (decision #120).
+  /// Rename for an item whose name cannot sync (spec #49 residual row).
   Future<void> renameEntry(BuildContext context, String path) async {
     final parent = p.posix.dirname(path);
     final siblings = {
@@ -1412,7 +1411,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                     directory ? 'openDirectory' : 'open',
                                     path,
                                   ),
-                            onRename: entry['nameRefused'] == true
+                            onRename: entry['cantSyncName'] == true
                                 ? () => renameEntry(context, path)
                                 : null,
                             finish:

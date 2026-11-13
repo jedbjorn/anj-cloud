@@ -2,10 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
 import '../core/app/controller.dart';
-import '../core/sync/name_policy.dart';
+import '../core/sync/name_rule.dart';
 
-/// Renames a local item whose name is not allowed on other devices
-/// (decision #120). The rename is a worker action; the dialog never touches
+/// Renames a local item whose name cannot sync (spec #49 residual row). The rename is a worker action; the dialog never touches
 /// the root. Pops with the new path.
 class RenameDialog extends StatefulWidget {
   const RenameDialog({
@@ -17,7 +16,7 @@ class RenameDialog extends StatefulWidget {
   final ClientController controller;
   final String path;
 
-  /// Names already in the item's folder, for the clash check.
+  /// Names already in the item's folder.
   final Set<String> siblings;
 
   @override
@@ -41,9 +40,8 @@ class _RenameDialogState extends State<RenameDialog> {
   String? _validate(String? value) {
     final name = value ?? '';
     if (name == _current) return 'Choose a different name.';
-    if (name == '.' || name == '..') return 'Use one name.';
-    final problem = NamePolicy.problem(name, widget.siblings);
-    if (problem != null) return problem.text;
+    final refused = renameRefusal(name);
+    if (refused != null) return refused;
     if (widget.siblings.contains(name)) {
       return 'A file or folder already uses this name.';
     }
@@ -70,7 +68,7 @@ class _RenameDialogState extends State<RenameDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final why = NamePolicy.problem(_current, widget.siblings);
+    final why = NameRule.cloudCheck(_current);
     return PopScope(
       canPop: !_busy,
       child: AlertDialog(
@@ -85,9 +83,8 @@ class _RenameDialogState extends State<RenameDialog> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Text(
-                  'This name is not allowed on other devices, so it stays on '
-                          'this device only. ${why?.text ?? ''}'
-                      .trim(),
+                  "This name can't sync${why == null ? '' : ': ${why.reason}'}"
+                  '. It stays on this device only.',
                   key: const ValueKey('rename-reason'),
                 ),
                 const SizedBox(height: 16),

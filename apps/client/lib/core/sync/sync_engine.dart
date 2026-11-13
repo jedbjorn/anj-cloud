@@ -15,8 +15,8 @@ import 'edit_completion.dart';
 import 'excluded_tracking.dart';
 import 'file_adder.dart';
 import 'folder_creation.dart';
-import 'name_holds.dart';
 import 'name_policy.dart';
+import 'name_rule.dart';
 import '../../platform/watchers.dart';
 import '../ports/change_watcher.dart';
 import '../ports/root_filesystem.dart';
@@ -1035,50 +1035,23 @@ class SyncEngine {
       entry.kind == ItemKind.directory &&
       (entry.conflict != null ||
           entry.awaitingFolderUpload ||
-          (entry.etag == null && isNameRefusal(entry.status)) ||
+          (entry.etag == null && isCantSyncName(entry.status)) ||
           operation(entry.path, 'delete') != null);
 
-  /// Whether this device's filesystem can hold every name the server can
-  /// write. False on Windows (the Win32 namespace refuses `CON`, a trailing
-  /// dot or space, ...): such server names stay Cloud-only (decision #120 Q2,
-  /// [NameHolds]). Test seam.
-  bool holdsAnyName = !Platform.isWindows;
-
-  /// Whether the root's volume folds case and normalization
-  /// ([RootFilesystem.caseInsensitive]: Windows, default macOS volumes):
-  /// then of server siblings that fold together only one is created
-  /// ([NameHolds]). Test seam.
-  late bool foldsCase = tree.native.caseInsensitive(tree.root.path);
+  /// This device's operating system for the per-device local names
+  /// (spec #49 R3). Test seam.
+  NameOs nameOs = NameRule.current;
 
   /// Whether a row says its full path is over [win32MaxPath] characters
   /// ([longPathNote]; Windows). Test seam.
   bool notesLongPaths = Platform.isWindows;
 
-  /// Status of a never-synchronized local item held for its name (decision
-  /// #120): its own name is not allowed on other devices, or it lies in a
-  /// folder whose name is not. Sibling clashes need the listing, so they are
-  /// found in the pass (and then held), not here.
-  String? _nameStatus(Entry entry) {
+  /// The residual row of a never-synchronized local item whose name no rule
+  /// resolves (spec #49 Error States), else null.
+  String? _residualStatus(Entry entry) {
     if (entry.etag != null) return null;
-    if (NamePolicy.check(p.posix.basename(entry.path)) != null) {
-      return nameNotAllowedStatus;
-    }
-    return _inNameRefusedFolder(entry.path) ? nameFolderPendingStatus : null;
-  }
-
-  bool _inNameRefusedFolder(String path) {
-    var parent = p.posix.dirname(path);
-    while (parent != '.') {
-      final entry = manifest.entries[parent];
-      if (entry != null &&
-          entry.kind == ItemKind.directory &&
-          entry.etag == null &&
-          isNameRefusal(entry.status)) {
-        return true;
-      }
-      parent = p.posix.dirname(parent);
-    }
-    return false;
+    final problem = NameRule.cloudCheck(p.posix.basename(entry.path));
+    return problem == null ? null : cantSyncNameStatus(problem);
   }
 
   /// Mirrors the reconcile branches below that upload or download a file's
@@ -1105,7 +1078,7 @@ class SyncEngine {
       return false;
     }
     if (here != null && here.hash != entry.baselineHash) {
-      if (current == null && _nameStatus(entry) != null) return false;
+      if (current == null && _residualStatus(entry) != null) return false;
       return !_uploadWaits(here);
     }
     if (current == null ||
@@ -2213,6 +2186,94 @@ class SyncEngine {
     return rawLocal[top];
   }
 
+  /// Global cleanup (spec #49 R1, R2): a local item whose name the cloud
+  /// cannot or must not hold, where the rule has a cheap fix (whitespace at
+  /// either end, `\` and control characters, too long, a folder ending in
+  /// `.part`), is renamed in place under the fixed name: the same item, no
+  /// transfer, and a folder carries its subtree. The pass then reads it as
+  /// a move of a synchronized item (sent as a cloud rename) or as a new item
+  /// under the clean name. Shallowest first, the scan's items re-keyed. A
+  /// rename that fails leaves the item as it is ([_residualStatus] shows it).
+  void _cleanUpNames(Map<String, LocalItem> rawLocal) {
+    int depth(String path) => '/'.allMatches(path).length;
+    final candidates = [
+      for (final item in rawLocal.values)
+        if (_cleanable(item)) item.path,
+    ]..sort((a, b) => depth(a) - depth(b));
+    if (candidates.isEmpty) return;
+    Map<String, Set<String>>? names;
+    Set<String> namesIn(String folder) => (names ??= () {
+      final index = <String, Set<String>>{};
+      for (final path in [...rawLocal.keys, ...manifest.entries.keys]) {
+        index
+            .putIfAbsent(p.posix.dirname(path), () => {})
+            .add(p.posix.basename(path));
+      }
+      return index;
+    }()).putIfAbsent(folder, () => {});
+    final renames = <(String, String)>[];
+    for (final listed in candidates) {
+      var from = listed;
+      for (final (old, now) in renames) {
+        if (withinOrAt(old, from)) from = renamedPath(old, now, from);
+      }
+      final item = rawLocal[from];
+      if (item == null || item.identity == null) continue;
+      final folder = p.posix.dirname(from), name = p.posix.basename(from);
+      final siblings = namesIn(folder);
+      final clean = NameRule.cleanup(
+        name,
+        siblings: siblings.where((v) => v != name),
+        folder: item.kind == ItemKind.directory,
+      );
+      if (clean == name) continue;
+      final to = folder == '.' ? clean : '$folder/$clean';
+      try {
+        tree.native.renameExclusive(tree.fd, from, to, item.identity!);
+      } on FileSystemException {
+        continue; // Left as it is; its row says why it cannot sync.
+      }
+      renames.add((from, to));
+      siblings
+        ..remove(name)
+        ..add(clean);
+      for (final path
+          in rawLocal.keys.where((v) => withinOrAt(from, v)).toList()) {
+        final old = rawLocal.remove(path)!;
+        final moved = renamedPath(from, to, path);
+        rawLocal[moved] = old.movedTo(moved);
+      }
+      if (_watching && _view != null) {
+        _drop(from);
+        watcher!.retainUnder(from, const {});
+        _rescan(const {}, {to});
+      }
+      _touched.addAll({from, to});
+    }
+  }
+
+  /// A `.part` or `.filepart` file: a download still in progress
+  /// (decision #195), never uploaded and shown with no row.
+  static bool _temporary(LocalItem item) =>
+      item.kind == ItemKind.file &&
+      NameRule.isTemporary(p.posix.basename(item.path));
+
+  /// Whether [item] is one [_cleanUpNames] may rename: its name changes
+  /// under the rule, and it is not a top folder, `Shared`, an incoming
+  /// share's folder, excluded, view-only or a local temporary.
+  bool _cleanable(LocalItem item) {
+    final name = p.posix.basename(item.path);
+    final folder = item.kind == ItemKind.directory;
+    if (!folder && item.kind != ItemKind.file) return false;
+    if (!folder && NameRule.isTemporary(name)) return false;
+    if (NameRule.cleanup(name, folder: folder) == name) return false;
+    return !isTopFolder(item.path) &&
+        item.path != sharedFolder &&
+        _shareFolderOf(item.path) != item.path &&
+        !isSyncExcluded(item.path) &&
+        !viewOnly(item.path);
+  }
+
   /// How long losses under a top folder must have stopped before an
   /// inferred deletion there is sent: the watcher's longest delay plus its
   /// quiet period (about 12 s). A recursive delete of the top folder
@@ -3231,11 +3292,10 @@ class SyncEngine {
     // A share placed in Documents, Music or Videos (spec #34 P6) is its
     // owner's storage like a mount in Shared/ ([_shareFolderOf]).
     if (!held && _shareFolderOf(from) != _shareFolderOf(to)) return false;
-    if (held ||
-        NamePolicy.check(p.posix.basename(to)) != null ||
-        _inNameRefusedFolder(to)) {
+    if (held || NameRule.cloudCheck(p.posix.basename(to)) != null) {
       // The new row shows the rule's own status: the ordinary create path
-      // holds the name (decision #120), the owner's folder is paused (#80).
+      // shows a name no rule resolves (spec #49), the owner's folder is
+      // paused (#80).
       _park(from, to);
       return true;
     }
@@ -3375,19 +3435,6 @@ class SyncEngine {
         _localWork = true;
         continue;
       }
-      final siblings = [
-        for (final path in remote.keys)
-          if (path != from && p.posix.dirname(path) == parent)
-            p.posix.basename(path),
-      ];
-      if (NamePolicy.problem(p.posix.basename(to), siblings) != null) {
-        // The new name clashes with a cloud sibling (decision #120): kept
-        // local at it, held by the ordinary create path; the cloud item
-        // stays where it was.
-        finish(op);
-        _park(from, to);
-        continue;
-      }
       if (stopped) continue;
       // A move planned during this loop (re-planned by a re-key or an
       // abandoned move) is made durable by another commit point first.
@@ -3407,7 +3454,8 @@ class SyncEngine {
       try {
         await cloud.move(from, to, etag: current.etag);
       } on NameNotPortable {
-        // A clashing sibling appeared after the listing: held the same way.
+        // A name the cloud refuses (spec #49 residual): kept local at it,
+        // where the ordinary create path shows why; the cloud item stays.
         finish(op);
         _park(from, to);
         continue;
@@ -3450,7 +3498,7 @@ class SyncEngine {
       }
     }
     final held = manifest.entries[to];
-    if (held != null && held.etag == null && isNameRefusal(held.status)) {
+    if (held != null && held.etag == null && isCantSyncName(held.status)) {
       held.status = 'queued';
     }
     _dirty
@@ -3464,21 +3512,6 @@ class SyncEngine {
   /// reconciled this pass, so nothing is deleted, downloaded or uploaded for
   /// them; every pass pairs them again.
   final Set<String> _cloudHeld = {};
-
-  /// The names this device cannot hold, for the cloud moves of one pass:
-  /// built on first use and again after each move applied, since a move
-  /// changes which names are on this device.
-  NameHolds? _moveHoldsCache;
-  NameHolds _moveHolds(
-    Map<String, LocalItem> rawLocal,
-    Map<String, RemoteItem> remote,
-  ) => _moveHoldsCache ??= NameHolds(
-    win32Names: !holdsAnyName,
-    foldsCase: foldsCase,
-    remote: remote.keys,
-    local: rawLocal,
-    entries: manifest.entries,
-  );
 
   bool _cloudHolds(String path) {
     if (_cloudHeld.isEmpty) return false;
@@ -3571,7 +3604,6 @@ class SyncEngine {
     Map<String, RemoteItem> remote,
   ) {
     _dropMovedTombstones(remote);
-    _moveHoldsCache = null;
     final settled = <String>{};
     try {
       // Each round applies the top pairs; a row moved out of a folder that
@@ -3583,7 +3615,6 @@ class SyncEngine {
         for (final MapEntry(key: from, value: to) in pairs.entries) {
           if (_applyCloudMove(from, to, local, rawLocal, remote)) {
             moved = true;
-            _moveHoldsCache = null;
           } else {
             settled.add(from);
           }
@@ -3594,7 +3625,6 @@ class SyncEngine {
       // A local move the cloud's rename did not settle and did not hold:
       // reconciled the ordinary way (the new local name is uploaded).
       _renamedBothSides.clear();
-      _moveHoldsCache = null;
     }
   }
 
@@ -3791,20 +3821,14 @@ class SyncEngine {
       }
       return true;
     }
-    // Another local item already holds the new name.
+    // Another local item still holds the new name: the clash partner whose
+    // removal frees it (spec #49 AC7), applied later in this pass, or an
+    // item of this device not synchronized yet. The item keeps its place
+    // until the name is free; paired again every pass.
     if (rawLocal.containsKey(to) && !withinOrAt(at, to)) {
-      // On this device under its old name: not Cloud-only.
-      return hold(here != null ? movedNameClashStatus : serverNameClashStatus);
-    }
-    if (here != null) {
-      // A new name this device cannot hold (decision #120 Q2): a name the
-      // platform refuses, a sibling that folds onto it, or a folder on the
-      // way that is itself held. The item stays where it is with the
-      // reason; it is never renamed and no folder is made for it, so on a
-      // case-blind volume it cannot land inside the sibling its new folder
-      // folds onto. Nothing is deleted, moved or uploaded for it meanwhile.
-      final refused = _moveHolds(rawLocal, remote).status(to, moving: at);
-      if (refused != null) return hold(movedHoldStatus(refused));
+      return hold(
+        here != null ? 'rename pending: another item here has the new name' : null,
+      );
     }
     if (here == null) {
       // Not removal-inferred yet (expected here, no delete): next pass. An
@@ -4033,7 +4057,7 @@ class SyncEngine {
       if (!withinOrAt(to, row.path)) continue;
       row.movedNote = null;
       // Held at its old path for this move: planned afresh at the new one.
-      if (isServerNameHold(row.status) ||
+      if (isLegacyNameHold(row.status) ||
           row.status.startsWith('rename pending')) {
         row.status = 'queued';
       }
@@ -4177,9 +4201,9 @@ class SyncEngine {
   static bool _unsettled(Entry entry) =>
       entry.status == 'queued' ||
       entry.status.toLowerCase().contains('pending') ||
-      isNameRefusal(entry.status) ||
-      // Rechecked each pass: a clash loser comes down once its sibling goes.
-      isServerNameHold(entry.status);
+      // A row an earlier client held for its name (decision #120): resolved
+      // through the name rule on the first pass (spec #49 AC8).
+      isLegacyNameHold(entry.status);
 
   Future<int> _tick(
     bool audit,
@@ -4207,6 +4231,7 @@ class SyncEngine {
       _migrateLegacyIdentities();
       _keepTopFolders(rawLocal);
       _keepSharedFolder(rawLocal);
+      _cleanUpNames(rawLocal);
       _recordMountIdentities();
       _lookUpVanished(rawLocal);
       localUnavailable = false;
@@ -4275,7 +4300,10 @@ class SyncEngine {
     );
     var local = Map<String, LocalItem>.fromEntries(
       rawLocal.entries.where(
-        (v) => !isSyncExcluded(v.key) && !pendingFolder(v.key),
+        (v) =>
+            !isSyncExcluded(v.key) &&
+            !pendingFolder(v.key) &&
+            !_temporary(v.value),
       ),
     );
     // Candidate detection: any local path whose type, identity, stamp or
@@ -4402,7 +4430,7 @@ class SyncEngine {
         // A held upload keeps its reason (amber), not "queued" (#27 rule).
         entry.status =
             uploads.status(item.path, _localSignature(item)) ??
-            _nameStatus(entry) ??
+            _residualStatus(entry) ??
             'queued';
       }
     }
@@ -4410,7 +4438,8 @@ class SyncEngine {
     // A new file that is busy has a row too (SC-048 F5): never synchronized,
     // not expected present, so nothing is inferred from it.
     for (final path in tree.busy) {
-      if (!isSyncExcluded(path)) {
+      if (!isSyncExcluded(path) &&
+          !NameRule.isTemporary(p.posix.basename(path))) {
         manifest.entries.putIfAbsent(path, () => Entry(path, ItemKind.file));
       }
     }
@@ -5039,33 +5068,6 @@ class SyncEngine {
             _expectsTransfer(path, local, remote),
       ),
     );
-    // Remote names per folder, built on first use, for the clash check of
-    // local creates (decision #120); creates in this pass are added.
-    Map<String, Set<String>>? remoteNames;
-    Set<String> siblingsOf(String path) {
-      remoteNames ??= () {
-        final index = <String, Set<String>>{};
-        for (final key in remote.keys) {
-          index
-              .putIfAbsent(p.posix.dirname(key), () => {})
-              .add(p.posix.basename(key));
-        }
-        return index;
-      }();
-      return remoteNames!.putIfAbsent(p.posix.dirname(path), () => {});
-    }
-
-    // Server names this device cannot create (decision #120 Q2), grouped
-    // once per folder for the pass.
-    final holds = NameHolds(
-      win32Names: !holdsAnyName,
-      foldsCase: foldsCase,
-      remote: remote.keys,
-      local: local,
-      entries: manifest.entries,
-    );
-    NameProblem? createProblem(String path) =>
-        NamePolicy.problem(p.posix.basename(path), siblingsOf(path));
     String? previous;
     var listingOnlyRows = 0;
     for (final path in paths) {
@@ -5111,11 +5113,6 @@ class SyncEngine {
       }
       // An ancestor delete/edit conflict must block child re-uploads too.
       if (blocked(path)) {
-        if (entry.etag == null &&
-            local.containsKey(path) &&
-            _inNameRefusedFolder(path)) {
-          entry.status = nameFolderPendingStatus;
-        }
         _dirty.add(path);
         continue;
       }
@@ -5161,17 +5158,14 @@ class SyncEngine {
           if (here == null &&
               current == null &&
               entry.etag == null &&
-              (isNameRefusal(entry.status) ||
-                  entry.status == nameFolderPendingStatus)) {
+              (isCantSyncName(entry.status) ||
+                  isLegacyNameHold(entry.status))) {
             // Renamed or removed before it was ever synchronized.
             uploads.forget(path);
             entry.expectedPresent = false;
             entry.status = 'removed locally';
             continue;
           }
-          final heldFolder = current != null && here == null
-              ? holds.status(path)
-              : null;
           if (here != null &&
               current == null &&
               entry.etag == null &&
@@ -5180,30 +5174,18 @@ class SyncEngine {
               conflict(entry, viewOnlyConflict);
               continue;
             }
-            // Never created while its name is not allowed on other devices.
-            final held = uploads.hold(path, _localSignature(here));
-            if (held != null && held.name && !held.predicted) {
-              entry.status = held.status;
-              continue;
-            }
-            if (createProblem(path) != null) {
-              entry.status = nameNotAllowedStatus;
+            // A name no rule resolves (spec #49): never created.
+            final residual = _residualStatus(entry);
+            if (residual != null) {
+              entry.status = residual;
               continue;
             }
             await cloud.mkdir(path);
-            siblingsOf(path).add(p.posix.basename(path));
             entry.localIdentity = _recordedIdentity(here);
             if (_birthTracked(here)) entry.localBirth = here.birth;
             entry.awaitingFolderUpload = false;
             entry.expectedPresent = true;
             entry.status = 'current local';
-          } else if (heldFolder != null) {
-            // A server folder this device cannot hold (decision #120 Q2):
-            // never created, so a case-blind filesystem never merges it into
-            // the kept sibling; its files follow the same rule.
-            entry.etag = current!.etag;
-            entry.expectedPresent = false;
-            entry.status = heldFolder;
           } else if (current != null) {
             // Last guard (review D-H1): a share is never adopted over a
             // folder with no synchronized history.
@@ -5261,7 +5243,7 @@ class SyncEngine {
               (operation(path, 'upload') != null ||
                   _unsettled(entry) ||
                   isSizeRefusal(entry.status) ||
-                  isNameRefusal(entry.status))) {
+                  isCantSyncName(entry.status))) {
             _settleUnsyncedRemoval(entry);
           }
           continue;
@@ -5302,21 +5284,15 @@ class SyncEngine {
             size: here.size,
             limit: limit,
           );
-          // A hold this client predicted from the listing is re-evaluated
-          // on every visit, so it lifts when the clashing sibling goes.
-          final create = current == null && entry.etag == null;
           if (held != null &&
-              held.name &&
-              held.predicted &&
-              (!create || createProblem(path) == null)) {
-            uploads.forget(path);
-          } else if (held != null &&
               (held.refused || uploads.clock() < held.notBefore)) {
             entry.status = held.status;
             continue;
           }
-          if (create && createProblem(path) != null) {
-            entry.status = uploads.refuseName(path, signature, predicted: true);
+          // A name no rule resolves (spec #49): never sent.
+          final residual = _residualStatus(entry);
+          if (residual != null) {
+            entry.status = residual;
             continue;
           }
           // Over the limit the server reported: never staged, never sent.
@@ -5358,7 +5334,6 @@ class SyncEngine {
             rethrow;
           }
           uploads.succeeded(path);
-          if (current == null) siblingsOf(path).add(p.posix.basename(path));
           // A version read back separately may be a concurrent writer's; it
           // never becomes release evidence (spec #12 rule 2).
           final readBack = cloud.lastUploadReadBack;
@@ -5372,14 +5347,7 @@ class SyncEngine {
           entry.status = 'current local';
           finish(op);
         } else if (current != null && (changed || here == null)) {
-          final held = here == null ? holds.status(path) : null;
-          if (held != null) {
-            // A server name this device cannot hold (decision #120 Q2):
-            // Cloud-only with its reason; never created, never renamed here.
-            entry.etag = current.etag;
-            entry.baselineHash = null;
-            entry.status = held;
-          } else if (retention(path) == Retention.cloud && here == null) {
+          if (retention(path) == Retention.cloud && here == null) {
             entry.etag = current.etag;
             entry.baselineHash = null;
             entry.status = 'cloud-only';
@@ -5441,10 +5409,10 @@ class SyncEngine {
           manifest.save();
           return paths.length;
         }
-        // The gateway refused the name (decision #120): held until the item
-        // changes or the user retries; the local item is kept as it is.
-        if (error is NameNotPortable && here != null) {
-          entry.status = uploads.refuseName(path, _localSignature(here));
+        // The gateway refused the name (its spec #49 backstop): the residual
+        // row, visited again when the item changes or the user retries.
+        if (error is NameNotPortable) {
+          entry.status = error.message;
         } else if (uploadFailure != null) {
           // An interrupted upload backs off; a size refusal waits for the
           // file to change or the user to retry (SC-028).
@@ -6248,24 +6216,24 @@ class SyncEngine {
     return path;
   }
 
-  /// The Rename action of a row held for its name (decision #120). Renames
-  /// the never-synchronized local item within its folder, never replacing
-  /// anything; the next pass uploads it under the new name. Only the user
-  /// renames: nothing here is automatic.
+  /// The Rename action of the residual row (spec #49 Error States): a name
+  /// no rule resolves. Renames the never-synchronized local item within its
+  /// folder, never replacing anything; the next pass uploads it under the new
+  /// name (cleaning it first, as any local name).
   Future<String> renameLocal(String path, String name) async {
     requireStorageReady();
     validateRelative(path);
     final entry = manifest.entries[path];
-    if (entry == null || entry.etag != null || !isNameRefusal(entry.status)) {
+    if (entry == null || entry.etag != null || !isCantSyncName(entry.status)) {
       throw const FileSystemException(
-        'Only an item whose name is not allowed on other devices can be renamed here.',
+        'Only an item whose name cannot sync can be renamed here.',
       );
     }
-    if (name.contains('/') || name == '.' || name == '..') {
-      throw const FileSystemException('Use one name without path separators.');
-    }
-    final problem = NamePolicy.check(name);
-    if (problem != null) throw FileSystemException(problem.text);
+    final refused = renameRefusal(
+      name,
+      folder: entry.kind == ItemKind.directory,
+    );
+    if (refused != null) throw FileSystemException(refused);
     final parent = p.posix.dirname(path);
     final target = parent == '.' ? name : '$parent/$name';
     validateRelative(target);
@@ -6295,9 +6263,6 @@ class SyncEngine {
       throw const FileSystemException(
         'A file or folder already uses this name. Choose another name.',
       );
-    }
-    if (NamePolicy.clashWith(name, siblings) != null) {
-      throw FileSystemException(NameProblem.clash.text);
     }
     tree.native.renameExclusive(tree.fd, path, target, item.identity!);
     markDirty(path, descendants: true);

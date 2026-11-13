@@ -1,18 +1,50 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'name_policy.dart';
 
 /// The operating systems the name rule distinguishes (spec #49 R3).
 enum NameOs { windows, macos, linux, android }
 
-/// Why the cloud cannot or must not hold a name (spec #49 R2).
+/// Why the cloud cannot or must not hold a name (spec #49 R2). The names
+/// are the gateway's 422 `name-not-portable` reasons.
 enum CloudNameProblem {
-  empty,
-  untrimmed,
-  forbiddenCharacter,
-  forbiddenName,
-  forbiddenExtension,
-  tooLong,
+  empty('the name is empty'),
+  untrimmed('it starts or ends with a space'),
+  forbiddenCharacter('it contains a character the cloud cannot store'),
+  forbiddenName('the cloud does not allow this name'),
+  forbiddenExtension('.part and .filepart files are temporary downloads'),
+  tooLong('the name is too long for the cloud');
+
+  const CloudNameProblem(this.reason);
+
+  /// One plain reason, for the residual row ([cantSyncNameStatus]).
+  final String reason;
+
+  /// The problem a gateway `reason` code names, else null.
+  static CloudNameProblem? fromReason(Object? reason) {
+    for (final problem in values) {
+      if (problem.name == reason) return problem;
+    }
+    return null;
+  }
+}
+
+/// The only name error left (spec #49 Error States): a name the rule cannot
+/// resolve, such as `.htaccess`. The row keeps the Rename action.
+String cantSyncNameStatus(CloudNameProblem? problem) =>
+    '$_cantSync${(problem ?? CloudNameProblem.forbiddenName).reason}';
+const _cantSync = "Can't sync this name: ";
+bool isCantSyncName(String status) => status.startsWith(_cantSync);
+
+/// Why a name the user gives (Rename, Add files, the documents provider) is
+/// refused (spec #49): only an empty name, a path separator, or what R2
+/// cannot fix. Anything else is accepted, and cleaned like any local name.
+String? renameRefusal(String name, {bool folder = false}) {
+  if (name.isEmpty) return 'Enter a name.';
+  if (name.contains('/')) return 'Use one name without path separators.';
+  final problem = NameRule.cloudCheck(NameRule.cleanup(name, folder: folder));
+  return problem == null ? null : "This name can't sync: ${problem.reason}.";
 }
 
 /// One cloud item of a folder: its cloud name, Nextcloud `oc:fileid` and
@@ -214,6 +246,21 @@ abstract final class NameRule {
     if (_size(name) > maxBytes) return CloudNameProblem.tooLong;
     return null;
   }
+
+  /// Whether a file named [name] is a local temporary (decision #195): a
+  /// `.part` or `.filepart` download in progress, never uploaded and shown
+  /// with no row. A folder of that name is renamed instead ([cleanup]).
+  static bool isTemporary(String name) =>
+      _forbiddenExtensions.any(_lower(name).endsWith);
+
+  /// This device's operating system for [localNames].
+  static NameOs get current => Platform.isWindows
+      ? NameOs.windows
+      : Platform.isMacOS
+      ? NameOs.macos
+      : Platform.isAndroid
+      ? NameOs.android
+      : NameOs.linux;
 
   /// R3 steps 1-3: characters, trailing dots, device names.
   static String _windows(String name) {

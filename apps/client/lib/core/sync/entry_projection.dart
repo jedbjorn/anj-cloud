@@ -4,6 +4,7 @@ import '../state/model.dart';
 import '../gateway/sharing.dart';
 import 'file_adder.dart';
 import 'name_policy.dart';
+import 'name_rule.dart';
 import 'top_folders.dart';
 import 'sync_engine.dart';
 
@@ -53,10 +54,8 @@ Future<Map<String, Object?>> projectEntry(
   final errors = [
     // Too large for the server: shown, and amber, until the file changes.
     if (isSizeRefusal(entry.status)) entry.status,
-    // Name not allowed on other devices (decision #120): amber, with Rename.
-    if (isNameRefusal(entry.status)) entry.status,
-    // A server name this device cannot hold (#120 Q2): amber, no Rename.
-    if (isServerNameHold(entry.status)) entry.status,
+    // A name no rule resolves (spec #49 residual row): amber, with Rename.
+    if (isCantSyncName(entry.status)) entry.status,
     // Open in another app without read sharing (SC-048 F5): amber until
     // a pass can read it.
     if (isBusyStatus(entry.status)) entry.status,
@@ -107,7 +106,8 @@ Future<Map<String, Object?>> projectEntry(
           engine.tree.root.path.length + 1 + entry.path.length > win32MaxPath)
         longPathNote,
     ]
-    ..['nameRefused'] = isNameRefusal(entry.status)
+    // The residual row's Rename (spec #49 Error States).
+    ..['cantSyncName'] = entry.etag == null && isCantSyncName(entry.status)
     // Deleted here and waiting to be sent (spec #44): the row, and a folder's
     // rows below it, leave the library at once; Undo brings them back.
     ..['deleteQueued'] = deleteQueued(engine, entry.path)

@@ -7,6 +7,7 @@ import '../local/root_tree.dart';
 import '../ports/documents_filesystem.dart';
 import '../state/model.dart';
 import 'name_policy.dart';
+import 'name_rule.dart';
 import 'sync_engine.dart';
 import 'sync_path_policy.dart';
 
@@ -156,7 +157,7 @@ class FileAdder {
       if (row.expectedPresent && engine.localDirectories.contains(current)) {
         return true;
       }
-      if (row.etag == null || isServerNameHold(row.status)) return false;
+      if (row.etag == null) return false;
     }
     return true;
   }
@@ -230,14 +231,12 @@ class FileAdder {
   /// The skip of a name before any numbering, or null.
   static AddSkip? nameSkip(
     String parent,
-    String name,
-    Iterable<String> siblings,
-  ) {
-    if (name.isEmpty ||
-        name == '.' ||
-        name == '..' ||
-        name.contains('/') ||
-        NamePolicy.problem(name, siblings) != null) {
+    String name, {
+    required bool directory,
+  }) {
+    // Spec #49: only a name R2 cannot fix (or a file that would only ever be
+    // a quiet local temporary); every other name is cleaned by the pass.
+    if (renameRefusal(name, folder: directory) != null) {
       return AddSkip.blockedName;
     }
     if (isSyncExcluded(_join(parent, name))) return AddSkip.excluded;
@@ -274,7 +273,6 @@ class FileAdder {
     final taken = {...siblings};
     // Selection-relative folder -> its verdict, for the subtree rule.
     final folders = <String, AddSkip?>{};
-    final children = <String, Set<String>>{};
     final verdicts = <Map<String, Object?>>[];
     var files = 0, folderCount = 0, bytes = 0;
     for (final item in items) {
@@ -294,11 +292,10 @@ class FileAdder {
         skip = folders[parent];
         listed = false;
       } else {
-        final beside = top ? taken : (children[parent] ??= <String>{});
         skip = nameSkip(
           top ? destination : _join(destination, parent),
           name,
-          top ? const <String>{} : beside,
+          directory: directory,
         );
         if (skip == null && !directory) {
           if (item['virtual'] == true) {
@@ -309,7 +306,7 @@ class FileAdder {
         }
         if (skip == null) {
           target = top ? freeName(name, taken, directory: directory) : name;
-          beside.add(target);
+          if (top) taken.add(target);
           if (directory) {
             folderCount++;
           } else {
@@ -349,7 +346,7 @@ class FileAdder {
     _notPaused();
     _writableFolder(parent);
     final siblings = _siblings(parent);
-    final skip = nameSkip(parent, name, number ? const <String>{} : siblings);
+    final skip = nameSkip(parent, name, directory: false);
     if (skip != null) throw DocumentsFailure(skip.name, skip.text(uploadLimit));
     final chosen = number ? freeName(name, siblings, directory: false) : name;
     if (!number && siblings.contains(name)) {
@@ -367,7 +364,7 @@ class FileAdder {
       final siblings = _siblings(parent);
       _notPaused();
       _writableFolder(parent);
-      final skip = nameSkip(parent, name, number ? const <String>{} : siblings);
+      final skip = nameSkip(parent, name, directory: true);
       if (skip != null) {
         throw DocumentsFailure(skip.name, skip.text(uploadLimit));
       }

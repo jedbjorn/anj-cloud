@@ -12,6 +12,7 @@ import 'fetch_api.dart';
 import 'releases_api.dart';
 import '../state/model.dart';
 import '../sync/name_policy.dart';
+import '../sync/name_rule.dart';
 import '../local/root_tree.dart';
 import '../update/release.dart';
 import 'sharing.dart';
@@ -194,7 +195,7 @@ class DavCloud
     _ => 'Cloud request failed ($status). Pending work is retained.',
   };
 
-  /// A 422 `name-not-portable` (decision #120) becomes [NameNotPortable];
+  /// A 422 `name-not-portable` (spec #49 backstop) becomes [NameNotPortable];
   /// any other 422 is an ordinary failure.
   Future<void> nameRefusal(HttpClientResponse response) async {
     Object? body;
@@ -206,7 +207,7 @@ class DavCloud
       /* The status alone is not enough to name the reason. */
     }
     if (body is Map && body['error'] == 'name-not-portable') {
-      throw NameNotPortable(NameProblem.fromReason(body['reason']));
+      throw NameNotPortable(CloudNameProblem.fromReason(body['reason']));
     }
     failure(422);
   }

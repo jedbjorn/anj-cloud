@@ -7,7 +7,7 @@ import '../local/root_tree.dart';
 import '../ports/documents_filesystem.dart';
 import '../state/model.dart';
 import 'file_adder.dart';
-import 'name_policy.dart';
+import 'name_rule.dart';
 import 'open_documents.dart';
 import 'sync_engine.dart';
 import 'sync_path_policy.dart';
@@ -289,8 +289,10 @@ class DocumentsOps {
         'Use one name without path separators.',
       );
     }
-    final problem = NamePolicy.problem(name, siblings);
-    if (problem != null) throw DocumentsFailure('refused', problem.text);
+    // Spec #49: only what R2 cannot fix. A `.part` file is a quiet local
+    // temporary, and a folder of that name is renamed, so neither is refused.
+    final refused = renameRefusal(name, folder: true);
+    if (refused != null) throw DocumentsFailure('refused', refused);
     final target = _join(parent, name);
     validateRelative(target);
     if (isSyncExcluded(target)) {
