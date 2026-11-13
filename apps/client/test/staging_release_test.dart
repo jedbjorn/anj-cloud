@@ -421,6 +421,30 @@ void main() {
   );
 
   test(
+    'a downloaded file shows no staging files: its linked name is the file',
+    () async {
+      cloud.put('$dir/x.txt', 'x' * 40);
+      await engine.tick();
+      expect(local('x.txt').readAsStringSync(), 'x' * 40);
+      final artifacts = engine.localArtifacts('$dir/x.txt');
+      expect(artifacts['count'], 0);
+      expect(artifacts['bytes'], 0);
+      expect(artifacts['uncertain'], isFalse);
+      expect(artifactSummary(await project('$dir/x.txt')), isNull);
+      // The linked name stays: eviction and release still use it.
+      if (tree.native.hardLinks) {
+        expect(records('$dir/x.txt', 'download'), hasLength(1));
+        expect(staged('download-'), hasLength(1));
+      }
+      // Once the file is gone from the root, the same name is a staging copy.
+      local('x.txt').deleteSync();
+      if (tree.native.hardLinks) {
+        expect(engine.localArtifacts('$dir/x.txt')['count'], 1);
+      }
+    },
+  );
+
+  test(
     'artifact detail counts kinds and sizes hard-linked inodes once',
     () async {
       cloud.put('$dir/x.txt', 'x' * 40);
@@ -437,15 +461,16 @@ void main() {
         expect(artifacts['bytes'], 80);
         return;
       }
-      // download-1 and preserved-* share the replaced inode (40), check-* is a
-      // separate pre-replacement snapshot (40) and download-2 is the root
-      // file's inode (50). Four names, three inodes: 130 bytes, not 170.
-      expect(artifacts['count'], 4);
-      expect(artifacts['kinds'], {'download': 2, 'recovery': 1, 'check': 1});
-      expect(artifacts['bytes'], 130);
+      // download-1 and preserved-* share the replaced inode (40) and check-*
+      // is a separate pre-replacement snapshot (40). download-2 is the root
+      // file itself (its install linked it into place), so it is not a
+      // staging file. Three names, two inodes: 80 bytes, not 120.
+      expect(artifacts['count'], 3);
+      expect(artifacts['kinds'], {'download': 1, 'recovery': 1, 'check': 1});
+      expect(artifacts['bytes'], 80);
       expect(
         artifactSummary(await project('$dir/x.txt')),
-        'Local staging files: recovery 1, download 2, check 1 (130 bytes)',
+        'Local staging files: recovery 1, download 1, check 1 (80 bytes)',
       );
       expect(jsonEncode(artifacts['files']), contains('"kind":"recovery"'));
     },

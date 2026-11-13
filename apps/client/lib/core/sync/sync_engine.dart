@@ -7293,12 +7293,28 @@ class SyncEngine {
     final files = <Map<String, Object?>>[];
     final kinds = <String, int>{};
     final inodes = <String>{};
-    for (final record in _artifactsFor(path)) {
+    final records = _artifactsFor(path);
+    // The file itself, where an install linked its staging name into place
+    // (`hardLinks`): that name is the live file, not a staging copy, as for
+    // recovery copies (spec #25 ruling).
+    String? live;
+    if (records.isNotEmpty && manifest.entries[path]?.kind == ItemKind.file) {
+      try {
+        live = artifacts.native.info(tree.fd, path).identity;
+      } on FileSystemException {
+        // Absent here (Cloud-only, deleted): every staging name counts.
+      }
+    }
+    for (final record in records) {
       try {
         final info = artifacts.native.info(
           tree.stageFd,
           record.data['name'] as String,
         );
+        if (info.identity == live &&
+            info.identity == record.data['identity']) {
+          continue;
+        }
         var kind = artifactKind(record.data['role'] as String?);
         if (record.data['role'] == 'working') {
           // An unchanged working copy is a downloaded copy (decision #183).
