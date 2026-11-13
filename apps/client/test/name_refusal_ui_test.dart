@@ -48,6 +48,12 @@ void main() {
       ..entries = [
         _row('Documents', kind: 'directory'),
         _row('Documents/.htaccess', status: residual, refused: true),
+        _row(
+          'Documents/.well-known',
+          kind: 'directory',
+          status: residual,
+          refused: true,
+        ),
         _row('Documents/readme.txt'),
         _row('Documents/.bashrc'),
         _row('Documents/old.txt', status: 'removed locally'),
@@ -187,6 +193,24 @@ void main() {
     expect(controller.renames, ['Documents/.htaccess -> htaccess.txt']);
     expect(find.text('Rename .htaccess'), findsNothing);
     expect(find.text('Renamed to htaccess.txt'), findsOneWidget);
+  });
+
+  testWidgets('a residual folder takes a name R2 cleans for folders: '
+      '`.part` is accepted (decision #195)', (tester) async {
+    await open(tester);
+    await tester.tap(
+      find.byKey(const ValueKey('rename:Documents/.well-known')),
+    );
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byKey(const ValueKey('rename-name')),
+      'Site.part',
+    );
+    await tester.pumpAndSettle();
+    expect(find.textContaining('temporary downloads'), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('confirm-rename')));
+    await tester.pumpAndSettle();
+    expect(controller.renames, ['Documents/.well-known -> Site.part']);
   });
 
   testWidgets('a refused rename keeps the dialog open with the reason', (

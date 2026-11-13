@@ -11,10 +11,14 @@ class RenameDialog extends StatefulWidget {
     super.key,
     required this.controller,
     required this.path,
+    this.folder = false,
     this.siblings = const {},
   });
   final ClientController controller;
   final String path;
+
+  /// The item is a folder: R2 cleans a folder name like the worker does.
+  final bool folder;
 
   /// Names already in the item's folder.
   final Set<String> siblings;
@@ -40,7 +44,7 @@ class _RenameDialogState extends State<RenameDialog> {
   String? _validate(String? value) {
     final name = value ?? '';
     if (name == _current) return 'Choose a different name.';
-    final refused = renameRefusal(name);
+    final refused = renameRefusal(name, folder: widget.folder);
     if (refused != null) return refused;
     if (widget.siblings.contains(name)) {
       return 'A file or folder already uses this name.';

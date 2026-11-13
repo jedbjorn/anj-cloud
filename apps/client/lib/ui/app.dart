@@ -765,7 +765,11 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
   );
 
   /// Rename for an item whose name cannot sync (spec #49 residual row).
-  Future<void> renameEntry(BuildContext context, String path) async {
+  Future<void> renameEntry(
+    BuildContext context,
+    String path, {
+    bool folder = false,
+  }) async {
     final parent = p.posix.dirname(path);
     final siblings = {
       for (final entry in controller.entries)
@@ -778,8 +782,12 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     final renamed = await showDialog<String>(
       context: context,
       barrierDismissible: false,
-      builder: (_) =>
-          RenameDialog(controller: controller, path: path, siblings: siblings),
+      builder: (_) => RenameDialog(
+        controller: controller,
+        path: path,
+        folder: folder,
+        siblings: siblings,
+      ),
     );
     if (renamed != null && context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1414,7 +1422,11 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                     path,
                                   ),
                             onRename: entry['cantSyncName'] == true
-                                ? () => renameEntry(context, path)
+                                ? () => renameEntry(
+                                    context,
+                                    path,
+                                    folder: directory,
+                                  )
                                 : null,
                             finish:
                                 file &&
