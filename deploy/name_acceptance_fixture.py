@@ -100,7 +100,8 @@ async def migration(stack, operator, actor, folder, before, run):
         if name == " Trip ":
             stack.dav("MKCOL", user, base + name, expected=(201,))
         else:
-            stack.dav("PUT", user, base + name, data=b"seeded", expected=(201,))
+            # A body without a Content-Type makes PHP's stream wrapper print a notice into the helper's JSON.
+            stack.dav("PUT", user, base + name, data=b"seeded", headers={"Content-Type": "application/octet-stream"}, expected=(201,))
     seeded = await names(actor, folder)
     if sorted(set(seeded) - set(before)) != sorted(SEEDED):
         raise RuntimeError("Seeded names differ: " + json.dumps(seeded))
