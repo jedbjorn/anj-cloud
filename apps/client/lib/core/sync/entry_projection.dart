@@ -1,5 +1,6 @@
 import '../state/model.dart';
 import '../gateway/sharing.dart';
+import 'file_adder.dart';
 import 'name_policy.dart';
 import 'top_folders.dart';
 import 'sync_engine.dart';
@@ -73,6 +74,11 @@ Future<Map<String, Object?>> projectEntry(
         entry.expectedPresent &&
         !entry.status.startsWith('deleted') &&
         engine.localDirectories.contains(entry.path)
+    // Add files and Save to AnJ Cloud (spec #43, decision #190): the
+    // worker's own destination test, so the menu and the worker agree.
+    ..['canReceiveFiles'] =
+        entry.kind == ItemKind.directory &&
+        FileAdder.canReceive(engine, entry.path)
     ..['effectiveRetention'] = engine.retention(entry.path).name
     // A top folder's own choice for what is inside it (decision #163).
     ..['contentsRetention'] = isTopFolder(entry.path)

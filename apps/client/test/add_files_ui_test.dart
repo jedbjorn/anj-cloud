@@ -128,23 +128,45 @@ Map<String, dynamic> _folder(
   'effectiveRetention': 'local',
   'status': 'current local',
   'localDirectoryAvailable': true,
+  // The worker's destination test, as the projection reports it.
+  'canReceiveFiles': true,
   ...extra,
 };
 
 List<Map<String, dynamic>> _library() => [
   _folder('Documents'),
   _folder('Documents/Receipts'),
-  // Cloud only and not on this device.
+  // Synced, Cloud only and not on this device: a destination (#190).
   _folder(
     'Archive',
     extra: {'localDirectoryAvailable': false, 'effectiveRetention': 'cloud'},
   ),
+  // No recorded cloud version, or a conflict: not a destination.
+  _folder(
+    'Draft',
+    extra: {'localDirectoryAvailable': false, 'canReceiveFiles': false},
+  ),
+  _folder('Clash', extra: {'conflict': 'both', 'canReceiveFiles': false}),
   _folder('Shared'),
-  _folder('Shared/Photos', extra: {'viewOnly': true, 'inIncomingShare': true}),
+  _folder(
+    'Shared/Photos',
+    extra: {
+      'viewOnly': true,
+      'inIncomingShare': true,
+      'canReceiveFiles': false,
+    },
+  ),
   _folder('Shared/Team', extra: {'inIncomingShare': true}),
   // Top-level rows (the library starts with folders collapsed).
   _folder('Projects'),
-  _folder('Photos', extra: {'viewOnly': true, 'inIncomingShare': true}),
+  _folder(
+    'Photos',
+    extra: {
+      'viewOnly': true,
+      'inIncomingShare': true,
+      'canReceiveFiles': false,
+    },
+  ),
   {
     'path': 'Documents/a.txt',
     'kind': 'file',
@@ -211,19 +233,13 @@ void main() {
           addDestinationProblem(rows[path]!, ready: ready, paused: paused);
       expect(problem('Documents'), isNull);
       expect(problem('Shared/Team'), isNull);
-      expect(problem('Archive'), 'Not available on this device');
+      expect(problem('Archive'), isNull);
+      expect(problem('Draft'), 'Not available on this device');
+      expect(problem('Clash'), 'Not available on this device');
       expect(problem('Shared/Photos'), 'View-only share');
       expect(problem('Documents', paused: true), 'Sync is paused');
       expect(
         problem('Documents', ready: false),
-        'Not available on this device',
-      );
-      expect(
-        addDestinationProblem(
-          {...rows['Documents']!, 'conflict': 'x'},
-          ready: true,
-          paused: false,
-        ),
         'Not available on this device',
       );
       expect(addOffered(rows['Documents/a.txt']!), isFalse);
@@ -242,9 +258,16 @@ void main() {
       await tester.tapAt(const Offset(5, 5));
       await tester.pumpAndSettle();
 
+      await _openMenu(tester, 'Archive');
+      expect(_item(tester, 'addFiles:Archive').enabled, isTrue);
+      expect(_item(tester, 'addFolder:Archive').enabled, isTrue);
+      await tester.tapAt(const Offset(5, 5));
+      await tester.pumpAndSettle();
+
       for (final (path, reason) in [
         ('Photos', 'View-only share'),
-        ('Archive', 'Not available on this device'),
+        ('Draft', 'Not available on this device'),
+        ('Clash', 'Not available on this device'),
       ]) {
         await _openMenu(tester, path);
         expect(_item(tester, 'addFiles:$path').enabled, isFalse, reason: path);
@@ -284,6 +307,7 @@ void main() {
         'Documents/Receipts',
         'Shared',
         'Shared/Team',
+        'Archive',
       ]) {
         expect(
           find.byKey(ValueKey('share-folder:$path')),
@@ -292,7 +316,8 @@ void main() {
         );
       }
       for (final path in [
-        'Archive',
+        'Draft',
+        'Clash',
         'Shared/Photos',
         'Photos',
         'Documents/a.txt',
@@ -578,6 +603,22 @@ void main() {
         find.text('Pair this phone with AnJ Cloud first.'),
         findsOneWidget,
       );
+      controller
+        ..pairingState = 'paired'
+        ..stateReceived = false
+        ..firstSyncPending = true;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SaveToCloudScreen(
+            adds: adds,
+            controller: controller,
+            share: const SharedItems([AddSource(path: 'y', reference: 'y')]),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Finish setting up AnJ Cloud first.'), findsOneWidget);
+      expect(find.text('Loading folders…'), findsNothing);
       expect(find.byKey(const ValueKey('share-save')), findsNothing);
       expect(worker.calls, isEmpty);
       await close(tester);

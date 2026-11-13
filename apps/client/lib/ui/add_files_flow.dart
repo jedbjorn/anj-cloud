@@ -16,9 +16,9 @@ String? addDestinationProblem(
 }) {
   if (paused) return 'Sync is paused';
   if (entry['viewOnly'] == true) return 'View-only share';
-  if (!ready ||
-      entry['localDirectoryAvailable'] != true ||
-      entry['conflict'] != null) {
+  // The worker's own test (spec #43, decision #190): on this device, or a
+  // synced Cloud-only folder it creates here first.
+  if (!ready || entry['canReceiveFiles'] != true) {
     return 'Not available on this device';
   }
   return null;
@@ -512,6 +512,10 @@ class _SaveToCloudScreenState extends State<SaveToCloudScreen> {
     }
     if (controller.paused) {
       return 'Sync is paused. Resume sync, then share again.';
+    }
+    // Paired, but sync has not started: the first-sync screen waits.
+    if (controller.firstSyncPending) {
+      return 'Finish setting up AnJ Cloud first.';
     }
     if (!controller.stateReceived) return null;
     if (!controller.canCreateFolder) {

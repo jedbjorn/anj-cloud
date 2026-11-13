@@ -98,43 +98,110 @@ class FileAdder {
     }
   }
 
-  /// Names beside [parent], locally and in the cloud.
+  /// A row of a completed deletion: its name is free again.
+  static bool _deletedRow(Entry entry) =>
+      entry.etag == null &&
+      !entry.expectedPresent &&
+      const {
+        'deleted',
+        'deleted remotely',
+        'removed locally',
+      }.contains(entry.status);
+
+  /// Names beside [parent], locally and in the cloud. A name deleted
+  /// everywhere is free.
   Set<String> _siblings(String parent) => {
     for (final key in {
       ...tree.scanItems(includeExcluded: true).keys,
-      ...engine.manifest.entries.keys,
+      for (final entry in engine.manifest.entries.values)
+        if (!_deletedRow(entry)) entry.path,
       for (final op in engine.manifest.operations.values)
         if (op.kind != 'artifact') op.path,
     })
       if (_parentOf(key) == parent) p.posix.basename(key),
   };
 
-  /// [folder] can receive items: a directory here, not excluded and not in a
-  /// View only share. A folder this add just made has no manifest entry
-  /// until the next pass and still qualifies.
-  void _writableFolder(String folder) {
+  static bool _pendingDelete(SyncEngine engine, String path) =>
+      engine.manifest.operations.values.any(
+        (op) =>
+            op.kind == 'delete' &&
+            (op.path == path || p.posix.isWithin(op.path, path)),
+      );
+
+  /// Spec #43 Eligible Destinations (decision #190), the one test the
+  /// library projection (`canReceiveFiles`) and the worker share: a real
+  /// folder without a conflict, not excluded, not View only, with no pending
+  /// deletion on it or above it, that is either on this device or a synced
+  /// Cloud-only folder (a recorded cloud version, not a held #120 name) whose
+  /// missing parents pass the same test.
+  static bool canReceive(SyncEngine engine, String path) {
+    if (path.isEmpty || isSyncExcluded(path)) return false;
+    final entry = engine.manifest.entries[path];
+    if (entry == null ||
+        entry.kind != ItemKind.directory ||
+        entry.conflict != null ||
+        engine.viewOnly(path) ||
+        _pendingDelete(engine, path)) {
+      return false;
+    }
+    for (var current = path; current.isNotEmpty; current = _parentOf(current)) {
+      final row = engine.manifest.entries[current];
+      if (row == null ||
+          row.kind != ItemKind.directory ||
+          row.conflict != null ||
+          row.status.startsWith('deleted')) {
+        return false;
+      }
+      // On this device: nothing above it needs creating.
+      if (row.expectedPresent && engine.localDirectories.contains(current)) {
+        return true;
+      }
+      if (row.etag == null || isServerNameHold(row.status)) return false;
+    }
+    return true;
+  }
+
+  /// [folder] can receive items: a directory here, or a synced Cloud-only
+  /// folder ([canReceive]), which [create] makes on this device first (the
+  /// pass then uploads and releases what is added; the folder stays). A
+  /// folder this add just made has no manifest entry until the next pass and
+  /// still qualifies.
+  void _writableFolder(String folder, {bool create = true}) {
     if (folder.isNotEmpty) {
       validateRelative(folder);
       final entry = engine.manifest.entries[folder];
-      if (tree.statItem(folder)?.kind != ItemKind.directory ||
-          (entry != null && entry.kind != ItemKind.directory) ||
+      final here = tree.statItem(folder)?.kind == ItemKind.directory;
+      if ((!here && !canReceive(engine, folder)) ||
+          (entry != null &&
+              (entry.kind != ItemKind.directory || entry.conflict != null)) ||
           isSyncExcluded(folder)) {
         throw const DocumentsFailure(
           'notFound',
           'The folder is not available on this device',
         );
       }
+      if (!here && create) _materialize(folder);
     }
     if (engine.viewOnly(folder)) {
       throw const DocumentsFailure('readOnly', 'View-only share');
     }
-    if (engine.manifest.operations.values.any(
-      (op) =>
-          op.kind == 'delete' &&
-          (op.path == folder || p.posix.isWithin(op.path, folder)),
-    )) {
+    if (_pendingDelete(engine, folder)) {
       throw const DocumentsFailure('refused', 'The folder is being deleted');
     }
+  }
+
+  /// Creates the Cloud-only [folder] (and missing parents) on this device,
+  /// the way downloads and moves do.
+  void _materialize(String folder) {
+    tree.ensureDirectory(folder);
+    for (
+      var current = folder;
+      current.isNotEmpty;
+      current = _parentOf(current)
+    ) {
+      engine.localDirectories.add(current);
+    }
+    engine.markDirty(folder);
   }
 
   /// Whether [name] is used in [taken], exactly or apart from case or
@@ -185,7 +252,8 @@ class FileAdder {
   /// before children. [free] is the free space of the root's volume.
   Map<String, Object?> check(String destination, List<Map> items, {int? free}) {
     if (destination.isNotEmpty) validateRelative(destination);
-    _writableFolder(destination);
+    // Nothing is created before the user confirms.
+    _writableFolder(destination, create: false);
     return plan(
       items,
       siblings: _siblings(destination),

@@ -469,6 +469,127 @@ void main() {
     });
   });
 
+  group('decision #190: a synced Cloud-only folder is a destination', () {
+    /// Documents/Cloudy exists in the cloud only: no local directory.
+    Future<void> cloudOnlyFolder() async {
+      engine.setRetention('Documents', Retention.cloud);
+      await cloud.mkdir('Documents/Cloudy');
+      cloud.put('Documents/Cloudy/there.txt', 'there');
+      await engine.tick();
+      await engine.tick();
+      expect(
+        Directory('${tree.root.path}/Documents/Cloudy').existsSync(),
+        isFalse,
+      );
+      expect(store.entries['Documents/Cloudy']?.etag, isNotNull);
+    }
+
+    test('added files upload, are released, and the folder stays', () async {
+      await cloudOnlyFolder();
+      expect(FileAdder.canReceive(engine, 'Documents/Cloudy'), isTrue);
+      // The check creates nothing before the user confirms.
+      adder.check('Documents/Cloudy', [
+        {'path': 'new.txt', 'size': 3},
+      ]);
+      expect(
+        Directory('${tree.root.path}/Documents/Cloudy').existsSync(),
+        isFalse,
+      );
+      final path = await adder.addFile(
+        'Documents/Cloudy',
+        'new.txt',
+        source('new.txt', 'new'),
+        number: true,
+      );
+      expect(path, 'Documents/Cloudy/new.txt');
+      for (var i = 0; i < 4; i++) {
+        await engine.tick();
+      }
+      expect(utf8.decode(cloud.files[path]!), 'new');
+      expect(local(path).existsSync(), isFalse, reason: 'released locally');
+      expect(store.entries[path]!.status, 'cloud-only');
+      expect(
+        Directory('${tree.root.path}/Documents/Cloudy').existsSync(),
+        isTrue,
+      );
+      expect(engine.retention('Documents/Cloudy'), Retention.cloud);
+      expect(cloud.files.containsKey('Documents/Cloudy/there.txt'), isTrue);
+    });
+
+    test('not offered: no recorded cloud version, a conflict, a pending '
+        'deletion above it', () async {
+      await cloudOnlyFolder();
+      final row = store.entries['Documents/Cloudy']!;
+      final etag = row.etag;
+      row.etag = null;
+      expect(FileAdder.canReceive(engine, 'Documents/Cloudy'), isFalse);
+      row
+        ..etag = etag
+        ..conflict = 'both changed';
+      expect(FileAdder.canReceive(engine, 'Documents/Cloudy'), isFalse);
+      await expectLater(
+        adder.addFile(
+          'Documents/Cloudy',
+          'x.txt',
+          source('x', 'x'),
+          number: true,
+        ),
+        skipped('notFound'),
+      );
+      row.conflict = null;
+      expect(FileAdder.canReceive(engine, 'Documents/Cloudy'), isTrue);
+      final pending = Operation(uniqueId(), 'delete', 'Documents');
+      store.operations[pending.id] = pending;
+      expect(FileAdder.canReceive(engine, 'Documents/Cloudy'), isFalse);
+      store.operations.remove(pending.id);
+      expect(
+        Directory('${tree.root.path}/Documents/Cloudy').existsSync(),
+        isFalse,
+      );
+    });
+
+    test('deleted in the cloud during the add: the bytes are kept', () async {
+      await cloudOnlyFolder();
+      final path = await adder.addFile(
+        'Documents/Cloudy',
+        'mine.txt',
+        source('mine.txt', 'mine'),
+        number: true,
+      );
+      // Another device deletes the folder before this pass uploads.
+      cloud.remove('Documents/Cloudy/there.txt');
+      cloud.directories.remove('Documents/Cloudy');
+      cloud.versions.remove('Documents/Cloudy');
+      for (var i = 0; i < 4; i++) {
+        await engine.tick();
+      }
+      // The added file stays on this device and the folder needs review.
+      expect(local(path).readAsStringSync(), 'mine');
+      expect(store.entries['Documents/Cloudy']!.conflict, isNotNull);
+      expect(cloud.files.containsKey(path), isFalse);
+    });
+  });
+
+  test('a name deleted everywhere is free again', () async {
+    local('Documents/Receipt.pdf').writeAsStringSync('old');
+    await engine.tick();
+    engine.requestDelete('Documents/Receipt.pdf');
+    for (var i = 0; i < 3; i++) {
+      await engine.tick();
+    }
+    expect(cloud.files.containsKey('Documents/Receipt.pdf'), isFalse);
+    expect(store.entries['Documents/Receipt.pdf']?.status, 'deleted');
+    expect(
+      await adder.addFile(
+        'Documents',
+        'Receipt.pdf',
+        source('Receipt.pdf', 'new'),
+        number: true,
+      ),
+      'Documents/Receipt.pdf',
+    );
+  });
+
   test(
     'retention: an added file follows its folder like any new file',
     () async {
