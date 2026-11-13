@@ -68,9 +68,13 @@ List<PopupMenuEntry<String>> addMenuItems(String path, String? reason) => [
     ),
 ];
 
-void _say(BuildContext context, String text) =>
+void _say(
+  BuildContext context,
+  String text, {
+  Duration duration = const Duration(seconds: 4),
+}) =>
     ScaffoldMessenger.maybeOf(context)
-        ?.showSnackBar(SnackBar(content: Text(text)));
+        ?.showSnackBar(SnackBar(content: Text(text), duration: duration));
 
 /// Folder ⋮ → Add files… / Add folder…: the system picker, then
 /// [addSources].
@@ -143,7 +147,8 @@ Future<AddResult?> addSources(
   }
   if (!context.mounted) return result;
   if (result.plain) {
-    _say(context, result.headline);
+    // The confirmation of what was copied stays long enough to read.
+    _say(context, result.headline, duration: const Duration(seconds: 6));
   } else {
     await showDialog<void>(
       context: context,

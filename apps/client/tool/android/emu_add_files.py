@@ -67,6 +67,17 @@ def confirm_add():
     u.adb("shell", "input", "tap", str((x1 + x2) // 2), str((y1 + y2) // 2))
 
 
+def find_now(pattern, timeout=60):
+    """[u.find] without its pause between screen reads: for a summary snackbar."""
+    deadline = time.time() + timeout
+    regex = re.compile(pattern, re.S | re.I)
+    while time.time() < deadline:
+        for n in u.nodes():
+            if regex.search(u.label(n)):
+                return n
+    return None
+
+
 def dump(name):
     (u.OUT / f"screen-{name}.txt").write_text(u.screen_text() + "\n")
 
@@ -320,7 +331,7 @@ def main():
         u.step("AC1 the confirmation names the folder and the count", confirm is not None
                and re.search(r"3 files", u.screen_text()) is not None, screen=u.screen_text()[:300])
         confirm_add()
-        added = u.find(r"Added 3 files to Documents/Receipts", timeout=60)
+        added = find_now(r"Added 3 files to Documents/Receipts")
         u.step("AC1 summary: Added 3 files", added is not None)
         uploaded = wait_server([f"Documents/Receipts/{n}" for n in ("one.txt", "two.pdf", "three.jpg")])
         unchanged = {n: u.adb("shell", "sha256sum", f"{device}/{n}").split()[0] for n in ("one.txt", "two.pdf", "three.jpg")}
@@ -336,7 +347,7 @@ def main():
             u.find(r"^Add to Documents/Receipts", timeout=30)
             confirm_add()
             if attempt == 1:
-                u.step("AC5 first a.txt added", u.find(r"Added 1 file to Documents/Receipts", timeout=60) is not None)
+                u.step("AC5 first a.txt added", find_now(r"Added 1 file to Documents/Receipts") is not None)
         renamed = u.find(r"Added as a \(2\)\.txt", timeout=60)
         dump("ac5-summary")
         u.step("AC5 the second is numbered: Added as a (2).txt", renamed is not None, screen=u.screen_text()[:400])
@@ -356,7 +367,7 @@ def main():
         u.step("AC2 the tree is read and confirmed", confirm is not None
                and "3 folders and 2 files" in u.screen_text(), screen=u.screen_text()[:300])
         confirm_add()
-        u.step("AC2 summary", u.find(r"Added 3 folders and 2 files to Documents", timeout=60) is not None)
+        u.step("AC2 summary", find_now(r"Added 3 folders and 2 files to Documents") is not None)
         tree = wait_server(["Documents/Tree/top.txt", "Documents/Tree/Sub/inner.txt"])
         deadline = time.time() + 60
         while time.time() < deadline and not folder_on_server("Documents/Tree/Empty"):
