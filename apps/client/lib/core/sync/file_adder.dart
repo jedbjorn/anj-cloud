@@ -34,7 +34,7 @@ enum AddSkip {
   /// The reason in plain words; [limit] is the upload limit in bytes.
   String text(int limit) => switch (this) {
     overLimit => 'Larger than the ${sizeLabel(limit)} upload limit',
-    blockedName => 'Name not allowed on other devices',
+    blockedName => "Can't sync this name",
     excluded => 'Not synchronized by AnJ Cloud',
     unreadable => 'Could not read this file',
     noStream => 'Not a file that can be copied',
