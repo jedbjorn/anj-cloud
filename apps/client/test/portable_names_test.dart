@@ -158,6 +158,27 @@ void main() {
     expect(overall(), isNot(SyncStatus.attention));
   });
 
+  test('AC8 after a pass that is not an audit: the rows at the old name of '
+      'a folder renamed in place are settled', () async {
+    await engine.tick();
+    Directory('${tree.root.path}/Documents/F ').createSync();
+    write('Documents/F /c.rfa', 'c');
+    store.entries
+      ..['Documents/F '] = (Entry('Documents/F ', ItemKind.directory)
+        ..status = 'Name not allowed on other devices: rename to sync')
+      ..['Documents/F /c.rfa'] = (Entry('Documents/F /c.rfa', ItemKind.file)
+        ..status = 'pending: the folder name is not allowed on other devices');
+    store.save();
+    await engine.tick();
+    await engine.tick();
+    expect(
+      store.entries.values.where((e) => isLegacyNameHold(e.status)),
+      isEmpty,
+    );
+    expect(cloud.files['Documents/F/c.rfa'], 'c'.codeUnits);
+    expect(entry('Documents/F/c.rfa').status, 'current local');
+  });
+
   test('ordinary names and dotfiles upload unchanged', () async {
     final names = [
       'report.txt',

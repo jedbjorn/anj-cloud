@@ -2264,6 +2264,9 @@ class SyncEngine {
         _rescan(const {}, {to});
       }
       _touched.addAll({from, to});
+      // The rows left at the old name are reconciled this pass, even when
+      // it is not an audit (a row never synchronized there is settled).
+      _dirty.addAll(manifest.entries.keys.where((v) => withinOrAt(from, v)));
     }
   }
 
