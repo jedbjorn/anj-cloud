@@ -71,6 +71,13 @@ On macOS use `shasum -a 256 -c` instead. Alternatively, transfer the checked APK
 allowing installs from that source. Android accepts updates only with the same signing certificate.
 The synced folder is chosen in shared storage, visible to file managers and other apps you authorize.
 
+To put files from the phone into AnJ Cloud, open a folder's **⋮** menu and choose **Add files…** or
+**Add folder…**, or share from any app (Gallery, Files) and pick **AnJ Cloud**. The items are copied, never
+moved, and sync like any new file. Before anything is copied the app lists what it will skip: files over the
+server's upload limit, names other devices cannot hold, and names AnJ Cloud never syncs. A name already used in
+the folder gets a number, such as `photo (2).jpg`. No storage permission is needed: Android's picker grants
+access to the chosen items only.
+
 ## Building your own clients
 
 Building is an alternative to the official downloads. Set up your deployment profile with your default

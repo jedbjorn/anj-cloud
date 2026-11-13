@@ -54,6 +54,28 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- "AnJ Cloud" in the Share sheet for files of any type (spec #43). It only forwards the
+             share, with its read grant, to MainActivity in AnJ Cloud's own task, so the one engine
+             stays attached to one activity and an open library keeps its place. -->
+        <activity
+            android:name=".ShareActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:label="${appLabel}"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="*/*"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="*/*"/>
+            </intent-filter>
+        </activity>
         <!-- Runs only while files transfer and stops when the queue drains (spec #28 A4). -->
         <service
             android:name=".TransferService"

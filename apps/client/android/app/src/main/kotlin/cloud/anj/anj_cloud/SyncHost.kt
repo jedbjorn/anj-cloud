@@ -27,6 +27,7 @@ object SyncHost {
         // Before the entry point runs, so a background run that started the process finds it.
         BackgroundChannel.install(app, engine)
         UpdateChannel.register(app, engine)
+        AddFilesChannel.register(app, engine)
         // The documents provider's and "Apps with access" channels (spec #28 A5), listening
         // before the Dart entry starts.
         DocumentsBridge.attach(app, engine)

@@ -958,8 +958,12 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
       'op': op,
       'args': args,
     });
+    // An open may download first; an add copy may wait for a transfer the
+    // running pass is making.
     return result.future.timeout(
-      op == 'open' ? const Duration(minutes: 10) : const Duration(seconds: 60),
+      op == 'open' || op.startsWith('add')
+          ? const Duration(minutes: 10)
+          : const Duration(seconds: 60),
       onTimeout: () {
         _documentsRequests.remove(request);
         throw const DocumentsFailure(
@@ -969,6 +973,11 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
       },
     );
   }
+
+  /// Stops the add copy of [run] at its next chunk (spec #43); answered by
+  /// that copy's `addFile` failing as cancelled.
+  void cancelAdd(String run) =>
+      _input?.send({'action': 'addCancel', 'run': run});
 
   /// The running package download's request, for [cancelReleaseDownload].
   String? _activeDownload;
