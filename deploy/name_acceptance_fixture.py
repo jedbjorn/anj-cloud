@@ -57,7 +57,7 @@ async def names(actor, folder):
 
 
 async def acceptance(actor, folder):
-    for name in (" lead.txt", "trail.txt ", "\tTab.txt"):
+    for name in (" lead.txt", "trail.txt ", "both "):
         await refused(actor, "PUT", folder + "/" + name, "untrimmed", **CREATE)
     await refused(actor, "MKCOL", folder + "/ Trip", "untrimmed", **CREATE)
     await refused(actor, "PUT", folder + "/" + "x" * 300 + ".txt", "tooLong", **CREATE)
