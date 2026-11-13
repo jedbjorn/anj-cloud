@@ -13,6 +13,7 @@ import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.provider.OpenableColumns
 import android.util.Log
+import android.webkit.MimeTypeMap
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -258,11 +259,21 @@ object AddFilesChannel {
             }
         }
         return mapOf(
-            "path" to (name ?: uri.lastPathSegment?.substringAfterLast('/')?.ifEmpty { null } ?: "file"),
+            "path" to (name ?: fallbackName(app, uri)),
             "size" to size,
             "virtual" to virtual,
             "uri" to uri.toString(),
         )
+    }
+
+    /// A name for a source whose provider reports none: the URI's last segment, with the
+    /// extension of its type when it has none (so a shared photo stays a .jpg).
+    private fun fallbackName(app: Context, uri: Uri): String {
+        val base = uri.lastPathSegment?.substringAfterLast('/')?.ifEmpty { null } ?: "file"
+        if (base.substringAfterLast('.', "").isNotEmpty()) return base
+        val type = runCatching { app.contentResolver.getType(uri) }.getOrNull()
+        val extension = type?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
+        return if (extension.isNullOrEmpty()) base else "$base.$extension"
     }
 
     /// The picked tree, the folder itself first and every folder before its contents.
