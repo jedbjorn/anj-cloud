@@ -62,6 +62,9 @@ async def scenario(stack, run):
     finally:
         if actor is not None:
             try:
+                # A fresh session: the gateway closed the idle one while the client ran.
+                await actor.close()
+                await actor.open()
                 try:
                     etag = await actor.etag(folder + "/")
                     await actor.request("DELETE", href(folder), headers={"If-Match": etag}, expected=(204,))

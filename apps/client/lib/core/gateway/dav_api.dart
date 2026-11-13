@@ -1016,6 +1016,26 @@ class DavCloud
   }
 
   @override
+  Future<List<TrashRestoreResult>> restoreTrashMany(List<String> ids) async {
+    final results = <TrashRestoreResult>[];
+    try {
+      // The gateway takes at most 500 per request.
+      for (var start = 0; start < ids.length; start += 500) {
+        final chunk = [for (final id in ids.skip(start).take(500)) trashId(id)];
+        final data = await _sharing(
+          'POST',
+          '/trash/restore',
+          body: {'ids': chunk},
+        );
+        results.addAll(parseRestoreMany(data, chunk));
+      }
+      return results;
+    } finally {
+      forgetListing();
+    }
+  }
+
+  @override
   Future<void> deleteTrash(String id) async {
     await _sharing('DELETE', '/trash/${trashId(id)}');
   }

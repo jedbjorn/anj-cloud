@@ -178,6 +178,31 @@ void main() {
     });
   });
 
+  testWidgets('selection follows the entry, not its place in the list', (
+    tester,
+  ) async {
+    await open(tester);
+    await tester.tap(find.byKey(const ValueKey('trash-select')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('notes.txt'));
+    await tester.pumpAndSettle();
+    // The list reloads with another order (a new deletion on top).
+    controller.entries2 = [
+      {...controller.entries2[1]},
+      {...controller.entries2[0]},
+    ];
+    await tester.fling(find.byType(ListView), const Offset(0, 400), 1000);
+    await tester.pumpAndSettle();
+    expect(controller.calls.where((c) => c.$1 == 'list'), hasLength(2));
+    await tester.tap(find.byKey(const ValueKey('trash-delete-selected')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('confirm-trash-delete')));
+    await tester.pumpAndSettle();
+    final delete = controller.calls.lastWhere((c) => c.$1 == 'delete');
+    expect(delete.$2['deviceIds'], ['dev-2']);
+    expect(delete.$2['serverIds'], isEmpty);
+  });
+
   testWidgets('offline: the note says only this device is shown', (
     tester,
   ) async {

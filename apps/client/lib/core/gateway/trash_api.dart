@@ -76,11 +76,23 @@ class TrashRestore {
   final bool renamed;
 }
 
+/// One item of a batch restore: where it went, or why it did not.
+class TrashRestoreResult {
+  const TrashRestoreResult(this.id, {this.restored, this.error});
+  final String id;
+  final TrashRestore? restored;
+  final String? error;
+}
+
 /// The gateway's `/trash/` routes (spec #44) over this device's certificate.
 abstract interface class TrashApi {
   /// Null when the gateway has no trash routes (an older server).
   Future<ServerTrash?> listTrash();
   Future<TrashRestore> restoreTrash(String id);
+
+  /// `POST /trash/restore`: several items with one listing and one hold of
+  /// the gateway's lock (Undo of a bulk delete), one result per id.
+  Future<List<TrashRestoreResult>> restoreTrashMany(List<String> ids);
   Future<void> deleteTrash(String id);
   Future<int> emptyTrash();
 }
@@ -111,7 +123,37 @@ mixin ForwardTrash on ForwardSharing implements TrashApi {
   @override
   Future<TrashRestore> restoreTrash(String id) => _trash.restoreTrash(id);
   @override
+  Future<List<TrashRestoreResult>> restoreTrashMany(List<String> ids) =>
+      _trash.restoreTrashMany(ids);
+  @override
   Future<void> deleteTrash(String id) => _trash.deleteTrash(id);
   @override
   Future<int> emptyTrash() => _trash.emptyTrash();
+}
+
+/// The batch route's answer, `{"results": [...]}`, as results for [ids].
+List<TrashRestoreResult> parseRestoreMany(Object? data, List<String> ids) {
+  final rows = data is Map && data['results'] is List
+      ? (data['results'] as List).whereType<Map>().toList()
+      : throw const CloudFailure('Invalid trash response.');
+  final byId = {for (final row in rows) '${row['id']}': row};
+  return [
+    for (final id in ids)
+      () {
+        final row = byId[id];
+        final path = row?['path'];
+        if (row != null && path is String) {
+          validateRelative(path);
+          return TrashRestoreResult(
+            id,
+            restored: TrashRestore(path, renamed: row['renamed'] == true),
+          );
+        }
+        final error = row?['error'];
+        return TrashRestoreResult(
+          id,
+          error: error is String && error.isNotEmpty ? error : 'Not restored',
+        );
+      }(),
+  ];
 }

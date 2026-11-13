@@ -446,10 +446,14 @@ void main() {
       // synchronization/recovery guards own content changed after the last scan.
       expect(engine.applyBulk('delete', [selected])['accepted'], 1);
       await engine.tick();
-      final entry = store.entries['Projects/Child/note.txt']!;
-      expect(entry.preservedCopies, isNotEmpty);
+      // The latest bytes are in the device trash, marked as the version to
+      // restore (spec #44).
+      final copy = store.operations.values.singleWhere(
+        (op) => op.kind == 'trash' && op.path == 'Projects/Child/note.txt',
+      );
+      expect(copy.data['changed'], isTrue);
       expect(
-        engine.artifacts.resolve(entry.preservedCopies.last).readAsStringSync(),
+        engine.artifacts.resolve(copy.staged!).readAsStringSync(),
         'late unsynchronized save',
       );
     });

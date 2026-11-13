@@ -27,6 +27,7 @@ class DeviceTrashItem {
     required this.path,
     required this.size,
     required this.at,
+    this.changed = false,
   });
   final String id;
   final String path;
@@ -34,11 +35,16 @@ class DeviceTrashItem {
 
   /// When it entered the trash (ms since epoch).
   final int at;
+
+  /// The deleted file held edits the server never had: these bytes, not the
+  /// server's trash item, are the latest version (Undo and Restore use them).
+  final bool changed;
   Map<String, Object?> toJson() => {
     'id': id,
     'path': path,
     'size': size,
     'at': at,
+    'changed': changed,
   };
 }
 
@@ -81,6 +87,31 @@ class DeviceTrash {
 
   int get _now => clock().millisecondsSinceEpoch;
 
+  static const serverSetting = 'serverTrash';
+  static const checkedSetting = 'serverTrashChecked';
+
+  /// The server has the gateway's trash routes (seen at a pass or in the
+  /// Trash view). Until it has, a deleted file's copy is kept here even when
+  /// the server held the same bytes: an older gateway gives no way back.
+  bool get serverTrash => manifest.setting(serverSetting) == 'yes';
+
+  /// Whether a pass should ask the server again: about once a day.
+  bool get checkDue {
+    final at = int.tryParse(manifest.setting(checkedSetting) ?? '');
+    return at == null ||
+        at > _now ||
+        _now - at >= Duration.millisecondsPerDay ||
+        manifest.setting(serverSetting) == null;
+  }
+
+  /// What the server answered: its trash (routes and `trash_days`), or null
+  /// for a gateway without them.
+  void learned(ServerTrash? listed) {
+    manifest.setSetting(serverSetting, listed == null ? 'no' : 'yes');
+    if (listed != null) days = listed.trashDays;
+    manifest.setSetting(checkedSetting, '$_now');
+  }
+
   Iterable<Operation> get records =>
       manifest.operations.values.where((o) => o.kind == deviceTrashKind);
 
@@ -100,6 +131,7 @@ class DeviceTrash {
             path: record.path,
             size: record.data['size'] as int? ?? 0,
             at: record.data['at'] as int? ?? _now,
+            changed: record.data['changed'] == true,
           ),
       ]..sort((a, b) {
         final order = b.at.compareTo(a.at);
@@ -108,14 +140,18 @@ class DeviceTrash {
 
   int get bytes => items().fold(0, (sum, item) => sum + item.size);
 
-  /// Moves the copies of every completed deletion into the trash (also the
-  /// migration of rows left by earlier versions, T7: their clock starts now).
-  /// A row that still has pending work, a conflict about something other
-  /// than its copy, or a copy whose ownership is uncertain keeps its row.
-  /// Returns how many copies moved.
+  /// Moves the copy each completed deletion produced into the trash (also the
+  /// migration of rows left by earlier versions, T7: their clock starts now):
+  /// the bytes a deletion preserved, or the snapshot of a file removed before
+  /// it ever uploaded. Every other copy of the row (a replacement, eviction or
+  /// conflict copy, a leftover snapshot) keeps its Recovery row (spec #44).
+  /// A row with pending work, a conflict about something other than its
+  /// copy, or a copy whose ownership is uncertain keeps its row too. Returns
+  /// how many copies moved.
   int collect() {
     var moved = 0;
     final now = _now;
+    final serverTrash = this.serverTrash;
     for (final entry in manifest.entries.values.toList()) {
       if (!deletionStatuses.contains(entry.status)) continue;
       if (entry.conflict != null &&
@@ -139,43 +175,62 @@ class DeviceTrash {
           }
           continue;
         }
-        if (!present.every(recovery.owned)) {
+        final names = {for (final c in present) c.staged};
+        final deletion = manifest.operations.values
+            .where(
+              (o) =>
+                  o.kind == 'retained' &&
+                  o.path == entry.path &&
+                  names.contains(o.staged) &&
+                  (o.data['deletion'] == true ||
+                      o.data['unsyncedRemoval'] == true),
+            )
+            .firstOrNull;
+        if (deletion == null || !present.every(recovery.owned)) {
           kept = true;
           continue;
         }
-        // A copy of a version whose hash is known waits for spec #12 rule 2:
-        // released once nothing holds it open, or found changed (a conflict
-        // about the copy) and then moved here.
-        if (entry.conflict == null &&
-            present.any(
-              (c) => manifest.operations.values.any(
-                (o) =>
-                    o.kind == 'retained' &&
-                    o.staged == c.staged &&
-                    o.data['deletion'] == true &&
-                    o.data['deletedVersionHash'] != null,
-              ),
-            )) {
+        final edited =
+            deletion.data['localChanged'] == true ||
+            entry.conflict == preservedChangedConflict;
+        // A copy of a version the server holds waits for spec #12 rule 2
+        // (released once nothing holds it open) when the server has a trash
+        // to restore from; a copy found changed comes here at once.
+        if (serverTrash &&
+            !edited &&
+            entry.conflict == null &&
+            deletion.data['deletion'] == true &&
+            deletion.data['deletedVersionHash'] != null) {
           kept = true;
           continue;
         }
         final lead = present.first;
-        final retainedHash = manifest.operations.values
-            .where((o) => o.kind == 'retained' && o.staged == lead.staged)
-            .map((o) => o.hash)
-            .firstOrNull;
+        // The same bytes of the same deletion already in the trash (a deletion
+        // copy and the snapshot of an upload that never finished): one entry;
+        // this copy is released under the guard once it verifies identical.
+        final twin = _twin(entry.path, lead, now);
+        if (twin != null) {
+          try {
+            recovery.removeNamesVerified(present, entry.path, twin);
+            changed = true;
+          } on FileSystemException {
+            kept = true;
+          }
+          continue;
+        }
         final record =
             Operation(
                 uniqueId(),
                 deviceTrashKind,
                 entry.path,
                 staged: lead.staged,
-                hash: lead.record?.hash ?? retainedHash,
+                hash: lead.record?.hash ?? deletion.hash,
               )
               ..data = {
                 'at': now,
                 'size': lead.info!.size,
                 'names': [for (final c in present) c.staged],
+                if (edited) 'changed': true,
               };
         manifest.operations[record.id] = record;
         for (final c in present) {
@@ -194,6 +249,48 @@ class DeviceTrash {
       if (changed) manifest.save();
     }
     return moved;
+  }
+
+  /// The content hash of the trash record for [path] made within
+  /// [sameDeletion] of [now] that holds exactly [copy]'s bytes, else null.
+  String? _twin(String path, RecoveryCopy copy, int now) {
+    final recent = records
+        .where(
+          (r) =>
+              r.path == path &&
+              ((r.data['at'] as int? ?? now) - now).abs() <=
+                  sameDeletion.inMilliseconds,
+        )
+        .toList();
+    if (recent.isEmpty) return null;
+    final hash = _hash(copy);
+    if (hash == null) return null;
+    for (final record in recent) {
+      var known = record.data['sha'] as String?;
+      if (known == null) {
+        final lead = recovery
+            .trashCopies(record)
+            .where((c) => c.info != null)
+            .firstOrNull;
+        known = lead == null ? null : _hash(lead);
+        if (known != null) record.data['sha'] = known;
+      }
+      if (known == hash) return hash;
+    }
+    return null;
+  }
+
+  String? _hash(RecoveryCopy copy) {
+    try {
+      return tree.native.copyAndHash(
+        tree.stageFd,
+        p.basename(copy.staged),
+        null,
+        purpose: 'trash-twin',
+      );
+    } on FileSystemException {
+      return null;
+    }
   }
 
   /// Removes copies older than [days] (more than exactly that long ago) and
@@ -363,7 +460,8 @@ class TrashEntry {
 
   /// Deletion time, ms since epoch.
   int get deleted => server != null ? server!.deleted * 1000 : device!.at;
-  int get size => server?.size ?? device!.size;
+  int get size =>
+      device?.changed == true ? device!.size : server?.size ?? device!.size;
   bool get folder => server?.folder ?? false;
 
   Map<String, Object?> toJson(int days) => {
@@ -378,6 +476,8 @@ class TrashEntry {
     'deviceId': device?.id,
     'deviceSize': device?.size,
     'onlyDevice': server == null,
+    // The device copy holds edits the server never had: Restore uses it.
+    'deviceFirst': device?.changed == true,
   };
 }
 

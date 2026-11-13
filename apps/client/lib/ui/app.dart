@@ -9,6 +9,7 @@ import 'admin_section.dart';
 import '../core/app/add_files.dart';
 import '../core/app/controller.dart';
 import '../core/app/fetch_jobs.dart';
+import '../core/sync/bulk_targets.dart';
 import 'recovery_actions.dart';
 import 'create_folder_dialog.dart';
 import 'downloader_tab.dart';

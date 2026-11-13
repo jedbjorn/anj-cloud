@@ -239,6 +239,23 @@ Future<void> main(List<String> args) async {
           local('taken (restored).txt').readAsStringSync() == 'deleted bytes',
       result,
     );
+    // Edited, then deleted before any pass sent the edit: the server trashes
+    // the older version, and Undo brings back the edited bytes.
+    local('edited.txt').writeAsStringSync('version one', flush: true);
+    await settle();
+    local('edited.txt').writeAsStringSync('version two', flush: true);
+    final edited = delete(['edited.txt']);
+    await engine.tick();
+    final undoEdited = await engine.undoDelete([
+      path('edited.txt'),
+    ], edited['at'] as int);
+    await settle();
+    claim(
+      'Undo of a file edited here brings back the edit, not the older server version',
+      ((undoEdited['results'] as List).single as Map)['result'] == 'restored' &&
+          local('edited.txt').readAsStringSync() == 'version two' &&
+          await serverSha('edited.txt') == sha('version two'.codeUnits),
+    );
     stdout.writeln(jsonEncode({'passed': true, 'claims': claims}));
   } finally {
     engine.close();

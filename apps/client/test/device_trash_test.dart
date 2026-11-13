@@ -71,6 +71,7 @@ class _TrashCloud extends FakeCloud implements TrashApi {
   @override
   Future<ServerTrash?> listTrash() async {
     check();
+    if (!trashRoutes) return null;
     return ServerTrash(trashDays, [
       for (final MapEntry(key: id, value: item) in trash.entries)
         ServerTrashItem(
@@ -102,6 +103,20 @@ class _TrashCloud extends FakeCloud implements TrashApi {
     if (!item.files.containsKey('')) await mkdir(target);
     return TrashRestore(target, renamed: target != item.path);
   }
+
+  @override
+  Future<List<TrashRestoreResult>> restoreTrashMany(List<String> ids) async {
+    check();
+    batches.add(ids);
+    return [
+      for (final id in ids)
+        trash.containsKey(id)
+            ? TrashRestoreResult(id, restored: await restoreTrash(id))
+            : TrashRestoreResult(id, error: 'Not in Trash'),
+    ];
+  }
+
+  final batches = <List<String>>[];
 
   @override
   Future<void> deleteTrash(String id) async {
@@ -518,6 +533,119 @@ void main() {
         expect(ops('retained').where((o) => o.path == replaced), hasLength(1));
       },
     );
+  });
+
+  group('review fixes', () {
+    test(
+      'C1: edited here, then deleted: Undo and Restore bring back the '
+      'edited bytes; the older server version is left in its trash',
+      () async {
+        final path = await uploaded('edited.txt', 'version one');
+        // Edited, then deleted before any pass sent the edit.
+        local(path).writeAsStringSync('version two, edited here', flush: true);
+        final at = delete([path])['at'] as int;
+        await engine.tick();
+        await engine.tick();
+        expect(cloud.files.containsKey(path), isFalse);
+        expect(cloud.trash.values.single.files[''], 'version one'.codeUnits);
+        final copy = engine.deviceTrash.items().single;
+        expect(copy.changed, isTrue);
+        final entry =
+            ((await engine.trashListing())['entries'] as List).single as Map;
+        expect((entry['deviceFirst'], entry['serverId'] != null), (true, true));
+        final undo = await engine.undoDelete([path], at);
+        expect(((undo['results'] as List).single as Map)['result'], 'restored');
+        expect(local(path).readAsStringSync(), 'version two, edited here');
+        expect(cloud.batches, isEmpty, reason: 'the server item is not used');
+        await engine.tick();
+        await engine.tick();
+        expect(cloud.files[path], 'version two, edited here'.codeUnits);
+        expect(cloud.trash, hasLength(1));
+        // Restore from the Trash view picks the device copy too.
+        local(path).writeAsStringSync('version three', flush: true);
+        delete([path]);
+        await engine.tick();
+        await engine.tick();
+        final listing = await engine.trashListing();
+        final again = (listing['entries'] as List).cast<Map>().firstWhere(
+          (e) => e['deviceFirst'] == true,
+        );
+        await engine.trashRestore(
+          serverId: again['serverId'] as String?,
+          deviceId: again['deviceId'] as String?,
+        );
+        expect(local(path).readAsStringSync(), 'version three');
+      },
+    );
+
+    test('C2: against a gateway without Trash every deleted file keeps a '
+        'device copy, and Undo restores from it', () async {
+      cloud.trashRoutes = false;
+      store.deleteSetting('serverTrashChecked');
+      final path = await uploaded('old-gateway.txt', 'known bytes');
+      expect(engine.deviceTrash.serverTrash, isFalse);
+      final at = delete([path])['at'] as int;
+      await engine.tick();
+      await engine.tick();
+      expect(local(path).existsSync(), isFalse);
+      expect(engine.deviceTrash.items().single.path, path);
+      final undo = await engine.undoDelete([path], at);
+      expect(((undo['results'] as List).single as Map)['result'], 'restored');
+      expect(local(path).readAsStringSync(), 'known bytes');
+      await engine.tick();
+      await engine.tick();
+      expect(cloud.files[path], 'known bytes'.codeUnits);
+      // Once the routes are seen, the normal release rules apply again.
+      cloud.trashRoutes = true;
+      store.deleteSetting('serverTrashChecked');
+      final other = await uploaded('new-gateway.txt', 'released');
+      expect(engine.deviceTrash.serverTrash, isTrue);
+      delete([other]);
+      await engine.tick();
+      expect(engine.deviceTrash.items().where((c) => c.path == other), isEmpty);
+    });
+
+    test('C3: only the copy the delete produced goes to the trash; a '
+        'replacement copy of the same row keeps its Recovery row', () async {
+      final path = await uploaded('mixed.txt', 'local version');
+      cloud.put(path, 'remote version');
+      await engine.tick();
+      expect(local(path).readAsStringSync(), 'remote version');
+      expect(engine.recovery.describe(path), isNotNull);
+      delete([path]);
+      await engine.tick();
+      await engine.tick();
+      // The deleted version is known and held by the server: released. The
+      // replacement copy is not the delete's: it stays a Recovery row.
+      expect(engine.deviceTrash.items(), isEmpty);
+      final kept = engine.recovery.describe(path)!;
+      expect(
+        (kept['paths'] as List).map(
+          (s) => File(s as String).readAsStringSync(),
+        ),
+        ['local version'],
+      );
+      expect(await visible(path), isTrue);
+    });
+
+    test('C4: a pass learns trash_days; a 30-day server does not purge at '
+        'day 8', () async {
+      cloud.trashDays = 30;
+      store.deleteSetting('serverTrashChecked');
+      await engine.tick();
+      expect(engine.deviceTrash.days, 30);
+      final path = await uploaded('month.txt', 'kept a month');
+      forgetHash(path);
+      delete([path]);
+      await engine.tick();
+      final start = now;
+      now = start.add(const Duration(days: 8));
+      await engine.tick();
+      expect(engine.deviceTrash.items(), hasLength(1));
+      now = start.add(const Duration(days: 30, seconds: 1));
+      await engine.tick();
+      expect(engine.deviceTrash.items(), isEmpty);
+    });
   });
 
   test(

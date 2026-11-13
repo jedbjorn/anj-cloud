@@ -2,12 +2,34 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:anj_cloud/core/gateway/cloud_api.dart';
+import 'package:anj_cloud/core/gateway/trash_api.dart';
 import 'package:anj_cloud/core/gateway/fetch_api.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/ports/secret_store.dart';
 
-class FakeCloud implements CloudApi {
+class FakeCloud implements CloudApi, TrashApi {
+  // A current gateway's trash routes (spec #44), empty: deletion copies follow
+  // the normal release rules. [trashRoutes] false models an older gateway.
+  bool trashRoutes = true;
+  @override
+  Future<ServerTrash?> listTrash() async {
+    check();
+    return trashRoutes ? const ServerTrash(7, []) : null;
+  }
+
+  @override
+  Future<TrashRestore> restoreTrash(String id) async =>
+      throw const CloudFailure('Not in Trash', status: 404);
+  @override
+  Future<List<TrashRestoreResult>> restoreTrashMany(List<String> ids) async => [
+    for (final id in ids) TrashRestoreResult(id, error: 'Not in Trash'),
+  ];
+  @override
+  Future<void> deleteTrash(String id) async {}
+  @override
+  Future<int> emptyTrash() async => 0;
+
   final Map<String, List<int>> files = {};
   final Map<String, String> versions = {};
   final Set<String> directories = {};

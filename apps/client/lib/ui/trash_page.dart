@@ -72,7 +72,13 @@ class _TrashPageState extends State<TrashPage> {
   String? _error;
   bool _busy = false;
   bool _selecting = false;
-  final _selected = <int>{};
+
+  /// Selected entries by their server and device ids, never by position: the
+  /// list reloads after every action.
+  final _selected = <String>{};
+
+  static String _key(Map<String, dynamic> entry) =>
+      '${entry['serverId']}|${entry['deviceId']}';
 
   @override
   void initState() {
@@ -92,7 +98,8 @@ class _TrashPageState extends State<TrashPage> {
       setState(() {
         _listing = listing;
         _error = null;
-        _selected.removeWhere((i) => i >= _entries.length);
+        final present = {for (final e in _entries) _key(e)};
+        _selected.removeWhere((key) => !present.contains(key));
       });
     } catch (error) {
       if (mounted) setState(() => _error = '$error');
@@ -227,7 +234,8 @@ class _TrashPageState extends State<TrashPage> {
               onPressed: _busy || _selected.isEmpty
                   ? null
                   : () => _deleteNow([
-                      for (final i in _selected.toList()..sort()) entries[i],
+                      for (final e in entries)
+                        if (_selected.contains(_key(e))) e,
                     ]),
               child: const Text('Delete now'),
             )
@@ -279,8 +287,8 @@ class _TrashPageState extends State<TrashPage> {
                 padding: EdgeInsets.all(32),
                 child: Center(child: Text('Trash is empty')),
               ),
-            for (var i = 0; i < entries.length; i++)
-              _row(entries[i], i, compact: compact, now: now),
+            for (final entry in entries)
+              _row(entry, compact: compact, now: now),
           ],
         ),
       ),
@@ -288,15 +296,17 @@ class _TrashPageState extends State<TrashPage> {
   }
 
   Widget _row(
-    Map<String, dynamic> entry,
-    int index, {
+    Map<String, dynamic> entry, {
     required bool compact,
     required int now,
   }) {
     final path = entry['path'] as String;
     final folder = p.posix.dirname(path);
     final onlyDevice = entry['onlyDevice'] == true;
-    final both = entry['serverId'] != null && entry['deviceId'] != null;
+    final both =
+        entry['serverId'] != null &&
+        entry['deviceId'] != null &&
+        entry['deviceFirst'] != true;
     final details = [
       'In ${folder == '.' ? 'AnJ Cloud' : folder}',
       'Deleted ${formatLibraryDate((entry['deleted'] as int) ~/ 1000)}',
@@ -306,8 +316,8 @@ class _TrashPageState extends State<TrashPage> {
       key: ValueKey('trash:$path:${entry['deleted']}'),
       leading: _selecting
           ? Checkbox(
-              value: _selected.contains(index),
-              onChanged: (_) => _toggle(index),
+              value: _selected.contains(_key(entry)),
+              onChanged: (_) => _toggle(entry),
             )
           : Icon(
               entry['kind'] == 'folder'
@@ -320,12 +330,12 @@ class _TrashPageState extends State<TrashPage> {
         '${onlyDevice ? '\nOnly on this device' : ''}',
       ),
       isThreeLine: true,
-      onTap: _selecting ? () => _toggle(index) : null,
+      onTap: _selecting ? () => _toggle(entry) : null,
       onLongPress: _selecting
           ? null
           : () => setState(() {
               _selecting = true;
-              _selected.add(index);
+              _selected.add(_key(entry));
             }),
       trailing: _selecting
           ? null
@@ -370,7 +380,8 @@ class _TrashPageState extends State<TrashPage> {
     );
   }
 
-  void _toggle(int index) => setState(() {
-    if (!_selected.remove(index)) _selected.add(index);
+  void _toggle(Map<String, dynamic> entry) => setState(() {
+    final key = _key(entry);
+    if (!_selected.remove(key)) _selected.add(key);
   });
 }
