@@ -110,7 +110,7 @@ void main() {
       local('Documents/keep.txt').writeAsStringSync('keep');
       local('Documents/replace.txt').writeAsStringSync('old');
       local('Documents/gone.txt').writeAsStringSync('gone');
-      local('Documents/bad:name.txt').writeAsStringSync('rename');
+      local('Documents/.htaccess').writeAsStringSync('rename');
       Directory('${tree.root.path}/Documents/Empty').createSync();
       local('Archive/blob.bin')
         ..parent.createSync()
@@ -127,7 +127,7 @@ void main() {
       await engine.tick();
       await engine.tick();
       // A local rename command.
-      await engine.renameLocal('Documents/bad:name.txt', 'renamed.txt');
+      await engine.renameLocal('Documents/.htaccess', 'renamed.txt');
       await engine.tick();
       // Cloud-only release (guarded quarantine, then unlink).
       engine.setRetention('Archive', Retention.cloud);

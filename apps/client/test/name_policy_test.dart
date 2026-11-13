@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:anj_cloud/core/sync/name_policy.dart';
+import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/sync/name_tables.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -19,16 +20,6 @@ void main() {
 
   test('tables and vectors share one Unicode version', () {
     expect(vectors['unicode'], nameTablesUnicodeVersion);
-  });
-
-  test('checks match the shared vectors', () {
-    for (final vector in (vectors['check'] as List).cast<Map>()) {
-      expect(
-        NamePolicy.check(vector['name'] as String)?.name,
-        vector['reason'],
-        reason: jsonEncode(vector['name']),
-      );
-    }
   });
 
   test('fold keys match the shared vectors', () {
@@ -61,26 +52,12 @@ void main() {
     expect(NamePolicy.sameInCloud('caf\u00e9', 'Cafe\u0301'), isFalse);
   });
 
-  test('clashes match the shared vectors', () {
-    for (final vector in (vectors['clash'] as List).cast<Map>()) {
-      expect(
-        NamePolicy.clashWith(
-          vector['name'] as String,
-          (vector['siblings'] as List).cast<String>(),
-        ),
-        vector['clash'],
-        reason: jsonEncode(vector),
-      );
+  // The vectors' check and clash sets were decision #120's rule; spec #49
+  // retired it on the client (name_rule_test.dart covers the name rule).
+  test('gateway reasons map to cloud-name problems', () {
+    for (final problem in CloudNameProblem.values) {
+      expect(CloudNameProblem.fromReason(problem.name), problem);
     }
-  });
-
-  test('gateway reasons map to problems', () {
-    for (final problem in NameProblem.values) {
-      expect(NameProblem.fromReason(problem.name), problem);
-    }
-    expect(NameProblem.fromReason('unknown'), isNull);
-    expect(NamePolicy.problem('a.txt', ['A.TXT']), NameProblem.clash);
-    expect(NamePolicy.problem('CON', ['con']), NameProblem.reserved);
-    expect(NamePolicy.problem('.bashrc', ['.profile']), isNull);
+    expect(CloudNameProblem.fromReason('unknown'), isNull);
   });
 }

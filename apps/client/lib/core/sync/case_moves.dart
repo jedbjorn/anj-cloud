@@ -54,6 +54,13 @@ String renamedPath(String from, String to, String path) =>
 const movedHereStatus =
     'Moved on this device; kept here in the cloud until the new name can sync';
 
+/// The row of an item the cloud renamed to a name another local item still
+/// holds here: the clash partner whose removal frees it (spec #49 AC7),
+/// applied later in the pass, or an item of this device not synchronized
+/// yet. It keeps its place until the name is free.
+const renamePendingStatus =
+    'rename pending: another item here has the new name';
+
 /// The same, for a move to a name that is never synchronized (an
 /// exclusion): the new item has no row, so the old one says why.
 String movedNotSyncedStatus(String name) =>

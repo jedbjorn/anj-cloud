@@ -405,6 +405,18 @@ class Entry {
     }
   }
 
+  /// The item's cloud name where it differs from its local one (spec #49
+  /// R3, decision #199): written from every listing, so it is always
+  /// rebuildable from a fresh one. Null: the local name is the cloud name.
+  String? _cloudName;
+  String? get cloudName => _cloudName;
+  set cloudName(String? v) {
+    if (v != _cloudName) {
+      _cloudName = v;
+      _changed();
+    }
+  }
+
   /// Cloud modification time, Unix seconds.
   int? _remoteModified;
   int? get remoteModified => _remoteModified;
@@ -498,6 +510,7 @@ class Entry {
     // Absent rather than null: rows written before spec #24 stay unchanged
     // until a value arrives.
     if (_fileId != null) 'fileId': _fileId,
+    if (_cloudName != null) 'cloudName': _cloudName,
     if (_localIdentity != null) 'localIdentity': _localIdentity,
     if (_movedNote != null) 'movedNote': _movedNote,
     if (_localBirth != null) 'localBirth': _localBirth,
@@ -532,6 +545,7 @@ class Entry {
         ..remoteHash = j['remoteHash'] as String?
         ..remoteHashEtag = j['remoteHashEtag'] as String?
         ..fileId = j['fileId'] as int?
+        ..cloudName = j['cloudName'] as String?
         ..localIdentity = j['localIdentity'] as String?
         ..movedNote = j['movedNote'] as String?
         ..localBirth = j['localBirth'] as int?

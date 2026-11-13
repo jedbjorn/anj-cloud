@@ -310,6 +310,9 @@ class LibraryRow {
   /// This folder holds a syncing file at any depth.
   final bool syncingWithin;
   String get path => entry['path'] as String;
+
+  /// The path as shown: cloud names, never a device's own (spec #49).
+  String get shown => entry['cloudPath'] as String? ?? path;
   bool get directory => entry['kind'] == 'directory';
   int get depth => path.split('/').length - 1;
 }
@@ -437,7 +440,9 @@ List<LibraryRow> libraryRows(
                                 ? LibraryPolicy.cloud
                                 : LibraryPolicy.local) ==
                             policy))) &&
-            (entry['path'] as String).toLowerCase().contains(query),
+            ((entry['cloudPath'] ?? entry['path']) as String)
+                .toLowerCase()
+                .contains(query),
       )
       .map((entry) => entry['path'] as String)
       .toSet();

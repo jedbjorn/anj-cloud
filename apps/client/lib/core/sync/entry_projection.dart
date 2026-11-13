@@ -68,6 +68,8 @@ Future<Map<String, Object?>> projectEntry(
   return (entry.toJson()
       ..removeWhere((key, _) => Entry.indexKeys.contains(key)))
     ..['selectionVersion'] = engine.selectionVersion(entry)
+    // Shown names are cloud names (spec #49); `path` stays the row's key.
+    ..['cloudPath'] = engine.names.cloudPath(entry.path)
     // The documents provider binds folder approvals to it (spec #28 A5).
     ..['localIdentity'] = engine.localIdentities[entry.path]
     ..['localDirectoryAvailable'] =

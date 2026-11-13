@@ -37,6 +37,10 @@ String cantSyncNameStatus(CloudNameProblem? problem) =>
 const _cantSync = "Can't sync this name: ";
 bool isCantSyncName(String status) => status.startsWith(_cantSync);
 
+/// A cloud item this device cannot hold under any name: no ` (n)` fits its
+/// local limit beside the extension (spec #49 R3, decision #198).
+const unplaceableStatus = "${_cantSync}it is too long for this device";
+
 /// Why a name the user gives (Rename, Add files, the documents provider) is
 /// refused (spec #49): only an empty name, a path separator, or what R2
 /// cannot fix. Anything else is accepted, and cleaned like any local name.
@@ -230,6 +234,16 @@ abstract final class NameRule {
     if (!taken.contains(NamePolicy.foldKey(result))) return result;
     return _suffixed(result, folder, taken) ?? name;
   }
+
+  /// [name] with R1's first free ` (n)` beside [siblings] (by fold key),
+  /// or null when none fits.
+  static String? suffixed(
+    String name,
+    Iterable<String> siblings, {
+    bool folder = false,
+  }) => _suffixed(name, folder, {
+    for (final sibling in siblings) NamePolicy.foldKey(sibling),
+  });
 
   /// Why the cloud cannot or must not hold [name], else null.
   static CloudNameProblem? cloudCheck(String name) {

@@ -18,7 +18,7 @@ import 'package:anj_cloud/core/state/identity_index.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/case_moves.dart';
-import 'package:anj_cloud/core/sync/name_policy.dart';
+import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
 import 'package:anj_cloud/platform/native/local_watcher.dart';
@@ -26,6 +26,7 @@ import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
+import 'test_platform.dart';
 
 /// Records every request; folder deletion proven, so the old behaviour (a
 /// delete plus a full re-upload) would show here.
@@ -678,44 +679,49 @@ void main() {
   group('row 7: a new path that cannot sync keeps the cloud item', () {
     setUp(start);
 
-    test('a name decision #120 blocks: nothing deleted, the reason on the '
-        'new row; renamed again to an allowed name, it moves', () async {
+    test('a name no rule resolves (spec #49 residual): nothing deleted, the '
+        'reason on the new row; renamed again to a name that syncs, it '
+        'moves', () async {
       await library();
-      rename('Docs/report.txt', 'Docs/report: final.txt');
+      rename('Docs/report.txt', 'Docs/.htaccess');
       await ticks();
       expect(cloud.calls, isEmpty);
       expect(remote('Docs/report.txt'), 'report');
       expect(
-        store.entries['Docs/report: final.txt']!.status,
-        nameNotAllowedStatus,
+        store.entries['Docs/.htaccess']!.status,
+        cantSyncNameStatus(CloudNameProblem.forbiddenName),
       );
       expect(store.entries['Docs/report.txt']!.status, movedHereStatus);
-      rename('Docs/report: final.txt', 'Docs/report final.txt');
+      rename('Docs/.htaccess', 'Docs/report final.txt');
       await ticks();
       expect(cloud.calls, ['MOVE Docs/report.txt -> Docs/report final.txt']);
       expect(store.entries['Docs/report final.txt']!.status, 'current local');
     });
 
-    test('a name clashing with a cloud sibling (#120): held, nothing '
-        'deleted', () async {
+    test('a name equal to a cloud sibling\'s by case only (spec #49): an '
+        'ordinary move, both kept', () async {
       await library();
       cloud.put('Archive/Report.txt', 'another item');
       await ticks(1);
+      // APFS would replace the sibling with the renamed file.
+      if (foldsCase(tree.root)) return;
       cloud.calls.clear();
       rename('Docs/report.txt', 'Archive/report.txt');
       await ticks();
-      expect(cloud.calls.where((c) => !c.startsWith('GET')), isEmpty);
-      expect(remote('Docs/report.txt'), 'report');
-      expect(store.entries['Archive/report.txt']!.status, nameNotAllowedStatus);
-      expect(store.entries['Docs/report.txt']!.status, movedHereStatus);
+      expect(cloud.calls.where((c) => !c.startsWith('GET')), [
+        'MOVE Docs/report.txt -> Archive/report.txt',
+      ]);
+      expect(remote('Archive/report.txt'), 'report');
+      expect(remote('Archive/Report.txt'), 'another item');
+      expect(store.entries['Archive/report.txt']!.status, 'current local');
     });
 
     test('moved back to its name: the row is ordinary again', () async {
       await library();
-      rename('Docs/report.txt', 'Docs/a|b.txt');
+      rename('Docs/report.txt', 'Docs/.htaccess');
       await ticks(2);
       expect(store.entries['Docs/report.txt']!.status, movedHereStatus);
-      rename('Docs/a|b.txt', 'Docs/report.txt');
+      rename('Docs/.htaccess', 'Docs/report.txt');
       await ticks(2);
       expect(cloud.calls, isEmpty);
       expect(store.entries['Docs/report.txt']!.status, 'current local');
@@ -738,16 +744,14 @@ void main() {
       expect(store.entries['Docs/notes.txt']!.status, 'current local');
     });
 
-    test(
-      'a folder moved to a blocked name keeps its whole cloud subtree',
-      () async {
-        await library();
-        rename('Photos/2026/Trip', 'Photos/2026/Trip?');
-        await ticks();
-        expect(cloud.calls, isEmpty);
-        expect(remote('Photos/2026/Trip/deep/b.jpg'), 'b');
-      },
-    );
+    test('a folder moved to a name no rule resolves keeps its whole cloud '
+        'subtree', () async {
+      await library();
+      rename('Photos/2026/Trip', 'Photos/2026/.htaccess');
+      await ticks();
+      expect(cloud.calls, isEmpty);
+      expect(remote('Photos/2026/Trip/deep/b.jpg'), 'b');
+    });
   });
 
   group('row 4: unpaired removals on partial passes (fake clock)', () {
@@ -868,7 +872,7 @@ void main() {
 
     test('a hold that ends in a park lets the worker idle', () async {
       await heldThenDelivered(
-        'Other/b|c.txt',
+        'Other/.htaccess',
         () => store.entries['Docs/a.txt']!.status == movedHereStatus,
       );
       idleAfterMaxDelay();

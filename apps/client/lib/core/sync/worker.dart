@@ -25,6 +25,7 @@ import '../ports/root_location.dart';
 import '../../platform/adapters.dart';
 import '../update/release.dart';
 import 'sync_activity.dart';
+import 'cloud_names.dart';
 import 'sync_engine.dart';
 import 'sync_schedule.dart';
 
@@ -156,11 +157,15 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
   // disconnected cloud); a paired one is gated for Pause.
   final gate = cloud is DisconnectedCloud ? null : PausableCloud(cloud);
   final activity = SyncActivity();
+  // Every request leaves with cloud names (spec #49, decision #199); the
+  // activity it records stays under local paths, as the rows are.
+  final names = CloudNames();
   final engine = SyncEngine(
     manifest,
     tree!,
-    gate == null ? cloud : ActivityCloud(gate, activity),
+    gate == null ? cloud : ActivityCloud(NamedCloud(gate, names), activity),
     activity: activity,
+    names: names,
   );
   // Local changes arrive as inotify events; without them (or on a network
   // or FUSE root) every pass stat-scans the root, with a status note.

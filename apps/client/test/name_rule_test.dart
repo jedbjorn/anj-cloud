@@ -123,9 +123,11 @@ void main() {
       );
       for (final (name, local) in named) {
         expect(NameRule.cloudName(local, items, os(vector)), name);
-        if (os(vector) == NameOs.windows) {
-          expect(NamePolicy.check(local), isNull);
-        }
+        // A local name is already what this device would call it.
+        expect(
+          NameRule.localNames([NameEntry(local)], os(vector))[local],
+          local,
+        );
       }
     }
   });

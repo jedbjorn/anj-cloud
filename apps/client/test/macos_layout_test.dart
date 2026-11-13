@@ -1,7 +1,7 @@
 import 'dart:io';
 
+import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/app/controller.dart';
-import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/platform/macos/macos_edit_menu.dart';
 import 'package:anj_cloud/ui/admin_section.dart';
 import 'package:anj_cloud/ui/app.dart';
@@ -61,7 +61,11 @@ void main() {
               'current local',
             ),
             ('Budget 2026.numbers', 'file', 'current local'),
-            ('CON', 'file', nameNotAllowedStatus),
+            (
+              '.htaccess',
+              'file',
+              cantSyncNameStatus(CloudNameProblem.forbiddenName),
+            ),
             ('Photos', 'directory', 'cloud-only'),
             ('notes.txt', 'file', 'pending: upload'),
           ])
@@ -73,7 +77,7 @@ void main() {
               'effectiveRetention': status == 'cloud-only' ? 'cloud' : 'local',
               'expectedPresent': status != 'cloud-only',
               'size': 123456789,
-              'presentationErrors': [if (isNameRefusal(status)) status],
+              'presentationErrors': [if (isCantSyncName(status)) status],
             },
         ];
 

@@ -6,6 +6,7 @@ import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
+import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/core/sync/sync_schedule.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
@@ -15,7 +16,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'fakes.dart';
 import 'test_platform.dart';
 
-/// Refuses chosen names the way the gateway does (decision #120).
+/// Refuses chosen names the way the gateway's backstop does (spec #49).
 class _NameRefusingCloud extends FakeCloud {
   final Set<String> refused = {};
   final Map<String, int> attemptsBy = {};
@@ -29,7 +30,7 @@ class _NameRefusingCloud extends FakeCloud {
   }) async {
     attemptsBy[path] = (attemptsBy[path] ?? 0) + 1;
     if (refused.contains(path)) {
-      throw const NameNotPortable(NameProblem.clash);
+      throw NameNotPortable(CloudNameProblem.untrimmed);
     }
     created.add(path);
     return super.upload(path, source, etag: etag);
@@ -39,7 +40,7 @@ class _NameRefusingCloud extends FakeCloud {
   Future<void> mkdir(String path) async {
     attemptsBy[path] = (attemptsBy[path] ?? 0) + 1;
     if (refused.contains(path)) {
-      throw const NameNotPortable(NameProblem.clash);
+      throw NameNotPortable(CloudNameProblem.untrimmed);
     }
     created.add(path);
     return super.mkdir(path);
@@ -82,26 +83,79 @@ void main() {
     operations: store.operations.values,
   );
 
-  test('a blocked local name stays local-only with the row', () async {
-    for (final name in ['CON', 'nul.txt', 'report.', 'a:b.txt', 'x|y']) {
+  final residual = cantSyncNameStatus(CloudNameProblem.forbiddenName);
+
+  test('names decision #120 blocked sync verbatim with no row (spec #49 '
+      'AC3)', () async {
+    final names = ['CON', 'nul.txt', 'report.', 'a:b?.txt', 'x|y'];
+    for (final name in names) {
       write('Documents/$name', name);
     }
     await engine.tick();
     await engine.tick();
-    for (final name in ['CON', 'nul.txt', 'report.', 'a:b.txt', 'x|y']) {
+    for (final name in names) {
       final path = 'Documents/$name';
-      expect(cloud.attemptsBy[path], isNull, reason: path);
-      expect(cloud.files.containsKey(path), isFalse);
-      expect(entry(path).status, nameNotAllowedStatus);
-      expect(local(path).readAsStringSync(), name, reason: 'kept as is');
+      expect(cloud.files[path], utf8.encode(name), reason: path);
+      expect(entry(path).status, 'current local', reason: path);
       final row = await projected(path);
-      expect(row['nameRefused'], isTrue);
-      expect(row['presentationErrors'], [nameNotAllowedStatus]);
-      expect(libraryStatus(row), nameNotAllowedStatus);
-      expect(rowBadge(row), RowBadge.needsAttention);
-      expect(hasQueuedWork(row), isTrue);
+      expect(row['cantSyncName'], isFalse);
+      expect(row['presentationErrors'], isEmpty);
+      expect(rowBadge(row), isNot(RowBadge.needsAttention));
     }
-    expect(overall(), SyncStatus.attention);
+    expect(overall(), isNot(SyncStatus.attention));
+  });
+
+  test('AC8: rows an earlier client held under decision #120 resolve on the '
+      'first pass, with no user action', () async {
+    // A local trailing-space folder and a blocked name, held local-only.
+    Directory('${tree.root.path}/Documents/Furniture Families ').createSync();
+    write('Documents/Furniture Families /chair.rfa', 'chair');
+    write('Documents/CON.txt', 'con');
+    // A Cloud-only clash held back on a case-folding device.
+    cloud.put('Documents/Notes.txt', 'upper');
+    cloud.put('Documents/notes.txt', 'lower');
+    const held = 'Name not allowed on other devices: rename to sync';
+    store.entries
+      ..['Documents/Furniture Families '] = (Entry(
+        'Documents/Furniture Families ',
+        ItemKind.directory,
+      )..status = held)
+      ..['Documents/Furniture Families /chair.rfa'] = (Entry(
+        'Documents/Furniture Families /chair.rfa',
+        ItemKind.file,
+      )..status = 'pending: the folder name is not allowed on other devices')
+      ..['Documents/CON.txt'] = (Entry('Documents/CON.txt', ItemKind.file)
+        ..status = held)
+      ..['Documents/notes.txt'] = (Entry('Documents/notes.txt', ItemKind.file)
+        ..status =
+            'Cloud only: another item here has the same name on this device. '
+            'Rename one on another device to get both here');
+    store.save();
+    for (final entry in store.entries.values) {
+      expect(isLegacyNameHold(entry.status), isTrue, reason: entry.path);
+    }
+    await engine.tick();
+    await engine.tick();
+    await engine.tick();
+    for (final entry in store.entries.values) {
+      expect(isLegacyNameHold(entry.status), isFalse, reason: entry.path);
+      expect(isCantSyncName(entry.status), isFalse, reason: entry.path);
+    }
+    expect(
+      cloud.files['Documents/Furniture Families/chair.rfa'],
+      'chair'.codeUnits,
+    );
+    expect(cloud.files['Documents/CON.txt'], 'con'.codeUnits);
+    expect(
+      entry('Documents/Furniture Families/chair.rfa').status,
+      'current local',
+    );
+    expect(entry('Documents/CON.txt').status, 'current local');
+    if (!foldsCase(tree.root)) {
+      expect(local('Documents/notes.txt').readAsStringSync(), 'lower');
+      expect(local('Documents/Notes.txt').readAsStringSync(), 'upper');
+    }
+    expect(overall(), isNot(SyncStatus.attention));
   });
 
   test('ordinary names and dotfiles upload unchanged', () async {
@@ -112,7 +166,6 @@ void main() {
       '.config',
       'CONSOLE.log',
       'COM10',
-      ' leading',
       '雪 #1 100%.txt',
     ];
     for (final name in names) {
@@ -123,85 +176,101 @@ void main() {
       final path = 'Documents/$name';
       expect(cloud.files[path], utf8.encode(name), reason: path);
       expect(entry(path).status, 'current local');
-      expect((await projected(path))['nameRefused'], isFalse);
+      expect((await projected(path))['cantSyncName'], isFalse);
     }
     expect(overall(), isNot(SyncStatus.attention));
   });
 
-  test('a case or normalization clash with a cloud sibling is held, and '
-      'lifts when the sibling goes', () async {
+  test('R1: an untrimmed folder is renamed in place and its subtree syncs '
+      'under the clean name; a `.part` file is skipped quietly', () async {
+    Directory('${tree.root.path}/Documents/Furniture Families ').createSync();
+    write('Documents/Furniture Families /chair.rfa', 'chair');
+    write('Documents/ leading.txt', 'lead');
+    write('Documents/movie.mkv.part', 'partial');
+    final identity = tree
+        .scanItems(includeExcluded: true)['Documents/Furniture Families ']!
+        .identity;
+    expect(identity, isNotNull);
+    await engine.tick();
+    await engine.tick();
+    await engine.tick();
+    expect(
+      Directory('${tree.root.path}/Documents/Furniture Families ').existsSync(),
+      isFalse,
+    );
+    // Renamed in place: the same folder, not a copy.
+    expect(
+      tree.scanItems()['Documents/Furniture Families']!.identity,
+      identity,
+    );
+    expect(
+      local('Documents/Furniture Families/chair.rfa').readAsStringSync(),
+      'chair',
+    );
+    expect(cloud.directories, contains('Documents/Furniture Families'));
+    expect(
+      cloud.files['Documents/Furniture Families/chair.rfa'],
+      'chair'.codeUnits,
+    );
+    expect(cloud.files['Documents/leading.txt'], 'lead'.codeUnits);
+    expect(cloud.attemptsBy.keys.where((k) => k != k.trim()), isEmpty);
+    expect(cloud.attemptsBy.keys.where((k) => k.contains(' /')), isEmpty);
+    expect(cloud.attemptsBy['Documents/movie.mkv.part'], isNull);
+    expect(local('Documents/movie.mkv.part').readAsStringSync(), 'partial');
+    expect(store.entries.containsKey('Documents/movie.mkv.part'), isFalse);
+    expect(overall(), isNot(SyncStatus.attention));
+  });
+
+  test('a name equal to a cloud sibling\'s by case is its own item on Linux '
+      '(spec #49 AC3)', () async {
     cloud.put('Documents/Notes.txt', 'cloud');
-    cloud.put('Documents/café.txt', 'nfc');
     await engine.tick();
     write('Documents/notes.txt', 'local');
-    write('Documents/café.txt', 'nfd');
     await engine.tick();
     await engine.tick();
-    if (foldsCase(tree.root) && foldsNormalization(tree.root)) {
-      // APFS: each pair of spellings is one item, so the writes edit the
-      // downloaded files; there is no sibling to hold or to lift.
+    if (foldsCase(tree.root)) {
+      // APFS: one item, so the write edits the downloaded file.
       expect(cloud.attemptsBy['Documents/notes.txt'], isNull);
-      expect(cloud.attemptsBy['Documents/cafe\u0301.txt'], isNull);
       expect(cloud.files['Documents/Notes.txt'], 'local'.codeUnits);
-      expect(cloud.files['Documents/caf\u00e9.txt'], 'nfd'.codeUnits);
       expect(entry('Documents/Notes.txt').status, 'current local');
-      expect(entry('Documents/caf\u00e9.txt').status, 'current local');
-      expect(store.entries.containsKey('Documents/notes.txt'), isFalse);
       return;
     }
-    expect(cloud.attemptsBy['Documents/notes.txt'], isNull);
-    expect(cloud.attemptsBy['Documents/café.txt'], isNull);
-    expect(entry('Documents/notes.txt').status, nameNotAllowedStatus);
-    expect(entry('Documents/café.txt').status, nameNotAllowedStatus);
-    // Linux holds both names: the cloud file is here too, untouched.
-    expect(local('Documents/Notes.txt').readAsStringSync(), 'cloud');
-    expect(local('Documents/notes.txt').readAsStringSync(), 'local');
-    cloud.remove('Documents/Notes.txt');
-    await engine.tick();
-    await engine.tick();
+    expect(cloud.files['Documents/Notes.txt'], 'cloud'.codeUnits);
     expect(cloud.files['Documents/notes.txt'], 'local'.codeUnits);
     expect(entry('Documents/notes.txt').status, 'current local');
+    expect(entry('Documents/Notes.txt').status, 'current local');
+  });
+
+  test('two new local names that differ by case both upload', () async {
+    write('Documents/Photo.jpg', 'one');
+    write('Documents/photo.jpg', 'two');
+    await engine.tick();
+    await engine.tick();
+    if (foldsCase(tree.root)) {
+      // APFS: one item, Photo.jpg, holding the second write.
+      expect(cloud.created, contains('Documents/Photo.jpg'));
+      expect(cloud.created, isNot(contains('Documents/photo.jpg')));
+      expect(cloud.files['Documents/Photo.jpg'], 'two'.codeUnits);
+      expect(store.entries.containsKey('Documents/photo.jpg'), isFalse);
+      return;
+    }
+    expect(cloud.files['Documents/Photo.jpg'], 'one'.codeUnits);
+    expect(cloud.files['Documents/photo.jpg'], 'two'.codeUnits);
   });
 
   test(
-    'two new local names that clash: the second waits for a rename',
-    () async {
-      write('Documents/Photo.jpg', 'one');
-      write('Documents/photo.jpg', 'two');
-      await engine.tick();
-      await engine.tick();
-      if (foldsCase(tree.root)) {
-        // APFS: one item, Photo.jpg, holding the second write.
-        expect(cloud.created, contains('Documents/Photo.jpg'));
-        expect(cloud.created, isNot(contains('Documents/photo.jpg')));
-        expect(cloud.files['Documents/Photo.jpg'], 'two'.codeUnits);
-        expect(entry('Documents/Photo.jpg').status, 'current local');
-        expect(store.entries.containsKey('Documents/photo.jpg'), isFalse);
-        return;
-      }
-      final uploaded = cloud.created
-          .where((path) => path.toLowerCase() == 'documents/photo.jpg')
-          .toList();
-      expect(uploaded, hasLength(1));
-      final other = uploaded.single == 'Documents/Photo.jpg'
-          ? 'Documents/photo.jpg'
-          : 'Documents/Photo.jpg';
-      expect(entry(other).status, nameNotAllowedStatus);
-      expect(local(other).existsSync(), isTrue);
-    },
-  );
-
-  test(
-    'a gateway refusal holds the file until it changes or a retry',
+    'a gateway refusal is the residual row until the gateway accepts',
     () async {
       cloud.refused.add('Documents/plain.txt');
       write('Documents/plain.txt', 'v1');
       await engine.tick();
       await engine.tick();
-      await engine.tick();
-      expect(cloud.attemptsBy['Documents/plain.txt'], 1);
-      expect(entry('Documents/plain.txt').status, nameNotAllowedStatus);
-      expect((await projected('Documents/plain.txt'))['nameRefused'], isTrue);
+      expect(cloud.files.containsKey('Documents/plain.txt'), isFalse);
+      expect(
+        entry('Documents/plain.txt').status,
+        cantSyncNameStatus(CloudNameProblem.untrimmed),
+      );
+      expect((await projected('Documents/plain.txt'))['cantSyncName'], isTrue);
       cloud.refused.clear();
       engine.uploads.retryAll();
       await engine.tick();
@@ -210,51 +279,58 @@ void main() {
     },
   );
 
-  test('a blocked folder keeps its contents local and pending', () async {
-    Directory('${tree.root.path}/Documents/AUX').createSync();
-    write('Documents/AUX/inside.txt', 'inside');
-    Directory('${tree.root.path}/Documents/AUX/deeper').createSync();
+  test('a name no rule resolves is the one residual row; a folder of that '
+      'name keeps its contents local', () async {
+    write('Documents/.htaccess', 'rules');
+    Directory('${tree.root.path}/Documents/.HTACCESS').createSync();
+    write('Documents/.HTACCESS/inside.txt', 'inside');
     await engine.tick();
     await engine.tick();
-    expect(cloud.directories, isNot(contains('Documents/AUX')));
-    expect(cloud.attemptsBy.keys.where((k) => k.contains('AUX')), isEmpty);
-    expect(entry('Documents/AUX').status, nameNotAllowedStatus);
-    expect(entry('Documents/AUX/inside.txt').status, nameFolderPendingStatus);
-    expect(entry('Documents/AUX/deeper').status, nameFolderPendingStatus);
-    expect((await projected('Documents/AUX'))['nameRefused'], isTrue);
-    final child = await projected('Documents/AUX/inside.txt');
-    expect(child['nameRefused'], isFalse);
-    expect(hasProblem(child), isTrue);
+    expect(cloud.attemptsBy.keys.where((k) => k.contains('htaccess')), isEmpty);
+    expect(cloud.attemptsBy.keys.where((k) => k.contains('HTACCESS')), isEmpty);
+    for (final path in ['Documents/.htaccess', 'Documents/.HTACCESS']) {
+      expect(entry(path).status, residual, reason: path);
+      final row = await projected(path);
+      expect(row['cantSyncName'], isTrue);
+      expect(row['presentationErrors'], [residual]);
+      expect(libraryStatus(row), residual);
+      expect(rowBadge(row), RowBadge.needsAttention);
+    }
+    expect(local('Documents/.htaccess').readAsStringSync(), 'rules');
+    expect(
+      local('Documents/.HTACCESS/inside.txt').readAsStringSync(),
+      'inside',
+    );
+    expect(overall(), SyncStatus.attention);
   });
 
   test(
     'Rename renames in place; the new name syncs and the old row ends',
     () async {
-      write('Documents/CON.txt', 'bytes');
-      Directory('${tree.root.path}/Documents/PRN').createSync();
-      write('Documents/PRN/child.txt', 'child');
+      write('Documents/.htaccess', 'bytes');
+      Directory('${tree.root.path}/Documents/.HTACCESS').createSync();
+      write('Documents/.HTACCESS/child.txt', 'child');
       await engine.tick();
-      expect(entry('Documents/CON.txt').status, nameNotAllowedStatus);
+      expect(entry('Documents/.htaccess').status, residual);
       expect(
-        await engine.renameLocal('Documents/CON.txt', 'console.txt'),
-        'Documents/console.txt',
+        await engine.renameLocal('Documents/.htaccess', 'htaccess.txt'),
+        'Documents/htaccess.txt',
       );
       expect(
-        await engine.renameLocal('Documents/PRN', 'Printouts'),
-        'Documents/Printouts',
+        await engine.renameLocal('Documents/.HTACCESS', 'Rules'),
+        'Documents/Rules',
       );
       await engine.tick();
       await engine.tick();
-      expect(local('Documents/CON.txt').existsSync(), isFalse);
-      expect(local('Documents/console.txt').readAsStringSync(), 'bytes');
-      expect(cloud.files['Documents/console.txt'], 'bytes'.codeUnits);
-      expect(cloud.directories, contains('Documents/Printouts'));
-      expect(cloud.files['Documents/Printouts/child.txt'], 'child'.codeUnits);
-      expect(cloud.files.keys.where((k) => k.contains('CON.txt')), isEmpty);
+      expect(local('Documents/.htaccess').existsSync(), isFalse);
+      expect(local('Documents/htaccess.txt').readAsStringSync(), 'bytes');
+      expect(cloud.files['Documents/htaccess.txt'], 'bytes'.codeUnits);
+      expect(cloud.directories, contains('Documents/Rules'));
+      expect(cloud.files['Documents/Rules/child.txt'], 'child'.codeUnits);
       for (final old in [
-        'Documents/CON.txt',
-        'Documents/PRN',
-        'Documents/PRN/child.txt',
+        'Documents/.htaccess',
+        'Documents/.HTACCESS',
+        'Documents/.HTACCESS/child.txt',
       ]) {
         final row = await projected(old);
         expect(visibleInLibrary(row), isFalse, reason: old);
@@ -263,42 +339,41 @@ void main() {
     },
   );
 
-  test(
-    'Rename refuses blocked, clashing and taken names, and other items',
-    () async {
-      write('Documents/nul', 'x');
-      write('Documents/taken.txt', 'y');
-      write('Documents/Other.md', 'z');
-      await engine.tick();
-      Future<void> refuses(String path, String name, Matcher message) =>
-          expectLater(
-            engine.renameLocal(path, name),
-            throwsA(
-              isA<FileSystemException>().having(
-                (e) => e.message,
-                'message',
-                message,
-              ),
+  test('Rename refuses only empty, `/`, unresolvable, taken and excluded '
+      'names, and items that can sync', () async {
+    write('Documents/.htaccess', 'x');
+    write('Documents/taken.txt', 'y');
+    await engine.tick();
+    Future<void> refuses(String path, String name, Matcher message) =>
+        expectLater(
+          engine.renameLocal(path, name),
+          throwsA(
+            isA<FileSystemException>().having(
+              (e) => e.message,
+              'message',
+              message,
             ),
-          );
-      await refuses('Documents/nul', 'aux.txt', contains('Windows reserves'));
-      await refuses('Documents/nul', 'nul.', contains('Windows reserves'));
-      await refuses('Documents/nul', 'x?', contains('cannot contain'));
-      await refuses('Documents/nul', 'taken.txt', contains('already uses'));
-      await refuses('Documents/nul', 'TAKEN.TXT', contains('upper/lower case'));
-      await refuses('Documents/nul', 'a/b', contains('path separators'));
-      await refuses('Documents/nul', '.DS_Store', contains('excluded'));
-      await refuses(
-        'Documents/taken.txt',
-        'renamed.txt',
-        contains('Only an item'),
-      );
-      expect(local('Documents/nul').readAsStringSync(), 'x');
-    },
-  );
+          ),
+        );
+    const path = 'Documents/.htaccess';
+    await refuses(path, '', contains('Enter a name'));
+    await refuses(path, 'a/b', contains('path separators'));
+    await refuses(path, '.HTAccess', contains("can't sync"));
+    await refuses(path, 'x.filepart', contains("can't sync"));
+    await refuses(path, 'taken.txt', contains('already uses'));
+    await refuses(path, '.DS_Store', contains('excluded'));
+    await refuses(
+      'Documents/taken.txt',
+      'renamed.txt',
+      contains('Only an item'),
+    );
+    expect(local(path).readAsStringSync(), 'x');
+    // A name decision #120 refused is accepted and cleaned like any other.
+    expect(await engine.renameLocal(path, 'aux.txt'), 'Documents/aux.txt');
+  });
 
   test(
-    'a cloud file with a blocked name is held and edited on Linux',
+    'cloud files that differ only by case are kept and edited on Linux',
     () async {
       cloud.put('Documents/AUX.txt', 'cloud');
       cloud.put('Documents/A.txt', 'upper');
@@ -318,12 +393,11 @@ void main() {
         'Documents/a.txt',
       ]) {
         expect(entry(path).status, 'current local');
-        expect((await projected(path))['nameRefused'], isFalse);
+        expect((await projected(path))['cantSyncName'], isFalse);
       }
     },
-    // Two cloud files that differ only by case cannot both exist on a
-    // case-folding volume; that is decision #120's local clash rule for
-    // names already on the server (spec #31 row 2, on mac-test).
+    // On a case-folding volume the pair is R3 step 5's (macOS: a ` (2)`
+    // local name), covered by the macOS layout and translation tests.
     skip: foldsCase(Directory.systemTemp)
         ? 'needs a byte-exact volume: A.txt and a.txt both stay local here'
         : null,
