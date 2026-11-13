@@ -868,33 +868,39 @@ void main() {
       expect(remote('Other/b.txt'), isNull);
     });
 
-    test('a cloud rename on a watched root, into a new folder: one rename, '
-        'the view and the watches follow', () async {
-      final before = identity('Docs/a.txt');
-      await cloud.moveElsewhere('Docs/a.txt', 'Fresh/b.txt');
-      await ticks(2);
-      expect(fs.renames, ['Docs/a.txt -> Fresh/b.txt']);
-      expect(cloud.calls, isEmpty);
-      expect(identity('Fresh/b.txt'), before);
-      // The new folder is watched: a file made in it later is uploaded.
-      write('Fresh/c.txt', 'c');
-      for (var i = 0; i < 30 && remote('Fresh/c.txt') == null; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 100));
-        now += settings.quiet;
-        await engine.tick();
-      }
-      expect(cloud.calls, ['PUT Fresh/c.txt']);
-      cloud.calls.clear();
-      // Later passes see nothing to do: the watcher's own events of the
-      // rename are not a local move or a new item.
-      for (var i = 0; i < 4; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 200));
-        now += settings.quiet;
-        await engine.tick();
-      }
-      expect(cloud.calls, isEmpty);
-      expect(store.entries['Fresh/b.txt']!.status, 'current local');
-    });
+    test(
+      'a cloud rename on a watched root, into a new folder: one rename, '
+      'the view and the watches follow',
+      () async {
+        final before = identity('Docs/a.txt');
+        await cloud.moveElsewhere('Docs/a.txt', 'Fresh/b.txt');
+        await ticks(2);
+        expect(fs.renames, ['Docs/a.txt -> Fresh/b.txt']);
+        expect(cloud.calls, isEmpty);
+        expect(identity('Fresh/b.txt'), before);
+        // The new folder is watched: a file made in it later is uploaded.
+        write('Fresh/c.txt', 'c');
+        for (var i = 0; i < 30 && remote('Fresh/c.txt') == null; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          now += settings.quiet;
+          await engine.tick();
+        }
+        expect(cloud.calls, ['PUT Fresh/c.txt']);
+        cloud.calls.clear();
+        // Later passes see nothing to do: the watcher's own events of the
+        // rename are not a local move or a new item.
+        for (var i = 0; i < 4; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          now += settings.quiet;
+          await engine.tick();
+        }
+        expect(cloud.calls, isEmpty);
+        expect(store.entries['Fresh/b.txt']!.status, 'current local');
+      },
+      skip: notOnWindows(
+        'its watches are the Linux change watchers (windows_watch_seat_test covers Windows)',
+      ),
+    );
   });
 
   group('row 7: a new name another item here holds keeps the item', () {
