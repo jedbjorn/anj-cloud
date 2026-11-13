@@ -262,7 +262,7 @@ class Stack:
         """Sets Nextcloud's trash retention to exactly `trash_days` (minimum and maximum, `7, 7`) and
         returns the days read back. Expiry is Nextcloud's own background job in the cron container."""
         days = self.trash_days()
-        self.occ("config:system:set", "trashbin_retention_obligation", f"--value={days}, {days}")
+        self.occ("config:system:set", "trashbin_retention_obligation", "--value=" + f"{days}, {days}")
         current = self.occ("config:system:get", "trashbin_retention_obligation").strip()
         if current != f"{days}, {days}":
             raise RuntimeError("Nextcloud did not keep the trash retention setting")

@@ -91,9 +91,6 @@ class Run:
             raise RuntimeError("Expected trash item is not listed")
         return rows[0]
 
-    def occ(self, *args):
-        return self.stack.occ(*args).strip()
-
     # AC3 -----------------------------------------------------------------------------------------
 
     async def list_case(self, alice, folder, outside):
@@ -179,7 +176,7 @@ class Run:
     # AC4 -----------------------------------------------------------------------------------------
 
     async def expiry_case(self, alice, folder):
-        setting = self.occ("config:system:get", "trashbin_retention_obligation")
+        setting = self.stack.occ("config:system:get", "trashbin_retention_obligation").strip()
         if setting != "7, 7":
             raise RuntimeError("trashbin_retention_obligation is not 7, 7: " + setting[:40])
         if (await self.trash(alice))["trash_days"] != 7:
@@ -194,7 +191,7 @@ class Run:
                                         data=json.dumps({"user": FIXTURE_USERS[0], "id": name, "old": old, "new": old - days * DAY}))
             if output.strip() != "ok":
                 raise RuntimeError("Backdating a trash item failed")
-        self.occ("trashbin:expire", FIXTURE_USERS[0])
+        self.stack.occ("trashbin:expire", "--", FIXTURE_USERS[0])
         paths = [row["path"] for row in (await self.trash(alice))["items"]]
         if folder + "/eight-days.txt" in paths or folder + "/six-days.txt" not in paths:
             raise RuntimeError("Expiry did not remove exactly the item older than 7 days")

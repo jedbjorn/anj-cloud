@@ -60,7 +60,7 @@ def populate(stack, uid, relative, prefix=""):
     base = f"{DATA}/{uid}/files/anj-cloud/{relative}"
     script = build_script(base, prefix, tree_folders())
     stack.compose("exec", "-T", "--user", "www-data", "nextcloud", "sh", "-s", data=script)
-    stack.occ("files:scan", "--quiet", f"--path=/{uid}/files/anj-cloud/{relative}")
+    stack.occ("files:scan", "--quiet", "--path=" + f"/{uid}/files/anj-cloud/{relative}")
 
 
 def count(log, uid, marks):
