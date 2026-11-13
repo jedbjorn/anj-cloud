@@ -33,6 +33,7 @@ const _terminalStatuses = {'deleted', 'deleted remotely', 'removed locally'};
 const _passive = {
   'artifact',
   'retained',
+  'trash',
   'excluded-entry',
   'excluded-operation',
 };
@@ -589,7 +590,20 @@ class RecoveryCopies {
     if (source == null) {
       throw const FileSystemException('No recovery copy here can be restored.');
     }
-    final destination = this.destination(path);
+    return _restore(path, source, destination(path));
+  }
+
+  /// The crash-safe write of spec #25: [source] is copied into a recorded
+  /// staging file, fsynced and read back, then renamed to [destination]
+  /// without replacing anything. The copy is released only once the file
+  /// there reads back with the same hash. [trash] names the device-trash
+  /// record (spec #44) whose copy this is.
+  Map<String, Object?> _restore(
+    String path,
+    RecoveryCopy source,
+    String destination, {
+    String? trash,
+  }) {
     final temp = artifacts.reserve(path, 'recover-temp');
     final tempRecord = artifacts.record(temp)!;
     final op =
@@ -604,6 +618,7 @@ class RecoveryCopies {
             'source': source.staged,
             'destination': destination,
             'name': tempRecord.data['name'],
+            'trash': ?trash,
           };
     manifest.operations[op.id] = op;
     manifest.save();
@@ -794,7 +809,23 @@ class RecoveryCopies {
       verified = false;
     }
     var kept = true;
-    if (verified && release) {
+    final trash = op.data['trash'];
+    if (verified && release && trash is String) {
+      // A device-trash copy (spec #44): every name of its file goes, then
+      // the trash record.
+      final names = trashCopies(manifest.operations[trash]);
+      if (names.isNotEmpty && names.every((c) => c.info == null || _owned(c))) {
+        try {
+          _remove(names, row, expectedHash: op.hash);
+          manifest.operations.remove(trash);
+          kept = false;
+        } on FileSystemException {
+          kept = true;
+        }
+      } else if (names.isEmpty) {
+        manifest.operations.remove(trash);
+      }
+    } else if (verified && release) {
       final source = op.data['source'] as String;
       final copies = copiesOf(row);
       final copy = copies.where((c) => c.staged == source).firstOrNull;
@@ -819,6 +850,85 @@ class RecoveryCopies {
     manifest.save();
     _settle(row);
     return kept;
+  }
+
+  // ----------------------------------------------------------- Device trash
+
+  /// The names of a device-trash record's file (spec #44) as they stand now:
+  /// its owning records and present files. Empty for anything else.
+  List<RecoveryCopy> trashCopies(Operation? trash) {
+    if (trash == null || trash.kind != 'trash') return const [];
+    final names = <String>{
+      ?trash.staged,
+      ...(trash.data['names'] as List? ?? const []).cast<String>(),
+    };
+    final byStaged = {
+      for (final record in artifacts.records)
+        if (record.staged != null) record.staged!: record,
+    };
+    return [
+      for (final staged in names)
+        RecoveryCopy(
+          staged,
+          byStaged[staged],
+          _present(p.basename(staged)),
+          retained: true,
+        ),
+    ];
+  }
+
+  NativeFileInfo? _present(String name) {
+    try {
+      return _info(name);
+    } on FileSystemException {
+      return null;
+    }
+  }
+
+  /// Whether this profile owns [copy] (its record matches the file).
+  bool owned(RecoveryCopy copy) => _owned(copy);
+
+  /// Copies grouped by file: hard-linked names together.
+  static List<List<RecoveryCopy>> byFile(List<RecoveryCopy> copies) =>
+      _byFile(copies);
+
+  /// Drops every reference to [staged], whose bytes are gone or now belong
+  /// to a device-trash record.
+  void forget(String staged, Operation? record) => _finalize(staged, record);
+
+  /// Deletes one file's names under the guard (Dismiss's primitive).
+  void removeNames(List<RecoveryCopy> names, String row) => _remove(names, row);
+
+  /// [removeNames], only when the bytes still hash to [expectedHash].
+  void removeNamesVerified(
+    List<RecoveryCopy> names,
+    String row,
+    String expectedHash,
+  ) => _remove(names, row, expectedHash: expectedHash);
+
+  /// Restores a device-trash copy (spec #44) to [destination] with the
+  /// crash-safe write; the record goes once the restored file verifies.
+  Map<String, Object?> restoreTrash(Operation trash, String destination) {
+    final names = trashCopies(trash).where(_owned).toList();
+    if (names.isEmpty) {
+      throw const FileSystemException('This copy can no longer be restored.');
+    }
+    return _restore(trash.path, names.first, destination, trash: trash.id);
+  }
+
+  /// [row] when nothing holds it, else `name (restored).ext`, then
+  /// `name (restored 2).ext` and so on, in the same folder (spec #44).
+  String trashDestination(String row) {
+    if (free(row, row: row)) return row;
+    final directory = p.posix.dirname(row);
+    final base = p.posix.basenameWithoutExtension(row);
+    final extension = p.posix.extension(row);
+    for (var n = 1; n < 10000; n++) {
+      final name = '$base (restored${n == 1 ? '' : ' $n'})$extension';
+      final candidate = directory == '.' ? name : '$directory/$name';
+      if (free(candidate, row: row)) return candidate;
+    }
+    throw const FileSystemException('No free name to restore to.');
   }
 
   // ---------------------------------------------------------------- Crashes

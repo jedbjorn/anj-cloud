@@ -15,6 +15,7 @@ import '../sync/name_policy.dart';
 import '../local/root_tree.dart';
 import '../update/release.dart';
 import 'sharing.dart';
+import 'trash_api.dart';
 
 /// The listing's explicit PROPFIND body. Every property the engine relies on
 /// (type, version, size) plus the modification time and file ID that rank
@@ -64,7 +65,8 @@ class DavCloud
         SharingApi,
         AdminTransport,
         ReleaseTransport,
-        FetchTransport {
+        FetchTransport,
+        TrashApi {
   DavCloud(
     this.origin,
     SecurityContext context, {
@@ -989,6 +991,61 @@ class DavCloud
   Future<void> deleteFetchJob(String id) => _fetch.deleteFetchJob(id);
   @override
   Future<void> clearFetchJobs() => _fetch.clearFetchJobs();
+
+  /// Trash (spec #44): the gateway's `/trash/` routes. A restore changes the
+  /// tree, so the next listing walks every folder (SC-057).
+  @override
+  Future<ServerTrash?> listTrash() async {
+    final data = await _sharing('GET', '/trash/', missingIsNull: true);
+    return data == null ? null : ServerTrash.fromJson(data);
+  }
+
+  @override
+  Future<TrashRestore> restoreTrash(String id) async {
+    try {
+      final data = await _sharing('POST', '/trash/${trashId(id)}/restore');
+      if (data is! Map || data['path'] is! String) {
+        throw const CloudFailure('Invalid trash response.');
+      }
+      final path = data['path'] as String;
+      validateRelative(path);
+      return TrashRestore(path, renamed: data['renamed'] == true);
+    } finally {
+      forgetListing();
+    }
+  }
+
+  @override
+  Future<List<TrashRestoreResult>> restoreTrashMany(List<String> ids) async {
+    final results = <TrashRestoreResult>[];
+    try {
+      // The gateway takes at most 500 per request.
+      for (var start = 0; start < ids.length; start += 500) {
+        final chunk = [for (final id in ids.skip(start).take(500)) trashId(id)];
+        final data = await _sharing(
+          'POST',
+          '/trash/restore',
+          body: {'ids': chunk},
+        );
+        results.addAll(parseRestoreMany(data, chunk));
+      }
+      return results;
+    } finally {
+      forgetListing();
+    }
+  }
+
+  @override
+  Future<void> deleteTrash(String id) async {
+    await _sharing('DELETE', '/trash/${trashId(id)}');
+  }
+
+  @override
+  Future<int> emptyTrash() async {
+    final data = await _sharing('DELETE', '/trash/');
+    final deleted = data is Map ? data['deleted'] : null;
+    return deleted is int ? deleted : 0;
+  }
 
   @override
   void close() {

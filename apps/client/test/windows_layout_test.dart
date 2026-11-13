@@ -197,13 +197,11 @@ void main() {
       await tester.tap(find.byKey(const ValueKey('select-card:Photos')));
       await tester.pump();
       clean(tester, '$name select bar');
+      // One step (spec #44): no confirmation; the Trash snackbar fits.
       await tester.tap(find.byKey(const ValueKey('bulk-delete')));
       await tester.pumpAndSettle();
-      expect(find.text('Delete selected items everywhere?'), findsOneWidget);
-      clean(tester, '$name delete confirmation');
-      await tester.sendKeyEvent(LogicalKeyboardKey.escape);
-      await tester.pumpAndSettle();
       expect(find.byType(AlertDialog), findsNothing);
+      clean(tester, '$name after delete');
 
       await tester.pumpWidget(const SizedBox());
       controller.dispose();

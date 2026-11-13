@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:math';
 
+import '../gateway/trash_api.dart';
+
 import '../gateway/cloud_api.dart';
 import '../state/model.dart';
 import '../gateway/sharing.dart';
@@ -93,7 +95,9 @@ class RemoteSchedule {
 
 /// Network gate in front of the real cloud. While paused every call fails
 /// before any request is made, so no command or pass can reach the server.
-class PausableCloud with ForwardSharing, ForwardAdmin implements CloudApi {
+class PausableCloud
+    with ForwardSharing, ForwardAdmin, ForwardTrash
+    implements CloudApi {
   PausableCloud(this.inner);
   final CloudApi inner;
   bool paused = false;
@@ -244,6 +248,8 @@ SyncStatus deriveStatus({
     'excluded-entry',
     'excluded-operation',
     'working',
+    // A device-trash copy (spec #44) is never pending work.
+    'trash',
   };
   if (operations.any((o) => !passive.contains(o.kind)) ||
       entries.any((e) {

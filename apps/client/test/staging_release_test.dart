@@ -55,6 +55,11 @@ class _ReadBackCloud extends FakeCloud {
 /// Spec #12 (decision #37): redundant staging copies are released only when
 /// the server provably holds the same bytes; everything else is retained.
 void main() {
+  // The release rules and the Recover/Dismiss primitives as such; the
+  // device trash that now takes deletion copies (spec #44) is covered by
+  // device_trash_test.dart.
+  setUpAll(() => SyncEngine.debugDeletionRecoveryRows = true);
+  tearDownAll(() => SyncEngine.debugDeletionRecoveryRows = false);
   const dir = 'Documents/issue/run';
   const pending =
       'Reconciled. Busy or uncertain Cloud releases remain pending.';
@@ -682,53 +687,56 @@ void main() {
   });
 
   for (final phase in ['before-unlink', 'after-unlink-before-db']) {
-    test('a real process crash at $phase converges with no copy lacking a record', () async {
-      final path = '${fixture.path}/crash-$phase';
-      final dart = testDartExecutable;
-      final crashed = await Process.run(dart, [
-        'run',
-        'tool/staging_release_fixture.dart',
-        path,
-        phase,
-      ]);
-      expect(
-        crashed.exitCode,
-        86,
-        reason: '${crashed.stdout}\n${crashed.stderr}',
-      );
-      final interrupted = Manifest(Directory('$path/profile'));
-      try {
-        final copy = interrupted.operations.values.singleWhere(
-          (o) => o.kind == 'artifact' && o.data['role'] == 'preserved',
+    test(
+      'a real process crash at $phase converges with no copy lacking a record',
+      () async {
+        final path = '${fixture.path}/crash-$phase';
+        final dart = testDartExecutable;
+        final crashed = await Process.run(dart, [
+          'run',
+          'tool/staging_release_fixture.dart',
+          path,
+          phase,
+        ]);
+        expect(
+          crashed.exitCode,
+          86,
+          reason: '${crashed.stdout}\n${crashed.stderr}',
         );
-        // Verified intent is durable before unlink; the record survives it.
-        expect(copy.data['releasing'], isNotNull);
-        expect(File(copy.staged!).existsSync(), phase == 'before-unlink');
-      } finally {
-        interrupted.close();
-      }
-      final resumed = await Process.run(dart, [
-        'run',
-        'tool/staging_release_fixture.dart',
-        path,
-        'resume',
-      ]);
-      expect(
-        resumed.exitCode,
-        0,
-        reason: '${resumed.stdout}\n${resumed.stderr}',
-      );
-      final result =
-          jsonDecode(File('$path/result.json').readAsStringSync()) as Map;
-      expect(result['status'], 'deleted');
-      expect(result['remote_present'], isFalse);
-      expect(result['root_present'], isFalse);
-      expect(result['staged'], isEmpty);
-      expect(result['unrecorded'], isEmpty);
-      expect(result['records'], isEmpty);
-      expect(result['retained'], 0);
-      expect(result['preserved_copies'], isEmpty);
-      expect(result['message'], 'Reconciled.');
-    });
+        final interrupted = Manifest(Directory('$path/profile'));
+        try {
+          final copy = interrupted.operations.values.singleWhere(
+            (o) => o.kind == 'artifact' && o.data['role'] == 'preserved',
+          );
+          // Verified intent is durable before unlink; the record survives it.
+          expect(copy.data['releasing'], isNotNull);
+          expect(File(copy.staged!).existsSync(), phase == 'before-unlink');
+        } finally {
+          interrupted.close();
+        }
+        final resumed = await Process.run(dart, [
+          'run',
+          'tool/staging_release_fixture.dart',
+          path,
+          'resume',
+        ]);
+        expect(
+          resumed.exitCode,
+          0,
+          reason: '${resumed.stdout}\n${resumed.stderr}',
+        );
+        final result =
+            jsonDecode(File('$path/result.json').readAsStringSync()) as Map;
+        expect(result['status'], 'deleted');
+        expect(result['remote_present'], isFalse);
+        expect(result['root_present'], isFalse);
+        expect(result['staged'], isEmpty);
+        expect(result['unrecorded'], isEmpty);
+        expect(result['records'], isEmpty);
+        expect(result['retained'], 0);
+        expect(result['preserved_copies'], isEmpty);
+        expect(result['message'], 'Reconciled.');
+      },
+    );
   }
 }

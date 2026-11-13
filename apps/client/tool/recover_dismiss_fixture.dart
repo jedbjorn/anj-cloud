@@ -24,6 +24,9 @@ class _RefusingCloud extends FixtureCloud {
 }
 
 Future<void> main(List<String> arguments) async {
+  // Recover and Dismiss as such (spec #25); deletion copies now go to the
+  // device trash (spec #44), so this producer keeps its Recovery row here.
+  SyncEngine.debugDeletionRecoveryRows = true;
   if (arguments.length != 2) {
     throw ArgumentError(
       'Supply an absent disposable fixture path and a crash phase or resume.',

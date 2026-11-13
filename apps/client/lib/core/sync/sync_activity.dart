@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import '../gateway/trash_api.dart';
+
 import '../gateway/cloud_api.dart';
 import '../state/model.dart';
 import '../gateway/sharing.dart';
@@ -65,7 +67,9 @@ class SyncActivity {
 /// Records every upload and download as in flight for its path while it
 /// runs, whichever component started it (reconcile, editing, eviction proof,
 /// opening a cloud-only file). Everything else is forwarded unchanged.
-class ActivityCloud with ForwardSharing, ForwardAdmin implements CloudApi {
+class ActivityCloud
+    with ForwardSharing, ForwardAdmin, ForwardTrash
+    implements CloudApi {
   ActivityCloud(this.inner, this.activity);
   final CloudApi inner;
   @override

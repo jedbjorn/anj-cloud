@@ -22,6 +22,8 @@ import '../ports/change_watcher.dart';
 import '../ports/root_filesystem.dart';
 import 'pass_metrics.dart';
 import 'recovery_copies.dart';
+import 'device_trash.dart';
+import '../gateway/trash_api.dart';
 import 'sync_path_policy.dart';
 import '../state/manifest.dart';
 import '../state/model.dart';
@@ -108,6 +110,16 @@ class SyncEngine {
     recordsFor: _artifactsFor,
     restored: markDirty,
     localIdentities: localIdentities,
+  );
+
+  /// The device trash (spec #44): deletion-produced copies, purged after
+  /// the server's `trash_days`.
+  late final DeviceTrash deviceTrash = DeviceTrash(
+    manifest,
+    tree,
+    recovery,
+    clock: () => wallClock(),
+    restored: markDirty,
   );
   late final ExcludedTracking exclusions = ExcludedTracking(
     manifest,
@@ -1012,6 +1024,8 @@ class SyncEngine {
     'retained',
     'excluded-entry',
     'excluded-operation',
+    // A device-trash copy (spec #44): no work, never a reason to visit.
+    'trash',
   };
   static String _localSignature(LocalItem item) =>
       '${item.kind.name}|${item.identity}|${item.scanStamp}|${item.hash}';
@@ -2212,6 +2226,11 @@ class SyncEngine {
   /// Test seam for every engine of an isolate (suites whose deletions under
   /// Documents are not about the settle time).
   static Duration? debugTopDeleteSettleAll;
+
+  /// Test seam: deletion-produced copies stay Recovery rows as before spec
+  /// #44, for tests of the release rules and the Recover and Dismiss
+  /// primitives that conflict and eviction copies still use.
+  static bool debugDeletionRecoveryRows = false;
 
   /// When a pass last found an item of each top folder newly missing.
   final Map<String, Duration> _topLastLoss = {};
@@ -5521,6 +5540,9 @@ class SyncEngine {
     // Same pass as the upload/deletion acknowledgement; also converges copies
     // left by earlier versions and interrupted releases.
     var releasePending = false;
+    // Whether the server has a trash to restore from, and its trash_days
+    // (spec #44), about once a day: decides whether deletion copies may go.
+    await _learnTrash();
     try {
       releasePending = releaseRedundantStaging();
     } on FileSystemException {
@@ -5771,6 +5793,9 @@ class SyncEngine {
         manifest.save();
       }
       if (retained.data['deletion'] != true) continue;
+      // A server without a trash (an older gateway, or not yet known) gives
+      // no way back: the copy is kept in the device trash instead (spec #44).
+      if (!deviceTrash.serverTrash) continue;
       final expected = retained.data['deletedVersionHash'] as String?;
       if (expected == null) continue;
       adoptInterruptedPreserve(retained.staged!);
@@ -5797,7 +5822,9 @@ class SyncEngine {
       }
     }
     // Rule 1: an upload snapshot whose version the server acknowledged.
+    final trash = deviceTrash.held;
     for (final record in artifacts.records.toList()) {
+      if (trash.contains(record.staged)) continue;
       final role = record.data['role'];
       if ((role != 'upload' && role != 'upload-recovery') ||
           record.phase != 'complete' ||
@@ -5826,6 +5853,17 @@ class SyncEngine {
       } on FileSystemException {
         pending = true;
       }
+    }
+    // The device trash (spec #44): a copy the restored file now holds goes,
+    // the copies of completed deletions move into the trash (also the rows
+    // earlier versions left, T7), and copies past `trash_days` are purged.
+    // Never a reason to report a pending release.
+    try {
+      deviceTrash.releaseRestored();
+      if (!debugDeletionRecoveryRows) deviceTrash.collect();
+      deviceTrash.purge();
+    } on FileSystemException {
+      // Retried at the next pass; nothing is removed unless verified.
     }
     // Forget an unobserved folder deletion once no descendant can still be
     // reconciled as a remote deletion.
@@ -5922,7 +5960,15 @@ class SyncEngine {
     if (entry.kind == ItemKind.file && local.containsKey(entry.path)) {
       preserve(
         entry,
-        facts: deletionFacts(entry, versionKnown ? op.expectedEtag : null),
+        facts: {
+          ...deletionFacts(entry, versionKnown ? op.expectedEtag : null),
+          // Edited here after the version the server deleted (spec #44).
+          if (op.data['localChanged'] == true ||
+              (local[entry.path]?.hash != null &&
+                  entry.baselineHash != null &&
+                  local[entry.path]!.hash != entry.baselineHash))
+            'localChanged': true,
+        },
       );
       local.remove(entry.path);
     }
@@ -6374,6 +6420,7 @@ class SyncEngine {
             persist: false,
           );
           if (existing == null) addedOperations.add(queued.id);
+          _noteLocalEdits(entry, queued);
           entry.status = 'delete queued';
         } else {
           _choose(entry, Retention.values.byName(action), choicesBefore);
@@ -6398,6 +6445,11 @@ class SyncEngine {
       'failed': 0,
       'covered': checked.length - roots.length,
       'errors': errors,
+      // What one Undo puts back (spec #44), and when it was deleted.
+      if (action == 'delete') ...{
+        'paths': [for (final entry in roots) entry.path],
+        'at': wallClock().millisecondsSinceEpoch,
+      },
     };
   }
 
@@ -6505,10 +6557,339 @@ class SyncEngine {
         'This item has no synchronized version. Retain it until it is uploaded.',
       );
     }
-    intent(path, 'delete', etag: entry.etag);
+    _noteLocalEdits(entry, intent(path, 'delete', etag: entry.etag));
     entry.status = 'delete queued';
     manifest.save();
     markDirty(path, descendants: true);
+  }
+
+  /// A file whose local bytes differ from the version last synced: the delete
+  /// trashes the server's older version, so the bytes preserved here are the
+  /// latest and Undo and Restore use them (spec #44).
+  void _noteLocalEdits(Entry entry, Operation delete) {
+    if (entry.kind == ItemKind.file &&
+        entry.localHash != null &&
+        entry.baselineHash != null &&
+        entry.localHash != entry.baselineHash) {
+      delete.data['localChanged'] = true;
+    }
+  }
+
+  Future<void> _learnTrash() async {
+    final api = trashApi;
+    if (api == null || !deviceTrash.checkDue) return;
+    try {
+      deviceTrash.learned(await api.listTrash());
+    } on Exception {
+      // Unreachable now: what was known stays, and the next pass asks again.
+    }
+  }
+
+  // ------------------------------------------------------------- Trash
+
+  /// The gateway's trash routes (spec #44), when this cloud has them.
+  TrashApi? get trashApi => cloud is TrashApi ? cloud as TrashApi : null;
+
+  static const trashUnreachable =
+      "Can't reach the server: showing only this device's trash";
+
+  /// The Trash view: one entry per deletion, newest first (spec #44). The
+  /// server part is left out, with a note, when [server] is false (paused or
+  /// offline) or the server cannot be reached.
+  Future<Map<String, Object?>> trashListing({bool server = true}) async {
+    ServerTrash? listed;
+    String? note;
+    final api = trashApi;
+    if (!server || api == null) {
+      note = trashUnreachable;
+    } else {
+      try {
+        listed = await api.listTrash();
+        deviceTrash.learned(listed);
+        if (listed == null) {
+          note =
+              "This server has no Trash yet: showing only this device's trash";
+        }
+      } on Exception {
+        note = trashUnreachable;
+      }
+    }
+    final days = deviceTrash.days;
+    return {
+      'note': note,
+      'server': listed != null,
+      'trashDays': days,
+      'deviceBytes': deviceTrash.bytes,
+      'entries': [
+        for (final entry in mergeTrash(
+          listed?.items ?? const [],
+          deviceTrash.items(),
+        ))
+          entry.toJson(days),
+      ],
+    };
+  }
+
+  /// Restore of one Trash entry: the server item when there is one, else the
+  /// device copy. Returns where it went and whether the name was taken.
+  Future<Map<String, Object?>> trashRestore({
+    String? serverId,
+    String? deviceId,
+  }) async {
+    requireStorageReady();
+    final edited =
+        deviceId != null &&
+        deviceTrash.items().any((c) => c.id == deviceId && c.changed);
+    if (serverId != null && !edited) {
+      final api = trashApi;
+      if (api == null) throw const CloudFailure(trashUnreachable);
+      final restored = await api.restoreTrash(serverId);
+      _restoredFromServer(restored.path);
+      return {'path': restored.path, 'renamed': restored.renamed};
+    }
+    if (deviceId == null) throw const CloudFailure('No longer in Trash');
+    final result = deviceTrash.restore(deviceId);
+    final destination = result['destination'] as String;
+    return {
+      'path': destination,
+      'renamed': destination != result['path'],
+      if (result['kept'] == true) 'kept': true,
+    };
+  }
+
+  /// An item the server restored: its path is read again by the next pass,
+  /// and a delete still queued there is dropped (it would delete it again).
+  void _restoredFromServer(String path) {
+    final queued = operation(path, 'delete');
+    if (queued != null) finish(queued);
+    final entry = manifest.entries[path];
+    if (entry != null && deletionStatuses.contains(entry.status)) {
+      entry.refreshRemote = true;
+      manifest.save();
+    }
+    markDirty(path, descendants: true);
+  }
+
+  /// Delete now (spec #44): permanent, for the given server items and
+  /// device copies. Returns how many went and the errors of the rest.
+  Future<Map<String, Object?>> trashDelete(
+    List<String> serverIds,
+    List<String> deviceIds,
+  ) async {
+    var deleted = 0;
+    final errors = <String>[];
+    final api = trashApi;
+    for (final id in serverIds) {
+      try {
+        if (api == null) throw const CloudFailure(trashUnreachable);
+        await api.deleteTrash(id);
+        deleted++;
+      } on CloudFailure catch (error) {
+        if (error.status == 404) {
+          deleted++;
+        } else {
+          errors.add(error.message);
+        }
+      }
+    }
+    for (final id in deviceIds) {
+      try {
+        deviceTrash.delete(id);
+        deleted++;
+      } on FileSystemException catch (error) {
+        errors.add(error.message);
+      }
+    }
+    return {'deleted': deleted, 'errors': errors.toSet().toList()};
+  }
+
+  /// Empty Trash (spec #44): the server's anj-cloud/ items when it can be
+  /// reached, and every device copy that can be removed now.
+  Future<Map<String, Object?>> trashEmpty({bool server = true}) async {
+    var deleted = 0;
+    final errors = <String>[];
+    final api = trashApi;
+    if (server && api != null) {
+      try {
+        deleted += await api.emptyTrash();
+      } on Exception {
+        errors.add("Couldn't empty the server's Trash. Try again later.");
+      }
+    } else {
+      errors.add(trashUnreachable);
+    }
+    final before = deviceTrash.records.length;
+    deleted += deviceTrash.empty();
+    if (deviceTrash.records.length == before && before > 0) {
+      errors.add('Copies open in another program are kept.');
+    }
+    return {'deleted': deleted, 'errors': errors};
+  }
+
+  /// Undo of one delete (spec #44): every path of it back with the same
+  /// content. A delete not yet sent is cancelled (the local item never
+  /// left); one the server applied is restored from the server's trash,
+  /// else from the device trash. A name taken meanwhile gets `(restored)`.
+  /// [at] is when the delete was made (ms since epoch). Never loses data:
+  /// an item that cannot come back stays in Trash.
+  Future<Map<String, Object?>> undoDelete(
+    List<String> paths,
+    int at, {
+    bool server = true,
+  }) async {
+    requireStorageReady();
+    final results = <Map<String, Object?>>[];
+    final remote = <String>[];
+    for (final path in paths) {
+      validateRelative(path);
+      final queued = operation(path, 'delete');
+      if (queued != null && queued.data['dispatchState'] != 'started') {
+        finish(queued);
+        final entry = manifest.entries[path];
+        if (entry != null && entry.status == 'delete queued') {
+          entry.status = 'current local';
+          manifest.save();
+        }
+        markDirty(path, descendants: true);
+        results.add({'path': path, 'result': 'restored', 'to': path});
+      } else {
+        remote.add(path);
+      }
+    }
+    if (remote.isEmpty) return {'results': results};
+    // Clocks may disagree: a server item for the path deleted up to an hour
+    // before this delete was made still counts as this delete's.
+    const skew = Duration(hours: 1);
+    Map<String, Object?> deviceResult(String path, DeviceTrashItem copy) {
+      final result = deviceTrash.restore(copy.id);
+      final destination = result['destination'] as String;
+      return {
+        'path': path,
+        'result': destination == path ? 'restored' : 'renamed',
+        'to': destination,
+      };
+    }
+
+    DeviceTrashItem? copyOf(String path, {bool edited = false}) => deviceTrash
+        .items()
+        .where(
+          (c) =>
+              c.path == path &&
+              c.at >= at - skew.inMilliseconds &&
+              (!edited || c.changed),
+        )
+        .firstOrNull;
+    final fromServer = <String>[];
+    for (final path in remote) {
+      // Edited here before the delete: these bytes are the latest version and
+      // win over the server's older one, which is left to expire.
+      final edited = copyOf(path, edited: true);
+      if (edited == null) {
+        fromServer.add(path);
+        continue;
+      }
+      try {
+        _dropUnsentDelete(path);
+        results.add(deviceResult(path, edited));
+      } on FileSystemException catch (error) {
+        results.add({
+          'path': path,
+          'result': 'failed',
+          'message': error.message,
+        });
+      }
+    }
+    if (fromServer.isEmpty) return {'results': results};
+    ServerTrash? listed;
+    String? unreachable;
+    final api = trashApi;
+    if (server && api != null) {
+      try {
+        listed = await api.listTrash();
+        deviceTrash.learned(listed);
+      } on Exception {
+        unreachable = trashUnreachable;
+      }
+    } else {
+      unreachable = trashUnreachable;
+    }
+    final since = (at - skew.inMilliseconds) ~/ 1000;
+    final ids = <String, String>{};
+    for (final path in fromServer) {
+      final items =
+          (listed?.items ?? const <ServerTrashItem>[])
+              .where((i) => i.path == path && i.deleted >= since)
+              .toList()
+            ..sort((a, b) => b.deleted.compareTo(a.deleted));
+      if (items.isNotEmpty) ids[path] = items.first.id;
+    }
+    // One request for all of them (spec #44 S6).
+    final restored = <String, TrashRestoreResult>{};
+    if (ids.isNotEmpty) {
+      try {
+        for (final result in await api!.restoreTrashMany(ids.values.toList())) {
+          restored[result.id] = result;
+        }
+      } on Exception catch (error) {
+        unreachable = error is CloudFailure ? error.message : trashUnreachable;
+      }
+    }
+    for (final path in fromServer) {
+      try {
+        final id = ids[path];
+        final result = id == null ? null : restored[id];
+        if (result?.restored case final done?) {
+          _restoredFromServer(done.path);
+          results.add({
+            'path': path,
+            'result': done.renamed ? 'renamed' : 'restored',
+            'to': done.path,
+          });
+          continue;
+        }
+        if (result?.error case final error?) {
+          results.add({'path': path, 'result': 'failed', 'message': error});
+          continue;
+        }
+        final copy = copyOf(path);
+        if (copy != null) {
+          _dropUnsentDelete(path);
+          results.add(deviceResult(path, copy));
+          continue;
+        }
+        final queued = operation(path, 'delete');
+        if (queued != null && listed != null) {
+          // Sent, but the server never deleted it: the item is still there.
+          finish(queued);
+          final entry = manifest.entries[path];
+          if (entry != null && entry.status.startsWith('delete')) {
+            entry.status = 'current local';
+            manifest.save();
+          }
+          markDirty(path, descendants: true);
+          results.add({'path': path, 'result': 'restored', 'to': path});
+          continue;
+        }
+        results.add({
+          'path': path,
+          'result': 'failed',
+          'message': unreachable ?? 'No longer in Trash',
+        });
+      } on Exception catch (error) {
+        results.add({
+          'path': path,
+          'result': 'failed',
+          'message': error is FileSystemException ? error.message : '$error',
+        });
+      }
+    }
+    return {'results': results};
+  }
+
+  /// A delete still recorded for [path] that a device-copy restore answers.
+  void _dropUnsentDelete(String path) {
+    final queued = operation(path, 'delete');
+    if (queued != null) finish(queued);
   }
 
   /// Downloads (or snapshots) [path] into a private working copy, or hands
@@ -6665,7 +7046,10 @@ class SyncEngine {
   List<Operation> _artifactsFor(String path) {
     if (_artifactIndexVersion != manifest.operationsVersion) {
       _artifactIndex.clear();
+      // A device-trash copy (spec #44) is no row's copy or staging file.
+      final trash = deviceTrash.held;
       for (final record in artifacts.records) {
+        if (trash.contains(record.staged)) continue;
         _artifactIndex
             .putIfAbsent(
               (record.data['entryPath'] ?? record.path) as String,

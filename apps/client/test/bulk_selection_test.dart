@@ -29,7 +29,30 @@ class _Controller extends ClientController {
     List<Map<String, dynamic>> targets,
   ) async {
     batches.add((action, targets));
-    return {'accepted': targets.length, 'failed': 0, 'errors': <String>[]};
+    return {
+      'accepted': targets.length,
+      'failed': 0,
+      'errors': <String>[],
+      if (action == 'delete') ...{
+        'paths': [for (final target in targets) target['path']],
+        'at': 1000,
+      },
+    };
+  }
+
+  final trashCalls = <(String, Map<String, Object?>)>[];
+  @override
+  Future<Map<String, dynamic>> trash(
+    String op, [
+    Map<String, Object?> args = const {},
+  ]) async {
+    trashCalls.add((op, args));
+    return {
+      'results': [
+        for (final path in args['paths'] as List? ?? const [])
+          {'path': path, 'result': 'restored', 'to': path},
+      ],
+    };
   }
 
   @override
@@ -137,7 +160,7 @@ void main() {
       },
     );
     testWidgets('a mix of files and folders takes both storage choices without '
-        'confirmation; delete cancel and confirm use exact targets', (
+        'confirmation; Delete is one step with the exact targets, then Undo', (
       tester,
     ) async {
       await select(tester);
@@ -170,24 +193,20 @@ void main() {
       await tester.pump();
       await tester.tap(find.byKey(const ValueKey('bulk-delete')));
       await tester.pumpAndSettle();
-      expect(
-        find.textContaining('including hidden or filtered items'),
-        findsOneWidget,
-      );
-      await tester.tap(find.widgetWithText(TextButton, 'Cancel').last);
-      await tester.pumpAndSettle();
-      expect(controller.batches, isEmpty);
-      expect(find.text('2 selected'), findsOneWidget);
-      await tester.tap(find.byKey(const ValueKey('bulk-delete')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('confirm-bulk-delete')));
-      await tester.pumpAndSettle();
+      // No confirmation (spec #44 T1): sent at once, then the snackbar.
+      expect(find.byType(AlertDialog), findsNothing);
       expect(controller.batches.single.$1, 'delete');
       expect(controller.batches.single.$2.map((e) => e['path']), [
         'Folder',
         'note.txt',
       ]);
       expect(find.text('0 selected'), findsOneWidget);
+      expect(find.text('2 items moved to Trash'), findsOneWidget);
+      await tester.tap(find.text('Undo'));
+      await tester.pumpAndSettle();
+      expect(controller.trashCalls.single.$1, 'undo');
+      expect(controller.trashCalls.single.$2['paths'], ['Folder', 'note.txt']);
+      expect(find.text('2 items restored.'), findsOneWidget);
     });
     testWidgets('Escape overrides focused search and cancels modal plus mode', (
       tester,
@@ -215,11 +234,8 @@ void main() {
       await tester.pump();
       await tester.tap(find.byKey(const ValueKey('select-card:note.txt')));
       await tester.pump();
-      await tester.tap(find.byKey(const ValueKey('bulk-delete')));
-      await tester.pumpAndSettle();
       await tester.sendKeyEvent(LogicalKeyboardKey.escape);
       await tester.pumpAndSettle();
-      expect(find.byType(AlertDialog), findsNothing);
       expect(find.byKey(const ValueKey('bulk-delete')), findsNothing);
       expect(controller.batches, isEmpty);
     });
@@ -239,20 +255,22 @@ void main() {
       expect(find.text('0 selected'), findsOneWidget);
     });
     testWidgets(
-      'stale delete confirmation cannot dispatch after replacement refresh',
+      'a replaced item leaves the selection before Delete can send it',
       (tester) async {
         await select(tester);
         await tester.tap(find.byKey(const ValueKey('select-card:note.txt')));
         await tester.pump();
-        await tester.tap(find.byKey(const ValueKey('bulk-delete')));
-        await tester.pumpAndSettle();
         controller.entries = [_entry('note.txt', 'file', version: '2')];
         controller.reportMessage('replaced');
         await tester.pump();
-        await tester.tap(find.byKey(const ValueKey('confirm-bulk-delete')));
-        await tester.pumpAndSettle();
-        expect(controller.batches, isEmpty);
         expect(find.text('0 selected'), findsOneWidget);
+        expect(
+          tester
+              .widget<FilledButton>(find.byKey(const ValueKey('bulk-delete')))
+              .onPressed,
+          isNull,
+        );
+        expect(controller.batches, isEmpty);
       },
     );
     for (final width in [1280.0, 360.0]) {
@@ -282,12 +300,7 @@ void main() {
         expect(find.text('Select All'), findsNothing);
         expect(find.text('Details'), findsNothing);
         final evidence = Platform.environment['ANJ_UI_EVIDENCE_DIR'];
-        for (final confirmation in [false, true]) {
-          if (confirmation) {
-            await tester.tap(find.byKey(const ValueKey('bulk-delete')));
-            await tester.pumpAndSettle();
-            expect(find.byType(AlertDialog), findsOneWidget);
-          }
+        for (final confirmation in [false]) {
           if (evidence != null) {
             await tester.runAsync(() async {
               final render =
@@ -433,10 +446,14 @@ void main() {
       // synchronization/recovery guards own content changed after the last scan.
       expect(engine.applyBulk('delete', [selected])['accepted'], 1);
       await engine.tick();
-      final entry = store.entries['Projects/Child/note.txt']!;
-      expect(entry.preservedCopies, isNotEmpty);
+      // The latest bytes are in the device trash, marked as the version to
+      // restore (spec #44).
+      final copy = store.operations.values.singleWhere(
+        (op) => op.kind == 'trash' && op.path == 'Projects/Child/note.txt',
+      );
+      expect(copy.data['changed'], isTrue);
       expect(
-        engine.artifacts.resolve(entry.preservedCopies.last).readAsStringSync(),
+        engine.artifacts.resolve(copy.staged!).readAsStringSync(),
         'late unsynchronized save',
       );
     });

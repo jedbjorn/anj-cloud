@@ -232,12 +232,12 @@ void main() {
           expect(rect.bottom, lessThanOrEqualTo(size.height), reason: action);
         }
         await _check(tester, '$at-07-select');
+        // One step (spec #44): no confirmation; the Trash snackbar fits.
         await tester.tap(find.byKey(const ValueKey('bulk-delete')));
         await tester.pumpAndSettle();
-        expect(find.text('Delete selected items everywhere?'), findsOneWidget);
-        await _check(tester, '$at-08-delete-confirm');
-        await tester.tap(find.text('Cancel'));
-        await tester.pumpAndSettle();
+        expect(find.byType(AlertDialog), findsNothing);
+        expect(find.text('Moved to Trash'), findsOneWidget);
+        await _check(tester, '$at-08-moved-to-trash');
         handle.dispose();
       });
 

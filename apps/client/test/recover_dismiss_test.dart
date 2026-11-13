@@ -30,6 +30,11 @@ class _Cloud extends FakeCloud {
 
 /// Spec #25 (decision #57): Recover and Dismiss of retained recovery copies.
 void main() {
+  // The release rules and the Recover/Dismiss primitives as such; the
+  // device trash that now takes deletion copies (spec #44) is covered by
+  // device_trash_test.dart.
+  setUpAll(() => SyncEngine.debugDeletionRecoveryRows = true);
+  tearDownAll(() => SyncEngine.debugDeletionRecoveryRows = false);
   // Deletions under Documents here are not about the settle time of spec
   // #34 P7 (H1); top_folders_test.dart covers it.
   setUpAll(() => SyncEngine.debugTopDeleteSettleAll = Duration.zero);

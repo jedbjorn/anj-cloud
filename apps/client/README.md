@@ -427,6 +427,54 @@ siblings that differ only by normalization remain a clash (#120).
 `tool/case_move_fixture.dart`, driven by
 `deploy/case_move_fixture.py`, proves this against a review stack.
 
+## Trash
+
+Spec #44. Delete is one step: the rows leave the library at once (a delete
+queued here hides its row and, for a folder, every row below it) and a
+snackbar says "Moved to Trash" with **Undo** and **View** for about 8 seconds.
+The only confirmations left are Delete now and Empty Trash in the Trash view
+(app menu, **Trash**), which lists, one entry per deletion and newest first,
+the account's server trash below `anj-cloud/` (the gateway's `/trash/`
+routes, [access protocol](../../services/access/README.md#trash)) and this
+device's own trash.
+
+- **Device trash** (`lib/core/sync/device_trash.dart`). The copy a completed
+  deletion produced (the bytes it preserved, or the snapshot of a file removed
+  before it ever uploaded) becomes a `trash` record instead of a Recovery row
+  when the server cannot be shown to hold it: original path, when it entered
+  the trash, size and every staging name of the file. Spec #12's release rules
+  are unchanged where the server has a trash: a copy whose bytes equal the
+  deleted version is still released. Until a pass has seen the gateway's trash
+  routes (an older gateway, or not yet known), every deleted file keeps its
+  copy here, so Undo and Restore work from it. Every other copy of the row (a
+  replacement, eviction or conflict copy, a leftover snapshot) keeps Recover
+  and Dismiss. Rows left by earlier versions convert the same way on the first
+  pass (their clock starts then). The same bytes for the same path and
+  deletion are one entry. A pass learns `trash_days` about once a day; a copy
+  is purged at the first pass more than `trash_days` after it entered the
+  trash (7 while unknown), and released early when the live file at its path
+  holds the same bytes again.
+- **Edited, then deleted.** When the local bytes differ from the version last
+  synced, the delete trashes the server's older version; the device copy is
+  marked as the latest, and Undo and Restore use it (the server's item is left
+  to expire).
+- **Restore** of an entry restores the server item; the menu's "Restore this
+  device's copy" (and Restore of a device-only or edited entry) uses spec
+  #25's crash-safe write: original path, else `name (restored).ext`, missing
+  folders created again, never replacing anything.
+- **Undo** cancels a delete not yet sent (the local item never left);
+  otherwise it restores the server's trash items for its paths deleted since
+  the delete was made (an hour of clock difference allowed) with one batch
+  request (`POST /trash/restore`), else the device copy. A name taken
+  meanwhile gets `(restored)`; an item that cannot come back stays in Trash
+  and the snackbar says so.
+- While paused or offline only this device's trash is shown, with "Can't
+  reach the server: showing only this device's trash".
+
+`tool/trash_fixture.dart`, driven by `deploy/trash_client_fixture.py`,
+proves one-step delete, both trashes and Undo against a review stack;
+`tool/android/emu_trash.py` does the same through the phone UI.
+
 ## Temporary file exclusions
 
 The sync boundary excludes exactly these case-sensitive basenames at any depth:

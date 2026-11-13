@@ -49,6 +49,21 @@ class LayoutController extends ClientController {
   @override
   void setIconColor(String path, int? color) => colours[path] = color;
 
+  /// Deletes go to Trash at once (spec #44): the snackbar's paths.
+  @override
+  Future<Map<String, dynamic>> bulkCommand(
+    String action,
+    List<Map<String, dynamic>> targets,
+  ) async => {
+    'accepted': targets.length,
+    'failed': 0,
+    'errors': <String>[],
+    if (action == 'delete') ...{
+      'paths': [for (final target in targets) target['path']],
+      'at': 1800000000000,
+    },
+  };
+
   @override
   void command(
     String action,

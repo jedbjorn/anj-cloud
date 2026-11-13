@@ -401,7 +401,7 @@ void main() {
       held.closeSync();
     }
   });
-  test('explicit Delete everywhere preserves then removes the local source and never resurrects it', () async {
+  test('explicit Delete everywhere preserves then removes the local source and never resurrects it; a late write is kept in the device trash', () async {
     await baseline();
     final held = local('Documents/note.txt').openSync(mode: FileMode.append);
     try {
@@ -413,13 +413,18 @@ void main() {
       held.flushSync();
       await engine.tick();
       expect(cloud.files.containsKey('Documents/note.txt'), isFalse);
+      // The changed copy is a deletion copy the server does not hold: it is
+      // in the device trash (spec #44), not a Recovery row.
       final entry = store.entries['Documents/note.txt']!;
-      expect(entry.conflict, isNotNull);
+      expect(entry.conflict, isNull);
+      expect(entry.preservedCopies, isEmpty);
+      final trash = store.operations.values
+          .where((op) => op.kind == 'trash' && op.path == 'Documents/note.txt')
+          .toList();
+      expect(trash, hasLength(1));
       expect(
-        entry.preservedCopies
-            .map((path) => File(path).readAsStringSync())
-            .any((text) => text.contains('late editor write')),
-        isTrue,
+        File(trash.single.staged!).readAsStringSync(),
+        contains('late editor write'),
       );
     } finally {
       held.closeSync();

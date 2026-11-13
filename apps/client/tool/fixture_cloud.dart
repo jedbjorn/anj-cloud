@@ -4,10 +4,31 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:anj_cloud/core/gateway/cloud_api.dart';
+import 'package:anj_cloud/core/gateway/trash_api.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
 
-class FixtureCloud implements CloudApi {
+class FixtureCloud implements CloudApi, TrashApi {
+  // A current gateway's trash routes (spec #44), empty: deletion copies follow
+  // the normal release rules. [trashRoutes] false models an older gateway.
+  bool trashRoutes = true;
+  @override
+  Future<ServerTrash?> listTrash() async {
+    return trashRoutes ? const ServerTrash(7, []) : null;
+  }
+
+  @override
+  Future<TrashRestore> restoreTrash(String id) async =>
+      throw const CloudFailure('Not in Trash', status: 404);
+  @override
+  Future<List<TrashRestoreResult>> restoreTrashMany(List<String> ids) async => [
+    for (final id in ids) TrashRestoreResult(id, error: 'Not in Trash'),
+  ];
+  @override
+  Future<void> deleteTrash(String id) async {}
+  @override
+  Future<int> emptyTrash() async => 0;
+
   FixtureCloud(this.root) {
     root.createSync(recursive: true);
   }

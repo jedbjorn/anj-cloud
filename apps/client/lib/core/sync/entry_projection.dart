@@ -1,3 +1,5 @@
+import 'package:path/path.dart' as p;
+
 import '../state/model.dart';
 import '../gateway/sharing.dart';
 import 'file_adder.dart';
@@ -106,6 +108,9 @@ Future<Map<String, Object?>> projectEntry(
         longPathNote,
     ]
     ..['nameRefused'] = isNameRefusal(entry.status)
+    // Deleted here and waiting to be sent (spec #44): the row, and a folder's
+    // rows below it, leave the library at once; Undo brings them back.
+    ..['deleteQueued'] = deleteQueued(engine, entry.path)
     // Recent ranks such a file by its local modification time.
     ..['pendingLocalEdit'] =
         entry.kind == ItemKind.file &&
@@ -129,4 +134,13 @@ Future<Map<String, Object?>> projectEntry(
     ..['inIncomingShare'] = engine.inIncomingShare(entry.path)
     ..['incomingMount'] = engine.isIncomingMountPath(entry.path)
     ..['sharedWith'] = engine.outgoingNames[entry.path];
+}
+
+/// [path] or a folder above it is a delete this device queued and has not
+/// sent yet.
+bool deleteQueued(SyncEngine engine, String path) {
+  for (var at = path; at != '.'; at = p.posix.dirname(at)) {
+    if (engine.manifest.entries[at]?.status == 'delete queued') return true;
+  }
+  return false;
 }

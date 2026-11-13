@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'trash_api.dart';
+
 import 'admin_api.dart';
 import 'cloud_api.dart';
 import 'dav_api.dart';
@@ -294,7 +296,7 @@ class CertificateRenewal {
 /// without restarting the sync engine. In-flight requests finish on the
 /// previous client; new requests use the renewed certificate.
 class RenewableCloud
-    with ForwardSharing, ForwardAdmin
+    with ForwardSharing, ForwardAdmin, ForwardTrash
     implements CloudApi, ReleaseTransport, FetchTransport {
   RenewableCloud(this._current);
   CloudApi _current;
