@@ -106,6 +106,23 @@ def main():
     def text():
         return u.screen_text()
 
+    def snackbar_tap(words, timeout=4):
+        """Taps the snackbar's `words`. It stays only about 8 seconds and a UI dump can wait out an animation,
+        so after `timeout` seconds of dumps the button is tapped where the phone layout puts it (the
+        screenshots show it there); the caller checks the outcome either way."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for n in u.nodes():
+                if re.fullmatch(exact(words), u.label(n)) and len(n["bounds"]) == 4:
+                    u.tap_node(n)
+                    return n
+        size = re.search(r"(\d+)x(\d+)", u.adb("shell", "wm", "size"))
+        width, height = (int(size.group(1)), int(size.group(2))) if size else (1080, 2400)
+        x = {"View": 720, "Undo": 940}[words] * width // 1080
+        u.adb("shell", "input", "tap", str(x), str(2174 * height // 2400))
+        time.sleep(1.5)
+        return None
+
     def exact(words):
         """A node whose text or description is exactly `words` (Flutter may set both, which the label joins)."""
         word = re.escape(words)
@@ -170,8 +187,7 @@ def main():
     # 3. Delete, then View: Trash lists it; Restore.
     name = names["view"]
     delete(name)
-    u.find(exact("Moved to Trash"), timeout=6)
-    u.tap(exact("View"), timeout=3)
+    snackbar_tap("View")
     listed = u.find(re.escape(name), timeout=10)
     if listed is None:  # Opened before the server applied it: pull to refresh.
         wait(lambda: in_trash(name), timeout=60)
@@ -200,8 +216,7 @@ def main():
     u.tap(r"AnJ Cloud menu|Show menu", timeout=30)
     u.tap(exact("Pause sync"))
     delete(name)
-    u.find(exact("Moved to Trash"), timeout=10)
-    u.tap(exact("Undo"), timeout=5)
+    snackbar_tap("Undo")
     u.find(exact("Restored."), timeout=20)
     u.step("paused: Undo of the pending delete answers Restored and the row returns", row(name, timeout=20) is not None,
            screen=text()[:400])

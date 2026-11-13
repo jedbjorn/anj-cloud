@@ -11,11 +11,14 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:anj_cloud/core/gateway/certificate_renewal.dart';
 import 'package:anj_cloud/core/gateway/dav_api.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
+import 'package:anj_cloud/core/sync/sync_activity.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:crypto/crypto.dart';
 
@@ -29,10 +32,19 @@ Future<void> main(List<String> args) async {
     ..setTrustedCertificates(config['ca'] as String)
     ..useCertificateChain(config['certificate'] as String)
     ..usePrivateKey(config['key'] as String);
-  final cloud = DavCloud(
-    Uri.parse(config['origin'] as String),
-    context,
-    folderDeletionQualified: true,
+  // Wrapped as the app's worker wraps it: renewable identity, pause gate,
+  // transfer activity.
+  final cloud = ActivityCloud(
+    PausableCloud(
+      RenewableCloud(
+        DavCloud(
+          Uri.parse(config['origin'] as String),
+          context,
+          folderDeletionQualified: true,
+        ),
+      ),
+    ),
+    SyncActivity(),
   );
   final tree = RootTree.setup(
     (Directory('${work.path}/files')..createSync()).path,
