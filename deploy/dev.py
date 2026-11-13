@@ -252,6 +252,7 @@ class Stack:
         self.check()
         if not self.profile.get("production"):
             self.accounts()
+        self.migrate_names()
 
     def trash_days(self):
         """Days deleted items stay in the trash (spec #44 T2): ANJ_TRASH_DAYS, else 7."""
@@ -279,6 +280,21 @@ class Stack:
             print("WARNING: the gateway did not take trash_days; it advertises its default (7 days)", file=sys.stderr)
             return None
         return days
+
+    def migrate_names(self):
+        """The one-time name migration every deploy runs (spec #49 Gateway; Operator.migrate_names).
+        Idempotent, so running it on each deploy renames only what is still untrimmed or over-long.
+        Best effort: a failure warns and the next deploy runs it again; it never fails the deploy."""
+        from deploy.access_operator import Operator
+        try:
+            counts = Operator(self).migrate_names()
+        except (RuntimeError, ValueError, KeyError) as error:
+            print(f"WARNING: the name migration did not complete ({error}); the next deploy runs it again", file=sys.stderr)
+            return None
+        print("Name migration: " + json.dumps(counts, separators=(",", ":")), file=sys.stderr)
+        if counts["accounts_failed"]:
+            print("WARNING: the name migration failed for some accounts; the next deploy runs it again", file=sys.stderr)
+        return counts
 
     def trusted_domains(self):
         domains = self.profile["trusted_domains"]

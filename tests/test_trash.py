@@ -476,15 +476,16 @@ class TrashTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("clear", self.fence())
         self.assertEqual(b"bytes", self.cloud.tree["alice"]["anj-cloud/Documents/a.txt"])
 
-    async def test_a_missing_folder_is_not_recreated_beside_a_case_twin(self):
+    async def test_a_missing_folder_is_recreated_beside_a_case_twin(self):
+        # Spec #49 Gateway: a folder differing only by case is another folder, not a refusal.
         self.cloud.put("alice", "anj-cloud/Documents/Trip/photo.jpg")
         item = self.cloud.delete("alice", "anj-cloud/Documents/Trip/photo.jpg")
         self.cloud.delete("alice", "anj-cloud/Documents/Trip")
         self.cloud.put("alice", "anj-cloud/Documents/trip/other.jpg")
-        status, body, _ = await self.call("POST", "/trash/%s/restore" % item)
-        self.assertEqual(409, status)
-        self.assertIn("case or accents", body["error"])
-        self.assertNotIn("anj-cloud/Documents/Trip", self.cloud.tree["alice"])
+        status, _, _ = await self.call("POST", "/trash/%s/restore" % item)
+        self.assertEqual(200, status)
+        self.assertIn("anj-cloud/Documents/Trip/photo.jpg", self.cloud.tree["alice"])
+        self.assertIn("anj-cloud/Documents/trip/other.jpg", self.cloud.tree["alice"])
         self.assertEqual("clear", self.fence())
 
     async def test_nothing_is_recreated_under_shared(self):

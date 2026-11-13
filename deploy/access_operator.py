@@ -405,6 +405,31 @@ class Operator:
             with self.owner_token(owner) as token:
                 return self.call(action, owner_uid=owner, token=token, **data)
 
+    def migrate_names(self):
+        """The one-time name migration (spec #49 Gateway, D4): one gateway pass per account over its
+        own tree, through a temporary owner token, renaming untrimmed and over-long names. Idempotent:
+        a second run renames nothing. Accounts the household list marks disabled are skipped. A pass
+        that fails is counted and the next run retries it. Counts only, never a name or an account."""
+        with self.lock():
+            disabled = {row["uid"] for row in self.call("accounts") if not row["enabled"]}
+            totals = {"accounts": 0, "folders": 0, "renamed": 0, "unresolved": 0, "failed": 0, "accounts_failed": 0}
+            for uid in sorted(json.loads(self.stack.occ("user:list", "--output=json"))):
+                if uid in disabled:
+                    continue
+                # A token that cannot be removed stops the run (reconcile); a refused pass does not.
+                with self.owner_token(uid) as token:
+                    try:
+                        counts = self.call("migrate-names", owner_uid=uid, token=token)
+                    except RuntimeError:
+                        counts = None
+                if counts is None:
+                    totals["accounts_failed"] += 1
+                    continue
+                totals["accounts"] += 1
+                for key in ("folders", "renamed", "unresolved", "failed"):
+                    totals[key] += counts[key]
+            return totals
+
     def account_set(self, uid, display_name=None, enabled=None):
         """Register a household account or change its display name and enabled state.
 
@@ -584,6 +609,7 @@ def main():
     repair.add_argument("uid")
     repair.add_argument("share_id")
     sub.add_parser("accounts")
+    sub.add_parser("migrate-names", help="Rename untrimmed and over-long cloud names once (spec #49); idempotent, counts only")
     account_set = sub.add_parser("account-set", help="Register a household account or change its display name/enabled state")
     account_set.add_argument("uid")
     account_set.add_argument("--display-name")
@@ -650,6 +676,8 @@ def main():
             result = operator.call("deny", pairing_id=args.pairing_id)
         elif args.command == "account-set":
             result = operator.account_set(args.uid, args.display_name, args.enabled)
+        elif args.command == "migrate-names":
+            result = operator.migrate_names()
         elif args.command in ("share", "share-update", "unshare", "shares"):
             names = {"share": ["path", "recipient"], "share-update": ["share_id"], "unshare": ["share_id"], "shares": []}[args.command]
             values = list(args.arguments)

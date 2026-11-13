@@ -293,9 +293,9 @@ class Trash:
         return (current is not None, bool(current and current["collection"]))
 
     async def make_parents(self, device, relative):
-        """Creates each missing folder above `relative`, top first. Refused (409): a file in the way, a folder
-        under Shared/ (that is someone else's share, gone or renamed: never recreated as a folder of one's
-        own), and a name another folder at that level already has apart from case or accents (#120)."""
+        """Creates each missing folder above `relative`, top first. Refused (409): a file in the way and a
+        folder under Shared/ (that is someone else's share, gone or renamed: never recreated as a folder of
+        one's own). A folder differing only by case or accents is another folder (spec #49 Gateway)."""
         parts = relative.split("/")[:-1]
         for depth in range(1, len(parts) + 1):
             encoded = encode_filename_path("/".join(parts[:depth])) + "/"
@@ -306,9 +306,6 @@ class Trash:
                 raise TrashError(409, "A file is where the item's folder was")
             if parts[0] == "Shared":
                 raise TrashError(409, "The share this came from is no longer here")
-            level = encode_filename_path("/".join(parts[:depth - 1])) + "/" if depth > 1 else ""
-            if portable_names.clash(parts[depth - 1], await self.gateway.mutations.siblings(device, level)) is not None:
-                raise TrashError(409, "A folder whose name differs only in case or accents is where the item's folder was")
             status = await self.request("MKCOL", self.gateway.backend + backend_root(device["uid"]) + encoded, device)
             if status not in (201, 405):
                 present, folder = await self.exists(device, encoded)
