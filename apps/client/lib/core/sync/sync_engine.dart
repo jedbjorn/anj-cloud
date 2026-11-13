@@ -4193,6 +4193,16 @@ class SyncEngine {
   /// beneath them: never created here, shown with the residual row.
   final Set<String> _unplaceable = {};
 
+  /// The cloud -> local map from the cloud names recorded with the rows,
+  /// before this process's first listing: an answer read then (the incoming
+  /// shares) keeps the local path its rows and mount rules are keyed by.
+  void _recordedSpelling() {
+    names.listed(const {}, {
+      for (final entry in manifest.entries.values)
+        if (entry.cloudName != null) names.cloudPath(entry.path): entry.path,
+    });
+  }
+
   /// The listing with each path in the local spelling of its item (spec #49
   /// Sync Boundary, decision #199). Each segment first takes this device's
   /// name for it (R3, once per listed folder: no sibling is listed per
@@ -4638,7 +4648,10 @@ class SyncEngine {
       return 0;
     }
     Map<String, RemoteItem> rawRemote;
-    // Before the listing: a disabled owner's folder vanishes from it.
+    // Before the listing: a disabled owner's folder vanishes from it. Its
+    // paths come back under local spellings, from the recorded names until
+    // this process has listed.
+    if (lastListedAt == null) _recordedSpelling();
     final incomingRead = migrationRemote != null || await _refreshIncoming();
     try {
       rawRemote =
