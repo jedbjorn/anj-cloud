@@ -594,7 +594,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text('Finish editing ${entry['path']}'),
+        title: Text('Finish editing ${entry['cloudPath'] ?? entry['path']}'),
         scrollable: compactLayout(context),
         content: SelectableText(
           'Saved changes sync automatically while your editor is open. Close every editor using these copies, then confirm that the listed current files are your completed edit results. The app will verify uploaded content before releasing eligible temporary files. Busy, conflicting or uncertain copies stay recoverable. Storage policy stays unchanged.\n\n${workingCopyDetails(entry)}',
@@ -634,7 +634,9 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text('Remove opened copy of ${entry['path']}'),
+        title: Text(
+          'Remove opened copy of ${entry['cloudPath'] ?? entry['path']}',
+        ),
         scrollable: compactLayout(context),
         content: const Text(
           'Close every app using this copy first. Changes saved to it after removal will not sync. The file stays in the cloud.',
@@ -762,28 +764,35 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     MaterialPageRoute<void>(builder: (_) => TrashPage(controller: controller)),
   );
 
-  /// Rename for an item whose name is not allowed on other devices
-  /// (decision #120).
-  Future<void> renameEntry(BuildContext context, String path) async {
+  /// Rename for an item whose name cannot sync (spec #49 residual row).
+  Future<void> renameEntry(
+    BuildContext context,
+    String path, {
+    bool folder = false,
+  }) async {
     final parent = p.posix.dirname(path);
+    // The typed name is a cloud name: it is checked against cloud names.
     final siblings = {
       for (final entry in controller.entries)
         if (entry['path'] case final String other
             when other != path &&
                 p.posix.dirname(other) == parent &&
                 !terminalDeletionStatuses.contains(entry['status']))
-          p.posix.basename(other),
+          p.posix.basename((entry['cloudPath'] ?? other) as String),
     };
     final renamed = await showDialog<String>(
       context: context,
       barrierDismissible: false,
-      builder: (_) =>
-          RenameDialog(controller: controller, path: path, siblings: siblings),
+      builder: (_) => RenameDialog(
+        controller: controller,
+        path: path,
+        folder: folder,
+        siblings: siblings,
+      ),
     );
     if (renamed != null && context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Renamed to ${p.posix.basename(renamed)}')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Renamed to $renamed')));
     }
   }
 
@@ -1412,8 +1421,12 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                     directory ? 'openDirectory' : 'open',
                                     path,
                                   ),
-                            onRename: entry['nameRefused'] == true
-                                ? () => renameEntry(context, path)
+                            onRename: entry['cantSyncName'] == true
+                                ? () => renameEntry(
+                                    context,
+                                    path,
+                                    folder: directory,
+                                  )
                                 : null,
                             finish:
                                 file &&
@@ -1455,6 +1468,8 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                               context,
                                               path: path,
                                               call: controller.sharing,
+                                              shown:
+                                                  entry['cloudPath'] as String?,
                                             ),
                                           );
                                         case 'addFiles':
@@ -1477,7 +1492,10 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                           showDialog<void>(
                                             context: context,
                                             builder: (context) => AlertDialog(
-                                              title: Text(path),
+                                              title: Text(
+                                                (entry['cloudPath'] ?? path)
+                                                    as String,
+                                              ),
                                               scrollable: compactLayout(
                                                 context,
                                               ),

@@ -16,15 +16,18 @@ import 'package:anj_cloud/core/ports/change_watcher.dart';
 import 'package:anj_cloud/core/ports/commit_durability.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
+import 'package:anj_cloud/core/sync/case_moves.dart';
+import 'package:anj_cloud/core/sync/cloud_names.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
+import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
-import 'package:anj_cloud/core/sync/sync_schedule.dart';
 import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
+import 'test_platform.dart';
 
 /// Records every request; folders have file IDs that follow a MOVE, and
 /// `Shared/<owner>` folders are incoming shares (another storage).
@@ -249,7 +252,9 @@ void main() {
   late SyncEngine engine;
   late _Fs fs;
 
-  void start({bool watch = false, CommitDurability? durability}) {
+  /// [os]: requests leave through the name boundary of a device on it
+  /// (spec #49 R3), as the worker builds it.
+  void start({bool watch = false, CommitDurability? durability, NameOs? os}) {
     fixture = Directory(
       Directory.systemTemp
           .createTempSync('anj-cloud-moves-')
@@ -265,12 +270,15 @@ void main() {
       groupCommits: durability != null,
     )..setSetting('retention', 'local');
     cloud = _Cloud();
+    final names = CloudNames();
     engine = SyncEngine(
       store,
       tree,
-      cloud,
+      os == null ? cloud : NamedCloud(cloud, names),
       watchers: watch ? const LinuxChangeWatchers() : null,
+      names: names,
     );
+    if (os != null) engine.nameOs = os;
   }
 
   tearDown(() {
@@ -297,11 +305,10 @@ void main() {
     }
   }
 
-  // The local identity the engine pairs by: device and inode.
-  String identity(String path) {
-    final out = Process.runSync('stat', ['-c', '%d:%i', root(path)]);
-    return (out.stdout as String).trim();
-  }
+  // The local identity the engine pairs by: volume and inode (file ID on
+  // Windows), from the boundary's own stat.
+  String identity(String path) =>
+      tree.scanItems(includeExcluded: true)[path]!.identity!;
 
   Future<void> library() async {
     write('Photos/2026/Trip/a.jpg', 'a');
@@ -518,7 +525,7 @@ void main() {
       // A second name outside the root: the user's own hard link, so the
       // restart cannot prove the link count and never pairs it here.
       final outside = '${fixture.path}/report-link.txt';
-      final made = Process.runSync('ln', [root('Docs/report.txt'), outside]);
+      final made = hardLink(root('Docs/report.txt'), outside);
       expect(made.exitCode, 0);
       await ticks(1);
       cloud.calls.clear();
@@ -568,10 +575,7 @@ void main() {
           await ticks(3);
           final outside = '${fixture.path}/report-link.txt';
           expect(
-            Process.runSync('ln', [
-              root('Documents/Docs/report.txt'),
-              outside,
-            ]).exitCode,
+            hardLink(root('Documents/Docs/report.txt'), outside).exitCode,
             0,
           );
           await ticks(1);
@@ -727,17 +731,17 @@ void main() {
       );
     });
 
-    test('renamed here to a blocked name (parked), renamed in the cloud: '
-        'the cloud name wins', () async {
+    test('renamed here to a name that cannot sync (parked), renamed in the '
+        'cloud: the cloud name wins', () async {
       await library();
-      File(root('Docs/report.txt')).renameSync(root('Docs/a:b.txt'));
+      File(root('Docs/report.txt')).renameSync(root('Docs/.htaccess'));
       await ticks(2);
       expect(cloud.calls, isEmpty);
       expect(remote('Docs/report.txt'), 'report', reason: 'parked by I1');
       await cloud.moveElsewhere('Docs/report.txt', 'Docs/B.txt');
       await ticks();
       expect(cloud.calls, isEmpty);
-      expect(fs.renames, ['Docs/a:b.txt -> Docs/B.txt']);
+      expect(fs.renames, ['Docs/.htaccess -> Docs/B.txt']);
       expect(store.entries.keys.where((k) => k.startsWith('Docs/')), [
         'Docs/B.txt',
       ]);
@@ -864,33 +868,39 @@ void main() {
       expect(remote('Other/b.txt'), isNull);
     });
 
-    test('a cloud rename on a watched root, into a new folder: one rename, '
-        'the view and the watches follow', () async {
-      final before = identity('Docs/a.txt');
-      await cloud.moveElsewhere('Docs/a.txt', 'Fresh/b.txt');
-      await ticks(2);
-      expect(fs.renames, ['Docs/a.txt -> Fresh/b.txt']);
-      expect(cloud.calls, isEmpty);
-      expect(identity('Fresh/b.txt'), before);
-      // The new folder is watched: a file made in it later is uploaded.
-      write('Fresh/c.txt', 'c');
-      for (var i = 0; i < 30 && remote('Fresh/c.txt') == null; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 100));
-        now += settings.quiet;
-        await engine.tick();
-      }
-      expect(cloud.calls, ['PUT Fresh/c.txt']);
-      cloud.calls.clear();
-      // Later passes see nothing to do: the watcher's own events of the
-      // rename are not a local move or a new item.
-      for (var i = 0; i < 4; i++) {
-        await Future<void>.delayed(const Duration(milliseconds: 200));
-        now += settings.quiet;
-        await engine.tick();
-      }
-      expect(cloud.calls, isEmpty);
-      expect(store.entries['Fresh/b.txt']!.status, 'current local');
-    });
+    test(
+      'a cloud rename on a watched root, into a new folder: one rename, '
+      'the view and the watches follow',
+      () async {
+        final before = identity('Docs/a.txt');
+        await cloud.moveElsewhere('Docs/a.txt', 'Fresh/b.txt');
+        await ticks(2);
+        expect(fs.renames, ['Docs/a.txt -> Fresh/b.txt']);
+        expect(cloud.calls, isEmpty);
+        expect(identity('Fresh/b.txt'), before);
+        // The new folder is watched: a file made in it later is uploaded.
+        write('Fresh/c.txt', 'c');
+        for (var i = 0; i < 30 && remote('Fresh/c.txt') == null; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          now += settings.quiet;
+          await engine.tick();
+        }
+        expect(cloud.calls, ['PUT Fresh/c.txt']);
+        cloud.calls.clear();
+        // Later passes see nothing to do: the watcher's own events of the
+        // rename are not a local move or a new item.
+        for (var i = 0; i < 4; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+          now += settings.quiet;
+          await engine.tick();
+        }
+        expect(cloud.calls, isEmpty);
+        expect(store.entries['Fresh/b.txt']!.status, 'current local');
+      },
+      skip: notOnWindows(
+        'its watches are the Linux change watchers (windows_watch_seat_test covers Windows)',
+      ),
+    );
   });
 
   group('row 7: a new name another item here holds keeps the item', () {
@@ -929,48 +939,27 @@ void main() {
       expect(disk('Docs/report.txt'), 'report');
       expect(disk('Archive/r.txt'), 'mine');
       expect(remote('Archive/r.txt'), 'report');
-      // The file is here under its old name: the row says so, not Cloud-only.
-      expect(store.entries['Docs/report.txt']!.status, movedNameClashStatus);
-      // On every platform such a row is amber with its reason and the app
-      // needs attention, until the clash is gone.
-      SyncStatus overall() => deriveStatus(
-        paused: false,
-        offline: false,
-        unpaired: false,
-        message: engine.message,
-        entries: store.entries.values,
-        operations: store.operations.values,
-      );
-      expect(overall(), SyncStatus.attention);
-      expect(
-        (await projectEntry(
-          engine,
-          store.entries['Docs/report.txt']!,
-        ))['presentationErrors'],
-        [movedNameClashStatus],
-      );
+      // The file is here under its old name until the name is free: the
+      // clash partner's removal (spec #49 AC7) or the other item's own sync.
+      expect(store.entries['Docs/report.txt']!.status, renamePendingStatus);
       // The other item goes: the move follows.
       File(root('Archive/r.txt')).deleteSync();
       await ticks();
       expect(fs.renames, ['Docs/report.txt -> Archive/r.txt']);
       expect(cloud.calls, isEmpty);
       expect(disk('Archive/r.txt'), 'report');
-      expect(overall(), isNot(SyncStatus.attention));
     });
   });
 
-  // A cloud move's target gets the same decision as a create or a download
-  // (NameHolds): on a device that cannot hold the new name, the item stays
-  // where it is with the reason, and nothing is renamed, created, deleted,
-  // moved or uploaded for it. The filesystem here folds case as NTFS does,
-  // so a wrong rename or folder creation lands inside the folded sibling.
-  group('a new name this device cannot hold keeps the item', () {
+  // A cloud move's target gets its local name like any listed item (spec
+  // #49 R3, decision #199): the item is renamed here to it, once, and every
+  // request leaves under the cloud name. The filesystem here folds case as
+  // NTFS does, so a wrong rename or folder creation lands inside the folded
+  // sibling.
+  group('a new cloud name this device spells differently', () {
     setUp(() {
-      start();
+      start(os: NameOs.windows);
       fs.foldingRoot = tree.root.path;
-      engine
-        ..holdsAnyName = false
-        ..foldsCase = true;
     });
 
     List<String> listing(String folder) => [
@@ -979,216 +968,100 @@ void main() {
     ]..sort();
 
     test(
-      'a cloud rename to a name the platform refuses: not renamed, held '
-      'with the reason, nothing sent; a later good name is followed',
+      'a cloud rename to a name Windows spells otherwise: one rename here '
+      'to the local name, nothing sent; edits upload under the cloud name',
       () async {
         await library();
         await cloud.moveElsewhere('Docs/report.txt', 'Docs/x.');
         await ticks(4);
-        expect(fs.renames, isEmpty);
+        expect(fs.renames, ['Docs/report.txt -> Docs/x']);
         expect(cloud.calls, isEmpty);
-        expect(listing('Docs'), ['report.txt']);
-        expect(disk('Docs/report.txt'), 'report');
-        expect(remote('Docs/x.'), 'report');
-        expect(
-          store.entries['Docs/report.txt']!.status,
-          movedNameNotAllowedStatus,
-        );
-        expect(store.entries['Docs/report.txt']!.conflict, isNull);
-        expect(store.operations, isEmpty);
-        // An edit here meanwhile stays here: nothing is uploaded over the
-        // cloud item under either name.
-        write('Docs/report.txt', 'edited while held');
+        expect(listing('Docs'), ['x']);
+        expect(disk('Docs/x'), 'report');
+        expect(store.entries['Docs/x']!.cloudName, 'x.');
+        expect(store.entries['Docs/x']!.status, 'current local');
+        write('Docs/x', 'edited');
         await ticks(3);
-        expect(cloud.calls, isEmpty);
-        expect(remote('Docs/x.'), 'report');
-        // Renamed again in the cloud to a name this device can hold: followed
-        // by one rename, and the edit then uploads as an edit of that item.
+        expect(cloud.calls, ['PUT Docs/x.']);
+        expect(remote('Docs/x.'), 'edited');
+        cloud.calls.clear();
+        fs.renames.clear();
         await cloud.moveElsewhere('Docs/x.', 'Docs/fine.txt');
         await ticks(4);
-        expect(fs.renames, ['Docs/report.txt -> Docs/fine.txt']);
-        expect(listing('Docs'), ['fine.txt']);
-        expect(cloud.calls, ['PUT Docs/fine.txt']);
-        expect(remote('Docs/fine.txt'), 'edited while held');
-        expect(store.entries['Docs/fine.txt']!.status, 'current local');
-        expect(store.entries.containsKey('Docs/report.txt'), isFalse);
+        expect(fs.renames, ['Docs/x -> Docs/fine.txt']);
+        expect(cloud.calls, isEmpty);
+        expect(store.entries['Docs/fine.txt']!.cloudName, isNull);
+        expect(store.entries.containsKey('Docs/x'), isFalse);
       },
     );
 
-    test('a file deleted here inside a folder kept at its old name for a '
-        'refused cloud name: the delete waits, then follows a later good name '
-        '(SC-105)', () async {
+    test('a folder renamed in the cloud to a name with the same local name: '
+        'nothing renamed here, and a delete inside it leaves under the new '
+        'cloud name (SC-105)', () async {
       await library();
       await cloud.moveElsewhere('Photos/2026/Trip', 'Photos/2026/Trip.');
       await ticks(3);
-      expect(
-        store.entries['Photos/2026/Trip']!.status,
-        movedNameNotAllowedStatus,
-      );
+      expect(fs.renames, isEmpty);
+      expect(store.entries['Photos/2026/Trip']!.cloudName, 'Trip.');
       File(root('Photos/2026/Trip/a.jpg')).deleteSync();
       await ticks(3);
-      expect(cloud.calls, isEmpty);
-      expect(remote('Photos/2026/Trip./a.jpg'), 'a');
-      expect(
-        [
-          for (final o in store.operations.values)
-            if (o.kind == 'delete') o.path,
-        ],
-        ['Photos/2026/Trip/a.jpg'],
-      );
-      await cloud.moveElsewhere('Photos/2026/Trip.', 'Photos/2026/Fine');
-      await ticks(4);
-      expect(fs.renames, ['Photos/2026/Trip -> Photos/2026/Fine']);
-      expect(cloud.calls, ['DELETE Photos/2026/Fine/a.jpg']);
-      expect(remote('Photos/2026/Fine/a.jpg'), isNull);
-      expect(exists('Photos/2026/Fine/a.jpg'), isFalse);
-      expect(disk('Photos/2026/Fine/deep/b.jpg'), 'b');
-      expect(store.entries['Photos/2026/Fine/a.jpg']?.status, 'deleted');
-      expect(store.entries['Photos/2026/Fine/a.jpg']!.expectedPresent, isFalse);
-      expect(store.operations.values.where((o) => o.kind == 'delete'), isEmpty);
+      expect(cloud.calls, ['DELETE Photos/2026/Trip./a.jpg']);
+      expect(remote('Photos/2026/Trip./a.jpg'), isNull);
+      expect(remote('Photos/2026/Trip./deep/b.jpg'), 'b');
+      expect(disk('Photos/2026/Trip/deep/b.jpg'), 'b');
     });
 
-    test('a cloud rename onto a sibling that differs only by case: not '
-        'renamed, held as a clash, both files untouched', () async {
+    test('a cloud rename onto a sibling that differs only by case: renamed '
+        'here to its ` (2)` name, both files untouched (AC4)', () async {
       await library();
       write('Docs/x.txt', 'other');
       await ticks(3);
       cloud.calls.clear();
+      fs.renames.clear();
       await cloud.moveElsewhere('Docs/x.txt', 'Docs/Report.txt');
       await ticks(4);
-      expect(fs.renames, isEmpty);
+      expect(fs.renames, ['Docs/x.txt -> Docs/Report (2).txt']);
       expect(fs.redirected, isEmpty);
       expect(cloud.calls, isEmpty);
-      expect(listing('Docs'), ['report.txt', 'x.txt']);
+      expect(listing('Docs'), ['Report (2).txt', 'report.txt']);
       expect(disk('Docs/report.txt'), 'report');
-      expect(disk('Docs/x.txt'), 'other');
+      expect(disk('Docs/Report (2).txt'), 'other');
       expect(remote('Docs/report.txt'), 'report');
       expect(remote('Docs/Report.txt'), 'other');
-      expect(store.entries['Docs/x.txt']!.status, movedNameClashStatus);
-      expect(store.entries['Docs/report.txt']!.status, 'current local');
+      expect(store.entries['Docs/Report (2).txt']!.status, 'current local');
       expect(store.operations, isEmpty);
     });
 
-    test('a cloud move into a folder held as a clash loser: not moved, no '
-        'folder made, nothing lands in the kept sibling, and the following '
-        'scans send nothing', () async {
+    test('a cloud move into the newer of two folders that differ by case: '
+        'into its ` (2)` folder here, nothing through the older one, and '
+        'the following scans send nothing', () async {
       await library();
       await cloud.made('Archive/Docs');
       await cloud.made('Archive/docs');
-      cloud.put('Archive/Docs/x.txt', 'kept folder');
-      cloud.put('Archive/docs/y.txt', 'held folder');
+      cloud.put('Archive/Docs/x.txt', 'older folder');
+      cloud.put('Archive/docs/y.txt', 'newer folder');
       await ticks(3);
-      expect(listing('Archive'), ['Docs', 'keep.txt']);
+      expect(listing('Archive'), ['Docs', 'docs (2)', 'keep.txt']);
       expect(listing('Archive/Docs'), ['x.txt']);
-      expect(store.entries['Archive/docs']!.status, serverNameClashStatus);
+      expect(listing('Archive/docs (2)'), ['y.txt']);
       cloud.calls.clear();
       fs.renames.clear();
       fs.redirected.clear();
 
       await cloud.moveElsewhere('Archive/keep.txt', 'Archive/docs/keep.txt');
       await ticks(5);
-      expect(fs.renames, isEmpty);
+      expect(fs.renames, ['Archive/keep.txt -> Archive/docs (2)/keep.txt']);
       expect(fs.redirected, isEmpty, reason: 'nothing written through Docs');
       expect(cloud.calls, isEmpty);
-      expect(listing('Archive'), ['Docs', 'keep.txt']);
       expect(listing('Archive/Docs'), ['x.txt']);
-      expect(disk('Archive/keep.txt'), 'keep');
-      // The moved file is here, at its old path; the folder and its own
-      // file are Cloud-only.
-      expect(store.entries['Archive/keep.txt']!.status, movedFolderNameStatus);
-      expect(store.entries['Archive/docs']!.status, serverNameClashStatus);
+      expect(listing('Archive/docs (2)'), ['keep.txt', 'y.txt']);
+      expect(disk('Archive/docs (2)/keep.txt'), 'keep');
       expect(
-        store.entries['Archive/docs/y.txt']!.status,
-        serverFolderNameStatus,
+        store.entries['Archive/docs (2)/keep.txt']!.status,
+        'current local',
       );
-      // Only the record of the kept folder's download remains.
-      expect([
-        for (final o in store.operations.values)
-          if (o.kind != 'artifact') '${o.kind} ${o.path}',
-      ], isEmpty);
-      // The cloud is as the other device left it.
       expect(remote('Archive/docs/keep.txt'), 'keep');
-      expect(remote('Archive/docs/y.txt'), 'held folder');
-      expect(remote('Archive/Docs/x.txt'), 'kept folder');
       expect(cloud.files.containsKey('Archive/keep.txt'), isFalse);
-    });
-
-    test('once the cloud gives a name this device can hold, the row is '
-        'planned afresh: no hold reason is left on it', () async {
-      await library();
-      // Held for a refused name, and held for its new folder.
-      await cloud.made('Archive/Docs');
-      await cloud.made('Archive/docs');
-      cloud.put('Archive/Docs/x.txt', 'kept folder');
-      await cloud.moveElsewhere('Docs/report.txt', 'Docs/x.');
-      await cloud.moveElsewhere('Archive/keep.txt', 'Archive/docs/keep.txt');
-      await ticks(4);
-      expect(
-        store.entries['Docs/report.txt']!.status,
-        movedNameNotAllowedStatus,
-      );
-      expect(store.entries['Archive/keep.txt']!.status, movedFolderNameStatus);
-      cloud.calls.clear();
-      await cloud.moveElsewhere('Docs/x.', 'Docs/fine.txt');
-      await cloud.moveElsewhere('Archive/docs/keep.txt', 'Archive/kept.txt');
-      // One pass: the rows move and are queued, before any later pass could
-      // settle them by other means.
-      await engine.tick();
-      expect(fs.renames, [
-        'Docs/report.txt -> Docs/fine.txt',
-        'Archive/keep.txt -> Archive/kept.txt',
-      ]);
-      for (final path in ['Docs/fine.txt', 'Archive/kept.txt']) {
-        expect(
-          isServerNameHold(store.entries[path]!.status),
-          isFalse,
-          reason: '$path: ${store.entries[path]!.status}',
-        );
-      }
-      await ticks(2);
-      expect(cloud.calls, isEmpty);
-      expect(store.entries['Docs/fine.txt']!.status, 'current local');
-      expect(store.entries['Archive/kept.txt']!.status, 'current local');
-    });
-
-    test('a pass stopped right after the rename leaves no hold reason on the '
-        'moved rows', () async {
-      await library();
-      await cloud.made('Archive/Docs');
-      await cloud.made('Archive/docs');
-      await cloud.moveElsewhere('Docs/report.txt', 'Docs/x.');
-      await cloud.moveElsewhere('Archive/keep.txt', 'Archive/docs/keep.txt');
-      await ticks(4);
-      await cloud.moveElsewhere('Docs/x.', 'Docs/fine.txt');
-      await cloud.moveElsewhere('Archive/docs/keep.txt', 'Archive/kept.txt');
-      // The pass is asked to stop as soon as the renames are done: the rows
-      // have moved, and nothing has reconciled them yet.
-      fs.afterRename = () => engine.stopRequested = true;
-      await engine.tick();
-      fs.afterRename = null;
-      expect(fs.renames, hasLength(2));
-      for (final path in ['Docs/fine.txt', 'Archive/kept.txt']) {
-        expect(
-          isServerNameHold(store.entries[path]!.status),
-          isFalse,
-          reason: '$path: ${store.entries[path]!.status}',
-        );
-      }
-    });
-
-    test('a Cloud-only item renamed in the cloud onto a name a local item '
-        'holds is still labelled Cloud-only', () async {
-      await library();
-      engine.setRetention('Docs', Retention.cloud);
-      await ticks(3);
-      expect(exists('Docs/report.txt'), isFalse);
-      write('Archive/r.txt', 'mine');
-      cloud.calls.clear();
-      await cloud.moveElsewhere('Docs/report.txt', 'Archive/r.txt');
-      await engine.tick();
-      expect(store.entries['Docs/report.txt']!.status, serverNameClashStatus);
-      expect(disk('Archive/r.txt'), 'mine');
-      expect(cloud.calls.where((c) => !c.startsWith('PUT')), isEmpty);
     });
 
     test('a cloud rename of the item itself in case only is still followed '

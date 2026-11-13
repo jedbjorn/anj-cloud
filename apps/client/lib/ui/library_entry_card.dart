@@ -278,8 +278,8 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
             message: widget.onOpen == null
                 ? 'Unsupported item'
                 : tap
-                ? '${row.path}\nTap to open $kind · Long-press for icon colour'
-                : '${row.path}\nDouble-click to open $kind · Right-click for icon colour\nKeyboard: Enter to open · Shift+F10 for colour',
+                ? '${row.shown}\nTap to open $kind · Long-press for icon colour'
+                : '${row.shown}\nDouble-click to open $kind · Right-click for icon colour\nKeyboard: Enter to open · Shift+F10 for colour',
             child: InkWell(
               key: ValueKey('content:${row.path}'),
               canRequestFocus: false,
@@ -332,7 +332,7 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
                             children: [
                               Flexible(
                                 child: Text(
-                                  p.posix.basename(row.path),
+                                  p.posix.basename(row.shown),
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: Theme.of(context).textTheme.titleSmall,
@@ -415,7 +415,7 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
                             ),
                           if (widget.showPath)
                             Text(
-                              row.path,
+                              row.shown,
                               style: Theme.of(context).textTheme.bodySmall,
                             ),
                           if (row.date != null)
@@ -568,8 +568,8 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
                       IconButton(
                         key: ValueKey('toggle:${row.path}'),
                         tooltip: widget.onToggle == null
-                            ? 'Clear filters to collapse ${row.path}'
-                            : '${widget.collapsed ? 'Expand' : 'Collapse'} ${row.path}',
+                            ? 'Clear filters to collapse ${row.shown}'
+                            : '${widget.collapsed ? 'Expand' : 'Collapse'} ${row.shown}',
                         onPressed: widget.onToggle,
                         // The theme's density on a phone keeps 48 dp.
                         visualDensity: touch ? null : VisualDensity.compact,
@@ -598,7 +598,7 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
     );
     if (!widget.selecting) return card;
     return Semantics(
-      label: row.path,
+      label: row.shown,
       selected: widget.selected,
       enabled: widget.onSelect != null,
       button: true,

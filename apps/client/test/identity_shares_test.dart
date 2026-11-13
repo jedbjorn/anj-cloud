@@ -72,7 +72,10 @@ void main() {
     cloud.shared.add('Documents/Family');
     await engine.tick();
     expect(store.entries['Documents/Family']!.sharedOut, isTrue);
-    expect(store.entries['Documents/Private/bank.txt']!.localIdentity, isNotNull);
+    expect(
+      store.entries['Documents/Private/bank.txt']!.localIdentity,
+      isNotNull,
+    );
   }
 
   test('M1: a deleted private file and a new file in a folder shared out on '
@@ -94,27 +97,29 @@ void main() {
     expect(text('Documents/Family/list.txt'), 'shopping list');
   });
 
-  test('M1: a deleted private folder and a new folder in a folder shared out '
-      'on its reused number: no MOVE, nothing private listed in the share',
-      () async {
-    await ownLibrary();
-    local('Documents/Private/bank2.txt').writeAsStringSync('statement 2');
-    await engine.tick();
-    await engine.tick();
-    Directory('${rootPath()}/Documents/Private').deleteSync(recursive: true);
-    Directory('${rootPath()}/Documents/Family/New').createSync();
-    store.entries['Documents/Private']!.localIdentity = tree
-        .statItem('Documents/Family/New')!
-        .identity!;
-    await engine.tick();
-    expect(cloud.moves, isEmpty);
-    await settle();
-    expect(cloud.moves, isEmpty);
-    expect(
-      cloud.files.keys.where((v) => v.startsWith('Documents/Family/New/')),
-      isEmpty,
-    );
-  });
+  test(
+    'M1: a deleted private folder and a new folder in a folder shared out '
+    'on its reused number: no MOVE, nothing private listed in the share',
+    () async {
+      await ownLibrary();
+      local('Documents/Private/bank2.txt').writeAsStringSync('statement 2');
+      await engine.tick();
+      await engine.tick();
+      Directory('${rootPath()}/Documents/Private').deleteSync(recursive: true);
+      Directory('${rootPath()}/Documents/Family/New').createSync();
+      store.entries['Documents/Private']!.localIdentity = tree
+          .statItem('Documents/Family/New')!
+          .identity!;
+      await engine.tick();
+      expect(cloud.moves, isEmpty);
+      await settle();
+      expect(cloud.moves, isEmpty);
+      expect(
+        cloud.files.keys.where((v) => v.startsWith('Documents/Family/New/')),
+        isEmpty,
+      );
+    },
+  );
 
   test('M1: a private file the user moves into a folder shared out (same size '
       'and time) is one MOVE; moved out again, one MOVE', () async {
@@ -130,8 +135,10 @@ void main() {
         .renameSync('${rootPath()}/Documents/Private/bank.txt');
     await engine.tick();
     await settle();
-    expect(cloud.moves.last,
-        'Documents/Family/bank.txt -> Documents/Private/bank.txt');
+    expect(
+      cloud.moves.last,
+      'Documents/Family/bank.txt -> Documents/Private/bank.txt',
+    );
     expect(cloud.deletes, 0);
   });
 
@@ -167,12 +174,11 @@ void main() {
     await settle();
     expect(cloud.moves, isEmpty);
     expect(cloud.deletes, 0);
+    expect(store.operations.values.where((o) => o.kind == 'delete'), isEmpty);
     expect(
-      store.operations.values.where((o) => o.kind == 'delete'),
-      isEmpty,
+      String.fromCharCodes(cloud.files['Documents/Family/f.txt']!),
+      'family',
     );
-    expect(String.fromCharCodes(cloud.files['Documents/Family/f.txt']!),
-        'family');
     expect(cloud.shared, contains('Documents/Family'));
     expect(Directory('${rootPath()}/Documents/Family').existsSync(), isTrue);
     expect(store.entries['Documents/Family/f.txt']!.etag, isNotNull);
@@ -191,7 +197,10 @@ void main() {
     }
     expect(local('Documents/Family/f.txt').existsSync(), isFalse);
     // The subfolder stays on disk with its identity: the only proof.
-    expect(Directory('${rootPath()}/Documents/Family/Sub').existsSync(), isTrue);
+    expect(
+      Directory('${rootPath()}/Documents/Family/Sub').existsSync(),
+      isTrue,
+    );
     expect(store.entries['Documents/Family/Sub']!.localIdentity, isNotNull);
     Directory('${rootPath()}/Documents/Family')
         .renameSync('${rootPath()}/Documents/Family 2026');
@@ -218,8 +227,10 @@ void main() {
     await engine.tick();
     await settle();
     expect(cloud.moves, ['Documents/Family -> Documents/Family 2026']);
-    expect(String.fromCharCodes(cloud.files['Documents/Family 2026/f.txt']!),
-        'family');
+    expect(
+      String.fromCharCodes(cloud.files['Documents/Family 2026/f.txt']!),
+      'family',
+    );
     expect(cloud.directories, isNot(contains('Documents/Family')));
   });
 
@@ -263,7 +274,9 @@ void main() {
     expect(cloud.moves, isEmpty);
     expect(cloud.deletes, 0);
     expect(cloud.files['Documents/Family/private.txt'], isNull);
-    expect(cloud.files['Documents/family/private.txt'], isNull);
+    // Spec #49 AC3: on Linux the case variant is its own, unshared folder.
+    expect(cloud.files['Documents/family/private.txt'], 'private'.codeUnits);
+    expect(cloud.shared, isNot(contains('Documents/family')));
     expect(text('Documents/Family/f.txt'), 'family');
     expect(cloud.shared, contains('Documents/Family'));
     expect(text('Documents/family/private.txt'), 'private');
@@ -298,54 +311,59 @@ void main() {
     expect(Directory('${rootPath()}/$folder').existsSync(), isTrue);
   }
 
-  test('D-M1: a Cloud-only subfolder moved out of a folder shared out: no '
-      'MOVE and no delete; restored in the share, the new folder is new',
-      () async {
-    await ownLibrary();
-    await cloudOnlySub('Documents/Family/Sub');
-    Directory('${rootPath()}/Documents/Family/Sub')
-        .renameSync('${rootPath()}/Documents/Private/Sub');
-    await engine.tick();
-    await settle();
-    expect(cloud.moves, isEmpty);
-    expect(cloud.deletes, 0);
-    expect(
-      store.operations.values.where((o) => o.kind == 'delete'),
-      isEmpty,
-    );
-    expect(String.fromCharCodes(cloud.files['Documents/Family/Sub/s.txt']!),
-        'sub');
-    expect(Directory('${rootPath()}/Documents/Family/Sub').existsSync(),
-        isTrue);
-    expect(cloud.directories, contains('Documents/Private/Sub'));
-  });
+  test(
+    'D-M1: a Cloud-only subfolder moved out of a folder shared out: no '
+    'MOVE and no delete; restored in the share, the new folder is new',
+    () async {
+      await ownLibrary();
+      await cloudOnlySub('Documents/Family/Sub');
+      Directory('${rootPath()}/Documents/Family/Sub')
+          .renameSync('${rootPath()}/Documents/Private/Sub');
+      await engine.tick();
+      await settle();
+      expect(cloud.moves, isEmpty);
+      expect(cloud.deletes, 0);
+      expect(store.operations.values.where((o) => o.kind == 'delete'), isEmpty);
+      expect(
+        String.fromCharCodes(cloud.files['Documents/Family/Sub/s.txt']!),
+        'sub',
+      );
+      expect(
+        Directory('${rootPath()}/Documents/Family/Sub').existsSync(),
+        isTrue,
+      );
+      expect(cloud.directories, contains('Documents/Private/Sub'));
+    },
+  );
 
-  test('D-M1: a Cloud-only private folder moved into a folder shared out: no '
-      'MOVE and no delete; restored where it was, the new folder is new',
-      () async {
-    await ownLibrary();
-    await cloudOnlySub('Documents/Private/Old');
-    Directory('${rootPath()}/Documents/Private/Old')
-        .renameSync('${rootPath()}/Documents/Family/Old');
-    await engine.tick();
-    await settle();
-    expect(cloud.moves, isEmpty);
-    expect(cloud.deletes, 0);
-    expect(
-      store.operations.values.where((o) => o.kind == 'delete'),
-      isEmpty,
-    );
-    expect(String.fromCharCodes(cloud.files['Documents/Private/Old/s.txt']!),
-        'sub');
-    expect(cloud.files['Documents/Family/Old/s.txt'], isNull);
-    expect(Directory('${rootPath()}/Documents/Private/Old').existsSync(),
-        isTrue);
-    expect(cloud.directories, contains('Documents/Family/Old'));
-  });
+  test(
+    'D-M1: a Cloud-only private folder moved into a folder shared out: no '
+    'MOVE and no delete; restored where it was, the new folder is new',
+    () async {
+      await ownLibrary();
+      await cloudOnlySub('Documents/Private/Old');
+      Directory('${rootPath()}/Documents/Private/Old')
+          .renameSync('${rootPath()}/Documents/Family/Old');
+      await engine.tick();
+      await settle();
+      expect(cloud.moves, isEmpty);
+      expect(cloud.deletes, 0);
+      expect(store.operations.values.where((o) => o.kind == 'delete'), isEmpty);
+      expect(
+        String.fromCharCodes(cloud.files['Documents/Private/Old/s.txt']!),
+        'sub',
+      );
+      expect(cloud.files['Documents/Family/Old/s.txt'], isNull);
+      expect(
+        Directory('${rootPath()}/Documents/Private/Old').existsSync(),
+        isTrue,
+      );
+      expect(cloud.directories, contains('Documents/Family/Old'));
+    },
+  );
 
   group('upgrade from a profile written before rows carried identities '
-      '(6a84d1d / 41e1f82: the four per-folder settings, no row identity)',
-      () {
+      '(6a84d1d / 41e1f82: the four per-folder settings, no row identity)', () {
     Future<void> placedShare() async {
       for (final folder in ['Documents', 'Documents/Taxes']) {
         cloud.directories.add(folder);

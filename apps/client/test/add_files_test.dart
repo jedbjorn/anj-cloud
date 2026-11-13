@@ -329,44 +329,45 @@ void main() {
       expect(local('Documents/a (2).txt').readAsStringSync(), '2');
     });
 
-    test(
-      'a blocked name is refused, not renamed; an excluded one skipped',
-      () async {
-        for (final name in ['CON.txt', 'a:b.txt', 'trailing.']) {
-          await expectLater(
-            adder.addFile('Documents', name, source('n', 'x'), number: true),
-            skipped('blockedName'),
-            reason: name,
-          );
-        }
-        await expectLater(
-          adder.addFile(
+    test('only a name the rule cannot resolve is refused (spec #49); an '
+        'excluded one skipped', () async {
+      // Decision #120 refused these; spec #49 adds them verbatim.
+      for (final name in ['CON.txt', 'a:b.txt', 'trailing.']) {
+        expect(
+          await adder.addFile(
             'Documents',
-            '.DS_Store',
-            source('d', 'x'),
+            name,
+            source(name, 'x'),
             number: true,
           ),
-          skipped('excluded'),
+          'Documents/$name',
         );
-        expect(
-          () => adder.addFolder('Documents', 'AUX', number: true),
-          throwsA(
-            isA<DocumentsFailure>().having(
-              (e) => e.code,
-              'code',
-              'blockedName',
-            ),
-          ),
+      }
+      for (final name in ['.htaccess', 'movie.mkv.part']) {
+        await expectLater(
+          adder.addFile('Documents', name, source('n', 'x'), number: true),
+          skipped('blockedName'),
+          reason: name,
         );
-        expect(
-          Directory('${tree.root.path}/Documents')
-              .listSync()
-              .map((e) => e.path.split('/').last),
-          unorderedEquals(['Receipts']),
-        );
-        stagingClean();
-      },
-    );
+      }
+      await expectLater(
+        adder.addFile('Documents', '.DS_Store', source('d', 'x'), number: true),
+        skipped('excluded'),
+      );
+      expect(
+        () => adder.addFolder('Documents', '.HTACCESS', number: true),
+        throwsA(
+          isA<DocumentsFailure>().having((e) => e.code, 'code', 'blockedName'),
+        ),
+      );
+      expect(
+        Directory('${tree.root.path}/Documents')
+            .listSync()
+            .map((e) => e.path.split('/').last),
+        unorderedEquals(['Receipts', 'CON.txt', 'a:b.txt', 'trailing.']),
+      );
+      stagingClean();
+    });
 
     test(
       'the plan numbers top items, refuses blocked folders with their subtree',
@@ -375,8 +376,8 @@ void main() {
           [
             {'path': 'a.txt', 'size': 1},
             {'path': 'A.TXT', 'size': 1},
-            {'path': 'Bad:Folder', 'directory': true},
-            {'path': 'Bad:Folder/inside.txt', 'size': 1},
+            {'path': '.htaccess', 'directory': true},
+            {'path': '.htaccess/inside.txt', 'size': 1},
             {'path': 'Tree', 'directory': true},
             {'path': 'Tree/Thumbs.db', 'size': 1},
             {'path': 'Tree/ok.txt', 'size': 1},

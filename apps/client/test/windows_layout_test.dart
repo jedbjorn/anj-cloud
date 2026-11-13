@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/app/controller.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/ui/admin_section.dart';
@@ -49,10 +50,13 @@ void main() {
                 'current local',
               ),
               ('Budget 2026.xlsx', 'file', fileBusyStatus),
-              ('CON', 'file', nameNotAllowedStatus),
+              (
+                '.htaccess',
+                'file',
+                cantSyncNameStatus(CloudNameProblem.forbiddenName),
+              ),
               ('Photos', 'directory', 'cloud-only'),
               ('notes.txt', 'file', 'pending: upload'),
-              ('a.txt', 'file', serverNameClashStatus),
               ('deep.txt', 'file', 'current local'),
             ])
               {
@@ -65,15 +69,12 @@ void main() {
                     : 'local',
                 'expectedPresent': status != 'cloud-only',
                 'size': 123456789,
-                // Each held or busy row carries its amber reason, and the
-                // local name refusal its Rename button.
+                // Each residual or busy row carries its amber reason, and
+                // the residual row its Rename button (spec #49).
                 'presentationErrors': [
-                  if (isServerNameHold(status) ||
-                      isBusyStatus(status) ||
-                      isNameRefusal(status))
-                    status,
+                  if (isBusyStatus(status) || isCantSyncName(status)) status,
                 ],
-                'nameRefused': isNameRefusal(status),
+                'cantSyncName': isCantSyncName(status),
                 'presentationNotes': [if (path == 'deep.txt') longPathNote],
               },
           ];

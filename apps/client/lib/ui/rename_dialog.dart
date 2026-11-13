@@ -2,22 +2,26 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
 import '../core/app/controller.dart';
-import '../core/sync/name_policy.dart';
+import '../core/sync/name_rule.dart';
 
-/// Renames a local item whose name is not allowed on other devices
-/// (decision #120). The rename is a worker action; the dialog never touches
-/// the root. Pops with the new path.
+/// Renames a local item whose name cannot sync (spec #49 residual row). The rename is a worker action; the dialog never touches
+/// the root. Pops with the typed name: the cloud name, which a message shows
+/// (decision #193), never this device's spelling of it.
 class RenameDialog extends StatefulWidget {
   const RenameDialog({
     super.key,
     required this.controller,
     required this.path,
+    this.folder = false,
     this.siblings = const {},
   });
   final ClientController controller;
   final String path;
 
-  /// Names already in the item's folder, for the clash check.
+  /// The item is a folder: R2 cleans a folder name like the worker does.
+  final bool folder;
+
+  /// Names already in the item's folder.
   final Set<String> siblings;
 
   @override
@@ -41,9 +45,8 @@ class _RenameDialogState extends State<RenameDialog> {
   String? _validate(String? value) {
     final name = value ?? '';
     if (name == _current) return 'Choose a different name.';
-    if (name == '.' || name == '..') return 'Use one name.';
-    final problem = NamePolicy.problem(name, widget.siblings);
-    if (problem != null) return problem.text;
+    final refused = renameRefusal(name, folder: widget.folder);
+    if (refused != null) return refused;
     if (widget.siblings.contains(name)) {
       return 'A file or folder already uses this name.';
     }
@@ -57,8 +60,8 @@ class _RenameDialogState extends State<RenameDialog> {
       _error = null;
     });
     try {
-      final path = await widget.controller.renameLocal(widget.path, _name.text);
-      if (mounted) Navigator.pop(context, path);
+      await widget.controller.renameLocal(widget.path, _name.text);
+      if (mounted) Navigator.pop(context, _name.text);
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -70,7 +73,7 @@ class _RenameDialogState extends State<RenameDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final why = NamePolicy.problem(_current, widget.siblings);
+    final why = NameRule.cloudCheck(_current);
     return PopScope(
       canPop: !_busy,
       child: AlertDialog(
@@ -85,9 +88,8 @@ class _RenameDialogState extends State<RenameDialog> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Text(
-                  'This name is not allowed on other devices, so it stays on '
-                          'this device only. ${why?.text ?? ''}'
-                      .trim(),
+                  "This name can't sync${why == null ? '' : ': ${why.reason}'}"
+                  '. It stays on this device only.',
                   key: const ValueKey('rename-reason'),
                 ),
                 const SizedBox(height: 16),

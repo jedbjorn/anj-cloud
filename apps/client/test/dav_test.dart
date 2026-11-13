@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/app/controller.dart';
 import 'package:anj_cloud/core/gateway/dav_api.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
@@ -125,60 +126,61 @@ void main() {
     expect(requests[2]['none'], '*');
     expect(requests[3]['match'], '"v2"');
   });
-  test(
-    '422 name-not-portable becomes NameNotPortable; other 422s do not',
-    () async {
-      var body =
-          '{"error": "name-not-portable", "reason": "clash", "message": "x"}';
-      handler = (request) async {
-        await request.drain<void>();
-        request.response.statusCode = 422;
-        request.response.headers.contentType = ContentType.json;
-        request.response.write(body);
-        await request.response.close();
-      };
-      final file = File('${fixture.path}/upload')..writeAsStringSync('test');
-      await expectLater(
-        api.upload('Documents/notes.txt', file, etag: null),
-        throwsA(
-          isA<NameNotPortable>()
-              .having((e) => e.problem, 'problem', NameProblem.clash)
-              .having((e) => e.message, 'message', nameNotAllowedStatus),
+  test('422 name-not-portable becomes NameNotPortable; other 422s do not', () async {
+    var body =
+        '{"error": "name-not-portable", "reason": "forbiddenName", "message": "x"}';
+    handler = (request) async {
+      await request.drain<void>();
+      request.response.statusCode = 422;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(body);
+      await request.response.close();
+    };
+    final file = File('${fixture.path}/upload')..writeAsStringSync('test');
+    await expectLater(
+      api.upload('Documents/notes.txt', file, etag: null),
+      throwsA(
+        isA<NameNotPortable>()
+            .having((e) => e.problem, 'problem', CloudNameProblem.forbiddenName)
+            .having(
+              (e) => e.message,
+              'message',
+              "Can't sync this name: the cloud does not allow this name",
+            ),
+      ),
+    );
+    body = '{"error": "name-not-portable", "reason": "tooLong"}';
+    await expectLater(
+      api.mkdir('Documents/folder'),
+      throwsA(
+        isA<NameNotPortable>().having(
+          (e) => e.problem,
+          'problem',
+          CloudNameProblem.tooLong,
         ),
-      );
-      body = '{"error": "name-not-portable", "reason": "reserved"}';
-      await expectLater(
-        api.mkdir('Documents/folder'),
-        throwsA(
-          isA<NameNotPortable>().having(
-            (e) => e.problem,
-            'problem',
-            NameProblem.reserved,
-          ),
+      ),
+    );
+    body = '{"error": "something-else"}';
+    await expectLater(
+      api.upload('Documents/notes.txt', file, etag: null),
+      throwsA(
+        isA<CloudFailure>()
+            .having((e) => e is NameNotPortable, 'name', isFalse)
+            .having((e) => e.status, 'status', 422),
+      ),
+    );
+    body = 'not json';
+    await expectLater(
+      api.mkdir('Documents/folder'),
+      throwsA(
+        isA<CloudFailure>().having(
+          (e) => e is NameNotPortable,
+          'name',
+          isFalse,
         ),
-      );
-      body = '{"error": "something-else"}';
-      await expectLater(
-        api.upload('Documents/notes.txt', file, etag: null),
-        throwsA(
-          isA<CloudFailure>()
-              .having((e) => e is NameNotPortable, 'name', isFalse)
-              .having((e) => e.status, 'status', 422),
-        ),
-      );
-      body = 'not json';
-      await expectLater(
-        api.mkdir('Documents/folder'),
-        throwsA(
-          isA<CloudFailure>().having(
-            (e) => e is NameNotPortable,
-            'name',
-            isFalse,
-          ),
-        ),
-      );
-    },
-  );
+      ),
+    );
+  });
   test(
     'Depth1 traversal preserves spaces percent and Unicode without leaving DAV',
     () async {

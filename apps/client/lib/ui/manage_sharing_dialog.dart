@@ -63,9 +63,11 @@ Future<bool?> showManageSharing(
   BuildContext context, {
   required String path,
   required SharingCall call,
+  String? shown,
 }) => showDialog<bool>(
   context: context,
-  builder: (context) => ManageSharingDialog(path: path, call: call),
+  builder: (context) =>
+      ManageSharingDialog(path: path, call: call, shown: shown),
 );
 
 class _Recipient {
@@ -98,8 +100,12 @@ class ManageSharingDialog extends StatefulWidget {
     super.key,
     required this.path,
     required this.call,
+    this.shown,
   });
   final String path;
+
+  /// The folder's path as shown: its cloud names (spec #49).
+  final String? shown;
   final SharingCall call;
 
   @override
@@ -113,7 +119,7 @@ class _ManageSharingDialogState extends State<ManageSharingDialog> {
   List<HouseholdUser> _users = const [];
   final List<_Recipient> _rows = [];
 
-  String get _folder => p.posix.basename(widget.path);
+  String get _folder => p.posix.basename(widget.shown ?? widget.path);
 
   @override
   void initState() {

@@ -188,28 +188,26 @@ void main() {
     expect(cloud.completedDownloads, before);
   });
 
-  test(
-    'creates never replace, take a free name and follow decision #120',
-    () async {
-      tree.ensureDirectory('Docs');
-      local('Docs/a.txt').writeAsStringSync('keep');
-      await engine.tick();
-      expect(ops.create('Docs', 'a.txt'), 'Docs/a (1).txt');
-      expect(local('Docs/a.txt').readAsStringSync(), 'keep');
-      expect(local('Docs/a (1).txt').lengthSync(), 0);
-      expect(() => ops.create('Docs', 'CON.txt'), refused('refused'));
-      expect(() => ops.create('Docs', 'a:b.txt'), refused('refused'));
-      expect(() => ops.create('Docs', 'A.TXT'), refused('refused'));
-      expect(() => ops.create('Docs', '../x'), refused('refused'));
-      expect(ops.createFolder('Docs', 'Sub'), 'Docs/Sub');
-      expect(Directory('${tree.root.path}/Docs/Sub').existsSync(), isTrue);
-      await engine.tick();
-      expect(cloud.files.containsKey('Docs/a (1).txt'), isTrue);
-      expect(cloud.directories, contains('Docs/Sub'));
-      paused = true;
-      expect(() => ops.create('Docs', 'b.txt'), refused('paused'));
-    },
-  );
+  test('creates never replace, take a free name and follow spec #49', () async {
+    tree.ensureDirectory('Docs');
+    local('Docs/a.txt').writeAsStringSync('keep');
+    await engine.tick();
+    expect(ops.create('Docs', 'a.txt'), 'Docs/a (1).txt');
+    expect(local('Docs/a.txt').readAsStringSync(), 'keep');
+    expect(local('Docs/a (1).txt').lengthSync(), 0);
+    // Decision #120 refused these; spec #49 creates them verbatim.
+    expect(ops.create('Docs', 'CON.txt'), 'Docs/CON.txt');
+    expect(ops.create('Docs', 'a:b.txt'), 'Docs/a:b.txt');
+    expect(() => ops.create('Docs', '.htaccess'), refused('refused'));
+    expect(() => ops.create('Docs', '../x'), refused('refused'));
+    expect(ops.createFolder('Docs', 'Sub'), 'Docs/Sub');
+    expect(Directory('${tree.root.path}/Docs/Sub').existsSync(), isTrue);
+    await engine.tick();
+    expect(cloud.files.containsKey('Docs/a (1).txt'), isTrue);
+    expect(cloud.directories, contains('Docs/Sub'));
+    paused = true;
+    expect(() => ops.create('Docs', 'b.txt'), refused('paused'));
+  });
 
   test('a folder made through the provider takes children at once', () async {
     // Review F2: a Files-app folder-tree copy creates a folder, then its
@@ -224,7 +222,7 @@ void main() {
     expect(ops.create('Docs/New/Nested', 'y.txt'), 'Docs/New/Nested/y.txt');
     // Every name, exclusion and no-replace rule still holds.
     expect(ops.create('Docs/New', 'x.txt'), 'Docs/New/x (1).txt');
-    expect(() => ops.create('Docs/New', 'CON'), refused('refused'));
+    expect(() => ops.create('Docs/New', '.htaccess'), refused('refused'));
     expect(() => ops.create('Docs/Missing', 'z.txt'), refused('notFound'));
     local('Docs/plain.txt').writeAsStringSync('f');
     expect(() => ops.create('Docs/plain.txt', 'z.txt'), refused('notFound'));

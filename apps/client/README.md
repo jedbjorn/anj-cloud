@@ -378,22 +378,39 @@ and the pass end; a crash before that commit only means the next listing
 records it again. `tool/bench/first_pass_bench.dart` times a first pass over
 new Cloud-only files with and without `--enable-asserts`.
 
-## Names other devices cannot hold
+## Per-device file names
 
-Decision #120 (seam S1): before a new file is uploaded or a new folder is
-created, `NamePolicy` (`lib/core/sync/name_policy.dart`) checks its name: Windows
-reserved names (CON, PRN, AUX, NUL, COM1-9, LPT1-9, with any extension), a
-trailing dot or space, `< > : " / \ | ? *` or a control character, and a
-name that differs from a cloud sibling only by case or Unicode normalization.
-Such an item stays on this device, unchanged, with the row "Name not allowed
-on other devices: rename to sync" (amber, Needs attention) and a Rename
-action; the contents of such a folder wait with it. The gateway applies the
-same rule, so its `name-not-portable` refusal (a sibling created elsewhere in
-the meantime) shows the same row, held until the item changes or Retry.
-Nothing is renamed automatically. Items already in the cloud keep syncing on
-Linux whatever their name, including edits; ordinary dotfiles are unaffected.
+Spec #49 (decisions #193, #195, #198, #199): a name is never blocked and the
+user is never asked to rename. `NameRule` (`lib/core/sync/name_rule.dart`)
+gives every cloud item a local name on this OS, once per listing:
+
+- R1/R2, everywhere: a leading or trailing space is trimmed, `\`, C0 controls
+  and DEL become lookalikes, names are cut at 250 bytes, and a folder ending
+  in `.part`/`.filepart` gets `_` appended. These change the cloud name too:
+  the local item is renamed in place (same identity, a folder carries its
+  subtree) and only then uploaded, so nothing is sent twice. A `.part` or
+  `.filepart` file is a local temporary: never uploaded, no row.
+- R3, this OS only: on Windows, `CON.txt` shows as `CON_.txt`, `a:b?.txt` as
+  `a：b？.txt`, `x.` as `x`, and of `Report.pdf` and `report.pdf` the older
+  item keeps the name and the other is `report (2).pdf`; on macOS only case
+  and normalization clashes are suffixed; Linux holds every name verbatim.
+  The cloud name never changes.
+
+The manifest is keyed by local path; each entry records the cloud name it
+stands for (`Entry.cloudName`), rebuilt from every listing, and `NamedCloud`
+(`lib/core/sync/cloud_names.dart`) translates each path per segment at the
+cloud boundary. A local name the rule did not give (a new file, a rename) is
+taken literally. When a sibling appears or disappears and an item's local
+name changes (`report (2).pdf` becomes `report.pdf` once `Report.pdf` is
+gone), the item is renamed in place through the same file ID pairing as a
+cloud rename, with no transfer. Rows and details show the cloud name.
+What the rule cannot resolve (today a file or folder named `.htaccess`)
+stays on this device with one row, "Can't sync this name: <reason>", and a
+Rename action; Rename refuses only an empty name, `/`, and a name the rule
+still cannot resolve. Rows left by the #120 client ("Name not allowed on
+other devices") resolve on the first pass after upgrade.
 `tool/name_policy_fixture.dart`, driven by `deploy/name_fixture.py`, proves
-this against a review stack.
+this with two Linux devices against a review stack.
 
 A rename of a synchronized item that changes only case or normalization
 (`Photos` to `photos`) is the same item, not a clash (SC-054,
@@ -407,7 +424,8 @@ falls back to ordinary reconciliation. The other way round, a cloud rename
 of that kind (the same file ID, else the same version, at the new spelling)
 renames the local item in place once, which on a case-insensitive volume is
 the only safe way (a download to the new spelling would land on the old
-item). A clashing name for a different item is still held as above. A
+item). A cloud rename onto a name a different local item still holds waits
+("rename pending", not Needs attention) until that item moves. A
 child renamed together with its folder (`Photos/Top.txt` and `Photos` to
 `photos/top.txt`) is paired again under the moved folder and moves too.
 The pairing goes by name, not content: deleting `Report.txt` and creating an
@@ -423,7 +441,8 @@ disk, with no clash, row or re-upload; where several local spellings share
 one cloud name, the synchronized item wins, then the exact spelling on disk,
 component by component). A normalization-only rename is
 therefore a no-op in the cloud: its rows take the new spelling. Two local
-siblings that differ only by normalization remain a clash (#120).
+siblings that differ only by normalization: the newer is renamed here with a
+` (n)` suffix.
 `tool/case_move_fixture.dart`, driven by
 `deploy/case_move_fixture.py`, proves this against a review stack.
 

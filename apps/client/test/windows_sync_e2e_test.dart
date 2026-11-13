@@ -22,6 +22,7 @@ import 'package:anj_cloud/core/gateway/identity.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
+import 'package:anj_cloud/core/sync/cloud_names.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
@@ -144,10 +145,12 @@ void main() {
           Uri.parse(origin),
           await identity.context(File(ca)),
         );
+        // As the worker builds it: requests leave under cloud names.
+        final names = CloudNames();
         return _Device(
           label,
           Directory(p.join(work.path, 'profile-$label')),
-          SyncEngine(store, tree, cloud),
+          SyncEngine(store, tree, NamedCloud(cloud, names), names: names),
           cloud,
         );
       }
@@ -613,10 +616,12 @@ void main() {
         });
         a.file(big).deleteSync();
 
-        // ---- names Windows cannot hold, created on the server -----------
+        // ---- names Windows spells otherwise, created on the server ------
+        // Spec #49 R3 (AC4): every item is here under a local name Windows
+        // can hold, silently; every request leaves under its cloud name.
         final names = config['names_folder'] as String;
         // It existed on the server before this device paired, so it starts
-        // Cloud-only; choose Local to materialize what can be.
+        // Cloud-only; choose Local to materialize it.
         await a.engine.tick();
         final listed = (await a.cloud.snapshot())
             .map((e) => e.path)
@@ -630,34 +635,29 @@ void main() {
         });
         a.engine.setRetention(names, Retention.local);
         await a.engine.tick();
+        await a.engine.tick();
         final remoteNames = (await a.cloud.snapshot())
             .map((e) => e.path)
             .where((path) => path.startsWith('$names/'))
-            .toList();
-        final onDisk = Directory(p.joinAll([a.root, ...names.split('/')]))
-            .listSync()
-            .map((e) => p.basename(e.path))
+            .map((path) => p.posix.relative(path, from: names))
             .toSet();
-        final blocked = <String, String>{};
-        for (final path in remoteNames) {
-          final entry = a.engine.manifest.entries[path];
-          blocked[p.posix.relative(path, from: names)] =
-              entry?.status ?? 'none';
-        }
-        final inKept = Directory(
-          p.joinAll([a.root, ...names.split('/'), 'Docs']),
-        ).listSync().map((e) => p.basename(e.path)).toSet();
-        record('remote names Windows cannot hold stay Cloud-only', {
-          'remote': remoteNames
-              .map((n) => p.posix.relative(n, from: names))
-              .toList(),
+        Set<String> namesOnDisk([String folder = '']) =>
+            Directory(p.joinAll([a.root, ...names.split('/'), folder]))
+                .listSync()
+                .map((e) => p.basename(e.path))
+                .toSet();
+        final onDisk = namesOnDisk();
+        final rows = {
+          for (final entry in a.engine.manifest.entries.values)
+            if (entry.path.startsWith('$names/'))
+              p.posix.relative(entry.path, from: names): entry.status,
+        };
+        record('remote names are here under their Windows names', {
+          'remote': remoteNames.toList(),
           'on_disk': onDisk.toList(),
-          'in_kept_folder': inKept.toList(),
-          'status': blocked,
+          'in_docs_2': namesOnDisk('docs (2)').toList(),
+          'status': rows,
         });
-        // Only the portable names and the byte-wise first of each clash are
-        // created; NTFS never merges docs/ into Docs/. A long path is
-        // created like any other (row 8), with its note.
         final deep = remoteNames
             .where((path) => path.endsWith('/deep.txt'))
             .firstOrNull;
@@ -666,23 +666,34 @@ void main() {
             ((pair as List)[0] as String, pair[1] as String),
         ];
         expect(onDisk, {
+          'CON_',
+          'nul_.txt',
+          'x',
+          'trailing',
           'A.txt',
+          'a (2).txt',
           'ok.txt',
           'Docs',
+          'docs (2)',
+          'bad',
+          if (remoteNames.contains('a:b')) 'a：b',
           // Synced now; moved in the cloud further down.
           for (final (source, _) in cloudMoves) source,
-          if (deep != null)
-            p.posix.split(p.posix.relative(deep, from: names))[0],
+          if (deep != null) p.posix.split(deep)[0],
         });
+        expect(namesOnDisk('Docs'), {'x.txt'});
+        expect(namesOnDisk('docs (2)'), {'y.txt'});
+        expect(namesOnDisk('bad'), {'inside.txt'});
+        // No row: nothing needs attention.
+        for (final MapEntry(key: name, value: status) in rows.entries) {
+          expect(status, 'current local', reason: name);
+        }
         if (deep != null) {
-          final absolute = a.file(deep).path;
-          expect(
-            a.file(deep).readAsStringSync(),
-            'server ${p.posix.relative(deep, from: names)}',
-          );
+          final absolute = a.file('$names/$deep').path;
+          expect(a.file('$names/$deep').readAsStringSync(), 'server $deep');
           final row = await projectEntry(
             a.engine,
-            a.engine.manifest.entries[deep]!,
+            a.engine.manifest.entries['$names/$deep']!,
           );
           expect(row['presentationNotes'], [longPathNote]);
           record('a path over 259 characters syncs with the note', {
@@ -690,70 +701,21 @@ void main() {
             'notes': row['presentationNotes'],
           });
         }
-        final optional = {
-          'a:b': serverNameNotAllowedStatus,
-          '${'n' * 252}.txt': serverNameNotAllowedStatus,
-        };
-        for (final MapEntry(key: name, value: status) in optional.entries) {
-          if (blocked.containsKey(name)) {
-            expect(blocked[name], status, reason: name);
-          }
-        }
-        record('row 8 names the server accepted', {
-          'present': [
-            for (final name in optional.keys)
-              if (blocked.containsKey(name))
-                name.length > 20 ? '${name.length} units' : name,
-          ],
-        });
-        expect(inKept, {'x.txt'});
-        for (final (held, status) in [
-          ('CON', serverNameNotAllowedStatus),
-          ('nul.txt', serverNameNotAllowedStatus),
-          ('x.', serverNameNotAllowedStatus),
-          ('trailing ', serverNameNotAllowedStatus),
-          ('a.txt', serverNameClashStatus),
-          ('docs', serverNameClashStatus),
-          ('docs/y.txt', serverFolderNameStatus),
-          ('bad.', serverNameNotAllowedStatus),
-          ('bad./inside.txt', serverFolderNameStatus),
-        ]) {
-          expect(blocked[held], status, reason: held);
-        }
-        // Three passes: the clash winner does not flip.
-        final winners = <Set<String>>[];
-        for (var i = 0; i < 3; i++) {
-          await a.engine.tick();
-          winners.add(
-            Directory(p.joinAll([a.root, ...names.split('/')]))
-                .listSync()
-                .map((e) => p.basename(e.path))
-                .toSet(),
-          );
-        }
-        expect(winners[1], winners[0]);
-        expect(winners[2], winners[0]);
-        record('clash winners are stable over three passes', {
-          'on_disk': winners[0].toList(),
-        });
+        // Edited here, it uploads under its cloud name.
+        a.file('$names/x').writeAsStringSync('edited x.', flush: true);
+        await a.engine.tick();
+        expect(
+          await remoteHash('$names/x.'),
+          _digest(utf8.encode('edited x.')),
+        );
+        record('an edit of x uploads to cloud x.', {});
 
-        // ---- moves made in the cloud to names this device cannot hold ----
+        // ---- moves made in the cloud to names Windows spells otherwise ---
         // The driver makes them in Nextcloud, as another device's renames
-        // would arrive: to a name Windows refuses, onto a case sibling of a
-        // file here, and into the folder held back as the clash loser. Each
-        // item must stay where it is, with its reason; nothing may land in
-        // the kept sibling folder, and nothing may be sent to the server.
-        Set<String> namesOnDisk() =>
-            Directory(p.joinAll([a.root, ...names.split('/')]))
-                .listSync()
-                .map((e) => p.basename(e.path))
-                .toSet();
-        Set<String> keptFolder() =>
-            Directory(p.joinAll([a.root, ...names.split('/'), 'Docs']))
-                .listSync()
-                .map((e) => p.basename(e.path))
-                .toSet();
-        final beforeMoves = namesOnDisk();
+        // would arrive: to a name Windows changes, onto a case sibling of a
+        // file here, and into the newer of the two case-sibling folders.
+        // Each is one rename here to its local name; nothing lands in Docs,
+        // and nothing is sent to the server.
         for (final (source, _) in cloudMoves) {
           expect(a.file('$names/$source').readAsStringSync(), 'server $source');
         }
@@ -764,29 +726,29 @@ void main() {
           await Future<void>.delayed(const Duration(seconds: 1));
         }
         expect(movesDone.existsSync(), isTrue, reason: 'the driver moved them');
-        final listedAfterMoves = <Set<String>>[];
-        for (var pass = 0; pass < 6; pass++) {
+        for (var pass = 0; pass < 4; pass++) {
           await a.engine.tick();
           await Future<void>.delayed(const Duration(seconds: 1));
-          listedAfterMoves.add(namesOnDisk());
-          expect(namesOnDisk(), beforeMoves, reason: 'pass $pass');
-          expect(keptFolder(), {'x.txt'}, reason: 'pass $pass');
         }
-        final moveStatus = <String, String>{};
+        const movedHere = {
+          'moved.': 'moved',
+          'OK.txt': 'OK (2).txt',
+          'docs/move-into.txt': 'docs (2)/move-into.txt',
+        };
         for (final (source, target) in cloudMoves) {
+          final local = movedHere[target]!;
           expect(
-            a.file('$names/$source').readAsStringSync(),
+            a.file('$names/$local').readAsStringSync(),
             'server $source',
-            reason: 'still here, untouched',
+            reason: '$source -> $local',
           );
-          moveStatus[target] =
-              a.engine.manifest.entries['$names/$source']?.status ?? 'none';
+          expect(a.file('$names/$source').existsSync(), isFalse);
+          expect(
+            a.engine.manifest.entries['$names/$local']?.status,
+            'current local',
+          );
         }
-        expect(moveStatus, {
-          'moved.': movedNameNotAllowedStatus,
-          'OK.txt': movedNameClashStatus,
-          'docs/move-into.txt': movedFolderNameStatus,
-        });
+        expect(namesOnDisk('Docs'), {'x.txt'});
         expect([
           for (final o in a.engine.manifest.operations.values)
             if (o.path.startsWith('$names/') &&
@@ -805,10 +767,9 @@ void main() {
           afterMoves,
           containsAll(['$names/Docs/x.txt', '$names/docs/y.txt']),
         );
-        record('cloud moves to names this device cannot hold keep the items', {
-          'status': moveStatus,
+        record('cloud moves are followed by one rename to the local name', {
           'on_disk': namesOnDisk().toList(),
-          'in_kept_folder': keptFolder().toList(),
+          'in_docs_2': namesOnDisk('docs (2)').toList(),
         });
 
         File(p.join(signal.path, 'expect.json')).writeAsStringSync(

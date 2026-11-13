@@ -363,7 +363,7 @@ void main() {
       AddSource(path: 'a.txt', size: 10, reference: 'a'),
       AddSource(path: 'b.txt', size: 20, reference: 'b'),
       AddSource(path: 'movie.mp4', size: 100 << 20, reference: 'm'),
-      AddSource(path: 'CON.txt', size: 1, reference: 'c'),
+      AddSource(path: '.htaccess', size: 1, reference: 'c'),
     ];
     await pumpApp(tester);
     await _openMenu(tester, 'Documents');
@@ -375,10 +375,7 @@ void main() {
       find.text('movie.mp4 — Larger than the 64 MB upload limit'),
       findsOneWidget,
     );
-    expect(
-      find.text('CON.txt — Name not allowed on other devices'),
-      findsOneWidget,
-    );
+    expect(find.text(".htaccess — Can't sync this name"), findsOneWidget);
     expect(worker.calls.where((c) => c.startsWith('addFile')), isEmpty);
     await tester.tap(find.byKey(const ValueKey('add-confirm')));
     await tester.pumpAndSettle();

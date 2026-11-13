@@ -362,7 +362,9 @@ void main() {
         engine.intent(path, 'delete', etag: store.entries[path]!.etag);
         store.entries[path]!.expectedPresent = false;
       }
-      store.entries['photos']!.status = nameNotAllowedStatus;
+      // The row decision #120 held it under (spec #49 AC8).
+      store.entries['photos']!.status =
+          'Name not allowed on other devices: rename to sync';
       store.save();
       cloud.online = true;
       await ticks();
@@ -372,8 +374,8 @@ void main() {
       expect(store.operations.values.where((o) => o.kind == 'delete'), isEmpty);
     });
 
-    test('keeps decision #120 for a different item: a new local name that '
-        'clashes with a Cloud-only one is held, not moved', () async {
+    test('spec #49: a new local name that differs from a Cloud-only one '
+        'by case only is a new item and uploads', () async {
       await cloud.mkdir('Docs');
       cloud.put('Docs/notes.txt', 'cloud');
       await ticks(1);
@@ -383,31 +385,41 @@ void main() {
       cloud.calls.clear();
       write('Docs/Notes.txt', 'local');
       await ticks();
-      expect(cloud.calls, isEmpty);
-      expect(store.entries['Docs/Notes.txt']!.status, nameNotAllowedStatus);
+      expect(cloud.calls.first, 'PUT Docs/Notes.txt');
+      expect(remote('Docs/Notes.txt'), 'local');
       expect(remote('Docs/notes.txt'), 'cloud');
+      expect(
+        store.entries.values.where(
+          (e) => e.status != 'current local' && e.status != 'cloud-only',
+        ),
+        isEmpty,
+      );
     });
 
-    test('keeps decision #120 when both spellings are distinct items: a '
-        'clashing sibling is still held', () async {
-      cloud.put('Docs/A.txt', 'upper');
-      await ticks(2);
-      cloud.calls.clear();
-      write('Docs/a.txt', 'lower');
-      await ticks();
-      if (foldsCase(tree.root)) {
-        // APFS: the two spellings are one item, so the write edits A.txt.
-        expect(listed('Docs'), ['A.txt']);
-        expect(cloud.calls, ['PUT Docs/A.txt']);
-        expect(remote('Docs/A.txt'), 'lower');
-        expect(store.entries.containsKey('Docs/a.txt'), isFalse);
-        expect(store.entries['Docs/A.txt']!.status, 'current local');
-        return;
-      }
-      expect(cloud.calls, isEmpty);
-      expect(store.entries['Docs/a.txt']!.status, nameNotAllowedStatus);
-      expect(File(root('Docs/A.txt')).readAsStringSync(), 'upper');
-    });
+    test(
+      'spec #49: two spellings that differ by case are two cloud items',
+      () async {
+        cloud.put('Docs/A.txt', 'upper');
+        await ticks(2);
+        cloud.calls.clear();
+        write('Docs/a.txt', 'lower');
+        await ticks();
+        if (foldsCase(tree.root)) {
+          // APFS: the two spellings are one item, so the write edits A.txt.
+          expect(listed('Docs'), ['A.txt']);
+          expect(cloud.calls, ['PUT Docs/A.txt']);
+          expect(remote('Docs/A.txt'), 'lower');
+          expect(store.entries.containsKey('Docs/a.txt'), isFalse);
+          expect(store.entries['Docs/A.txt']!.status, 'current local');
+          return;
+        }
+        expect(cloud.calls, ['PUT Docs/a.txt']);
+        expect(remote('Docs/a.txt'), 'lower');
+        expect(remote('Docs/A.txt'), 'upper');
+        expect(store.entries['Docs/a.txt']!.status, 'current local');
+        expect(File(root('Docs/A.txt')).readAsStringSync(), 'upper');
+      },
+    );
   });
 
   group('NFD names (decision #138)', () {
@@ -439,8 +451,8 @@ void main() {
       expect(store.entries.keys.where((k) => k.contains('é')), isEmpty);
     });
 
-    test('a new NFC sibling of a synced NFD folder is held: the cloud folder '
-        'stays the synced one, nothing uploads into it', () async {
+    test('a new NFC sibling of a synced NFD folder takes R1\'s (2) in '
+        'place: the synced folder keeps the cloud name', () async {
       write('Docs/Résumé/cv.txt', 'cv');
       await ticks(2);
       expect(remote('Docs/Résumé/cv.txt'), 'cv');
@@ -449,28 +461,28 @@ void main() {
       await ticks(3);
       if (foldsNormalization(tree.root)) {
         // APFS: both spellings name the synced folder, so the file is a new
-        // child of it and uploads; nothing is held.
+        // child of it and uploads.
         expect(listed('Docs'), hasLength(1));
-        expect(cloud.calls, ['PUT Docs/R\u00e9sum\u00e9/local.txt']);
-        expect(remote('Docs/R\u00e9sum\u00e9/local.txt'), 'local');
-        expect(_held(store), isEmpty);
+        expect(cloud.calls, ['PUT Docs/Résumé/local.txt']);
+        expect(remote('Docs/Résumé/local.txt'), 'local');
         return;
       }
-      expect(cloud.calls, isEmpty);
       expect(remote('Docs/Résumé/local.txt'), isNull);
-      expect(store.entries['Docs/Résumé']!.status, nameNotAllowedStatus);
+      expect(remote('Docs/Résumé (2)/local.txt'), 'local');
+      expect(listed('Docs'), unorderedEquals(['Résumé', 'Résumé (2)']));
+      expect(store.entries['Docs/Résumé']!.status, 'current local');
       expect(
-        store.entries['Docs/Résumé/local.txt']!.status,
-        nameFolderPendingStatus,
+        store.entries['Docs/Résumé (2)/local.txt']!.status,
+        'current local',
       );
-      final synced = store.entries['Docs/Résumé']!;
-      expect(synced.conflict, isNull);
-      expect(synced.status, 'current local');
       expect(store.entries['Docs/Résumé/cv.txt']!.status, 'current local');
+      cloud.calls.clear();
+      await ticks(2);
+      expect(cloud.calls, isEmpty, reason: 'no loop');
     });
 
-    test('a held NFD sibling of a synced NFC folder: a new cloud file '
-        'lands in the synced folder, not the held one', () async {
+    test('a new NFD sibling of a synced NFC folder takes R1\'s (2): a new '
+        'cloud file lands in the synced folder', () async {
       write('Docs/Résumé/cv.txt', 'cv');
       await ticks(2);
       write('Docs/Résumé/held.txt', 'held');
@@ -478,27 +490,25 @@ void main() {
       if (foldsNormalization(tree.root)) {
         // APFS: both spellings name the synced folder, so held.txt uploads
         // into it and the new cloud file lands beside it.
-        expect(remote('Docs/R\u00e9sum\u00e9/held.txt'), 'held');
-        expect(_held(store), isEmpty);
+        expect(remote('Docs/Résumé/held.txt'), 'held');
         cloud.calls.clear();
-        cloud.put('Docs/R\u00e9sum\u00e9/new.txt', 'new');
+        cloud.put('Docs/Résumé/new.txt', 'new');
         await ticks(2);
-        expect(cloud.calls, ['GET Docs/R\u00e9sum\u00e9/new.txt']);
+        expect(cloud.calls, ['GET Docs/Résumé/new.txt']);
         expect(listed('Docs'), hasLength(1));
         expect(
-          listed('Docs/R\u00e9sum\u00e9'),
+          listed('Docs/Résumé'),
           unorderedEquals(['cv.txt', 'held.txt', 'new.txt']),
         );
         return;
       }
-      expect(store.entries['Docs/Résumé']!.status, nameNotAllowedStatus);
+      expect(remote('Docs/Résumé (2)/held.txt'), 'held');
       cloud.calls.clear();
       cloud.put('Docs/Résumé/new.txt', 'new');
       await ticks(2);
       expect(cloud.calls, ['GET Docs/Résumé/new.txt']);
-      expect(File(root('Docs/Résumé/new.txt')).readAsStringSync(), 'new');
-      expect(listed('Docs/Résumé'), ['held.txt']);
-      expect(remote('Docs/Résumé/held.txt'), isNull);
+      expect(listed('Docs/Résumé'), unorderedEquals(['cv.txt', 'new.txt']));
+      expect(listed('Docs/Résumé (2)'), ['held.txt']);
       expect(store.entries['Docs/Résumé/new.txt']!.status, 'current local');
     });
 
@@ -633,12 +643,3 @@ void main() {
     });
   });
 }
-
-/// Entries held by a name clash (decision #120): none where names fold.
-Iterable<String> _held(Manifest store) => store.entries.entries
-    .where(
-      (e) =>
-          e.value.status == nameNotAllowedStatus ||
-          e.value.status == nameFolderPendingStatus,
-    )
-    .map((e) => e.key);

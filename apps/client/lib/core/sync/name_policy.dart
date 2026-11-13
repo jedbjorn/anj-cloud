@@ -1,57 +1,22 @@
 import '../state/model.dart';
+import 'name_rule.dart';
 import 'name_tables.dart';
 
-/// Why a name cannot exist on Windows or macOS (decision #120, seam S1).
-enum NameProblem {
-  empty('A name is required.'),
-  invalidCharacter(
-    'Names cannot contain < > : " / \\ | ? * or control characters on other devices.',
-  ),
-  reserved('Windows reserves this name (CON, PRN, AUX, NUL, COM1-9, LPT1-9).'),
-  trailingDotOrSpace(
-    'Names cannot end with a dot or a space on other devices.',
-  ),
-  clash(
-    'Another item in this folder has the same name apart from upper/lower case or accents.',
-  );
-
-  const NameProblem(this.text);
-
-  /// One sentence for the Rename dialog.
-  final String text;
-
-  /// The gateway's `reason` code for this problem.
-  static NameProblem? fromReason(Object? reason) => switch (reason) {
-    'empty' => empty,
-    'invalidCharacter' => invalidCharacter,
-    'reserved' => reserved,
-    'trailingDotOrSpace' => trailingDotOrSpace,
-    'clash' => clash,
-    _ => null,
-  };
-}
-
-/// Status of a local item that is not uploaded because of its name. Nothing
-/// is renamed for the user; the file stays on this device.
-const nameNotAllowedStatus =
-    'Name not allowed on other devices: rename to sync';
-
-/// Status of a local item inside a folder whose name is not allowed.
-const nameFolderPendingStatus =
-    'pending: the folder name is not allowed on other devices';
-
-bool isNameRefusal(String status) => status == nameNotAllowedStatus;
-
-/// Statuses of a server item this device cannot hold under its name
-/// (decision #120 Q2; `NameHolds`): Cloud-only and never created here. This
-/// device has no copy to rename, so the row offers no Rename and says where
-/// the fix is.
-const serverNameNotAllowedStatus =
-    'Cloud only: name not allowed on this device. Rename it on another device to get it here';
-const serverNameClashStatus =
-    'Cloud only: another item here has the same name on this device. Rename one on another device to get both here';
-const serverFolderNameStatus =
-    'Cloud only: its folder name is not allowed on this device';
+/// The rows decision #120 held items under, before spec #49 retired every
+/// name hold. A manifest written by an earlier client may still carry one:
+/// such a row is visited again on the first pass of this client and
+/// resolves through the name rule with no user action (spec #49 AC8).
+const _legacyNameHolds = {
+  'Name not allowed on other devices: rename to sync',
+  'pending: the folder name is not allowed on other devices',
+  'Cloud only: name not allowed on this device. Rename it on another device to get it here',
+  'Cloud only: another item here has the same name on this device. Rename one on another device to get both here',
+  'Cloud only: its folder name is not allowed on this device',
+  'Renamed on another device to a name not allowed on this device. It keeps its old name here; rename it again on another device',
+  'Renamed on another device to a name another item here has on this device. It keeps its old name here; rename one on another device',
+  'Moved on another device into a folder this device cannot hold. It stays where it is here',
+};
+bool isLegacyNameHold(String status) => _legacyNameHolds.contains(status);
 
 /// Information on a row whose full path on this device is over 259
 /// characters (Windows, spec #32 File Names): it syncs normally, but some
@@ -59,82 +24,24 @@ const serverFolderNameStatus =
 const longPathNote = 'Long path: some Windows apps may not open this';
 const win32MaxPath = 259;
 
-/// The same three reasons for an item that is on this device under its old
-/// name while a rename or move made on another device cannot be followed
-/// here: it is not Cloud-only, it keeps its old name until the new one can
-/// be held.
-const movedNameNotAllowedStatus =
-    'Renamed on another device to a name not allowed on this device. It keeps its old name here; rename it again on another device';
-const movedNameClashStatus =
-    'Renamed on another device to a name another item here has on this device. It keeps its old name here; rename one on another device';
-const movedFolderNameStatus =
-    'Moved on another device into a folder this device cannot hold. It stays where it is here';
-
-/// The status of an item kept at its old path for [held], the reason its
-/// new cloud name cannot be held here.
-String movedHoldStatus(String held) => switch (held) {
-  serverNameNotAllowedStatus => movedNameNotAllowedStatus,
-  serverNameClashStatus => movedNameClashStatus,
-  serverFolderNameStatus => movedFolderNameStatus,
-  _ => held,
-};
-
-bool isServerNameHold(String status) =>
-    status == serverNameNotAllowedStatus ||
-    status == serverNameClashStatus ||
-    status == serverFolderNameStatus ||
-    status == movedNameNotAllowedStatus ||
-    status == movedNameClashStatus ||
-    status == movedFolderNameStatus;
-
 /// A file another program holds open without read sharing (Windows; SC-048
 /// F5): left as it is until a later pass can read it.
 const fileBusyStatus = 'Open in another app: syncs when it is closed';
 bool isBusyStatus(String status) => status == fileBusyStatus;
 
-/// The gateway refused a create or rename: 422 `name-not-portable`, for
-/// example a sibling clash that appeared after the last listing, or a
-/// name this client's check did not cover.
+/// The gateway refused a create or rename: 422 `name-not-portable`, the
+/// backstop for a name the cloud cannot store (spec #49 Gateway). The row
+/// is the residual one ([cantSyncNameStatus]).
 class NameNotPortable extends CloudFailure {
-  const NameNotPortable(this.problem)
-    : super(nameNotAllowedStatus, status: 422);
-  final NameProblem? problem;
+  NameNotPortable(this.problem)
+    : super(cantSyncNameStatus(problem), status: 422);
+  final CloudNameProblem? problem;
 }
 
-/// The portable-name rule shared by every client and the gateway
-/// (services/access/portable_names.py). Both run
-/// tests/name_policy_vectors.json and use the same generated Unicode tables
-/// (name_tables.dart), so they cannot drift.
+/// Name spelling shared by every client and the gateway: fold keys and NFC
+/// (decision #138), from the generated Unicode tables (name_tables.dart).
+/// The name rule itself is [NameRule].
 abstract final class NamePolicy {
-  static const _reserved = {
-    'CON', 'PRN', 'AUX', 'NUL', //
-    'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
-    'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
-  };
-  static const _invalid = '<>:"/\\|?*';
-
-  /// The problem with one path component [name], or null when it is portable.
-  static NameProblem? check(String name) {
-    if (name.isEmpty) return NameProblem.empty;
-    for (final unit in name.codeUnits) {
-      if (unit < 0x20 || _invalid.codeUnits.contains(unit)) {
-        return NameProblem.invalidCharacter;
-      }
-    }
-    var stem = name.split('.').first;
-    while (stem.endsWith(' ')) {
-      stem = stem.substring(0, stem.length - 1);
-    }
-    if (stem.codeUnits.every((unit) => unit < 0x80) &&
-        _reserved.contains(stem.toUpperCase())) {
-      return NameProblem.reserved;
-    }
-    if (name.endsWith('.') || name.endsWith(' ')) {
-      return NameProblem.trailingDotOrSpace;
-    }
-    return null;
-  }
-
   /// Names with equal keys differ only by case or Unicode normalization:
   /// canonical caseless matching, NFD(casefold(NFD(name))).
   static String foldKey(String name) {
@@ -193,23 +100,6 @@ abstract final class NamePolicy {
     }
     return nameComposition[first * 0x110000 + second];
   }
-
-  /// The first of [siblings] that differs from [name] only by case or
-  /// normalization, else null. An identical name is the same item.
-  static String? clashWith(String name, Iterable<String> siblings) {
-    String? key;
-    for (final sibling in siblings) {
-      if (sibling == name) continue;
-      key ??= foldKey(name);
-      if (foldKey(sibling) == key) return sibling;
-    }
-    return null;
-  }
-
-  /// [check], then [clashWith].
-  static NameProblem? problem(String name, Iterable<String> siblings) =>
-      check(name) ??
-      (clashWith(name, siblings) == null ? null : NameProblem.clash);
 
   static const _sBase = 0xAC00, _lBase = 0x1100, _vBase = 0x1161;
   static const _tBase = 0x11A7, _tCount = 28, _nCount = 21 * 28;

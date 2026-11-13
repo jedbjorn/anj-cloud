@@ -7,7 +7,7 @@ import '../gateway/cloud_api.dart';
 import '../state/model.dart';
 import '../gateway/sharing.dart';
 import '../gateway/admin_api.dart';
-import 'name_policy.dart';
+import 'name_rule.dart';
 import 'sync_engine.dart';
 
 /// When the worker lists the cloud (decision #40): about every [idle] while
@@ -230,8 +230,7 @@ SyncStatus deriveStatus({
         (e) =>
             e.conflict != null ||
             isSizeRefusal(e.status) ||
-            isNameRefusal(e.status) ||
-            isServerNameHold(e.status),
+            isCantSyncName(e.status),
       )) {
     return SyncStatus.attention;
   }

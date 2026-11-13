@@ -27,14 +27,8 @@ class UploadHold {
   /// off, or a size refusal that waits for the file or the user.
   String status = 'queued';
 
-  /// Set for a size or name refusal: no automatic retry at all.
+  /// Set for a size refusal: no automatic retry at all.
   bool refused = false;
-
-  /// A name refusal (decision #120): a raised size limit never lifts it.
-  bool name = false;
-
-  /// A name refusal predicted by this client rather than the gateway's.
-  bool predicted = false;
 
   /// For a refusal: the limit it was judged against, and whether that was
   /// confirmed by the server (false for the older-gateway best guess).
@@ -90,7 +84,6 @@ class UploadBackoff {
     if (hold == null) return null;
     if (hold.signature != signature ||
         (hold.refused &&
-            !hold.name &&
             limit != null &&
             size != null &&
             size <= limit &&
@@ -126,19 +119,6 @@ class UploadBackoff {
     return hold.status;
   }
 
-  /// Holds [path] because the gateway refused its name (decision #120):
-  /// never retried automatically until it changes or the user retries.
-  /// [predicted] marks a refusal this client derived from the listing, which
-  /// the engine re-evaluates on every visit.
-  String refuseName(String path, String signature, {bool predicted = false}) {
-    final hold = _holds[path] = UploadHold(signature)
-      ..refused = true
-      ..name = true
-      ..predicted = predicted
-      ..status = nameNotAllowedStatus;
-    return hold.status;
-  }
-
   /// Records a failed attempt to upload [path] ([size] bytes). Returns the
   /// status to show, or null when [error] is not one this policy handles
   /// (the caller's usual handling applies).
@@ -152,7 +132,8 @@ class UploadBackoff {
     if (error is UploadTooLarge) {
       return refuse(path, signature, limit: error.limit ?? limit);
     }
-    if (error is NameNotPortable) return refuseName(path, signature);
+    // The gateway's name backstop (spec #49): the residual row, no hold.
+    if (error is NameNotPortable) return error.message;
     final kind = classify(error);
     if (kind == null) return null;
     final previous = _holds[path];
