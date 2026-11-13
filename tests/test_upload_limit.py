@@ -174,8 +174,8 @@ class UploadLimitTests(unittest.IsolatedAsyncioTestCase):
                     response = await client.put("/dav/Documents/s%d.bin" % size, data=b"a" * size, headers={"If-None-Match": "*"})
                     self.assertEqual(201, response.status)
                     self.assertEqual(str(LIMIT), response.headers[UPLOAD_LIMIT_HEADER])
-                    # The version read, then the sibling listing of a new name (decision #120).
-                    self.assertEqual(["PROPFIND", "PROPFIND", "PUT"], self.backend.calls)
+                    # The version read only: a new name needs no sibling listing (spec #49).
+                    self.assertEqual(["PROPFIND", "PUT"], self.backend.calls)
                     self.assertEqual(b"a" * size, self.backend.stored)
             response = await client.options("/dav/Documents/")
             self.assertEqual(200, response.status)
