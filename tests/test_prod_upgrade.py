@@ -132,6 +132,7 @@ class RedeploySourceTests(unittest.TestCase):
                         check={"return_value": {"checked": True}},
                         restart_release_ops={"return_value": {"console": "restarted", "watchdog": "restarted"}},
                         pm2={"return_value": ""},
+                        apply_trash={"return_value": 7}, advertise_trash={"return_value": 7},
                         alert={"side_effect": lambda key, *a, **k: self.alerts.append((key, a[1])) or "dispatcher"})
         defaults.update(extra)
         context = contextlib.ExitStack()

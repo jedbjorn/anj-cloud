@@ -41,6 +41,20 @@ DEV_PROFILE = {
     "trusted_domains": ("localhost", "127.0.0.1", "nextcloud"),
 }
 FIXTURE_ROOT = "anj-foundation-fixture"
+# How many days Nextcloud keeps deleted items before removing them for good (spec #44 T2). A deployment
+# setting: ANJ_TRASH_DAYS for dev and review stacks, `trash_days` in a production stack.json.
+TRASH_DAYS = 7
+MAX_TRASH_DAYS = 3650
+
+
+def valid_trash_days(value):
+    try:
+        days = int(str(value).strip())
+    except ValueError:
+        days = 0
+    if not 1 <= days <= MAX_TRASH_DAYS:
+        raise RuntimeError(f"trash_days must be a whole number of days from 1 to {MAX_TRASH_DAYS}")
+    return days
 PAYLOAD = b"anj-cloud synthetic foundation fixture\n" * 1024
 
 
@@ -234,9 +248,37 @@ class Stack:
         self.occ("config:system:set", "shareapi_allow_links", "--type=boolean", "--value=false")
         self.occ("config:system:set", "share_folder", "--value=/anj-cloud/Shared")
         self.occ("config:system:set", "sharing.allow_custom_share_folder", "--type=boolean", "--value=false")
+        self.advertise_trash(self.apply_trash())
         self.check()
         if not self.profile.get("production"):
             self.accounts()
+
+    def trash_days(self):
+        """Days deleted items stay in the trash (spec #44 T2): ANJ_TRASH_DAYS, else 7."""
+        return valid_trash_days(self.environment.get("ANJ_TRASH_DAYS", TRASH_DAYS))
+
+    def apply_trash(self):
+        """Sets Nextcloud's trash retention to exactly `trash_days` (minimum and maximum, `7, 7`) and
+        returns the days read back. Expiry is Nextcloud's own background job in the cron container."""
+        days = self.trash_days()
+        self.occ("config:system:set", "trashbin_retention_obligation", f"--value={days}, {days}")
+        current = self.occ("config:system:get", "trashbin_retention_obligation").strip()
+        if current != f"{days}, {days}":
+            raise RuntimeError("Nextcloud did not keep the trash retention setting")
+        return days
+
+    def advertise_trash(self, days=None):
+        """The gateway advertises the retention read back from Nextcloud to every client. Best effort: a
+        gateway from before spec #44 (a rollback) refuses the action and advertises nothing, a current one
+        that misses it advertises 7 until the next setup or upgrade; neither stops the deployment."""
+        days = self.apply_trash() if days is None else days
+        try:
+            self.compose("exec", "-T", "access", "python", "-m", "access.admin",
+                         data=json.dumps({"action": "trash-days", "days": days}))
+        except RuntimeError:
+            print("WARNING: the gateway did not take trash_days; it advertises its default (7 days)", file=sys.stderr)
+            return None
+        return days
 
     def trusted_domains(self):
         domains = self.profile["trusted_domains"]

@@ -55,6 +55,9 @@ def route_class(request):
     if path.startswith("/v1/client/releases/"):
         # Client update feed (spec #28 G1): never a package or file name.
         return "release"
+    if path == "/trash/" or path.startswith("/trash/"):
+        # Trash (spec #44): never an item ID's name or path.
+        return "trash"
     if path.startswith("/dav/"):
         return "dav-read" if method in READ_METHODS else "dav-write"
     return "other"

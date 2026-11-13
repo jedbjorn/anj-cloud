@@ -39,7 +39,8 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from deploy.dev import PROJECT as PROJECT_NAME, ROOT, Stack, private_directory, secret_file  # noqa: E402
+from deploy.dev import (PROJECT as PROJECT_NAME, ROOT, TRASH_DAYS, Stack, private_directory, secret_file,  # noqa: E402
+                        valid_trash_days)
 from deploy.vm import paths, render, stackenv  # noqa: E402
 from deploy.vm.pm2json import jlist_rows  # noqa: E402
 
@@ -566,6 +567,11 @@ class ProdStack(Stack):
         self.occ("config:system:set", "shareapi_allow_links", "--type=boolean", "--value=false")
         self.occ("config:system:set", "share_folder", "--value=/anj-cloud/Shared")
         self.occ("config:system:set", "sharing.allow_custom_share_folder", "--type=boolean", "--value=false")
+        self.apply_trash()
+
+    def trash_days(self):
+        """`trash_days` in stack.json (spec #44 T2), else 7."""
+        return valid_trash_days(self.config.get("trash_days", TRASH_DAYS))
 
     # PM2 ----------------------------------------------------------------------------------
 
@@ -656,6 +662,7 @@ class ProdStack(Stack):
         self.wait_ready(apps)
         if "gateway" in apps:
             self.ensure_tls_fresh()
+            self.advertise_trash()
         self.pm2("save")
         return self.check()
 
@@ -734,8 +741,11 @@ class ProdStack(Stack):
             self.install_bin(full)
             self.save_config(release=full)
             self.restart_stack()
+            # An upgrade applies the trash retention too (spec #44 T2), as setup does.
+            days = self.apply_trash()
             if "gateway" in self.active_apps():
                 self.ensure_tls_fresh()
+                self.advertise_trash(days)
             result = self.check()
             self.activate_release(full)
             self.save_config(previous_release=previous)

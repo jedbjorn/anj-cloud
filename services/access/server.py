@@ -32,6 +32,7 @@ from .sharing import OPERATOR_RIGHTS, ShareError, Sharing, owner_of
 from .console import Console
 from .fetch import Fetch
 from .releases import Releases
+from .trash import Trash
 
 REQUEST_HEADERS = {"content-type", "content-length", "if-match", "if-none-match", "if-modified-since",
                    "if-unmodified-since", "range", "if-range", "depth", "overwrite"}
@@ -125,6 +126,13 @@ class Gateway:
         if "_releases" not in self.__dict__:
             self._releases = Releases(self)
         return self._releases
+
+    @property
+    def trash(self):
+        """The caller's own trash, limited to anj-cloud/ (spec #44)."""
+        if "_trash" not in self.__dict__:
+            self._trash = Trash(self)
+        return self._trash
 
     @property
     def console(self):
@@ -723,6 +731,13 @@ class Gateway:
             fence = dict(self.registry.db.execute("SELECT * FROM mutation_fence WHERE singleton=1").fetchone())
             fence["owner_uid"] = owner_of(self.registry, fence["device"])
             return web.json_response(fence)
+        if action == "trash-days":
+            # The retention the deployment set and read back from Nextcloud (spec #44 T2).
+            if set(body) - {"action", "days"}:
+                raise Rejection("Unexpected trash field")
+            if "days" in body:
+                self.trash.set_days(body["days"])
+            return web.json_response({"trash_days": self.trash.days})
         if action == "settings-get":
             return web.json_response(self.settings())
         if action == "settings-set":
@@ -923,6 +938,7 @@ class Gateway:
         public.router.add_post("/v1/shares/incoming/{share_id}/rename", self.share_rename_for_all)
         self.console.add_routes(public.router)
         self.releases.add_routes(public.router)
+        self.trash.add_routes(public.router)
         if self.__dict__.get("fetch") is not None:
             self.fetch.add_routes(public.router)
         public.router.add_route("*", "/dav/{path:.*}", self.dav)

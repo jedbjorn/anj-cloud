@@ -53,6 +53,15 @@ python3 deploy/dev.py --project anj-cloud-review-<tag> --port <port> destroy --c
 
 `docker compose exec fetch python -I /opt/anj-fetch/worker.py version` prints the working yt-dlp; `... worker.py update` runs its updater now (stable channel; a failed update keeps the working copy).
 
+### Trash (spec #44)
+
+`up` sets Nextcloud's `trashbin_retention_obligation` to `D, D` (D = `ANJ_TRASH_DAYS`, default 7; production: `trash_days` in `state/stack.json`, applied by `prod.py up` and every `redeploy`), reads it back and stores it in the gateway, which advertises it on `GET /trash/` ([access protocol](../services/access/README.md#trash)). `deploy.trash_fixture` proves the routes on a review stack: listing only `anj-cloud/` items, restore with missing parents and taken names, Delete now and Empty leaving an item deleted outside `anj-cloud/`, Nextcloud's expiry of backdated items, a delete inside someone else's share, and a read-grant device's 403s. It cleans up after itself:
+
+```bash
+deploy/.local/access-venv/bin/python -m deploy.trash_fixture --project anj-cloud-review-<tag> --port <port> --evidence <dir> \
+    [--case list,restore,empty,expiry,share,read]
+```
+
 ## Pair and operate
 
 A pairing code carries the first 10 bytes (80 bits) of the issuer certificate's SHA-256 (decision #151, spec #35): the client fetches `GET /v1/ca` and accepts the CA only when it matches the code, so no CA file is copied. Never accept a CA the code does not pin, disable certificate validation or omit hostname checks. Certificate/key material stays outside the client's watched root.

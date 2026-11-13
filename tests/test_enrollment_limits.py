@@ -232,7 +232,7 @@ class RouteAuthenticationTests(unittest.IsolatedAsyncioTestCase):
             path = info.get("path") or info.get("formatter", "").replace("{path}", "probe/file.txt").replace("{share_id}", "1") \
                 .replace("{uid}", "alice").replace("{device_id}", "00000000-0000-4000-8000-000000000000") \
                 .replace("{invitation_id}", "00000000-0000-4000-8000-000000000001").replace("{operation}", "0" * 32) \
-                .replace("{target}", "android-arm64")
+                .replace("{target}", "android-arm64").replace("{item_id}", "1")
             methods = ["GET", "HEAD", "OPTIONS", "PROPFIND", "PUT", "MKCOL", "DELETE", "MOVE", "COPY", "LOCK", "POST", "PATCH"] \
                 if route.method == "*" else [route.method]
             for method in methods:

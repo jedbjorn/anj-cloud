@@ -96,6 +96,16 @@ Check `anj-cloud-setup status` and read `/var/log/anj-cloud-setup/upgrade-<UTC>.
 > step applies the firewall change during the upgrade. The worker needs outbound HTTPS (see
 > [requirements.md](requirements.md)); without it, downloads fail and nothing else is affected.
 
+> **The release with Trash** sets how long Nextcloud keeps deleted items: `trash_days` (default 7) in
+> `/srv/anj-cloud/state/stack.json`. Setup and every upgrade write Nextcloud's
+> `trashbin_retention_obligation` as `D, D` (items are removed for good D days after deletion, at the next
+> Nextcloud cron run), read it back and tell the gateway, which shows it to every client. To change it, set
+> `"trash_days": 30` (a whole number from 1 to 3650) in `stack.json` as `anj` and run the upgrade again (an
+> already-live release re-applies it). Check it with
+> `sudo docker exec -u www-data anj-cloud-prod-nextcloud-1 php occ config:system:get trashbin_retention_obligation`.
+> A rollback to a release before Trash leaves the Nextcloud setting in place and continues without the
+> gateway's Trash routes; clients then show only each device's own trash.
+
 > **Data migrations are not reversible by a release rollback.** A newer Nextcloud image or gateway registry
 > migration can make data incompatible with the previous release. Neither automatic fallback nor
 > `upgrade --rollback` can undo that data change. Review the target release for such migrations and make a
