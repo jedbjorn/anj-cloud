@@ -12,8 +12,10 @@ gateway approves the pairing code through it) and sets its upload limit with set
 Fixtures are pushed into the emulator's Download folder and picked in Android's own picker
 (DocumentsUI, driven with uiautomator); the QA app is paired by code with the review stack
 (adb reverse). Rows:
-  AC1  folder ⋮ → Add files… on a nested folder, three files: on the server with the same SHA-256,
-       the sources unchanged, the summary says "Added 3 files".
+  AC1  folder ⋮ → Add files… on a nested Cloud-only folder (Android's first-sync default, no
+       local folder; decision #190), three files: on the server with the same SHA-256, the
+       sources unchanged, the summary says "Added 3 files"; then released locally, the folder
+       kept, and its row still Cloud-only.
   AC5  a.txt added twice: the second is "a (2).txt", the summary says "Added as a (2).txt".
   AC2  Add folder… on a two-level tree with an empty folder: the server tree matches.
   AC3  upload limit 1 MiB: a 2 MiB file is listed as over the limit before copying, only the
@@ -312,22 +314,16 @@ def main():
         u.step("paired and running", u.find(r"^(Up to date|Syncing)|^Device pairing$", timeout=90) is not None)
         expand("Documents")
         u.step("Documents/Receipts is listed", u.find(r"^Receipts", timeout=120) is not None)
-        # Android keeps nothing by default: Receipts is Cloud only with no local folder, so its
-        # entries are disabled with the reason (AC6 on the device). Keeping it Local makes it
-        # a destination.
+        # Android keeps nothing by default: Receipts is Cloud only, with no local folder. A
+        # synced Cloud-only folder is a destination (decision #190): its entries are enabled.
         row_menu("Receipts")
         dump("receipts-cloud-menu")
-        u.step("a Cloud-only folder offers the entries disabled with the reason",
-               "Add files" in u.screen_text() and "Not available on this device" in u.screen_text(),
-               screen=u.screen_text()[-400:])
-        u.tap(r"^Local and cloud$")
-        deadline = time.time() + 120
-        while time.time() < deadline and local("Documents/Receipts") == "" and \
-                "Receipts" not in local("Documents"):
-            time.sleep(3)
-        time.sleep(3)
-        u.step("Documents/Receipts is a folder on the phone", "Receipts" in local("Documents"),
-               documents=local("Documents"))
+        menu = u.screen_text()
+        u.step("a synced Cloud-only folder offers Add files and Add folder, enabled",
+               "Add files" in menu and "Add folder" in menu and "unavailable" not in menu,
+               documents=local("Documents"), screen=menu[-300:])
+        u.adb("shell", "input", "keyevent", "KEYCODE_BACK")
+        time.sleep(1)
 
         # AC1: three files into a nested folder.
         row_menu("Receipts")
@@ -344,6 +340,24 @@ def main():
         u.step("AC1 all three on the server with the same SHA-256, sources unchanged",
                all(uploaded.get(f"Documents/Receipts/{n}") == sources[n] == unchanged[n]
                    for n in ("one.txt", "two.pdf", "three.jpg")), uploaded=uploaded, sources=unchanged)
+        # Into the Cloud-only folder: uploaded, then released here; the folder stays and its
+        # row still reads Cloud-only.
+        deadline = time.time() + 120
+        while time.time() < deadline and any(
+                n in local("Documents/Receipts").split("\n") for n in ("one.txt", "two.pdf", "three.jpg")):
+            time.sleep(3)
+        kept = u.run_as("ls", "-d", "files/anj-cloud/Documents/Receipts").strip()
+        u.step("AC1 Cloud-only: the local copies are released and the folder stays",
+               kept == "files/anj-cloud/Documents/Receipts" and not any(n in local("Documents/Receipts").split("\n")
+                                            for n in ("one.txt", "two.pdf", "three.jpg")),
+               receipts=local("Documents/Receipts"))
+        # The row reads "Cloud-only · on this device", title, then its "Cloud" badge.
+        labels = [u.label(n) for n in u.nodes() if u.label(n)]
+        at = labels.index("Receipts") if "Receipts" in labels else -1
+        around = labels[max(at - 2, 0):at + 2] if at >= 0 else []
+        u.step("AC1 Cloud-only: the Receipts row still reads Cloud-only",
+               "Cloud-only · on this device" in around and at + 1 < len(labels) and labels[at + 1] == "Cloud",
+               row=around)
 
         # AC5 on the device: a.txt twice.
         for attempt in (1, 2):
