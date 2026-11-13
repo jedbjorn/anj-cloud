@@ -269,15 +269,15 @@ class Run:
     # Review fixes S4, S6 ---------------------------------------------------------------------------
 
     async def fixes_case(self, alice, folder):
-        await self.mkcol(alice, folder + "/Trip")
-        await self.put(alice, folder + "/Trip/photo.jpg", b"photo")
-        await self.delete(alice, folder + "/Trip/photo.jpg")
-        photo = await self.item(alice, folder + "/Trip/photo.jpg")
-        await self.delete(alice, folder + "/Trip")
-        await self.mkcol(alice, folder + "/trip")
+        await self.mkcol(alice, folder + "/Album")
+        await self.put(alice, folder + "/Album/photo.jpg", b"photo")
+        await self.delete(alice, folder + "/Album/photo.jpg")
+        photo = await self.item(alice, folder + "/Album/photo.jpg")
+        await self.delete(alice, folder + "/Album")
+        await self.mkcol(alice, folder + "/album")
         await alice.request("POST", "/trash/%s/restore" % photo["id"], expected=(409,))
         listing, _ = await alice.request("PROPFIND", href(folder) + "/", headers={"Depth": "1"}, expected=(207,))
-        if b"/Trip/" in listing:
+        if b"/Album/" in listing:
             raise RuntimeError("A folder was recreated beside its case twin")
         ids = []
         for name in ("u1.txt", "u2.txt", "u3.txt"):
