@@ -18,6 +18,7 @@ import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
+import 'test_platform.dart';
 
 /// The Linux binding, answering single-path lookups case-insensitively.
 class _CaseInsensitiveFs extends NativeRootFs {
@@ -194,10 +195,10 @@ void main() {
       'present: an edit uploads, nothing is deleted', () async {
     Directory('${tree.root.path}/Docs').createSync();
     File('${tree.root.path}/Docs/a.txt').writeAsStringSync('one');
-    final link = await Process.run('ln', [
+    final link = hardLink(
       '${tree.root.path}/Docs/a.txt',
       '${tree.root.path}/Docs/b.txt',
-    ]);
+    );
     expect(link.exitCode, 0);
     await pump(
       () => remote('Docs/a.txt') == 'one' && remote('Docs/b.txt') == 'one',

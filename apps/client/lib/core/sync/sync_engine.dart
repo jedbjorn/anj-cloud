@@ -6397,11 +6397,41 @@ class SyncEngine {
         'A file or folder already uses this name. Choose another name.',
       );
     }
-    tree.native.renameExclusive(tree.fd, path, target, item.identity!);
+    // The typed name is the cloud name; this device holds it under its own
+    // spelling (R3), among the folder's synchronized cloud items.
+    final folder = entry.kind == ItemKind.directory;
+    final spelled = NameRule.localName(
+      name,
+      [
+        for (final known in manifest.entries.values)
+          if (known.etag != null &&
+              known.path != path &&
+              p.posix.dirname(known.path) == parent)
+            NameEntry(
+              known.cloudName ?? p.posix.basename(known.path),
+              fileId: known.fileId,
+              folder: known.kind == ItemKind.directory,
+            ),
+      ],
+      nameOs,
+      folder: folder,
+    );
+    if (spelled == null || siblings.contains(spelled)) {
+      throw const FileSystemException(
+        'A file or folder already uses this name. Choose another name.',
+      );
+    }
+    final moved = parent == '.' ? spelled : '$parent/$spelled';
+    tree.native.renameExclusive(tree.fd, path, moved, item.identity!);
+    if (spelled != name) {
+      // Until a listing names it, its cloud name is the one recorded here.
+      manifest.entries[moved] = Entry(moved, entry.kind)..cloudName = name;
+      manifest.save();
+    }
     markDirty(path, descendants: true);
-    markDirty(target);
+    markDirty(moved);
     message = 'Renamed. Synchronization is queued.';
-    return target;
+    return moved;
   }
 
   /// Uses the existing scan facts; projection adds no filesystem work per row.

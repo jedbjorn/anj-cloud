@@ -85,25 +85,31 @@ void main() {
 
   final residual = cantSyncNameStatus(CloudNameProblem.forbiddenName);
 
-  test('names decision #120 blocked sync verbatim with no row (spec #49 '
-      'AC3)', () async {
-    final names = ['CON', 'nul.txt', 'report.', 'a:b?.txt', 'x|y'];
-    for (final name in names) {
-      write('Documents/$name', name);
-    }
-    await engine.tick();
-    await engine.tick();
-    for (final name in names) {
-      final path = 'Documents/$name';
-      expect(cloud.files[path], utf8.encode(name), reason: path);
-      expect(entry(path).status, 'current local', reason: path);
-      final row = await projected(path);
-      expect(row['cantSyncName'], isFalse);
-      expect(row['presentationErrors'], isEmpty);
-      expect(rowBadge(row), isNot(RowBadge.needsAttention));
-    }
-    expect(overall(), isNot(SyncStatus.attention));
-  });
+  test(
+    'names decision #120 blocked sync verbatim with no row (spec #49 '
+    'AC3)',
+    () async {
+      final names = ['CON', 'nul.txt', 'report.', 'a:b?.txt', 'x|y'];
+      for (final name in names) {
+        write('Documents/$name', name);
+      }
+      await engine.tick();
+      await engine.tick();
+      for (final name in names) {
+        final path = 'Documents/$name';
+        expect(cloud.files[path], utf8.encode(name), reason: path);
+        expect(entry(path).status, 'current local', reason: path);
+        final row = await projected(path);
+        expect(row['cantSyncName'], isFalse);
+        expect(row['presentationErrors'], isEmpty);
+        expect(rowBadge(row), isNot(RowBadge.needsAttention));
+      }
+      expect(overall(), isNot(SyncStatus.attention));
+    },
+    skip: notOnWindows(
+      'names such as CON and a:b? (windows_names_test proves AC4)',
+    ),
+  );
 
   test('AC8: rows an earlier client held under decision #120 resolve on the '
       'first pass, with no user action', () async {
@@ -156,7 +162,7 @@ void main() {
       expect(local('Documents/Notes.txt').readAsStringSync(), 'upper');
     }
     expect(overall(), isNot(SyncStatus.attention));
-  });
+  }, skip: notOnWindows('a folder name that ends in a space'));
 
   test('AC8 after a pass that is not an audit: the rows at the old name of '
       'a folder renamed in place are settled', () async {
@@ -177,7 +183,7 @@ void main() {
     );
     expect(cloud.files['Documents/F/c.rfa'], 'c'.codeUnits);
     expect(entry('Documents/F/c.rfa').status, 'current local');
-  });
+  }, skip: notOnWindows('a folder name that ends in a space'));
 
   test('ordinary names and dotfiles upload unchanged', () async {
     final names = [
@@ -240,7 +246,7 @@ void main() {
     expect(local('Documents/movie.mkv.part').readAsStringSync(), 'partial');
     expect(store.entries.containsKey('Documents/movie.mkv.part'), isFalse);
     expect(overall(), isNot(SyncStatus.attention));
-  });
+  }, skip: notOnWindows('a folder name that ends in a space'));
 
   test('a name equal to a cloud sibling\'s by case is its own item on Linux '
       '(spec #49 AC3)', () async {
@@ -393,8 +399,12 @@ void main() {
       contains('Only an item'),
     );
     expect(local(path).readAsStringSync(), 'x');
-    // A name decision #120 refused is accepted and cleaned like any other.
-    expect(await engine.renameLocal(path, 'aux.txt'), 'Documents/aux.txt');
+    // A name decision #120 refused is accepted, held under this device's
+    // spelling (aux_.txt on Windows).
+    expect(
+      await engine.renameLocal(path, 'aux.txt'),
+      'Documents/${NameRule.localName('aux.txt', const [], NameRule.current)}',
+    );
   });
 
   test(

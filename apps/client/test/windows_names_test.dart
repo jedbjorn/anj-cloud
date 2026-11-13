@@ -60,7 +60,7 @@ void main() {
   List<String> onDiskIn(String folder) =>
       Directory('${engine.tree.root.path}/$folder')
           .listSync()
-          .map((item) => item.path.split('/').last)
+          .map((item) => item.path.split(RegExp(r'[/\\]')).last)
           .toList()
         ..sort();
   String? identity(String path) =>
@@ -279,6 +279,43 @@ void main() {
     expect(onDiskIn('Documents'), isNot(contains('Report.pdf')));
   });
 
+  test('Rename of the residual row: the typed name is the cloud name, held '
+      'here under this device\'s spelling', () async {
+    cloud.put('Documents/Report.pdf', 'older');
+    await engine.tick();
+    Future<String> renamed(String name) async {
+      local('Documents/.htaccess').writeAsStringSync(name);
+      await engine.tick();
+      expect(isCantSyncName(status('Documents/.htaccess')), isTrue);
+      final path = await engine.renameLocal('Documents/.htaccess', name);
+      await engine.tick();
+      await engine.tick();
+      return path;
+    }
+
+    expect(await renamed('aux.txt'), 'Documents/aux_.txt');
+    expect(await renamed('report.pdf'), 'Documents/report (2).pdf');
+    expect(String.fromCharCodes(cloud.files['Documents/aux.txt']!), 'aux.txt');
+    expect(
+      String.fromCharCodes(cloud.files['Documents/report.pdf']!),
+      'report.pdf',
+    );
+    expect(String.fromCharCodes(cloud.files['Documents/Report.pdf']!), 'older');
+    expect(
+      cloud.files.keys.where((k) => k.contains('_') || k.contains('(')),
+      isEmpty,
+      reason: 'no local spelling reaches the cloud',
+    );
+    expect(onDiskIn('Documents'), ['Report.pdf', 'aux_.txt', 'report (2).pdf']);
+    for (final path in ['Documents/aux_.txt', 'Documents/report (2).pdf']) {
+      expect(status(path), 'current local', reason: path);
+    }
+    // The next pass re-sends nothing.
+    final uploads = cloud.uploads;
+    await engine.tick();
+    expect(cloud.uploads, uploads);
+  });
+
   test('macOS resolves clashes only (AC5)', () async {
     engine.close();
     fixture.deleteSync(recursive: true);
@@ -294,7 +331,7 @@ void main() {
       'x.',
     ]);
     expect(status('Documents/report (2).pdf'), 'current local');
-  });
+  }, skip: notOnWindows('a Windows volume cannot hold the macOS names'));
 
   test('Linux keeps every name verbatim (AC3)', () async {
     engine.nameOs = NameOs.linux;

@@ -28,6 +28,23 @@ String get testDartExecutable {
 /// Null on Linux; elsewhere the skip reason for a test of Linux behaviour.
 String? linuxOnly(String why) => Platform.isLinux ? null : 'Linux only: $why';
 
+/// Null except on Windows, where it is the skip reason: for a test whose
+/// fixture puts on disk what a Windows volume cannot hold.
+String? notOnWindows(String why) =>
+    Platform.isWindows ? 'Not on Windows: $why' : null;
+
+/// Makes [link] a second hard link to the file [target]: `ln`, or on Windows
+/// `mklink /H` (which takes backslashed paths).
+ProcessResult hardLink(String target, String link) => Platform.isWindows
+    ? Process.runSync('cmd', [
+        '/c',
+        'mklink',
+        '/H',
+        link.replaceAll('/', r'\'),
+        target.replaceAll('/', r'\'),
+      ])
+    : Process.runSync('ln', [target, link]);
+
 /// Null when [path] (relative to apps/client) can be read; on a seat other
 /// than Linux, the skip reason when it is outside the sources sent there.
 /// Linux runs in the checkout, so a missing file still fails there.

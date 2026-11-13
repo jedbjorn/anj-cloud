@@ -27,6 +27,7 @@ import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
+import 'test_platform.dart';
 
 /// Records every request; folders have file IDs that follow a MOVE, and
 /// `Shared/<owner>` folders are incoming shares (another storage).
@@ -304,11 +305,10 @@ void main() {
     }
   }
 
-  // The local identity the engine pairs by: device and inode.
-  String identity(String path) {
-    final out = Process.runSync('stat', ['-c', '%d:%i', root(path)]);
-    return (out.stdout as String).trim();
-  }
+  // The local identity the engine pairs by: volume and inode (file ID on
+  // Windows), from the boundary's own stat.
+  String identity(String path) =>
+      tree.scanItems(includeExcluded: true)[path]!.identity!;
 
   Future<void> library() async {
     write('Photos/2026/Trip/a.jpg', 'a');
@@ -525,7 +525,7 @@ void main() {
       // A second name outside the root: the user's own hard link, so the
       // restart cannot prove the link count and never pairs it here.
       final outside = '${fixture.path}/report-link.txt';
-      final made = Process.runSync('ln', [root('Docs/report.txt'), outside]);
+      final made = hardLink(root('Docs/report.txt'), outside);
       expect(made.exitCode, 0);
       await ticks(1);
       cloud.calls.clear();
@@ -575,10 +575,7 @@ void main() {
           await ticks(3);
           final outside = '${fixture.path}/report-link.txt';
           expect(
-            Process.runSync('ln', [
-              root('Documents/Docs/report.txt'),
-              outside,
-            ]).exitCode,
+            hardLink(root('Documents/Docs/report.txt'), outside).exitCode,
             0,
           );
           await ticks(1);
