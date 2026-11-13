@@ -669,6 +669,11 @@ class ProdStack(Stack):
             result["name_migration"] = self.migrate_names()
         return result
 
+    def name_migration(self):
+        """The operator's migrate-names in process: prod.py already runs where the operator CLI does."""
+        from deploy.access_operator import Operator
+        return Operator(self).migrate_names()
+
     def tls_stale(self):
         """Names whose gateway copy differs from the operator file (renewal not yet loaded)."""
         loaded = json.loads(self.compose("exec", "-T", "access", "python", "-m", "access.install_tls"))

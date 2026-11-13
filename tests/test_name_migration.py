@@ -11,7 +11,6 @@ import base64
 import io
 import json
 import posixpath
-import sys
 from unittest import mock
 from urllib.parse import quote, unquote, urlsplit
 
@@ -275,15 +274,27 @@ class DeployHookTests(unittest.TestCase):
     def test_the_deploy_hook_is_best_effort(self):
         from deploy.dev import Stack
         stack = Stack("anj-cloud-review-migration", 18998)
-        with mock.patch("deploy.access_operator.Operator.migrate_names", side_effect=RuntimeError("Operator action rejected")), \
+        with mock.patch.object(stack, "run", side_effect=RuntimeError("Command failed (exit 1); output withheld")), \
                 mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
             self.assertIsNone(stack.migrate_names())
         self.assertIn("next deploy runs it again", stderr.getvalue())
         counts = {"accounts": 1, "folders": 2, "renamed": 1, "unresolved": 0, "failed": 0, "accounts_failed": 0}
-        with mock.patch("deploy.access_operator.Operator.migrate_names", return_value=counts), \
+        with mock.patch.object(stack, "run", return_value=json.dumps(counts)) as run, \
                 mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
             self.assertEqual(counts, stack.migrate_names())
+        # The operator CLI runs in the access venv against this project.
+        argv = run.call_args.args[0]
+        self.assertEqual((str(stack.venv_python), "deploy.access_operator", "anj-cloud-review-migration", "migrate-names"),
+                         (argv[0], argv[2], argv[4], argv[-1]))
         self.assertIn('Name migration: {"accounts":1', stderr.getvalue())
+
+    def test_production_runs_the_operator_in_process(self):
+        from deploy import prod
+        stack = mock.Mock()
+        with mock.patch("deploy.access_operator.Operator") as operator:
+            operator.return_value.migrate_names.return_value = {"renamed": 0}
+            self.assertEqual({"renamed": 0}, prod.ProdStack.name_migration(stack))
+        operator.assert_called_once_with(stack)
 
 
 if __name__ == "__main__":

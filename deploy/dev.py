@@ -281,14 +281,18 @@ class Stack:
             return None
         return days
 
+    def name_migration(self):
+        """One `access_operator.py migrate-names` run's totals, in the access venv (the operator CLI needs it)."""
+        return json.loads(self.run([str(self.venv_python), "-m", "deploy.access_operator", "--project", self.project,
+                                    "--port", str(self.port), "migrate-names"]))
+
     def migrate_names(self):
         """The one-time name migration every deploy runs (spec #49 Gateway; Operator.migrate_names).
         Idempotent, so running it on each deploy renames only what is still untrimmed or over-long.
         Best effort: a failure warns and the next deploy runs it again; it never fails the deploy."""
-        from deploy.access_operator import Operator
         try:
-            counts = Operator(self).migrate_names()
-        except (RuntimeError, ValueError, KeyError) as error:
+            counts = self.name_migration()
+        except (RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
             print(f"WARNING: the name migration did not complete ({error}); the next deploy runs it again", file=sys.stderr)
             return None
         print("Name migration: " + json.dumps(counts, separators=(",", ":")), file=sys.stderr)
