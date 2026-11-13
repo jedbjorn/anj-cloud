@@ -318,6 +318,78 @@ void main() {
     expect(cloud.uploads, uploads);
   });
 
+  test('Create folder: the typed name is the cloud name, created here under '
+      'this device\'s spelling before the native create', () async {
+    cloud.put('Documents/Report.pdf', 'older');
+    await cloud.mkdir('Documents/Projects');
+    await engine.tick();
+
+    final reserved = await engine.createFolder(
+      'Documents',
+      'CON',
+      Retention.local,
+    );
+    expect(reserved, 'Documents/CON_');
+    expect(store.entries[reserved]!.cloudName, 'CON');
+    final clash = await engine.createFolder(
+      'Documents',
+      'projects',
+      Retention.local,
+    );
+    expect(clash, 'Documents/projects (2)');
+    // Inside an aliased folder, only the new segment is spelled.
+    final nested = await engine.createFolder(reserved, 'aux', Retention.local);
+    expect(nested, 'Documents/CON_/aux_');
+    await engine.tick();
+    await engine.tick();
+
+    expect(
+      cloud.directories,
+      containsAll([
+        'Documents/CON',
+        'Documents/projects',
+        'Documents/Projects',
+        'Documents/CON/aux',
+      ]),
+    );
+    expect(
+      cloud.directories.where((d) => d.contains('_') || d.contains('(')),
+      isEmpty,
+      reason: 'no local spelling reaches the cloud',
+    );
+    expect(onDiskIn('Documents'), [
+      'CON_',
+      'Projects',
+      'Report.pdf',
+      'projects (2)',
+    ]);
+    for (final path in [reserved, clash, nested]) {
+      expect(status(path), 'current local', reason: path);
+    }
+    // An existing item's cloud name is taken.
+    await expectLater(
+      engine.createFolder('Documents', 'CON', Retention.local),
+      throwsA(isA<FileSystemException>()),
+    );
+  });
+
+  test('a folder creation left for review is reported under its cloud '
+      'path', () async {
+    await cloud.mkdir('Documents/CON');
+    await engine.tick();
+    expect(onDisk('Documents/CON_'), isTrue);
+    store.operations['interrupted'] = Operation(
+      'interrupted',
+      'createFolder',
+      'Documents/CON_/aux_',
+      phase: 'review',
+    )..data.addAll({'error': 'needs review', 'cloudName': 'aux'});
+    expect(
+      engine.folders.recover(),
+      'Folder Documents/CON/aux pending: needs review',
+    );
+  });
+
   test('macOS resolves clashes only (AC5)', () async {
     engine.close();
     fixture.deleteSync(recursive: true);

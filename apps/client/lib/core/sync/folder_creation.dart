@@ -10,11 +10,24 @@ import 'sync_path_policy.dart';
 /// The policy intent precedes publication of the exact private directory inode.
 /// Ambiguous publication after interruption stays pending without applying policy.
 class FolderCreation {
-  FolderCreation(this.manifest, this.tree);
+  FolderCreation(this.manifest, this.tree, {this.shown = _literal});
   final Manifest manifest;
   final RootTree tree;
 
-  Future<String> create(String parent, String name, Retention retention) async {
+  /// A local path under its cloud spelling, for messages (decision #193).
+  final String Function(String local) shown;
+
+  static String _literal(String local) => local;
+
+  /// Creates [name], this device's local spelling; [cloudName] is the typed
+  /// cloud name when it differs, recorded with the journaled intent so the
+  /// folder leaves under it (spec #49 R3).
+  Future<String> create(
+    String parent,
+    String name,
+    Retention retention, {
+    String? cloudName,
+  }) async {
     if (name.trim().isEmpty || name.contains('/') || name.contains('\\')) {
       throw const FileSystemException(
         'Enter a folder name without path separators.',
@@ -70,6 +83,7 @@ class FolderCreation {
         'identity': identity,
         'parentIdentity': parentIdentity,
         'retention': retention.name,
+        'cloudName': ?cloudName,
       });
     manifest.operations[op.id] = op;
     manifest.save();
@@ -98,9 +112,18 @@ class FolderCreation {
           manifest.save();
         }
       }
-      warning ??= 'Folder ${op.path} pending: ${op.data['error']}';
+      warning ??= 'Folder ${_shownOf(op)} pending: ${op.data['error']}';
     }
     return warning;
+  }
+
+  /// The pending folder's cloud path: its recorded cloud name under its
+  /// parent's cloud path.
+  String _shownOf(Operation op) {
+    final name = op.data['cloudName'] as String?;
+    if (name == null) return shown(op.path);
+    final parent = p.posix.dirname(op.path);
+    return parent == '.' ? name : '${shown(parent)}/$name';
   }
 
   void complete(Operation op) {
@@ -133,7 +156,8 @@ class FolderCreation {
     final entry = Entry(op.path, ItemKind.directory)
       ..override = Retention.values.byName(op.data['retention'] as String)
       ..awaitingFolderUpload = true
-      ..expectedPresent = true;
+      ..expectedPresent = true
+      ..cloudName = op.data['cloudName'] as String?;
     manifest.entries[op.path] = entry;
     manifest.operations.remove(op.id);
     try {

@@ -94,7 +94,11 @@ class SyncEngine {
   /// Files shown as syncing. The pass plans its transfer queue here; an
   /// [ActivityCloud] wrapping [cloud] records transfers in flight.
   final SyncActivity activity;
-  late final FolderCreation folders = FolderCreation(manifest, tree);
+  late final FolderCreation folders = FolderCreation(
+    manifest,
+    tree,
+    shown: names.cloudPath,
+  );
   final Set<String> localDirectories = {};
   final Map<String, String?> localIdentities = {};
   late final Artifacts artifacts = Artifacts(manifest, tree);
@@ -6377,7 +6381,20 @@ class SyncEngine {
     Retention value,
   ) async {
     requireStorageReady();
-    final path = await folders.create(parent, name, value);
+    // The typed name is the cloud name; this device creates it under its own
+    // spelling (R3), so a name the OS cannot hold never fails the create.
+    final spelled = _typedSpelling(parent, name, folder: true);
+    if (spelled == null) {
+      throw const FileSystemException(
+        'A file or folder already uses this name. Choose another name.',
+      );
+    }
+    final path = await folders.create(
+      parent,
+      spelled,
+      value,
+      cloudName: spelled == name ? null : name,
+    );
     markDirty(path);
     localDirectories.add(path);
     message = 'Folder created. Synchronization is queued.';
@@ -6434,22 +6451,11 @@ class SyncEngine {
     }
     // The typed name is the cloud name; this device holds it under its own
     // spelling (R3), among the folder's synchronized cloud items.
-    final folder = entry.kind == ItemKind.directory;
-    final spelled = NameRule.localName(
+    final spelled = _typedSpelling(
+      parent == '.' ? '' : parent,
       name,
-      [
-        for (final known in manifest.entries.values)
-          if (known.etag != null &&
-              known.path != path &&
-              p.posix.dirname(known.path) == parent)
-            NameEntry(
-              known.cloudName ?? p.posix.basename(known.path),
-              fileId: known.fileId,
-              folder: known.kind == ItemKind.directory,
-            ),
-      ],
-      nameOs,
-      folder: folder,
+      folder: entry.kind == ItemKind.directory,
+      except: path,
     );
     if (spelled == null || siblings.contains(spelled)) {
       throw const FileSystemException(
@@ -6467,6 +6473,36 @@ class SyncEngine {
     markDirty(moved);
     message = 'Renamed. Synchronization is queued.';
     return moved;
+  }
+
+  /// This device's local name for the user-typed cloud name [name] in
+  /// [parent] (root: ''), among the folder's synchronized cloud items other
+  /// than [except]; null when no ` (n)` fits (see [NameRule.localNames]).
+  String? _typedSpelling(
+    String parent,
+    String name, {
+    required bool folder,
+    String? except,
+  }) => NameRule.localName(
+    name,
+    [
+      for (final known in manifest.entries.values)
+        if (known.etag != null &&
+            known.path != except &&
+            _parentKey(known.path) == parent)
+          NameEntry(
+            known.cloudName ?? p.posix.basename(known.path),
+            fileId: known.fileId,
+            folder: known.kind == ItemKind.directory,
+          ),
+    ],
+    nameOs,
+    folder: folder,
+  );
+
+  static String _parentKey(String path) {
+    final parent = p.posix.dirname(path);
+    return parent == '.' ? '' : parent;
   }
 
   /// Uses the existing scan facts; projection adds no filesystem work per row.
