@@ -1,5 +1,6 @@
 import '../state/model.dart';
 import '../local/root_tree.dart';
+import 'sharing.dart';
 
 /// One item of the account's own Nextcloud trash that was deleted from under
 /// anj-cloud/ (spec #44): the gateway lists nothing else.
@@ -88,3 +89,29 @@ abstract interface class TrashApi {
 String trashId(String id) => RegExp(r'^[0-9]{1,19}$').hasMatch(id)
     ? id
     : throw const CloudFailure('Not in Trash');
+
+/// Forwards the trash routes through a wrapping cloud (renewable identity,
+/// the pause gate, transfer activity) to the connection that has them,
+/// passing the wrapper's own gate first like sharing does.
+mixin ForwardTrash on ForwardSharing implements TrashApi {
+  TrashApi get _trash {
+    beforeSharing();
+    final target = sharingTarget;
+    if (target is TrashApi) return target as TrashApi;
+    throw const CloudFailure('Trash is not available on this connection.');
+  }
+
+  @override
+  Future<ServerTrash?> listTrash() async {
+    beforeSharing();
+    final target = sharingTarget;
+    return target is TrashApi ? (target as TrashApi).listTrash() : null;
+  }
+
+  @override
+  Future<TrashRestore> restoreTrash(String id) => _trash.restoreTrash(id);
+  @override
+  Future<void> deleteTrash(String id) => _trash.deleteTrash(id);
+  @override
+  Future<int> emptyTrash() => _trash.emptyTrash();
+}

@@ -1,13 +1,16 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:anj_cloud/core/gateway/certificate_renewal.dart';
 import 'package:anj_cloud/core/gateway/trash_api.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/device_trash.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
+import 'package:anj_cloud/core/sync/sync_activity.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:anj_cloud/ui/library_view.dart';
 import 'package:crypto/crypto.dart';
@@ -516,6 +519,25 @@ void main() {
       },
     );
   });
+
+  test(
+    'the worker\'s cloud wrappers forward Trash; Pause refuses it',
+    () async {
+      final path = await uploaded('wrapped.txt', 'wrapped');
+      delete([path]);
+      await engine.tick();
+      final gate = PausableCloud(RenewableCloud(cloud));
+      final wrapped = ActivityCloud(gate, SyncActivity());
+      expect(wrapped, isA<TrashApi>());
+      final listed = await (wrapped as TrashApi).listTrash();
+      expect(listed!.items.single.path, path);
+      gate.paused = true;
+      await expectLater(wrapped.listTrash(), throwsA(isA<CloudFailure>()));
+      gate.paused = false;
+      final restored = await wrapped.restoreTrash(listed.items.single.id);
+      expect(restored.path, path);
+    },
+  );
 
   test('one entry per deletion: a device copy joins the server item of the '
       'same path and deletion; others stand alone, newest first', () {
