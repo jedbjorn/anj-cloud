@@ -268,10 +268,16 @@ class Stack:
         return days
 
     def advertise_trash(self, days=None):
-        """The gateway advertises the retention read back from Nextcloud to every client."""
+        """The gateway advertises the retention read back from Nextcloud to every client. Best effort: a
+        gateway from before spec #44 (a rollback) refuses the action and advertises nothing, a current one
+        that misses it advertises 7 until the next setup or upgrade; neither stops the deployment."""
         days = self.apply_trash() if days is None else days
-        self.compose("exec", "-T", "access", "python", "-m", "access.admin",
-                     data=json.dumps({"action": "trash-days", "days": days}))
+        try:
+            self.compose("exec", "-T", "access", "python", "-m", "access.admin",
+                         data=json.dumps({"action": "trash-days", "days": days}))
+        except RuntimeError:
+            print("WARNING: the gateway did not take trash_days; it advertises its default (7 days)", file=sys.stderr)
+            return None
         return days
 
     def trusted_domains(self):

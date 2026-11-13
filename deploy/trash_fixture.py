@@ -25,7 +25,7 @@ from deploy.access_fixture import pair
 from deploy.access_operator import Operator
 from deploy.dev import FIXTURE_USERS, Stack, private_directory
 
-CASES = ("list", "restore", "empty", "expiry", "share", "read")
+CASES = ("list", "restore", "empty", "expiry", "share", "read", "fixes")
 DAY = 86400
 
 # Runs inside the Nextcloud container as www-data: moves one trash item's deletion time back by the given
@@ -224,11 +224,36 @@ class Run:
         if json.loads(body)["path"] != where + "/f.txt" or await self.read(alice, shared + "/f.txt") != b"shared file":
             raise RuntimeError("Restore did not put the file back in the share")
         after_owner = [row["id"] for row in (await self.trash(alice))["items"] if row["path"] == shared + "/f.txt"]
+        # S1: the share turned View only (straight through Nextcloud; the gateway makes only full-access shares):
+        # the recipient's restore would land at the top level of the recipient's account, so it is refused.
+        await self.put(alice, shared + "/g.txt", b"view only")
+        await self.delete(bob, mount + "/g.txt")
+        view = await self.item(bob, mount + "/g.txt")
+        status, _ = self.stack.backend_http("PUT", "/ocs/v2.php/apps/files_sharing/api/v1/shares/%s?format=json" % share_id,
+                                            FIXTURE_USERS[0], b"permissions=1",
+                                            {"OCS-APIRequest": "true", "Content-Type": "application/x-www-form-urlencoded"})
+        if status != 200:
+            raise RuntimeError("Could not turn the share View only")
+        await bob.request("POST", "/trash/%s/restore" % view["id"], expected=(403,))
+        top, _ = self.stack.backend_http("PROPFIND", "/remote.php/dav/files/%s/g.txt" % FIXTURE_USERS[1], FIXTURE_USERS[1],
+                                         headers={"Depth": "0"})
+        await self.item(bob, mount + "/g.txt")
+        if top != 404 or Operator(self.stack).call("fence")["state"] != "clear":
+            raise RuntimeError("A View only restore landed outside anj-cloud/ or fenced writes")
+        # S5: the share is gone; the recipient's item under Shared/ is never recreated as a folder of its own.
         await alice.request("DELETE", "/v1/shares/%s" % share_id, expected=(200,))
+        await bob.request("POST", "/trash/%s/restore" % view["id"], expected=(409,))
+        status, _ = self.stack.backend_http("PROPFIND", "/remote.php/dav/files/%s/anj-cloud/%s" % (FIXTURE_USERS[1], quote(mount)),
+                                            FIXTURE_USERS[1], headers={"Depth": "0"})
+        if status != 404:
+            raise RuntimeError("A restore recreated a folder under Shared/")
+        await bob.request("DELETE", "/trash/", expected=(200,))
         self.passed("share", f"A recipient's delete inside the owner's share lands in {landed} trash(es); each side's Trash "
                     "shows only its own item; the recipient's restore puts the file back in the share for the owner, and the "
                     "owner's own trash item stays until it expires" if landed == "both" else f"lands in the {landed}'s trash",
                     landed=landed, owner_item_after_recipient_restore=bool(after_owner))
+        self.passed("share-fixes", "A restore into a share turned View only answers 403, stays in Trash and lands nowhere "
+                    "(S1); once the share is gone the item is not recreated under Shared/ (409, S5)")
 
     # AC7 -----------------------------------------------------------------------------------------
 
@@ -240,6 +265,38 @@ class Run:
             await reader.request(method, path, expected=(403,))
         await self.item(alice, folder + "/kept.txt")
         self.passed("read", "A read-grant device lists Trash; restore, delete and empty answer 403 and change nothing")
+
+    # Review fixes S4, S6 ---------------------------------------------------------------------------
+
+    async def fixes_case(self, alice, folder):
+        await self.mkcol(alice, folder + "/Trip")
+        await self.put(alice, folder + "/Trip/photo.jpg", b"photo")
+        await self.delete(alice, folder + "/Trip/photo.jpg")
+        photo = await self.item(alice, folder + "/Trip/photo.jpg")
+        await self.delete(alice, folder + "/Trip")
+        await self.mkcol(alice, folder + "/trip")
+        await alice.request("POST", "/trash/%s/restore" % photo["id"], expected=(409,))
+        listing, _ = await alice.request("PROPFIND", href(folder) + "/", headers={"Depth": "1"}, expected=(207,))
+        if b"/Trip/" in listing:
+            raise RuntimeError("A folder was recreated beside its case twin")
+        ids = []
+        for name in ("u1.txt", "u2.txt", "u3.txt"):
+            await self.put(alice, folder + "/" + name, name.encode())
+            await self.delete(alice, folder + "/" + name)
+            ids.append((await self.item(alice, folder + "/" + name))["id"])
+        await self.put(alice, folder + "/u3.txt", b"taken")
+        body, _ = await alice.request("POST", "/trash/restore", data=json.dumps({"ids": ids + ["1"]}),
+                                      headers={"Content-Type": "application/json"}, expected=(200,))
+        results = json.loads(body)["results"]
+        paths = [row.get("path") for row in results]
+        if (paths[:3] != [folder + "/u1.txt", folder + "/u2.txt", folder + "/u3 (restored).txt"] or results[3].get("status") != 404
+                or await self.read(alice, folder + "/u3 (restored).txt") != b"u3.txt"):
+            raise RuntimeError("Batch restore results differ: %r" % results)
+        if Operator(self.stack).call("fence")["state"] != "clear":
+            raise RuntimeError("Batch restore left writes fenced")
+        self.passed("fixes", "A missing folder is not recreated beside a case twin (409, S4); one batch restore brings back "
+                    "three items with a per-item result, a taken name as (restored), an unknown id as 404 (S6)",
+                    batch=results)
 
 
 async def scenario(stack, evidence, cases):
@@ -274,6 +331,8 @@ async def scenario(stack, evidence, cases):
             bob = await pair(stack, operator, FIXTURE_USERS[1], clients / "bob")
             actors.append(bob)
             await run.share_case(alice, bob, shared)
+        if "fixes" in cases:
+            await run.fixes_case(alice, folder)
         if "empty" in cases:
             await run.empty_case(alice, folder, outside)
     finally:

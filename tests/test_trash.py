@@ -7,6 +7,7 @@ always goes to the original location whatever the MOVE names, an exact name alre
 deleted by a share recipient carries a leading slash in its original location.
 """
 
+import asyncio
 import base64
 import json
 import posixpath
@@ -22,7 +23,7 @@ from gateway_harness import HOST, Harness
 from test_permanent_credentials import Device, pair
 from services.access.trash import restored_name, root_relative
 
-ROUTES = [("GET", "/trash/"), ("DELETE", "/trash/"), ("POST", "/trash/1/restore"), ("DELETE", "/trash/1")]
+ROUTES = [("GET", "/trash/"), ("DELETE", "/trash/"), ("POST", "/trash/1/restore"), ("DELETE", "/trash/1"), ("POST", "/trash/restore")]
 
 
 class FakeTrashCloud:
@@ -32,6 +33,11 @@ class FakeTrashCloud:
         self.tokens, self.tree, self.trash = {}, {}, {}
         self.next_id, self.clock = 500, 1_800_000_000
         self.fail = {}  # "restore" | "delete" | "list" -> status, "lost" (not applied) or "applied-lost"
+        self.readonly = set()  # folders the caller may not create in (a View only share)
+        self.top_level = False  # every restore lands at the account's top level
+        self.listings = 0  # trash listings answered
+        self.gate = None  # an Event a restore waits for, after `reached` is set
+        self.reached = None
         self.server = None
 
     def user(self, uid):
@@ -72,8 +78,8 @@ class FakeTrashCloud:
         item = self.trash[uid].pop(name)
         location = item["location"].lstrip("/")
         parent, leaf = posixpath.split(location)
-        if parent and self.tree[uid].get(parent, b"") is not None:
-            parent = ""  # Nextcloud restores at the account's top level when the folder is gone.
+        if self.top_level or (parent and (self.tree[uid].get(parent, b"") is not None or parent in self.readonly)):
+            parent = ""  # Nextcloud restores at the account's top level when the folder is gone or not writable.
         target = (parent + "/" if parent else "") + leaf
         if target in self.tree[uid]:
             base, extension = posixpath.splitext(leaf) if item["subtree"][""] is not None else (leaf, "")
@@ -91,6 +97,7 @@ class FakeTrashCloud:
         if path.startswith(trash_root):
             name = path[len(trash_root):].rstrip("/")
             if request.method == "PROPFIND" and not name:
+                self.listings += 1
                 failure = self.fail.pop("list", None)
                 if failure is not None:
                     return web.Response(status=failure if isinstance(failure, int) else 500)
@@ -114,6 +121,9 @@ class FakeTrashCloud:
                 return web.Response(status=failure)
             if failure == "lost":
                 return web.Response(status=500)  # The answer is lost; nothing was applied.
+            if request.method == "MOVE" and self.gate is not None:
+                self.reached.set()
+                await self.gate.wait()
             if request.method == "MOVE":
                 if "/remote.php/dav/trashbin/%s/restore/" % uid not in request.headers.get("Destination", ""):
                     return web.Response(status=403)
@@ -138,9 +148,11 @@ class FakeTrashCloud:
                     "<d:response><d:href>%s%s</d:href></d:response>" % (quote(files_root + child), "/" if tree[child] is None else "")
                     for child in children])
             folder = tree[relative] is None
+            permissions = "SG" if relative in self.readonly else "RGDNVCK" if folder else "RGDNVW"
             return self.multistatus(["<d:response><d:href>%s</d:href><d:propstat><d:prop><d:getetag>\"e-%s\"</d:getetag>"
-                                     "<d:resourcetype>%s</d:resourcetype><oc:fileid>7</oc:fileid></d:prop></d:propstat></d:response>"
-                                     % (quote(files_root + relative), abs(hash(relative)), "<d:collection/>" if folder else "")])
+                                     "<d:resourcetype>%s</d:resourcetype><oc:fileid>7</oc:fileid><oc:permissions>%s</oc:permissions>"
+                                     "</d:prop></d:propstat></d:response>"
+                                     % (quote(files_root + relative), abs(hash(relative)), "<d:collection/>" if folder else "", permissions)])
         if request.method == "MKCOL":
             if relative in tree:
                 return web.Response(status=405)
@@ -165,6 +177,19 @@ class FakeTrashCloud:
         self.server = TestServer(app)
         await self.server.start_server()
         return str(self.server.make_url("")).rstrip("/")
+
+
+class AdvertiseTests(unittest.TestCase):
+    def test_advertising_is_best_effort_for_a_gateway_without_the_action(self):
+        from unittest import mock
+        from deploy.dev import Stack
+        stack = Stack("anj-cloud-review-advertise", 18999)
+        with mock.patch.object(stack, "compose", side_effect=RuntimeError("Command failed (exit 1)")), \
+                mock.patch("sys.stderr"):
+            self.assertIsNone(stack.advertise_trash(7))
+        with mock.patch.object(stack, "compose", return_value='{"trash_days": 7}') as compose:
+            self.assertEqual(7, stack.advertise_trash(7))
+            self.assertIn("trash-days", compose.call_args.kwargs["data"])
 
 
 class NamingTests(unittest.TestCase):
@@ -200,12 +225,12 @@ class TrashTests(unittest.IsolatedAsyncioTestCase):
         await self.cloud.server.close()
         await self.harness.stop()
 
-    async def call(self, method, path, who="alice"):
+    async def call(self, method, path, who="alice", body=None):
         identity = {"alice": (self.alice, self.alice_leaf), "reader": (self.reader, self.reader_leaf)}.get(who)
         context = self.harness.client_context(*(identity or ()))
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=context), trust_env=False) as session:
             async with session.request(method, "https://127.0.0.1:%d%s" % (self.port, path), server_hostname=HOST,
-                                       allow_redirects=False) as response:
+                                       allow_redirects=False, json=body) as response:
                 text = await response.text()
                 try:
                     body = json.loads(text)
@@ -410,6 +435,86 @@ class TrashTests(unittest.IsolatedAsyncioTestCase):
         status, _, _ = await self.call("POST", "/trash/%s/restore" % bobs)
         self.assertEqual(404, status)
         self.assertEqual(1, len(self.cloud.trash["bob"]))
+
+    # Review fixes S1, S2, S4, S5, S6.
+
+    async def test_restore_into_a_folder_the_caller_cannot_create_in_is_refused(self):
+        self.cloud.put("alice", "anj-cloud/Shared/Proj/f.txt", b"shared")
+        item = self.cloud.delete("alice", "anj-cloud/Shared/Proj/f.txt")
+        self.cloud.readonly.add("anj-cloud/Shared/Proj")  # the share was turned View only
+        status, body, _ = await self.call("POST", "/trash/%s/restore" % item)
+        self.assertEqual((403, "You can't add to the folder this came from"), (status, body["error"]))
+        self.assertEqual(1, len(self.cloud.trash["alice"]))
+        self.assertNotIn("f.txt", self.cloud.tree["alice"])
+        self.assertEqual("clear", self.fence())
+
+    async def test_success_only_when_the_item_is_in_its_folder(self):
+        self.cloud.put("alice", "anj-cloud/Documents/a.txt")
+        item = self.cloud.delete("alice", "anj-cloud/Documents/a.txt")
+        self.cloud.top_level = True
+        status, body, _ = await self.call("POST", "/trash/%s/restore" % item)
+        self.assertEqual(503, status)
+        self.assertEqual("dispatched", self.fence())
+
+    async def test_a_dropped_client_never_leaves_a_restore_half_done(self):
+        self.cloud.put("alice", "anj-cloud/Documents/a.txt", b"bytes")
+        item = self.cloud.delete("alice", "anj-cloud/Documents/a.txt")
+        self.cloud.gate, self.cloud.reached = asyncio.Event(), asyncio.Event()
+        client = asyncio.ensure_future(self.call("POST", "/trash/%s/restore" % item))
+        await asyncio.wait_for(self.cloud.reached.wait(), 10)
+        client.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await client
+        await asyncio.sleep(0.2)
+        self.assertEqual("dispatched", self.fence())  # still running behind the shield
+        self.cloud.gate.set()
+        for _ in range(100):
+            if not self.gateway.trash.tasks:
+                break
+            await asyncio.sleep(0.05)
+        self.assertEqual(set(), self.gateway.trash.tasks)
+        self.assertEqual("clear", self.fence())
+        self.assertEqual(b"bytes", self.cloud.tree["alice"]["anj-cloud/Documents/a.txt"])
+
+    async def test_a_missing_folder_is_not_recreated_beside_a_case_twin(self):
+        self.cloud.put("alice", "anj-cloud/Documents/Trip/photo.jpg")
+        item = self.cloud.delete("alice", "anj-cloud/Documents/Trip/photo.jpg")
+        self.cloud.delete("alice", "anj-cloud/Documents/Trip")
+        self.cloud.put("alice", "anj-cloud/Documents/trip/other.jpg")
+        status, body, _ = await self.call("POST", "/trash/%s/restore" % item)
+        self.assertEqual(409, status)
+        self.assertIn("case or accents", body["error"])
+        self.assertNotIn("anj-cloud/Documents/Trip", self.cloud.tree["alice"])
+        self.assertEqual("clear", self.fence())
+
+    async def test_nothing_is_recreated_under_shared(self):
+        self.cloud.put("alice", "anj-cloud/Shared/Proj/f.txt")
+        item = self.cloud.delete("alice", "anj-cloud/Shared/Proj/f.txt")
+        self.cloud.delete("alice", "anj-cloud/Shared/Proj")  # the share was left or renamed
+        status, body, _ = await self.call("POST", "/trash/%s/restore" % item)
+        self.assertEqual((409, "The share this came from is no longer here"), (status, body["error"]))
+        self.assertNotIn("anj-cloud/Shared/Proj", self.cloud.tree["alice"])
+        self.assertEqual("clear", self.fence())
+
+    async def test_batch_restore_lists_once_and_answers_per_item(self):
+        ids = []
+        for name in ("a.txt", "b.txt"):
+            self.cloud.put("alice", "anj-cloud/Documents/" + name, name.encode())
+            ids.append(self.cloud.delete("alice", "anj-cloud/Documents/" + name))
+        self.cloud.put("alice", "anj-cloud/Documents/b.txt", b"taken")
+        listings = self.cloud.listings
+        status, body, _ = await self.call("POST", "/trash/restore", body={"ids": ids + ["999"]})
+        self.assertEqual(200, status)
+        self.assertEqual(1, self.cloud.listings - listings)
+        self.assertEqual([{"id": ids[0], "path": "Documents/a.txt", "renamed": False},
+                          {"id": ids[1], "path": "Documents/b (restored).txt", "renamed": True},
+                          {"id": "999", "error": "Not in Trash", "status": 404}], body["results"])
+        self.assertEqual("clear", self.fence())
+        for bad in ({"ids": []}, {"ids": ["x"]}, {"ids": ["1"], "more": 1}, {"ids": ["1"] * 501}):
+            status, _, _ = await self.call("POST", "/trash/restore", body=bad)
+            self.assertEqual(400, status, bad)
+        status, _, _ = await self.call("POST", "/trash/restore", "reader", body={"ids": ids})
+        self.assertEqual(403, status)
 
 
 class OperatorTrashDaysTests(unittest.IsolatedAsyncioTestCase):

@@ -42,6 +42,8 @@ disk is not a backup, and local ntfy alerts are not independent external monitor
 - [Upgrades](upgrades.md): the generic `local_upgrade.py` route first, with `stage.py anj-prod` kept for the
   advanced libvirt route. Local upgrades and explicit rollback passed in the lab; automatic failure
   fallback and the live advanced staging route were not exercised.
+- Trash retention: `trash_days` in `state/stack.json` (default 7 days), applied by setup and every upgrade;
+  see [Upgrades](upgrades.md).
 - [Troubleshooting](troubleshooting.md): generic-first status, health, pairing, DDNS, upgrade, and emergency
   checks, with host-only commands labelled separately.
 - [Backups and restore](backups.md): the existing encrypted virtiofs workflow, explicitly scoped to the

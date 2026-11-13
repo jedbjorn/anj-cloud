@@ -14,6 +14,7 @@ recipient's delete inside someone else's share lands in both trashes: the owner'
 its own item back into the share; the other side's item stays until it expires.
 """
 
+import asyncio
 import json
 import posixpath
 from urllib.parse import quote, unquote, urlsplit
@@ -34,6 +35,10 @@ DAY = 86400
 TRASH_PROPFIND = (b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns" xmlns:nc="http://nextcloud.org/ns">'
                   b'<d:prop><nc:trashbin-filename/><nc:trashbin-original-location/><nc:trashbin-deletion-time/>'
                   b'<oc:size/><d:getcontentlength/><d:resourcetype/><oc:fileid/></d:prop></d:propfind>')
+PERMISSIONS_PROPFIND = b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><oc:permissions/></d:prop></d:propfind>'
+# One batch restore (Undo of a bulk delete) restores at most this many items (the body stays under 16 KiB).
+MAX_BATCH = 500
+UNKNOWN = "The outcome is unknown; writes are paused until the operator checks it"
 NC = "{http://nextcloud.org/ns}"
 OC = "{http://owncloud.org/ns}"
 # Known refusals of a dispatched trash request: nothing changed.
@@ -77,6 +82,8 @@ def root_relative(location):
 class Trash:
     def __init__(self, gateway):
         self.gateway = gateway
+        # Locked trash work runs as its own task (see `shielded`); kept here until it ends.
+        self.tasks = set()
 
     @property
     def registry(self):
@@ -102,6 +109,7 @@ class Trash:
     def add_routes(self, router):
         router.add_get("/trash/", self.list_route)
         router.add_delete("/trash/", self.empty_route)
+        router.add_post("/trash/restore", self.restore_many_route)
         router.add_post("/trash/{item_id}/restore", self.restore_route)
         router.add_delete("/trash/{item_id}", self.delete_route)
 
@@ -120,6 +128,20 @@ class Trash:
             raise TrashError(404, "Not in Trash")
         return value
 
+    def shielded(self, work):
+        """Runs `work()` as its own task behind a shield, as /dav/ mutations do: a client that disconnects
+        (aiohttp then cancels its handler) never cuts a restore or deletion off between its recorded intent
+        and its outcome, which would leave every write paused. The task always finishes or reads back."""
+        task = asyncio.ensure_future(work())
+        self.tasks.add(task)
+        task.add_done_callback(self._finished)
+        return asyncio.shield(task)
+
+    def _finished(self, task):
+        self.tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
     async def list_route(self, request):
         device = self.caller(request)
         items = await self.items(device)
@@ -129,26 +151,45 @@ class Trash:
     async def restore_route(self, request):
         device = self.caller(request, write=True)
         item_id = self.item_id(request)
-        return web.json_response(await self.restore(device, item_id), headers={"Cache-Control": "no-store"})
+        return web.json_response(await self.shielded(lambda: self.restore(device, item_id)), headers={"Cache-Control": "no-store"})
+
+    async def restore_many_route(self, request):
+        """`{"ids": [...]}`: one listing and one hold of the lock for all of them (Undo of a bulk delete)."""
+        device = self.caller(request, write=True)
+        try:
+            body = await request.json()
+        except ValueError:
+            raise TrashError(400, "A JSON object is required") from None
+        ids = body.get("ids") if isinstance(body, dict) and set(body) == {"ids"} else None
+        if (not isinstance(ids, list) or not ids or len(ids) > MAX_BATCH
+                or not all(isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 19 for value in ids)):
+            raise TrashError(400, "Expected exactly: ids, a list of 1 to %d trash item IDs" % MAX_BATCH)
+        results = await self.shielded(lambda: self.restore_many(device, list(dict.fromkeys(ids))))
+        return web.json_response({"results": results}, headers={"Cache-Control": "no-store"})
 
     async def delete_route(self, request):
         device = self.caller(request, write=True)
         item_id = self.item_id(request)
-        async with self.gateway.mutations.lock:
-            self.ready(device)
-            item = await self.find(device, item_id)
-            await self.remove(device, item)
+
+        async def work():
+            async with self.gateway.mutations.lock:
+                self.ready(device)
+                await self.remove(device, await self.find(device, item_id))
+        await self.shielded(work)
         return web.Response(status=204, headers={"Cache-Control": "no-store"})
 
     async def empty_route(self, request):
         device = self.caller(request, write=True)
-        removed = 0
-        async with self.gateway.mutations.lock:
-            self.ready(device)
-            for item in await self.items(device):
-                await self.remove(device, item)
-                removed += 1
-        return web.json_response({"deleted": removed}, headers={"Cache-Control": "no-store"})
+
+        async def work():
+            removed = 0
+            async with self.gateway.mutations.lock:
+                self.ready(device)
+                for item in await self.items(device):
+                    await self.remove(device, item)
+                    removed += 1
+            return removed
+        return web.json_response({"deleted": await self.shielded(work)}, headers={"Cache-Control": "no-store"})
 
     def public(self, item):
         return {"id": item["id"], "path": item["path"], "kind": item["kind"], "size": item["size"],
@@ -241,7 +282,7 @@ class Trash:
         present = await self.in_trash(device, item)
         if present is None:
             # The fence stays closed with the recorded intent for operator recovery.
-            raise TrashError(503, "The outcome is unknown; writes are paused until the operator checks it")
+            raise TrashError(503, UNKNOWN)
         self.registry.mutation_finish()
         if present:
             raise TrashError(502, "The server did not delete this item")
@@ -252,7 +293,9 @@ class Trash:
         return (current is not None, bool(current and current["collection"]))
 
     async def make_parents(self, device, relative):
-        """Creates each missing folder above `relative`, top first; a file in the way refuses."""
+        """Creates each missing folder above `relative`, top first. Refused (409): a file in the way, a folder
+        under Shared/ (that is someone else's share, gone or renamed: never recreated as a folder of one's
+        own), and a name another folder at that level already has apart from case or accents (#120)."""
         parts = relative.split("/")[:-1]
         for depth in range(1, len(parts) + 1):
             encoded = encode_filename_path("/".join(parts[:depth])) + "/"
@@ -261,71 +304,119 @@ class Trash:
                 continue
             if present:
                 raise TrashError(409, "A file is where the item's folder was")
+            if parts[0] == "Shared":
+                raise TrashError(409, "The share this came from is no longer here")
+            level = encode_filename_path("/".join(parts[:depth - 1])) + "/" if depth > 1 else ""
+            if portable_names.clash(parts[depth - 1], await self.gateway.mutations.siblings(device, level)) is not None:
+                raise TrashError(409, "A folder whose name differs only in case or accents is where the item's folder was")
             status = await self.request("MKCOL", self.gateway.backend + backend_root(device["uid"]) + encoded, device)
             if status not in (201, 405):
                 present, folder = await self.exists(device, encoded)
                 if not (present and folder):
                     raise TrashError(502, "Could not recreate the item's folder")
 
+    async def require_writable(self, device, parent, folder):
+        """Nextcloud restores to the account's top level, outside anj-cloud/, when the original folder is
+        missing or the caller may not create in it (a share turned View only). Refused unless the folder's
+        own permissions let the caller create a file (C) or folder (K) there."""
+        url = self.gateway.backend + backend_root(device["uid"]) + parent
+        async with self.gateway.session.request("PROPFIND", url, data=PERMISSIONS_PROPFIND, auth=self.auth(device), allow_redirects=False,
+                                                headers={"Depth": "0", "Content-Type": "application/xml",
+                                                         "Accept-Encoding": "identity"}) as response:
+            if response.status == 404:
+                raise TrashError(409, "The folder this came from is no longer here")
+            if response.status != 207:
+                raise TrashError(502, "Could not read the folder this came from")
+            content = await bounded_body(response)
+        permissions = SafeET.fromstring(content, forbid_dtd=True).findtext(".//" + OC + "permissions") or ""
+        if ("K" if folder else "C") not in permissions:
+            raise TrashError(403, "You can't add to the folder this came from")
+
     async def restore(self, device, item_id):
         """Restores one item to its original path, under the lock and fence. Returns the final path."""
-        mutations = self.gateway.mutations
-        async with mutations.lock:
+        async with self.gateway.mutations.lock:
             self.ready(device)
-            item = await self.find(device, item_id)
-            relative = item["path"]
-            folder = item["kind"] == "folder"
-            parent, name = split_leaf(encode_filename_path(relative))
-            decoded_parent = posixpath.dirname(relative)
-            self.begin(device, {"kind": "trash-restore", "id": item["id"], "path": relative})
-            try:
-                await self.make_parents(device, relative)
-                before = await mutations.siblings(device, parent)
-            except TrashError:
-                self.registry.mutation_finish()
-                raise
-            except Exception:
-                self.registry.mutation_finish()
-                raise TrashError(502, "Could not prepare the restore") from None
-            # Restore never overwrites (decision #120 names too): the original name when nothing there has
-            # it, also apart from case and accents, else `name (restored).ext`, `(restored 2)`, ...
-            target, n = name, 0
-            while target in before or portable_names.clash(target, before) is not None:
-                n += 1
-                target = restored_name(name, folder, n)
-                if n > 1000:
-                    self.registry.mutation_finish()
-                    raise TrashError(409, "No free name to restore to")
-            restore_url = (self.gateway.backend + "/remote.php/dav/trashbin/" + quote(device["uid"], safe="")
-                           + "/restore/" + quote(item["name"], safe=""))
-            status = await self.request("MOVE", self.trash_url(device, quote(item["name"], safe="")), device,
-                                        headers={"Destination": restore_url})
-            if status in KNOWN_FAILURES:
-                self.registry.mutation_finish()
-                raise TrashError(404 if status == 404 else 502, "Not in Trash" if status == 404 else "The server did not restore this item")
-            try:
-                after = await mutations.siblings(device, parent)
-            except Exception:  # noqa: BLE001
-                after = None
-            if status not in (200, 201, 204):
-                # Unknown outcome: read back. Gone from the trash and a new name in the folder means applied;
-                # still in the trash means not; anything else leaves the fence closed.
-                present = await self.in_trash(device, item)
-                if present is None or after is None or (not present and not set(after) - set(before)):
-                    raise TrashError(503, "The outcome is unknown; writes are paused until the operator checks it")
-                if present:
-                    self.registry.mutation_finish()
-                    raise TrashError(502, "The server did not restore this item")
-            new = sorted(set(after or ()) - set(before))
-            landed = new[0] if len(new) == 1 else (name if name in (after or ()) and name not in before else None)
-            final = landed or name
-            if landed is not None and landed != target:
-                # Nextcloud chose the name (it compares exact names only): rename to ours, never replacing.
-                source = self.gateway.backend + backend_root(device["uid"]) + parent + quote(landed, safe="-._~")
-                destination = self.gateway.backend + backend_root(device["uid"]) + parent + quote(target, safe="-._~")
-                moved = await self.request("MOVE", source, device, headers={"Destination": destination, "Overwrite": "F"})
-                if moved in (201, 204):
-                    final = target
+            return await self.restore_item(device, await self.find(device, item_id))
+
+    async def restore_many(self, device, ids):
+        """Restores each item by the single restore's rules, in order: `{"id", "path", "renamed"}` or
+        `{"id", "error", "status"}` each. After an unknown outcome the rest are not attempted."""
+        results = []
+        async with self.gateway.mutations.lock:
+            self.ready(device)
+            listed = {item["id"]: item for item in await self.items(device)}
+            for item_id in ids:
+                if not self.registry.mutation_ready():
+                    results.append({"id": item_id, "error": "Writes are paused pending operator recovery", "status": 503})
+                    continue
+                if item_id not in listed:
+                    results.append({"id": item_id, "error": "Not in Trash", "status": 404})
+                    continue
+                try:
+                    results.append({"id": item_id, **await self.restore_item(device, listed[item_id])})
+                except TrashError as error:
+                    results.append({"id": item_id, "error": error.message, "status": error.status})
+        return results
+
+    async def restore_item(self, device, item):
+        """One restore under the held lock: parents, permission, a free name, the MOVE and its read-back."""
+        mutations = self.gateway.mutations
+        relative = item["path"]
+        folder = item["kind"] == "folder"
+        parent, name = split_leaf(encode_filename_path(relative))
+        decoded_parent = posixpath.dirname(relative)
+        self.begin(device, {"kind": "trash-restore", "id": item["id"], "path": relative})
+        try:
+            await self.make_parents(device, relative)
+            await self.require_writable(device, parent, folder)
+            before = await mutations.siblings(device, parent)
+        except TrashError:
             self.registry.mutation_finish()
-            path = (decoded_parent + "/" if decoded_parent else "") + final
-            return {"path": path, "renamed": final != name}
+            raise
+        except Exception:
+            self.registry.mutation_finish()
+            raise TrashError(502, "Could not prepare the restore") from None
+        # Restore never overwrites (decision #120 names too): the original name when nothing there has
+        # it, also apart from case and accents, else `name (restored).ext`, `(restored 2)`, ...
+        target, n = name, 0
+        while target in before or portable_names.clash(target, before) is not None:
+            n += 1
+            target = restored_name(name, folder, n)
+            if n > 1000:
+                self.registry.mutation_finish()
+                raise TrashError(409, "No free name to restore to")
+        restore_url = (self.gateway.backend + "/remote.php/dav/trashbin/" + quote(device["uid"], safe="")
+                       + "/restore/" + quote(item["name"], safe=""))
+        status = await self.request("MOVE", self.trash_url(device, quote(item["name"], safe="")), device,
+                                    headers={"Destination": restore_url})
+        if status in KNOWN_FAILURES:
+            self.registry.mutation_finish()
+            raise TrashError(404 if status == 404 else 502, "Not in Trash" if status == 404 else "The server did not restore this item")
+        try:
+            after = await mutations.siblings(device, parent)
+        except Exception:  # noqa: BLE001
+            after = None
+        if status not in (200, 201, 204):
+            # Unknown outcome: still in the trash means not applied; otherwise the folder must show it.
+            present = await self.in_trash(device, item)
+            if present:
+                self.registry.mutation_finish()
+                raise TrashError(502, "The server did not restore this item")
+        new = sorted(set(after or ()) - set(before))
+        landed = new[0] if len(new) == 1 else (name if name in new else None)
+        if landed is None:
+            # Not in the folder it came from (Nextcloud may have put it at the account's top level, outside
+            # anj-cloud/), or the folder could not be read: success is never reported, and the fence stays
+            # closed with the recorded intent for the operator.
+            raise TrashError(503, UNKNOWN)
+        final = landed
+        if landed != target:
+            # Nextcloud chose the name (it compares exact names only): rename to ours, never replacing.
+            source = self.gateway.backend + backend_root(device["uid"]) + parent + quote(landed, safe="-._~")
+            destination = self.gateway.backend + backend_root(device["uid"]) + parent + quote(target, safe="-._~")
+            moved = await self.request("MOVE", source, device, headers={"Destination": destination, "Overwrite": "F"})
+            if moved in (201, 204):
+                final = target
+        self.registry.mutation_finish()
+        path = (decoded_parent + "/" if decoded_parent else "") + final
+        return {"path": path, "renamed": final != name}
