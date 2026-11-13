@@ -67,6 +67,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     ::DispatchMessage(&msg);
   }
 
+  // Quit ends the loop with a WM_QUIT the engine posts itself, so the window
+  // has not been destroyed (WM_DESTROY, which tears the tray integration and
+  // the Flutter view down in order) yet. Left to the destructors, the engine
+  // and the integration were torn down while the window was still live and
+  // still dispatching to them, and the process exited 0xC000041D (a fatal
+  // exception in a window callback). Tear down here, with the loop done and
+  // before COM goes away.
+  window.Destroy();
+
   ::CoUninitialize();
   return EXIT_SUCCESS;
 }
