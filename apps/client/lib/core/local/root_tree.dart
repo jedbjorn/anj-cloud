@@ -55,6 +55,14 @@ class RootTree {
     return routing is PhoneFolderRouting ? routing : null;
   }
 
+  /// Whether work for root [path] or the staging name [staged] must wait:
+  /// the phone folders are paused (spec #52) and it belongs to them. Startup
+  /// recovery leaves such records exactly as they are until access returns.
+  bool phonePaused({String? path, String? staged}) =>
+      phoneFolders?.paused == true &&
+      ((path != null && inPhoneFolder(path)) ||
+          (staged != null && p.basename(staged).startsWith(sharedStagingTag)));
+
   /// A fresh staging name for bytes that belong at the root path [forPath]:
   /// in a phone folder ([PhoneFolderRouting]) the name carries
   /// [sharedStagingTag], so the bytes are staged on the phone folders' own

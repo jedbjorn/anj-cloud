@@ -287,6 +287,60 @@ void main() {
       expect(phone('Documents/b.txt').readAsStringSync(), 'b');
     });
 
+    test('across restarts (Android stops the app on every change of '
+        'access): a file deleted while paused is a deletion once access is '
+        'back', () async {
+      start();
+      cloud.put('Music/a.mp3', 'a');
+      cloud.put('Music/b.mp3', 'b');
+      await passes();
+      engine.close();
+      open = false;
+      store = Manifest(Directory('${fixture.path}/profile'));
+      start(paused: true);
+      await passes();
+      phone('Music/a.mp3').deleteSync();
+      await passes();
+      expect(cloud.files.keys, contains('Music/a.mp3'));
+      engine.close();
+      open = false;
+      store = Manifest(Directory('${fixture.path}/profile'));
+      start();
+      await passes(4);
+      expect(cloud.files.keys, isNot(contains('Music/a.mp3')));
+      expect(exists('$base/Music/a.mp3'), isFalse);
+      expect(phone('Music/b.mp3').readAsStringSync(), 'b');
+      expect(cloud.completedDownloads, 2);
+    });
+
+    test('a download interrupted by Android stopping the app waits, intact, '
+        'while paused; everything else keeps syncing', () async {
+      start();
+      cloud.put('Music/a.mp3', 'a');
+      await passes();
+      // A download of a new version, staged and about to be renamed in.
+      final staged = engine.artifacts.reserve('Music/a.mp3', 'download');
+      staged.writeAsStringSync('new a', flush: true);
+      engine.artifacts.complete(staged, hash: 'x');
+      engine.artifacts.record(staged)!.data['installing'] = 'Music/a.mp3';
+      store.save();
+      final name = staged.path.split('/').last;
+      expect(name, startsWith(sharedStagingTag));
+      expect(File('$staging/$name').existsSync(), isTrue);
+      engine.close();
+      open = false;
+      store = Manifest(Directory('${fixture.path}/profile'));
+      start(paused: true);
+      cloud.put('loose.txt', 'loose');
+      await passes();
+      expect(private('loose.txt').readAsStringSync(), 'loose');
+      expect(
+        store.operations.values.where((o) => o.data['installing'] != null),
+        hasLength(1),
+      );
+      expect(File('$staging/$name').readAsStringSync(), 'new a');
+    });
+
     test(
       'a paused start never creates the phone folders or their rows',
       () async {
@@ -301,6 +355,99 @@ void main() {
         expect(cloud.files.keys, contains('Music/a.mp3'));
       },
     );
+  });
+
+  test('resumed while running, with the watcher and event-driven hashing '
+      '(Android): nothing present is restored or downloaded again', () async {
+    layout = makeLayout();
+    PhoneFolderLayout.active = layout;
+    final tree = RootTree.setup(
+      files,
+      'phone',
+      MappedRootFs(layout, null, 'Linux errno', const Duration(minutes: 15)),
+    );
+    names = CloudNames();
+    engine = SyncEngine(store, tree, NamedCloud(cloud, names), names: names)
+      ..nameOs = NameOs.android;
+    open = true;
+    await engine.startWatching();
+    write(phone('Music/a.mp3'), 'a');
+    cloud.put('Music/b.mp3', 'b');
+    await passes(4);
+    expect(cloud.files.keys, contains('Music/a.mp3'));
+    final downloads = cloud.completedDownloads;
+    // Access revoked: Android stops the app; it starts again paused.
+    engine.close();
+    store = Manifest(Directory('${fixture.path}/profile'));
+    final paused = RootTree(
+      Directory('$files/anj-cloud'),
+      tree.staging,
+      MappedRootFs(
+        makeLayout(paused: true),
+        null,
+        'Linux errno',
+        const Duration(minutes: 15),
+      ),
+    );
+    engine = SyncEngine(store, paused, NamedCloud(cloud, names), names: names)
+      ..nameOs = NameOs.android;
+    await engine.startWatching();
+    await passes();
+    // Deleted by another app while paused.
+    phone('Music/a.mp3').deleteSync();
+    await passes();
+    expect(cloud.files.keys, contains('Music/a.mp3'));
+    // Access granted while it runs (Android does not stop the app then).
+    final tree2 = paused;
+    tree2.phoneFolders!.setPaused(false);
+    await engine.restartWatchingAfterPhoneFolders();
+    engine.requestFullVerification();
+    await passes(4);
+    expect(tree2.phoneFolders!.paused, isFalse);
+    expect(
+      store.entries.values.where((e) => e.restoring).map((e) => e.path),
+      isEmpty,
+    );
+    for (var i = 0; i < 30 && cloud.files.containsKey('Music/a.mp3'); i++) {
+      await Future<void>.delayed(const Duration(seconds: 1));
+      await engine.tick();
+    }
+    // ignore: avoid_print
+    print('DEBUG ${store.entries['Music/a.mp3']?.status} ${engine.message}');
+    expect(cloud.files.keys, isNot(contains('Music/a.mp3')));
+    expect(exists('$base/Music/a.mp3'), isFalse);
+    expect(cloud.completedDownloads, downloads);
+  });
+
+  test('access back in the middle of a pass that began paused: what that '
+      'pass did not list is neither restored nor deleted; the next pass '
+      'sends the deletion', () async {
+    start();
+    cloud.put('Music/a.mp3', 'a');
+    cloud.put('Music/b.mp3', 'b');
+    await passes();
+    final downloads = cloud.completedDownloads;
+    final routing = engine.tree.phoneFolders!..setPaused(true);
+    await passes();
+    phone('Music/a.mp3').deleteSync();
+    var resumed = false;
+    await engine.tick(
+      between: () async {
+        if (!resumed) {
+          resumed = true;
+          routing.setPaused(false);
+        }
+        return false;
+      },
+    );
+    expect(resumed, isTrue);
+    expect(exists('$base/Music/a.mp3'), isFalse);
+    expect(cloud.completedDownloads, downloads);
+    expect(cloud.files.keys, contains('Music/a.mp3'));
+    await passes(4);
+    expect(cloud.files.keys, isNot(contains('Music/a.mp3')));
+    expect(exists('$base/Music/a.mp3'), isFalse);
+    expect(cloud.completedDownloads, downloads);
   });
 
   group('AC3 existing phone contents', () {

@@ -625,6 +625,22 @@ class WorkerLoop {
   /// Whether the last pass threw (it is then never treated as quiet).
   bool _lastPassFailed = false;
 
+  /// A pause change of the phone folders waiting for the pass to end.
+  bool? _phonePaused;
+
+  /// Applies [_phonePaused]. Access back: the watcher starts again over the
+  /// phone folders and one full verification follows; the top-folder rules
+  /// (#150 / #163) decide about a folder that changed meanwhile.
+  Future<void> _applyPhoneFolders() async {
+    final paused = _phonePaused;
+    final routing = engine.tree.phoneFolders;
+    _phonePaused = null;
+    if (paused == null || routing == null || routing.paused == paused) return;
+    routing.setPaused(paused);
+    await engine.restartWatchingAfterPhoneFolders();
+    if (!routing.paused) engine.requestFullVerification();
+  }
+
   Future<void> _pass() async {
     _deadline?.cancel();
     _inPass = true;
@@ -653,6 +669,7 @@ class WorkerLoop {
     } finally {
       _inPass = false;
     }
+    await _applyPhoneFolders();
     // A pause handled during the pass leaves its message to the paused scan.
     if (_paused) {
       _passWanted = true;
@@ -1143,17 +1160,12 @@ class WorkerLoop {
             _passWanted = true;
           }
         case 'phoneFolders':
-          // All files access granted or lost while the app runs (spec #52).
-          // Granted: one full verification of everything; the top-folder
-          // rules (#150 / #163) decide about a folder that changed meanwhile.
-          final routing = engine.tree.phoneFolders;
-          if (routing != null) {
-            final paused = command['paused'] == true;
-            if (routing.paused != paused) {
-              routing.setPaused(paused);
-              await engine.restartWatchingAfterPhoneFolders();
-              if (!routing.paused) engine.requestFullVerification();
-            }
+          // All files access granted or lost while the app runs (spec #52),
+          // applied between passes only: a pass keeps the state it began
+          // with (commands also run between the paths of a pass).
+          if (engine.tree.phoneFolders != null) {
+            _phonePaused = command['paused'] == true;
+            if (!_inPass) await _applyPhoneFolders();
             schedule.requestNow();
             _passWanted = true;
           }

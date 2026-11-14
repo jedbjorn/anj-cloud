@@ -203,7 +203,9 @@ in `<files>/anj-cloud` behind the documents provider and "Apps with access".
   `isExternalStorageManager()` check decides (checked before the worker starts, on every
   app open and before a background run): without access Android still lists the folders,
   with other apps' files hidden. Revoking access makes Android stop the app; the next start
-  checks again. Access returning runs one full verification.
+  checks again. Granting it does not stop the app: the worker resumes the folders between
+  passes (a pass keeps the state it began with, so nothing its paused scan did not list is
+  read as missing) and runs one full verification.
 - **Moving an existing install.** The first start with access moves the private `Music`,
   `Videos` and `Documents` into the phone folders before anything syncs
   (`PhoneFolderMove`): each file is copied through shared staging, verified by hash,

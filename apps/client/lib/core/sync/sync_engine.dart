@@ -1077,9 +1077,14 @@ class SyncEngine {
       : nameOs;
 
   /// Whether [path] is in a phone folder that is paused (spec #52: no All
-  /// files access, or shared storage unavailable).
+  /// files access, or shared storage unavailable). A pass that started
+  /// paused stays paused to its end: its local scan has no phone items, so
+  /// nothing it saw may be read as missing (a resume mid-pass would restore
+  /// files deleted meanwhile, emulator AC5).
   bool phoneFolderPaused(String path) =>
-      tree.phoneFolders?.paused == true && inPhoneFolder(path);
+      (_phonePausedThisPass || tree.phoneFolders?.paused == true) &&
+      inPhoneFolder(path);
+  bool _phonePausedThisPass = false;
 
   /// Android's `.nomedia` marker and `.thumbnails` cache in a phone folder
   /// (spec #52 Folder Mapping): ignored unless the cloud already has that
@@ -4409,6 +4414,7 @@ class SyncEngine {
   ) async {
     _mountChanges.clear();
     _heldTargets.clear();
+    _phonePausedThisPass = tree.phoneFolders?.paused == true;
     Map<String, LocalItem> rawLocal;
     String? folderWarning;
     try {

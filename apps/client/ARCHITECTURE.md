@@ -273,7 +273,11 @@ the rest of the root stays in `<files>/anj-cloud`. AC0 on the emulator
   them; `SyncEngine._held` holds every path in them and `_keepTopFolders` skips them, so
   nothing is uploaded, downloaded, deleted or inferred deleted. The controller asks again
   on every app open and before a background run and sends `phoneFolders` to the worker,
-  which resumes with a full verification. Revoking access kills the app.
+  which applies it between passes only (`SyncEngine` also keeps the paused state a pass
+  began with: a resume mid-pass would read what the paused scan never listed as missing)
+  and resumes with a full verification. Revoking access kills the app; granting does not.
+  Startup recovery (interrupted installs, releases, recoveries, folder creation, Finish
+  editing) leaves records of paused phone folders untouched (`RootTree.phonePaused`).
 - **Media library.** `MappedRootFs` records each phone path an install, rename or removal
   touched; the worker sends them as `mediaScan` and the controller asks
   `MediaScannerConnection.scanFile` (AC0: writes by path are otherwise invisible).

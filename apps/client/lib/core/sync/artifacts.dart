@@ -154,6 +154,7 @@ class Artifacts {
     if (pending.isEmpty) return;
     for (final op in pending) {
       final name = op.data['name'] as String;
+      if (tree.phonePaused(path: op.path, staged: name)) continue;
       final listed = tree.native.watchScan(null, tree.stageFd, name, false);
       if (listed.items.isNotEmpty) {
         op.data.remove('installing');

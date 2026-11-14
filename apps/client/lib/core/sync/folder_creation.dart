@@ -102,6 +102,7 @@ class FolderCreation {
         in manifest.operations.values
             .where((op) => op.kind == 'createFolder')
             .toList()) {
+      if (tree.phonePaused(path: op.path, staged: op.staged)) continue;
       if (op.phase != 'review') {
         try {
           complete(op);

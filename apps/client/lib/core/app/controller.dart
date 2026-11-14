@@ -665,7 +665,12 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
       }
     });
     _workerStatus = ReceivePort()
-      ..listen((_) {
+      ..listen((value) {
+        // An uncaught worker error arrives as [error, stack]: kept in the log
+        // (no file content or credentials are in it), so a stop can be traced.
+        if (value is List && value.isNotEmpty) {
+          debugPrint('Sync worker stopped: ${value.first}\n${value.last}');
+        }
         if (_stopped?.isCompleted ?? true) return;
         _storageReady = false;
         _input = null;

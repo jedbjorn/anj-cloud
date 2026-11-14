@@ -311,6 +311,7 @@ class EditCompletion {
     for (final request in requests.toList()) {
       final entry = manifest.entries[request.path];
       if (entry == null || request.data['binding'] != binding) continue;
+      if (tree.phonePaused(path: request.path)) continue;
       for (final plan in plans(request)) {
         final to = info(plan['to'] as String);
         final from = info(plan['from'] as String);
