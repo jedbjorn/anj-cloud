@@ -24,6 +24,13 @@
     <!-- The in-app updater installs through a PackageInstaller session after the user
          allows "Install unknown apps" for AnJ Cloud (spec #28 A7). -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- Phone folders (spec #52, decision #201): Music, Videos and Documents live in the
+         phone's own Music, Movies and Documents folders in shared storage, which the app reads
+         and writes by path. Android calls this All files access; the user grants it in the
+         system setting the app opens. Without it those three folders are paused, never deleted.
+         The legacy READ/WRITE_EXTERNAL_STORAGE stay removed above. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage"/>
     <!-- allowBackup and dataExtractionRules: no backup, no device transfer (row 15). -->
     <application
         android:label="${appLabel}"

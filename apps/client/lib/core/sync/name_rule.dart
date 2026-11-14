@@ -4,7 +4,9 @@ import 'dart:io';
 import 'name_policy.dart';
 
 /// The operating systems the name rule distinguishes (spec #49 R3).
-enum NameOs { windows, macos, linux, android }
+/// [phone]: Android's shared storage, where the phone folders live (spec
+/// #52, decision #202): R3 step 1's characters and the case-clash step.
+enum NameOs { windows, macos, linux, android, phone }
 
 /// Why the cloud cannot or must not hold a name (spec #49 R2). The names
 /// are the gateway's 422 `name-not-portable` reasons.
@@ -154,6 +156,8 @@ abstract final class NameRule {
   static const Map<NameOs, (int, int Function(String))> localLimits = {
     NameOs.windows: (255, _units),
     NameOs.macos: (255, _size),
+    // ext4 under MediaProvider's FUSE: 255 bytes.
+    NameOs.phone: (255, _size),
   };
 
   /// `stem + tail` before the extension, the stem cut at a code point
@@ -327,7 +331,15 @@ abstract final class NameRule {
     }
     final base = {
       for (final entry in sorted)
-        entry.name: os == NameOs.windows ? _windows(entry.name) : entry.name,
+        entry.name: switch (os) {
+          NameOs.windows => _windows(entry.name),
+          // Shared storage refuses `" * : < > ? |` and controls (AC0): R3
+          // step 1 only; trailing dots and device names are fine there.
+          NameOs.phone => String.fromCharCodes(
+            entry.name.runes.map(_windowsLookalike),
+          ),
+          _ => entry.name,
+        },
     };
     final groups = <String, List<NameEntry>>{};
     for (final entry in sorted) {

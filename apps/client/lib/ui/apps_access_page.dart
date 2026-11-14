@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'phone_folders_screen.dart';
+
 import '../core/ports/documents.dart';
 
 /// The label of an approvable folder ('' is the whole library).
@@ -20,8 +22,16 @@ String addFolderSteps(String app, String folder) =>
 /// status, and the apps that asked. Default: no app has access. The AnJ
 /// Cloud provider enforces this list on every call.
 class AppsAccessPage extends StatefulWidget {
-  const AppsAccessPage({super.key, required this.access});
+  const AppsAccessPage({
+    super.key,
+    required this.access,
+    this.phoneFolders = false,
+  });
   final AppAccess access;
+
+  /// Music, Videos and Documents are phone folders (spec #52): the page
+  /// says so in its first line.
+  final bool phoneFolders;
   @override
   State<AppsAccessPage> createState() => _AppsAccessPageState();
 }
@@ -242,6 +252,16 @@ class _AppsAccessPageState extends State<AppsAccessPage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          if (widget.phoneFolders) ...[
+            Text(
+              phoneFoldersAppsAccessLine,
+              key: const ValueKey('apps-access-phone-folders'),
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           Text(
             'No app can open your AnJ Cloud files until you approve it here, '
             'for a folder you choose. Approving is not enough on its own: '

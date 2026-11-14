@@ -75,7 +75,7 @@ class FolderCreation {
         ? tree.native.identity(tree.fd)
         : local[parent]!.identity!;
     tree.native.checkRoot(tree.stageFd, tree.staging.path);
-    final staged = 'folder-${uniqueId()}';
+    final staged = tree.stageName('folder', forPath: path);
     tree.native.makeDirExclusive(tree.stageFd, staged);
     final identity = tree.native.directoryIdentity(tree.stageFd, staged);
     final op = Operation(uniqueId(), 'createFolder', path, staged: staged)
@@ -102,6 +102,7 @@ class FolderCreation {
         in manifest.operations.values
             .where((op) => op.kind == 'createFolder')
             .toList()) {
+      if (tree.phonePaused(path: op.path, staged: op.staged)) continue;
       if (op.phase != 'review') {
         try {
           complete(op);

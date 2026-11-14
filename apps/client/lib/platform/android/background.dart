@@ -179,6 +179,8 @@ class AndroidBackground extends ChangeNotifier implements MobileSettings {
     switch (call.method) {
       case 'backgroundRun':
         await _initialized;
+        // All files access as it is now, before the run's pass (spec #52).
+        await controller.checkPhoneFolders();
         return controller.backgroundRun();
       case 'network':
         controller.reportNetwork(wifi: args['wifi'] == true);

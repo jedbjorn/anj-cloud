@@ -406,6 +406,8 @@ void main() {
         'android.permission.POST_NOTIFICATIONS',
         // The in-app updater's PackageInstaller session (A7).
         'android.permission.REQUEST_INSTALL_PACKAGES',
+        // Phone folders: All files access (spec #52).
+        'android.permission.MANAGE_EXTERNAL_STORAGE',
       });
       expect(removed, {
         'android.permission.RECORD_AUDIO',

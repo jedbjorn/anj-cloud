@@ -8,6 +8,12 @@ namespace {
 bool owned_directory(int fd) {
   struct stat s = {};
   if (fstat(fd,&s) != 0) return false;
+#if defined(ANJ_COMPAT_ANDROID)
+  // The phone folders' staging folder in shared storage (spec #52): a folder
+  // there can be neither owned nor private (see on_shared_storage); the
+  // folder itself is still required.
+  if (S_ISDIR(s.st_mode) && on_shared_storage(fd)) return true;
+#endif
   if (!S_ISDIR(s.st_mode) || s.st_uid != geteuid() || (s.st_mode & 0077)) { errno = EPERM; return false; }
   return true;
 }

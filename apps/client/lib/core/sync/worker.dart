@@ -21,7 +21,10 @@ import '../gateway/sharing.dart';
 import '../local/root_identity.dart';
 import '../local/root_tree.dart';
 import '../local/staging_location.dart';
+import '../ports/phone_folders.dart';
+import '../ports/root_filesystem.dart';
 import '../ports/root_location.dart';
+import 'phone_folder_move.dart';
 import '../../platform/adapters.dart';
 import '../update/release.dart';
 import 'sync_activity.dart';
@@ -37,6 +40,11 @@ const rootCheckMessage = 'Checking folder after update…';
 Future<void> syncWorker(Map<String, Object?> initial) async {
   final output = initial['output'] as SendPort;
   final input = ReceivePort();
+  // Android's phone folders (spec #52): the root filesystem maps Music,
+  // Videos and Documents into shared storage.
+  final phone = PhoneFolderLayout.active = PhoneFolderLayout.fromJson(
+    initial['phoneFolders'],
+  );
   final native = platformAdapters().rootFilesystem(
     initial['nativeLibrary'] as String?,
   );
@@ -84,6 +92,16 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
         } on Object {
           settled = manifest.setting('staging') ?? staging;
         }
+      }
+      // The one-time move of an existing install's private Music, Videos
+      // and Documents into the phone's folders, before anything syncs
+      // (spec #52 Moving an Existing Install). Resumes after a crash.
+      if (phone != null &&
+          !phone.paused &&
+          !runPhoneFolderMove(manifest, native, rootPath, phone, output.send)) {
+        // Unfinished: the private copies are still there, so the phone
+        // folders stay paused (nothing is inferred from a half-moved folder).
+        (native as PhoneFolderRouting).setPaused(true);
       }
       tree = RootTree(Directory(root), Directory(settled), native);
       refusal = policy.refuseRoot(rootPath, fd: tree.fd);
@@ -191,6 +209,45 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
     await loop.run(input);
   } finally {
     renewal?.stop();
+  }
+}
+
+/// Runs or resumes the one-time move of the private Music, Videos and
+/// Documents into the phone's folders (spec #52), at start or when All files
+/// access arrives while the app runs. False when it could not finish: the
+/// private copies stay, the caller keeps the folders paused, and the move
+/// resumes at the next start or grant.
+bool runPhoneFolderMove(
+  Manifest manifest,
+  RootFilesystem native,
+  String privateRoot,
+  PhoneFolderLayout layout,
+  void Function(Object?) send,
+) {
+  final move = PhoneFolderMove(
+    manifest,
+    native,
+    privateRoot: privateRoot,
+    layout: layout,
+    onProgress: (message) => send({'event': 'checking', 'message': message}),
+  );
+  try {
+    move.run();
+    send({'event': 'phoneFolders', 'problem': null});
+    return true;
+  } on FileSystemException catch (error) {
+    send({
+      'event': 'phoneFolders',
+      'problem':
+          "Music, Videos and Documents could not be moved to your phone's "
+          'folders yet (${error.message}). They are paused; nothing was '
+          'deleted, and the move continues at the next start.',
+    });
+    return false;
+  } finally {
+    if (move.placed.isNotEmpty) {
+      send({'event': 'mediaScan', 'paths': move.placed});
+    }
   }
 }
 
@@ -590,6 +647,34 @@ class WorkerLoop {
   /// Whether the last pass threw (it is then never treated as quiet).
   bool _lastPassFailed = false;
 
+  /// A pause change of the phone folders waiting for the pass to end.
+  bool? _phonePaused;
+
+  /// Applies [_phonePaused]. Access back: the watcher starts again over the
+  /// phone folders and one full verification follows; the top-folder rules
+  /// (#150 / #163) decide about a folder that changed meanwhile.
+  Future<void> _applyPhoneFolders() async {
+    final paused = _phonePaused;
+    final routing = engine.tree.phoneFolders;
+    _phonePaused = null;
+    if (paused == null || routing == null || routing.paused == paused) return;
+    // Access arrived: the private folders move first (the normal update
+    // flow grants access while the app runs); unfinished, they stay paused.
+    if (!paused &&
+        !runPhoneFolderMove(
+          engine.manifest,
+          engine.tree.native,
+          engine.tree.root.path,
+          routing.layout,
+          send,
+        )) {
+      return;
+    }
+    routing.setPaused(paused);
+    await engine.restartWatchingAfterPhoneFolders();
+    if (!routing.paused) engine.requestFullVerification();
+  }
+
   Future<void> _pass() async {
     _deadline?.cancel();
     _inPass = true;
@@ -618,6 +703,7 @@ class WorkerLoop {
     } finally {
       _inPass = false;
     }
+    await _applyPhoneFolders();
     // A pause handled during the pass leaves its message to the paused scan.
     if (_paused) {
       _passWanted = true;
@@ -708,6 +794,10 @@ class WorkerLoop {
   /// readiness changed. Every command is answered ([force]), so the UI sees
   /// each outcome even when it repeats the previous one.
   Future<void> emit({bool force = false}) async {
+    // The media library is told exactly which phone paths changed (spec
+    // #52, AC0: path writes are not indexed by themselves).
+    final scans = engine.tree.phoneFolders?.drainMediaScans() ?? const [];
+    if (scans.isNotEmpty) send({'event': 'mediaScan', 'paths': scans});
     final entries = <Map<String, Object?>>[];
     for (final entry in engine.manifest.entries.values) {
       entries.add(await projectEntry(engine, entry));
@@ -1101,6 +1191,16 @@ class WorkerLoop {
             ));
             schedule.requestNow();
             engine.requestFullVerification();
+            _passWanted = true;
+          }
+        case 'phoneFolders':
+          // All files access granted or lost while the app runs (spec #52),
+          // applied between passes only: a pass keeps the state it began
+          // with (commands also run between the paths of a pass).
+          if (engine.tree.phoneFolders != null) {
+            _phonePaused = command['paused'] == true;
+            if (!_inPass) await _applyPhoneFolders();
+            schedule.requestNow();
             _passWanted = true;
           }
         case 'network':

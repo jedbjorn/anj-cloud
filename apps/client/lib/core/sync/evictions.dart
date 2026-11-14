@@ -102,6 +102,7 @@ class Evictions {
         in manifest.operations.values
             .where((o) => o.kind == 'evict')
             .toList()) {
+      if (tree.phonePaused(path: op.path, staged: op.staged)) continue;
       final entry = manifest.entries[op.path];
       if (entry == null) {
         continue;
