@@ -193,6 +193,13 @@ in `<files>/anj-cloud` behind the documents provider and "Apps with access".
   looked up (casefolded storage reports the stored spelling); the volume is never listed.
   The folder is parked in the staging folder (`anj-staging/.anj-top-<name>`) and renamed back
   from there, each step a no-replace rename; one left parked by a crash is finished first.
+- **Files that start on the phone stay on the phone (decision #203).** The first time sync
+  records a phone-folder file with no cloud version and no choice of its own (there when
+  mapping starts, added by another app, over USB or in the Files app), it gets its own
+  **Keep on this device** choice (`SyncEngine._keepPhoneOrigin`); files the move places get
+  it too. It uploads and is never released automatically; Cloud-only frees it when the user
+  chooses. Cloud files follow their folder, so a Cloud-only folder (Android's first-sync
+  default) does not download them.
 - **Media library.** Writes by path stay invisible to other apps until scanned (AC0), so
   after each install, rename or removal in a phone folder the app asks the media scanner
   for exactly those paths (`mediaScan` worker event, `MediaScannerConnection.scanFile`).

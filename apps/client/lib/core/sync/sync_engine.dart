@@ -1086,6 +1086,24 @@ class SyncEngine {
       inPhoneFolder(path);
   bool _phonePausedThisPass = false;
 
+  /// A file that starts on the phone stays on the phone (spec #52, decision
+  /// #203): the first time sync records a phone-folder file with no cloud
+  /// version and no choice of its own, it gets its own Keep on this device
+  /// choice, whatever its folder's. It uploads and is never released
+  /// automatically; Cloud-only frees it when the user chooses. Files that
+  /// come from the cloud already have a version and follow their folder.
+  void _keepPhoneOrigin(Entry entry, LocalItem item) {
+    if (item.kind != ItemKind.file ||
+        entry.kind != ItemKind.file ||
+        entry.etag != null ||
+        entry.override != null ||
+        tree.phoneFolders == null ||
+        !inPhoneFolder(item.path)) {
+      return;
+    }
+    entry.override = Retention.local;
+  }
+
   /// Android's `.nomedia` marker and `.thumbnails` cache in a phone folder
   /// (spec #52 Folder Mapping): ignored unless the cloud already has that
   /// item (a row with a version), so sync never creates them in the cloud.
@@ -4613,6 +4631,7 @@ class SyncEngine {
         item.path,
         () => Entry(item.path, item.kind),
       );
+      _keepPhoneOrigin(entry, item);
       if (entry.kind != item.kind) {
         conflict(entry, 'Local item type changed; review both versions.');
         continue;

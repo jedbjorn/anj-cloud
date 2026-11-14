@@ -491,13 +491,17 @@ class PhoneFolderMove {
         if (p.posix.basename(from) != p.posix.basename(to)) {
           moved.cloudName = old.cloudName ?? name;
         }
+        // Placed on the phone by the move: it stays there (decision #203).
+        if (moved.kind == ItemKind.file) moved.override ??= Retention.local;
         manifest.entries.remove(from);
         manifest.entries[to] = moved;
       } else if (p.posix.basename(to) != name) {
-        manifest.entries[to] = Entry(
-          to,
-          journal?['folder'] == true ? ItemKind.directory : ItemKind.file,
-        )..cloudName = name;
+        final folder = journal?['folder'] == true;
+        manifest.entries[to] =
+            Entry(to, folder ? ItemKind.directory : ItemKind.file)
+              ..cloudName = name
+              // Placed on the phone by the move: it stays there (#203).
+              ..override = folder ? null : Retention.local;
       }
     }
     for (final op in manifest.operations.values.toList()) {

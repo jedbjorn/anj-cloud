@@ -12,6 +12,7 @@ import 'package:anj_cloud/core/ports/phone_folders.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/cloud_names.dart';
+import 'package:anj_cloud/core/sync/first_sync.dart';
 import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/sync/phone_folder_move.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
@@ -536,6 +537,42 @@ void main() {
       containsAll(['Music/Album/a.mp3', 'Videos/v.mp4', 'Documents/d.txt']),
     );
     expect(store.entries.values.where((e) => e.restoring), isEmpty);
+  });
+
+  test('#203: under a Cloud-only Music a phone file uploads and stays, a '
+      'cloud file is not downloaded, and freeing the phone file explicitly '
+      'still works', () async {
+    // Android's first-sync default: nothing ticked, so Music is Cloud-only.
+    applyFirstSyncChoice(store, ['Documents', 'Music', 'Videos'], {});
+    write(phone('Music/present.mp3'), 'on the phone at mapping');
+    cloud.put('Music/cloud.mp3', 'only in the cloud');
+    start();
+    await passes(4);
+    write(phone('Music/added later.mp3'), 'added by another app');
+    await passes(4);
+    for (final name in ['present.mp3', 'added later.mp3']) {
+      expect(cloud.files.keys, contains('Music/$name'), reason: name);
+      expect(exists('$base/Music/$name'), isTrue, reason: name);
+      expect(store.entries['Music/$name']?.override, Retention.local);
+      expect(engine.retention('Music/$name'), Retention.local);
+    }
+    expect(exists('$base/Music/cloud.mp3'), isFalse);
+    expect(cloud.completedDownloads, 0);
+    // The user frees it: Cloud-only releases it like any file.
+    engine.setRetention('Music/present.mp3', Retention.cloud);
+    await passes(4);
+    expect(exists('$base/Music/present.mp3'), isFalse);
+    expect(
+      utf8.decode(cloud.files['Music/present.mp3']!),
+      'on the phone at mapping',
+    );
+    expect(exists('$base/Music/added later.mp3'), isTrue);
+    await passes(2);
+    expect(
+      exists('$base/Music/present.mp3'),
+      isFalse,
+      reason: 'not kept again',
+    );
   });
 
   group('AC3 existing phone contents', () {

@@ -77,7 +77,8 @@ access** for AnJ Cloud: the app explains it once and **Allow** opens the system 
 folders are paused, never deleted, and the home screen says so with an **Allow** button; everything else keeps
 syncing. An existing install moves its Music, Videos and Documents into the phone's folders on the first start
 with access, without downloading them again. Names the phone cannot hold, such as `Why?.mp3`, appear there with
-lookalike characters (`Why？.mp3`) and keep their names everywhere else. Moving a file to the phone's trash
+lookalike characters (`Why？.mp3`) and keep their names everywhere else. A file that starts on the phone stays on the phone: it uploads and keeps its own **Keep on this device**
+choice, even in a folder that is Cloud-only, until you choose Cloud-only for it. Moving a file to the phone's trash
 deletes it in AnJ Cloud too (it lands in the household trash). Files over the server's upload limit stay on the
 phone, marked "Too large to upload yet". Everything else in AnJ Cloud stays private to the app: other apps reach
 it only through the folders you approve in **Apps with access**, while any app with media or file access can use

@@ -154,6 +154,9 @@ def main():
     parser.add_argument("--phase", choices=("phone", "move"), required=True)
     parser.add_argument("--only", default="ac3,ac2,case,ac6,ac5",
                         help="phase phone: the rows to run, comma-separated (default all)")
+    parser.add_argument("--first-sync", choices=("keep", "default"), default="keep",
+                        help="phase phone: tick everything on the first-sync screen (keep), or "
+                             "leave Android's default (Music and Videos Cloud-only; AC3, #203)")
     args = parser.parse_args()
     only = set(args.only.split(","))
     if not args.project.startswith("anj-cloud-review-"):
@@ -255,7 +258,7 @@ def main():
         time.sleep(2)
         return u.screen_text()
 
-    def pair(apk, grant=True):
+    def pair(apk, grant=True, tick=True):
         u.adb("reverse", f"tcp:{args.port}", f"tcp:{args.port}")
         u.adb("install", "-r", "-t", str(apk), timeout=300)
         u.adb("shell", "pm", "grant", PKG, "android.permission.POST_NOTIFICATIONS", check=False)
@@ -283,9 +286,9 @@ def main():
                 break
             u.tap(r"^Try again$", timeout=10)
             time.sleep(8)
-        # Keep everything on this device (the user's choice on this screen; spec #52 Open
-        # question: Android's default leaves the folders Cloud-only).
-        for _ in range(10):
+        # Keep everything on this device (the user's choice on this screen), or leave
+        # Android's default, every folder Cloud-only (AC3 under decision #203).
+        for _ in range(10 if tick else 0):
             boxes = [n for n in u.nodes() if "CheckBox" in n["class"] and not n["checked"]
                      and len(n["bounds"]) == 4 and n["bounds"][3] < 2100]
             if boxes:
@@ -376,9 +379,13 @@ def main():
                 phone.push(b"the phone's version\n", diff)
                 put(same, media["song.mp3"])
                 put(diff, b"the cloud's version\n")
+                cloud_only = f"Music/{run}/ac3-cloud-only.mp3"
+                put(cloud_only, media["live.mp3"])
                 same_etag = etag(same)
                 before = {p: phone.sha(p) for p in (unique, same, diff)}
-                invite = pair(u.APKS / "app.apk")
+                defaults = args.first_sync == "default"
+                invite = pair(u.APKS / "app.apk", tick=not defaults)
+                facts["first_sync"] = args.first_sync
                 check("AC3: the unique phone file is uploaded with the same bytes",
                        wait(lambda: server_sha(unique) == sha(media["other.mp3"])) is True)
                 time.sleep(20)
@@ -400,6 +407,27 @@ def main():
                 server = server_names("")
                 check("AC3: no conflict copy was made for the identical file",
                        not [n for n in server if "ac3-same" in n and n != same], server=server)
+                if defaults:
+                    # Decision #203: phone files stay on the phone under a Cloud-only folder;
+                    # cloud files follow the folder.
+                    for _ in range(2):
+                        poke()
+                        time.sleep(30)
+
+                    def own_choice(path):
+                        body = u.run_as("sqlite3", "files/anj-profile/default/manifest.sqlite",
+                                        f"\"select body from entries where path='{path}'\"").strip()
+                        try:
+                            return json.loads(body).get("override")
+                        except ValueError:
+                            return None
+                    choices = {p: own_choice(p) for p in before}
+                    check("AC3 (#203): after two more passes every phone-origin file is still on the "
+                          "phone with its own Keep on this device choice",
+                          {p: phone.sha(p) for p in before} == before
+                          and all(c == "local" for c in choices.values()), choices=choices)
+                    check("AC3 (#203): the cloud's own file in the Cloud-only folder was not downloaded",
+                          not phone.exists(cloud_only) and server_sha(cloud_only) == sha(media["live.mp3"]))
 
             if invite is None:
                 invite = pair(u.APKS / "app.apk")
@@ -574,7 +602,8 @@ def main():
                      f"Documents/{run}/notes.txt": b"newer, lower case\n",
                      f"Music/{run}/play.mp3": media["song.mp3"],
                      f"Videos/{run}/clip.mp4": media["clip.mp4"],
-                     f"Documents/{run}/edit.txt": b"before the edit\n"}
+                     f"Documents/{run}/edit.txt": b"before the edit\n",
+                     f"Documents/{run}/clash.txt": b"the cloud's clash.txt\n"}
             phase_start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             for path, data in files.items():
                 put(path, data)
@@ -599,11 +628,18 @@ def main():
             time.sleep(3)
             edited = b"the unsynced local edit\n"
             u.run_as("sh", "-c", f"'printf \"the unsynced local edit\\n\" > files/anj-cloud/Documents/{run}/edit.txt'")
+            clash_edit = b"the unsynced clash edit\n"
+            u.run_as("sh", "-c", f"'printf \"the unsynced clash edit\\n\" > files/anj-cloud/Documents/{run}/clash.txt'")
             time.sleep(10)
             check("AC4: main: the edit is unsynced (sync paused)",
                    server_sha(f"Documents/{run}/edit.txt") == sha(b"before the edit\n"))
             private_before = {p: u.run_as("sha256sum", f"'files/anj-cloud/{p}'").split(" ")[0] for p in files}
             server_before = {p: etag(p) for p in files}
+            # The phone already holds other bytes where the unsynced clash edit goes: the move
+            # keeps both (a conflict copy), never overwriting the phone's file.
+            clash = f"Documents/{run}/clash.txt"
+            phone_clash = b"the phone's own clash.txt\n"
+            phone.push(phone_clash, clash)
             since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             # The update, as a user meets it: no access yet, the explanation, Allow, the
             # grant in Android's settings, back to the app (which keeps running).
@@ -639,11 +675,16 @@ def main():
             # pair the older keeps its name.
             phone_paths[f"Music/{run}/Where Is My Mind?.mp3"] = f"Music/{run}/Where Is My Mind？.mp3"
             phone_paths[f"Documents/{run}/notes.txt"] = f"Documents/{run}/notes (2).txt"
-            hashes = {p: phone.sha(phone_paths[p]) for p in files}
+            hashes = {p: phone.sha(phone_paths[p]) for p in files if p != clash}
             check("AC4: every file is in the phone folders exactly once, by hash",
-                   all(hashes[p] == private_before[p] for p in files)
+                   all(hashes[p] == private_before[p] for p in hashes)
                    and phone.sh("ls", f"'{SD}/Music/{run}/Album'").count("song") == len(songs),
-                   mismatched=[p for p in files if hashes[p] != private_before[p]])
+                   mismatched=[p for p in hashes if hashes[p] != private_before[p]])
+            copies = [n for n in phone.sh("ls", f"'{SD}/Documents/{run}'").split() if n.startswith("clash.txt.conflict-")]
+            check("AC4: the phone's own clash.txt is untouched and the unsynced edit is kept beside it "
+                  "as exactly one conflict copy",
+                  phone.sha(clash) == sha(phone_clash) and len(copies) == 1
+                  and phone.sha(f"Documents/{run}/{copies[0]}") == sha(clash_edit), copies=copies)
             check("finding 2: the grant while the app ran moved the folders (no restart needed "
                   "for it; this run also killed and restarted it mid-move)",
                   facts["grant"]["app_kept_running"], **facts["grant"])
@@ -660,7 +701,12 @@ def main():
             check("AC4: the unsynced edit is uploaded afterwards",
                    wait(lambda: server_sha(f"Documents/{run}/edit.txt") == sha(edited), timeout=180) is True)
             time.sleep(20)
-            unchanged = [p for p in files if not p.endswith("edit.txt")]
+            unchanged = [p for p in files if not p.endswith("edit.txt") and p != clash]
+            check("AC4: the conflict copy reaches the cloud; the cloud's clash.txt keeps its bytes",
+                  wait(lambda: any(n.startswith(f"Documents/{run}/clash.txt.conflict-")
+                                   and server_sha(n) == sha(clash_edit) for n in server_names("")),
+                       timeout=180) is True
+                  and server_sha(clash) == sha(b"the cloud's clash.txt\n"))
             check("finding 3: the renamed and case-clashed files keep their cloud names and versions; "
                   "no cloud copy under a phone name",
                   all(etag(p) == server_before[p] for p in unchanged)
