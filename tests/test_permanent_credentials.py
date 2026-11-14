@@ -153,6 +153,20 @@ class OperatorStack:
         return result.stdout
 
 
+def assert_strict_leaf(test, path, issuer_path):
+    """The leaf names its own key and its issuer's, and passes X509_STRICT verification (which
+    Python 3.13+ `ssl.create_default_context`, and so the gateway, applies)."""
+    leaf = x509.load_pem_x509_certificate(path.read_bytes())
+    issuer = x509.load_pem_x509_certificate(issuer_path.read_bytes())
+    test.assertEqual(x509.SubjectKeyIdentifier.from_public_key(leaf.public_key()),
+                     leaf.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value)
+    test.assertEqual(issuer.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest,
+                     leaf.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value.key_identifier)
+    verified = subprocess.run(["openssl", "verify", "-x509_strict", "-CAfile", str(issuer_path), str(path)],
+                              capture_output=True, text=True, timeout=60, check=False)
+    test.assertEqual(0, verified.returncode, verified.stdout + verified.stderr)
+
+
 def operator_with_issuer(directory, authority):
     operator = Operator(OperatorStack(directory))
     dev.private_directory(operator.directory)
@@ -442,6 +456,28 @@ class OperatorReissueTests(unittest.TestCase):
         self.operator.sign(csr, server, "server", "serverAuth", days=364)
         bounded = x509.load_pem_x509_certificate(server.read_bytes())
         self.assertLess(bounded.not_valid_after_utc, NOW + timedelta(days=365))
+        for issued in (target, server):
+            assert_strict_leaf(self, issued, self.operator.directory / "issuer.crt")
+
+    def test_trust_issuer_and_server_leaf_carry_key_identifiers(self):
+        # SC-213: OpenSSL 4 adds no key identifiers unless asked; the issuer and both leaves must
+        # carry them whichever OpenSSL the operator host runs.
+        with tempfile.TemporaryDirectory() as directory:
+            stack = OperatorStack(directory)
+            stack.origin = "https://localhost"
+            operator = Operator(stack)
+            operator.init_trust()
+            issuer_path = operator.directory / "issuer.crt"
+            issuer = x509.load_pem_x509_certificate(issuer_path.read_bytes())
+            subject_key = issuer.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+            self.assertEqual(x509.SubjectKeyIdentifier.from_public_key(issuer.public_key()), subject_key)
+            self.assertEqual(subject_key.digest, issuer.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value.key_identifier)
+            assert_strict_leaf(self, operator.directory / "server.crt", issuer_path)
+            device = Device()
+            csr = operator.directory / "device.csr"
+            csr.write_text(device.csr)
+            operator.sign(csr, operator.directory / "device.crt", "00000000-0000-0000-0000-000000000001")
+            assert_strict_leaf(self, operator.directory / "device.crt", issuer_path)
 
     def test_reissue_signs_same_key_and_identity_to_issuer_expiry_and_journals_intent(self):
         device, identity, old = self.short_device()

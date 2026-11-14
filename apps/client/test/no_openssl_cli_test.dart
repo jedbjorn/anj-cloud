@@ -190,7 +190,13 @@ void main() {
         '-c',
         r'/usr/bin/openssl version; openssl version; "$ANJ_TEST_OPENSSL" version',
       ]);
-      expect(probe.stdout, contains('OpenSSL 3'), reason: '${probe.stderr}');
+      // Exactly one version line, from the real binary: OpenSSL 3 or later
+      // (the same rule as test_platform.dart; Halo runs OpenSSL 4).
+      final versions = '${probe.stdout}'.trim().split('\n');
+      expect(versions, hasLength(1), reason: '${probe.stdout}${probe.stderr}');
+      final major = RegExp(r'^OpenSSL (\d+)\.').firstMatch(versions.single);
+      expect(major, isNotNull, reason: '${probe.stdout}${probe.stderr}');
+      expect(int.parse(major!.group(1)!), greaterThanOrEqualTo(3));
       expect(marker.readAsLinesSync(), ['version', 'version']);
       marker.deleteSync();
 

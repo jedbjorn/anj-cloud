@@ -93,7 +93,10 @@ class Operator:
                 self.stack.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
                                 "-noenc", *validity, "-subj", "/CN=" + profile["issuer_cn"], "-keyout", str(key),
                                 "-out", str(issuer), "-addext", "basicConstraints=critical,CA:TRUE,pathlen:0",
-                                "-addext", "keyUsage=critical,keyCertSign,cRLSign"])
+                                "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                                # Explicit key identifiers: OpenSSL 3 added them itself, OpenSSL 4 only
+                                # through the host's openssl.cnf (SC-213).
+                                "-addext", "subjectKeyIdentifier=hash", "-addext", "authorityKeyIdentifier=keyid:always"])
             if x509.load_pem_x509_certificate(issuer.read_bytes()).not_valid_after_utc <= datetime.now(timezone.utc):
                 raise RuntimeError("Issuer expired; explicit trust replacement and re-pairing required")
             server_key = self.directory / "server.key"
@@ -119,8 +122,11 @@ class Operator:
         if end <= datetime.now(timezone.utc):
             raise RuntimeError("Issuer expired; issuer rollover is required before signing")
         extension = self.directory / "leaf.ext"
+        # Key identifiers are set here: OpenSSL 4 adds none to an `x509 -req` given -extfile, and a
+        # leaf without an Authority Key Identifier fails X509_STRICT verification (SC-213).
         extension.write_text("[leaf]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n"
                              + "extendedKeyUsage=" + usage + "\n"
+                             + "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n"
                              + ("subjectAltName=" + ",".join(self.profile["server_san"]) + "\n" if usage == "serverAuth" else ""))
         extension.chmod(0o600)
         self.stack.run(["openssl", "x509", "-req", "-in", str(csr), "-CA", str(self.directory / "issuer.crt"),
