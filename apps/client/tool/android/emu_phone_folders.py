@@ -539,7 +539,7 @@ def main():
                      f"Music/{run}/play.mp3": media["song.mp3"],
                      f"Videos/{run}/clip.mp4": media["clip.mp4"],
                      f"Documents/{run}/edit.txt": b"before the edit\n"}
-            phase_start = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+            phase_start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             for path, data in files.items():
                 put(path, data)
             invite = pair(u.APKS / "main.apk", grant=False)
@@ -567,7 +567,7 @@ def main():
             check("AC4: main: the edit is unsynced (sync paused)",
                    server_sha(f"Documents/{run}/edit.txt") == sha(b"before the edit\n"))
             private_before = {p: u.run_as("sha256sum", f"files/anj-cloud/{p}").split(" ")[0] for p in files}
-            since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             # The update, with access granted, killed mid-move.
             u.adb("install", "-r", "-t", str(u.APKS / "app.apk"), timeout=300)
             u.adb("shell", "appops", "set", PKG, "MANAGE_EXTERNAL_STORAGE", "allow")
@@ -592,10 +592,16 @@ def main():
                    all(hashes[p] == private_before[p] for p in files)
                    and phone.sh("ls", f"'{SD}/Music/{run}/Album'").count("song") == len(songs),
                    mismatched=[p for p in files if hashes[p] != private_before[p]])
-            notice = u.find(r"now in your phone's folders", timeout=60)
-            check("AC4: the status line says once that the folders moved", notice is not None)
+            def notice_owed():
+                return u.run_as("sqlite3", "files/anj-profile/default/manifest.sqlite",
+                                "\"select value from settings where key='phoneFolderMoveNoticeV1'\"").strip()
+            owed = notice_owed()
             u.tap(r"AnJ Cloud menu|Show menu", timeout=30)
             u.tap(r"^Resume sync$")
+            seen = u.find(r"now in your phone's folders", timeout=20) is not None
+            check("AC4: the status line says once, on the first pass after the move, that the folders moved",
+                  owed == "1" and wait(lambda: notice_owed() == "0", timeout=60) is True,
+                  owed_before=owed, shown_after=notice_owed(), caught_on_screen=seen)
             check("AC4: the unsynced edit is uploaded afterwards",
                    wait(lambda: server_sha(f"Documents/{run}/edit.txt") == sha(edited), timeout=180) is True)
             time.sleep(20)
@@ -605,12 +611,22 @@ def main():
             (u.OUT / "gateway-whole-phase.txt").write_text(control)
 
             def gets(text):
-                return [line for line in text.splitlines() if re.search(r"\bGET\b", line)
-                        and re.search(r"song\d\d\.wav|play\.mp3|clip\.mp4|edit\.txt", line)]
-            check("AC4: the gateway log names file downloads (control: main's first sync)",
-                   bool(gets(control)), control=gets(control)[:3])
-            check("AC4: no re-download: the gateway served none of the moved files after the update",
-                   not gets(log), downloads=gets(log)[:5])
+                """File downloads in the gateway's request log: GETs on the DAV read route of at
+                least 1 MiB (the log names no paths; the fixture songs are 4 MiB each)."""
+                found = []
+                for line in text.splitlines():
+                    try:
+                        record = json.loads(line.split("|", 1)[-1].strip())
+                    except ValueError:
+                        continue
+                    if record.get("route") == "dav-read" and record.get("method") == "GET" \
+                            and record.get("bytes", 0) >= MIB:
+                        found.append(f"{record.get('time')} {record.get('status')} {record.get('bytes')}")
+                return found
+            check("AC4: the gateway log shows main's first sync downloading the songs (control)",
+                  len(gets(control)) >= len(songs), control=len(gets(control)))
+            check("AC4: no re-download: no file download at all after the update",
+                  not gets(log), downloads=gets(log)[:5])
             staged = u.run_as("sh", "-c", "'ls files/.anj-cloud-*/ files/anj-profile/default/staging/ 2>/dev/null'")
             check("AC4: the opened working copy is kept", "play.mp3" in staged, staging=staged[:400])
             log = u.adb("logcat", "-d", check=False)
