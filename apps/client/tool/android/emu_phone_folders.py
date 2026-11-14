@@ -277,6 +277,12 @@ def main():
         u.tap(r"^Pair$")
         u.step("paired by code: the first-sync screen",
                u.find(r"Choose what stays on this device", timeout=120) is not None)
+        # A freshly started stack can fail the first listing: the screen offers Try again.
+        for _ in range(5):
+            if u.find(r"Could not list your folders", timeout=5) is None:
+                break
+            u.tap(r"^Try again$", timeout=10)
+            time.sleep(8)
         # Keep everything on this device (the user's choice on this screen; spec #52 Open
         # question: Android's default leaves the folders Cloud-only).
         for _ in range(10):
@@ -698,7 +704,9 @@ def main():
                     phone.sh("mv", f"'{SD}/.f27-case'", f"'{SD}/{name}'")
             phone.sh("rm", "-rf", f"'{SD}/Music/{run}'", f"'{SD}/Movies/{run}'", f"'{SD}/Documents/{run}'")
         finally:
-            devices = op("devices") if invite is not None else []
+            # Every device of this account on this lane's own stack: also one a failed
+            # pairing left enrolled.
+            devices = op("devices")
             for device in devices if isinstance(devices, list) else []:
                 if device.get("uid") == UID and device.get("state") == "active":
                     op("revoke", device["id"])
