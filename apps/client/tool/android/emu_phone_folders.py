@@ -522,7 +522,7 @@ def main():
                       set(ours) <= set(after), missing=sorted(set(ours) - set(after)))
                 check("finding 1: and nothing on the phone is lost",
                       phone.sha(f"Movies/{run}/case.mp4") == sha(media["clip.mp4"])
-                      and phone.sha(f"Music/{run}/ac3-same.mp3") == sha(media["song.mp3"]))
+                      and phone.sha(f"Music/{run}/Live： 1999？.mp3") == sha(media["live.mp3"]))
             # --- AC6: a large phone file -------------------------------------------------------
             if "ac6" in only:
                 big = f"Movies/{run}/big.mkv"
