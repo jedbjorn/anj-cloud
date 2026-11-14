@@ -6552,7 +6552,11 @@ class SyncEngine {
     tree.native.renameExclusive(tree.fd, path, moved, item.identity!);
     if (spelled != name) {
       // Until a listing names it, its cloud name is the one recorded here.
-      manifest.entries[moved] = Entry(moved, entry.kind)..cloudName = name;
+      // The item keeps its storage choice: a phone file's own Keep on this
+      // device (#203) is not lost to the new spelling (#202).
+      manifest.entries[moved] = Entry(moved, entry.kind)
+        ..cloudName = name
+        ..override = entry.override;
       manifest.save();
     }
     markDirty(path, descendants: true);

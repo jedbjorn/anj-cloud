@@ -570,6 +570,39 @@ void main() {
     expect(store.entries['Music/new.mp3']?.override, isNot(Retention.local));
   });
 
+  for (final ownKeep in [true, false]) {
+    test('recheck: Rename to a name the phone spells differently keeps the '
+        "row's storage choice (${ownKeep ? 'own Keep: stays' : 'no own '
+                  'choice: follows the Cloud-only folder'})", () async {
+      applyFirstSyncChoice(store, ['Documents', 'Music', 'Videos'], {});
+      start();
+      // A name the cloud refuses: never uploaded, offered for Rename.
+      write(phone('Music/.htaccess'), 'live');
+      await passes(2);
+      expect(isCantSyncName(store.entries['Music/.htaccess']!.status), isTrue);
+      expect(store.entries['Music/.htaccess']!.override, Retention.local);
+      if (!ownKeep) {
+        store.entries['Music/.htaccess']!.override = null;
+        store.save();
+      }
+      final moved = await engine.renameLocal(
+        'Music/.htaccess',
+        'Live: 1999?.mp3',
+      );
+      expect(moved, 'Music/Live： 1999？.mp3');
+      await passes(6);
+      expect(utf8.decode(cloud.files['Music/Live: 1999?.mp3']!), 'live');
+      expect(cloud.files.keys.where((k) => k.contains('？')), isEmpty);
+      if (ownKeep) {
+        expect(phone('Music/Live： 1999？.mp3').readAsStringSync(), 'live');
+        expect(store.entries[moved]?.override, Retention.local);
+      } else {
+        expect(exists('$base/Music/Live： 1999？.mp3'), isFalse);
+        expect(store.entries[moved]?.override, isNull);
+      }
+    });
+  }
+
   test('#203: under a Cloud-only Music a phone file uploads and stays, a '
       'cloud file is not downloaded, and freeing the phone file explicitly '
       'still works', () async {
