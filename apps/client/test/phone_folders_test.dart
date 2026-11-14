@@ -10,6 +10,7 @@ import 'dart:io';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/ports/phone_folders.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
+import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/cloud_names.dart';
 import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/sync/phone_folder_move.dart';
@@ -73,6 +74,43 @@ void main() {
   bool exists(String path) =>
       FileSystemEntity.typeSync(path, followLinks: false) !=
       FileSystemEntityType.notFound;
+
+  /// Every shared-storage access of the routing boundary (review round 2),
+  /// checked against spec #52: nothing outside the three phone folders and
+  /// the staging folder, never a listing of the volume.
+  List<(String, String)> spy(MappedRootFs fs) {
+    final seen = <(String, String)>[];
+    fs.debugSharedAccess = (operation, path) => seen.add((operation, path));
+    return seen;
+  }
+
+  void expectInsidePhoneFolders(List<(String, String)> seen) {
+    final stagingPath = staging.substring(base.length + 1);
+    expect(seen, isNotEmpty);
+    for (final (operation, path) in seen) {
+      final first = path.split('/').first.toLowerCase();
+      final allowed =
+          (operation == 'open' && path.isEmpty) ||
+          path == stagingPath ||
+          path.startsWith('$stagingPath/') ||
+          (path.isNotEmpty && {'music', 'movies', 'documents'}.contains(first));
+      expect(allowed, isTrue, reason: '$operation "$path"');
+    }
+  }
+
+  /// Android's casefolded shared storage on a case-sensitive host: the
+  /// stored spelling a lookup of [phone] would resolve to.
+  String? casefolded(String phone) {
+    if (Directory('$base/$phone').existsSync()) return phone;
+    for (final item in Directory(base).listSync()) {
+      final name = item.path.split('/').last;
+      if (item is Directory && name.toLowerCase() == phone.toLowerCase()) {
+        return name;
+      }
+    }
+    return null;
+  }
+
   void write(File file, String text) {
     file.parent.createSync(recursive: true);
     file.writeAsStringSync(text, flush: true);
@@ -123,10 +161,14 @@ void main() {
       'nothing outside the three phone folders is listed or touched',
       () async {
         start();
+        final seen = spy(engine.tree.native as MappedRootFs);
         write(phone('Download/other.pdf'), 'not ours');
         write(File('$base/top-level.txt'), 'not ours');
         cloud.put('Download/x.txt', 'cloud folder named Download');
+        cloud.put('Music/m.mp3', 'm');
         await passes();
+        expectInsidePhoneFolders(seen);
+        expect(seen.where((a) => a.$1 == 'list' && a.$2.isEmpty), isEmpty);
         expect(cloud.files.keys, isNot(contains('Download/other.pdf')));
         expect(cloud.files.keys, isNot(contains('top-level.txt')));
         expect(phone('Download/other.pdf').readAsStringSync(), 'not ours');
@@ -459,6 +501,9 @@ void main() {
     cloud.put('Videos/v.mp4', 'v');
     cloud.put('Documents/d.txt', 'd');
     await passes();
+    final fs = engine.tree.native as MappedRootFs
+      ..debugStoredSpelling = casefolded;
+    final seen = spy(fs);
     final downloads = cloud.completedDownloads;
     Directory('$base/Music').renameSync('$base/music');
     Directory('$base/Movies').renameSync('$base/movies');
@@ -470,11 +515,20 @@ void main() {
     expect(phone('Music/Album/a.mp3').readAsStringSync(), 'a');
     expect(phone('Movies/v.mp4').readAsStringSync(), 'v');
     expect(phone('Documents/d.txt').readAsStringSync(), 'd');
-    // Killed between the two renames: finished at the next listing.
-    Directory('$base/Music').renameSync('$base/.anj-top-Music');
+    // Killed between the two renames, parked in the staging folder: finished
+    // before the next listing.
+    Directory('$base/Music').renameSync('$staging/.anj-top-Music');
     await passes(3);
     expect(phone('Music/Album/a.mp3').readAsStringSync(), 'a');
-    expect(exists('$base/.anj-top-Music'), isFalse);
+    expect(exists('$staging/.anj-top-Music'), isFalse);
+    // Only the three folders' own names and the staging folder: never a
+    // listing of the volume, never a temporary name at its top.
+    expectInsidePhoneFolders(seen);
+    expect(seen.where((a) => a.$1 == 'list' && a.$2.isEmpty), isEmpty);
+    expect(
+      Directory(base).listSync().map((e) => e.path.split('/').last),
+      everyElement(isNot(startsWith('.anj-'))),
+    );
     expect(cloud.deletes, 0);
     expect(cloud.completedDownloads, downloads);
     expect(
@@ -683,19 +737,45 @@ void main() {
       for (final path in cloudFiles.keys) {
         expect(cloud.versions[path], before[path], reason: '$path untouched');
       }
-      // No synchronized item reached the cloud under a phone name ...
+      // No item reached the cloud under a phone name; the file the cloud never
+      // had arrives under the name it had in the old app (review round 2).
       expect(
         cloud.files.keys.where(
-          (k) =>
-              k.contains('？') && !k.contains('Already') && !k.contains('new'),
+          (k) => k.contains('？') && !k.contains('Already'),
         ),
         isEmpty,
       );
-      // ... and a file the cloud never had takes its phone name there (the
-      // reverse direction: a new local name is the new cloud name).
-      expect(utf8.decode(cloud.files['Music/new？.mp3']!), 'mine');
+      expect(utf8.decode(cloud.files['Music/new?.mp3']!), 'mine');
       expect(store.entries.values.where((e) => e.conflict != null), isEmpty);
     });
+
+    for (final withRow in [false, true]) {
+      test('review round 2: a never-synchronized old file keeps the name the '
+          'user knew in the cloud (${withRow ? 'with' : 'without'} an old '
+          'unsynced row)', () async {
+        await privateNames(
+          {'Music/kept.mp3': 'kept'},
+          localOnly: {'Music/new?.mp3': 'mine', 'Music/Live: 1999?/a.mp3': 'a'},
+        );
+        if (withRow) {
+          store.entries['Music/new?.mp3'] = Entry(
+            'Music/new?.mp3',
+            ItemKind.file,
+          );
+          store.save();
+        }
+        move().run();
+        expect(phone('Music/new？.mp3').readAsStringSync(), 'mine');
+        expect(phone('Music/Live： 1999？/a.mp3').readAsStringSync(), 'a');
+        start();
+        await passes(4);
+        expect(utf8.decode(cloud.files['Music/new?.mp3']!), 'mine');
+        expect(utf8.decode(cloud.files['Music/Live: 1999?/a.mp3']!), 'a');
+        expect(cloud.files.keys.where((k) => k.contains('？')), isEmpty);
+        expect(phone('Music/new？.mp3').readAsStringSync(), 'mine');
+        expect(cloud.deletes, 0);
+      });
+    }
 
     for (final kill in ['conflict-installed', 'recorded']) {
       test('finding 4: killed at "$kill", the move keeps exactly one '

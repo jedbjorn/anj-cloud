@@ -156,7 +156,7 @@ class PhoneFolderMove {
       for (final item in items.where((i) => i['kind'] == 'directory')) {
         final path = item['path'] as String;
         final to = plan[path]?['to'] as String?;
-        if (to != null) _rekey(path, to);
+        if (to != null) _rekey(path, to, plan[path]);
       }
       manifest.save();
       // The private top folders go, deepest first; anything left (a file no
@@ -247,10 +247,20 @@ class PhoneFolderMove {
         if (dest != null) known[path] = dest;
       }
       final placed = _placeChildren(children, known, to, baseFd);
+      final folders = {
+        for (final c in children)
+          if (c['kind'] == 'directory') c['path'] as String,
+      };
       for (final MapEntry(key: path, value: dest) in placed.entries) {
         if (dest != null) destination[path] = dest;
         if (!plan.containsKey(path)) {
-          plan[path] = {'to': dest};
+          // The name the user knew, journaled with the place: the item keeps
+          // it as its cloud name, with or without a row (review round 2).
+          plan[path] = {
+            'to': dest,
+            'name': manifest.entries[path]?.cloudName ?? p.posix.basename(path),
+            'folder': folders.contains(path),
+          };
           changed = true;
         }
       }
@@ -393,7 +403,7 @@ class PhoneFolderMove {
     placed.add('${layout.base}/$phone');
     // The phone copy is verified: its row follows it, then the private copy
     // goes.
-    _rekey(path, to);
+    _rekey(path, to, journal);
     manifest.save();
     debugStep?.call('recorded', path);
     File('$privateRoot/$path').deleteSync();
@@ -467,17 +477,28 @@ class PhoneFolderMove {
   }
 
   /// The row of private [from] (and the operations about it) now at the
-  /// phone path [to]; a new name keeps the cloud name it stands for.
-  void _rekey(String from, String to) {
+  /// phone path [to]. Under a new name the item keeps the name the user knew
+  /// ([journal] `name`) as its cloud name: an item that had no row gets one
+  /// carrying it, so a file the cloud never had still arrives there under
+  /// the name it had (`new?.mp3` on the phone as `new？.mp3`).
+  void _rekey(String from, String to, Map<String, dynamic>? journal) {
     if (from == to) return;
+    final name = journal?['name'] as String? ?? p.posix.basename(from);
     final old = manifest.entries[from];
-    if (old != null && !manifest.entries.containsKey(to)) {
-      final moved = Entry.fromJson({...old.toJson(), 'path': to});
-      if (p.posix.basename(from) != p.posix.basename(to)) {
-        moved.cloudName = old.cloudName ?? p.posix.basename(from);
+    if (!manifest.entries.containsKey(to)) {
+      if (old != null) {
+        final moved = Entry.fromJson({...old.toJson(), 'path': to});
+        if (p.posix.basename(from) != p.posix.basename(to)) {
+          moved.cloudName = old.cloudName ?? name;
+        }
+        manifest.entries.remove(from);
+        manifest.entries[to] = moved;
+      } else if (p.posix.basename(to) != name) {
+        manifest.entries[to] = Entry(
+          to,
+          journal?['folder'] == true ? ItemKind.directory : ItemKind.file,
+        )..cloudName = name;
       }
-      manifest.entries.remove(from);
-      manifest.entries[to] = moved;
     }
     for (final op in manifest.operations.values.toList()) {
       final data = Map<String, dynamic>.from(op.data);

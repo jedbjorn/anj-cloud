@@ -62,6 +62,7 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
 
   void _openShared() {
     try {
+      _touch('open', '');
       _base = openRoot(layout.base);
       final staging = Directory(layout.staging)..createSync(recursive: true);
       privateDir(layout.staging);
@@ -71,6 +72,7 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
       _shared = openRoot(layout.staging);
       // Copies an interrupted install left (decision #130 (4)); no install
       // runs before the engine starts.
+      _touch('list', _stagingBeneathBase ?? layout.staging);
       for (final item in super.scan(_shared!)) {
         final name = item['path'] as String;
         if (!name.contains('/') &&
@@ -118,11 +120,14 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
       if (top == null) return (fd, path);
       final base = _base;
       if (paused || base == null) _refusePaused(path);
-      return (base, '${_phoneOf(top)}${path.substring(top.length)}');
+      final routed = '${_phoneOf(top)}${path.substring(top.length)}';
+      _touch('path', routed);
+      return (base, routed);
     }
     if (fd == _stage && path.startsWith(sharedStagingTag)) {
       final shared = _shared;
       if (shared == null) _refusePaused(path);
+      _touch('staging', '${_stagingBeneathBase ?? layout.staging}/$path');
       return (shared, path);
     }
     return (fd, path);
@@ -196,6 +201,7 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
 
   ({List<Map<String, dynamic>> items, List<Map<String, dynamic>> watches})
   _area(Pointer<Void>? handle, String top, bool recursive) {
+    _touch('list', _phoneOf(top));
     final listed = super.watchScan(handle, _base!, _phoneOf(top), recursive);
     return (
       items: listed.items.map(_renamed).toList(),
@@ -206,61 +212,98 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
   bool _privateTop(Map<String, dynamic> item) =>
       _topOf(item['path'] as String) != null;
 
+  /// Test seam: every access this boundary makes in shared storage, as
+  /// (operation, path relative to [PhoneFolderLayout.base]); `open` of ''
+  /// is opening the volume itself. Nothing outside the three phone folders
+  /// and the staging folder may ever appear (spec #52).
+  void Function(String operation, String path)? debugSharedAccess;
+
+  void _touch(String operation, String path) =>
+      debugSharedAccess?.call(operation, path);
+
+  /// The staging folder relative to the shared volume, or null when it is
+  /// elsewhere.
+  String? get _stagingBeneathBase =>
+      layout.staging.startsWith('${layout.base}/')
+      ? layout.staging.substring(layout.base.length + 1)
+      : null;
+
+  /// Test seam: the stored spelling a lookup of the phone folder [phone]
+  /// finds (null: no such folder). On a case-sensitive host it stands in
+  /// for Android's casefolded shared storage.
+  String? Function(String phone)? debugStoredSpelling;
+
+  /// The spelling the phone folder [phone] has on disk, from a lookup of
+  /// exactly that name (casefolded shared storage resolves any case, and the
+  /// boundary reports the stored one); null when there is none. Never a
+  /// listing of the volume.
+  String? _storedSpelling(int base, String phone) {
+    _touch('lookup', phone);
+    final seam = debugStoredSpelling;
+    if (seam != null) return seam(phone);
+    try {
+      final items = super.watchScan(null, base, phone, false).items;
+      if (items.isEmpty || items.single['kind'] != 'directory') return null;
+      return items.single['stored'] as String? ?? phone;
+    } on FileSystemException {
+      return null;
+    }
+  }
+
+  bool _exists(int base, String path) {
+    _touch('lookup', path);
+    try {
+      return super.watchScan(null, base, path, false).items.isNotEmpty;
+    } on FileSystemException {
+      return false;
+    }
+  }
+
   /// A phone folder renamed in case only (Files: `Music` to `music`) is
   /// still the top folder: its name is restored before any listing, so its
   /// contents are never read as gone (#150 / #163: a top folder's rename
-  /// never propagates). Shared storage compares names case-insensitively, so
-  /// the rename goes through `.anj-top-<name>`; one left by a crash between
-  /// the two steps is finished here. A folder that cannot be renamed back is
-  /// listed and reached under its stored spelling, as the top folder.
+  /// never propagates). The other spelling comes from a lookup of the
+  /// folder's own name, never from listing the volume. Shared storage
+  /// compares names case-insensitively, so the folder is parked in the
+  /// owned staging folder (`<staging>/.anj-top-<name>`, on the same volume)
+  /// and renamed back from there, each step a no-replace rename beneath the
+  /// volume's descriptor; a folder left parked by a crash is renamed back by
+  /// the next call, before anything is listed. A folder that cannot be
+  /// renamed back is listed and reached under its stored spelling.
   void _canonicalTops() {
     final base = _base;
     if (base == null) return;
-    List<Map<String, dynamic>> children;
-    try {
-      children = super.watchScan(null, base, '', false).items;
-    } on FileSystemException {
-      return;
-    }
-    final names = {
-      for (final item in children)
-        if (item['kind'] == 'directory') item['path'] as String,
-    };
+    final staging = _stagingBeneathBase;
     for (final phone in phoneFolderNames.values) {
-      if (names.contains(phone)) {
+      final parked = staging == null ? null : '$staging/.anj-top-$phone';
+      var stored = _storedSpelling(base, phone);
+      if (stored == null && parked != null && _exists(base, parked)) {
+        // Interrupted between the two renames: finish it.
+        _rename(base, parked, phone);
+        stored = _storedSpelling(base, phone);
+      }
+      if (stored == null || stored == phone) {
         _stored.remove(phone);
         continue;
       }
-      final parked = '.anj-top-$phone';
-      final variant = names.contains(parked)
-          ? parked
-          : names
-                .where((n) => n.toLowerCase() == phone.toLowerCase())
-                .firstOrNull;
-      if (variant == null) continue; // Gone: the engine creates it again.
       try {
-        var from = variant;
-        if (from != parked) {
-          super.renameExclusive(
-            base,
-            from,
-            parked,
-            super.directoryIdentity(base, from),
-          );
-          from = parked;
+        if (parked == null) {
+          throw const FileSystemException('No staging folder on this volume');
         }
-        super.renameExclusive(
-          base,
-          from,
-          phone,
-          super.directoryIdentity(base, from),
-        );
+        _rename(base, stored, parked);
+        _rename(base, parked, phone);
         _stored.remove(phone);
         _media.add('${layout.base}/$phone');
       } on FileSystemException {
-        _stored[phone] = variant;
+        _stored[phone] = _storedSpelling(base, phone) ?? stored;
       }
     }
+  }
+
+  void _rename(int base, String from, String to) {
+    _touch('rename', from);
+    _touch('rename', to);
+    super.renameExclusive(base, from, to, super.directoryIdentity(base, from));
   }
 
   /// Phone folders that could not be renamed back: name -> stored spelling.
@@ -280,6 +323,7 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
     }
     final shared = _shared;
     if (fd == _stage && shared != null) {
+      _touch('list', _stagingBeneathBase ?? layout.staging);
       return [
         ...super.scan(fd),
         for (final item in super.scan(shared))

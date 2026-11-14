@@ -249,7 +249,11 @@ the rest of the root stays in `<files>/anj-cloud`. AC0 on the emulator
   listings merge the private root with the three phone folders (private folders of those
   names are never listed), and a rename between the private root and a phone folder is
   refused with EXDEV. Everything stays descriptor-relative and no-follow (shared storage
-  cannot hold symlinks at all). The Android watcher trusts inotify there (AC0: another
+  cannot hold symlinks at all). Only the three folders and the staging folder are ever
+  touched: a top folder renamed in case only is found by a lookup of its own name (the
+  boundary's `stored` spelling; on Android `stored_path` reads that folder's entry name in
+  its parent) and renamed back through `<staging>/.anj-top-<name>`
+  (`MappedRootFs.debugSharedAccess` lets the tests check every access). The Android watcher trusts inotify there (AC0: another
   app's changes are reported) although FUSE is otherwise a silent filesystem.
 - **Two staging folders.** A staging name chosen for a phone path carries `phone-`
   (`RootTree.stageName`, `Artifacts.reserve`, folder creation, Finish editing's renames)

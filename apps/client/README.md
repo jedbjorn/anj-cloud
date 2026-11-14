@@ -188,6 +188,11 @@ in `<files>/anj-cloud` behind the documents provider and "Apps with access".
   keeps its cloud name. Android's `.pending-…` and `.trashed-…` names are not files (a
   move to the Files app's trash syncs as a deletion); `.nomedia` and `.thumbnails` sync
   only when the cloud already has them.
+- **A top folder renamed in case only** (`Music` to `music` in the Files app) is still the
+  top folder: before any listing its name is restored. Only the three folders' own names are
+  looked up (casefolded storage reports the stored spelling); the volume is never listed.
+  The folder is parked in the staging folder (`anj-staging/.anj-top-<name>`) and renamed back
+  from there, each step a no-replace rename; one left parked by a crash is finished first.
 - **Media library.** Writes by path stay invisible to other apps until scanned (AC0), so
   after each install, rename or removal in a phone folder the app asks the media scanner
   for exactly those paths (`mediaScan` worker event, `MediaScannerConnection.scanFile`).
@@ -210,7 +215,11 @@ in `<files>/anj-cloud` behind the documents provider and "Apps with access".
   `Videos` and `Documents` into the phone folders before anything syncs
   (`PhoneFolderMove`): each file is copied through shared staging, verified by hash,
   renamed into place without replacing anything, and only then removed privately; a crash
-  or kill resumes. A phone file already at that path with the same bytes links; different
+  or kill resumes. Each item's place and the name it had are journaled once: names follow
+  the phone rule above, and every item keeps the name it had as its cloud name (a file the
+  cloud never had too: `new?.mp3` is `new？.mp3` on the phone and `new?.mp3` in the cloud). A
+  conflict copy's name is journaled before it is written. The move also runs when access is
+  granted while the app runs. A phone file already at that path with the same bytes links; different
   bytes are both kept (the cloud's conflict rule decides on the next pass). Unsynced edits
   upload afterwards; nothing is downloaded again. The status line says once "Music, Videos
   and Documents are now in your phone's folders."
