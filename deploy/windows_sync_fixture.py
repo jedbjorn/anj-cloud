@@ -86,7 +86,8 @@ def other_server(work, port):
     server and the list of request lines it received."""
     subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
                     "-keyout", str(work / "other.key"), "-out", str(work / "other-ca.crt"), "-days", "2",
-                    "-subj", "/CN=Not this stack's issuer", "-addext", "subjectAltName=IP:127.0.0.1"],
+                    "-subj", "/CN=Not this stack's issuer", "-addext", "subjectAltName=IP:127.0.0.1",
+                    "-addext", "subjectKeyIdentifier=hash", "-addext", "authorityKeyIdentifier=keyid:always"],
                    check=True, capture_output=True)
     pem = (work / "other-ca.crt").read_bytes()
     seen = []
