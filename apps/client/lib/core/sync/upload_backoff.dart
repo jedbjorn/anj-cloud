@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import '../ports/phone_folders.dart';
 import '../state/model.dart';
 import 'name_policy.dart';
 
@@ -115,7 +116,9 @@ class UploadBackoff {
       ..refused = true
       ..limit = limit
       ..confirmed = confirmed
-      ..status = tooLargeMessage(limit, guess: !confirmed);
+      ..status = PhoneFolderLayout.active != null && inPhoneFolder(path)
+          ? phoneTooLargeMessage(limit, guess: !confirmed)
+          : tooLargeMessage(limit, guess: !confirmed);
     return hold.status;
   }
 

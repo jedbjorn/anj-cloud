@@ -173,6 +173,32 @@ void main() {
     expect(cloud['cloudOnly'], isTrue);
   });
 
+  test('spec #52: the phone folders leave the provider; their approvals end '
+      'and their old ids stop resolving', () async {
+    await service.approve(g1.package!, 'Music/Album', AccessMode.read);
+    await service.approve(g1.package!, 'Private', AccessMode.write);
+    final album = id('Music/Album');
+    service.dispose();
+    service = DocumentsService(
+      host,
+      store,
+      revoker: revoker,
+      clock: () => now,
+      hidden: (path) => path == 'Music' || path.startsWith('Music/'),
+    );
+    expect(names(service.children('root', system)), [
+      'Private',
+      'Shared',
+      'cloud.txt',
+    ]);
+    expect(service.folders, isNot(contains('Music')));
+    expect(
+      () => service.resolve(album),
+      throwsA(isA<DocumentsFailure>().having((e) => e.code, 'c', 'notFound')),
+    );
+    expect(service.approvals.map((a) => a.folder), ['Private']);
+  });
+
   test('Files app navigation resolves root, folder and file ancestry', () {
     expect(service.findPath(null, 'root', system), ['root']);
     expect(service.findPath(null, id('Music/Album'), system), [

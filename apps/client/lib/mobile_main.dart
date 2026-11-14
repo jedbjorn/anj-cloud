@@ -16,6 +16,7 @@ import 'core/update/update_blocker.dart';
 import 'platform/adapters.dart';
 import 'platform/android/android_add_files.dart';
 import 'platform/android/android_package_installer.dart';
+import 'platform/android/android_phone_folders.dart';
 import 'ui/app.dart';
 
 /// App-private storage layout on Android (spec #28 Storage and Access), all
@@ -76,6 +77,8 @@ Future<void> mobileMain() async {
     profile,
     pairingOptions: androidPairing,
     defaultNetworkPolicy: 'wifi',
+    // Music, Videos and Documents in the phone's own folders (spec #52).
+    phoneFolders: const AndroidPhoneFolders(),
   );
   // Background runs, connectivity and notifications (spec #28 A4). The
   // handler is installed before the worker starts; a WorkManager run that
@@ -101,6 +104,9 @@ Future<void> mobileMain() async {
   _keepAlive.add(
     AppLifecycleListener(
       onResume: () {
+        // All files access first: coming back from its settings page
+        // resumes the phone folders with a full verification (spec #52).
+        unawaited(controller.checkPhoneFolders());
         controller.windowShown(verify: true);
         unawaited(updater.resumed());
       },

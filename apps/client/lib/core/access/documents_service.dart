@@ -89,6 +89,7 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     this.platformApps,
     DateTime Function()? clock,
     this.pruneGrace = const Duration(minutes: 5),
+    this.hidden,
   }) : clock = clock ?? DateTime.now {
     host.addListener(_projectionChanged);
     host.onLocalRename = localRenamed;
@@ -101,6 +102,13 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
   final PlatformApps? platformApps;
   final DateTime Function() clock;
   final Duration pruneGrace;
+
+  /// Library paths this provider never serves: Android's phone folders
+  /// (spec #52), which other apps reach in shared storage instead. They are
+  /// absent from every listing, their ids resolve to nothing (`notFound`),
+  /// and approvals for folders inside them are removed as moot. Their
+  /// working copies (Open) are still handed out by per-document grant.
+  final bool Function(String path)? hidden;
 
   /// Called with the document ids whose children changed.
   void Function(List<String> ids)? onChildrenChanged;
@@ -156,7 +164,7 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
           if (copy['edited'] != false) edited.add(p.basename(staged));
         }
       }
-      if (visible(entry)) shown[path] = entry;
+      if (visible(entry) && hidden?.call(path) != true) shown[path] = entry;
     }
     // The provider's own changes show at once; the projection catches up
     // at the next pass, and each overlay row ends when it agrees.
@@ -201,6 +209,20 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     _working = working;
     _edited = edited;
     _ready = host.documentsReady;
+    final moot = hidden;
+    if (moot != null) {
+      // Approvals for folders inside the phone folders are moot (spec #52):
+      // removed with their ids at once, not after the prune grace.
+      final ended = [
+        for (final approval in _approvals().toList())
+          if (approval.folder.isNotEmpty && moot(approval.folder))
+            ...store.forget(approval.folder),
+      ];
+      if (ended.isNotEmpty) {
+        _approvalCache = null;
+        unawaited(_withdraw(ended));
+      }
+    }
     if (_ready) {
       final ended = [
         ...store.prune(byPath.keys.toSet(), grace: pruneGrace),

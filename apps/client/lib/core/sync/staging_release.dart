@@ -107,6 +107,12 @@ class StagingRelease {
     for (final record in artifacts.records.toList()) {
       final intent = record.data['releasing'];
       if (intent == null) continue;
+      if (tree.phonePaused(
+        path: record.path,
+        staged: record.data['name'] as String?,
+      )) {
+        continue;
+      }
       if (busy(entryPath(record)) || busy(record.path)) continue;
       if (record.data['directoryIdentity'] !=
           tree.native.identity(tree.stageFd)) {

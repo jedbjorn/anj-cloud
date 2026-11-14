@@ -4,7 +4,14 @@
 #include <time.h>
 
 namespace {
-struct LeaseState { dev_t device; ino_t inode; long long deadline_ns; };
+// [weak]: no lease could be taken (a phone folder file in shared storage,
+// spec #52 and #108 Q15); the guard then holds only while the file keeps the
+// size and modification time it had at guard open: the weaker guard,
+// behind the app's own open-file tracking (RegisteredReleaseGuard).
+struct LeaseState {
+  dev_t device; ino_t inode; long long deadline_ns;
+  bool weak; off_t size; struct timespec mtime;
+};
 std::map<int, LeaseState> leases;
 std::mutex lease_mutex;
 volatile sig_atomic_t lease_broken = 0;
@@ -28,9 +35,13 @@ bool establish_handler() {
 }
 bool guarded(int fd) {
   auto found = leases.find(fd);
-  if (found == leases.end() || lease_broken || now_ns() > found->second.deadline_ns || fcntl(fd,F_GETLEASE) != F_WRLCK) { errno = EAGAIN; return false; }
+  if (found == leases.end() || now_ns() > found->second.deadline_ns) { errno = EAGAIN; return false; }
+  const LeaseState& held = found->second;
+  if (!held.weak && (lease_broken || fcntl(fd,F_GETLEASE) != F_WRLCK)) { errno = EAGAIN; return false; }
   struct stat s = {};
-  if (fstat(fd,&s) != 0 || s.st_dev != found->second.device || s.st_ino != found->second.inode) { errno = ESTALE; return false; }
+  if (fstat(fd,&s) != 0 || s.st_dev != held.device || s.st_ino != held.inode) { errno = ESTALE; return false; }
+  if (held.weak && (s.st_size != held.size || mtim(s).tv_sec != held.mtime.tv_sec ||
+                    mtim(s).tv_nsec != held.mtime.tv_nsec)) { errno = EAGAIN; return false; }
   return true;
 }
 bool matches_guard(int guard, int parentfd, const char* name) {
@@ -53,16 +64,23 @@ int anj_guard_open(int directory,const char* path,const char* expected,int links
     int saved=errno?errno:ESTALE;close(fd);error_number=saved;return -1;
   }
   if(leases.empty())lease_broken=0;
+  bool weak=false;
   if(lease_broken || fcntl(fd,F_SETOWN,getpid())<0 || fcntl(fd,F_SETSIG,lease_signal)<0 || fcntl(fd,F_SETLEASE,F_WRLCK)<0) {
-    int saved=errno?errno:EAGAIN;close(fd);error_number=saved;return -1;
+    int saved=errno?errno:EAGAIN;
+#if defined(ANJ_COMPAT_ANDROID)
+    // Shared storage refuses every lease (EACCES, AC0): the weaker guard.
+    weak = !lease_broken && saved==EACCES && on_shared_storage(fd);
+#endif
+    if(!weak) { close(fd);error_number=saved;return -1; }
   }
-  leases[fd]={s.st_dev,s.st_ino,now_ns()+30000000000LL};error_number=0;return fd;
+  leases[fd]={s.st_dev,s.st_ino,now_ns()+30000000000LL,weak,s.st_size,mtim(s)};error_number=0;return fd;
 }
 int anj_guard_valid(int fd) { std::lock_guard<std::mutex> lock(lease_mutex);int n=guarded(fd)?0:-1;error_number=n<0?errno:0;return n; }
 int anj_guard_close(int fd) {
   std::lock_guard<std::mutex> lock(lease_mutex);
   auto found=leases.find(fd);if(found==leases.end()){error_number=EINVAL;return -1;}
-  fcntl(fd,F_SETLEASE,F_UNLCK);leases.erase(found);return close(fd);
+  if(!found->second.weak)fcntl(fd,F_SETLEASE,F_UNLCK);
+  leases.erase(found);return close(fd);
   // Keep our nonterminating signal handler installed: late queued break signals
   // must never be delivered to SIG_DFL after the guard has closed.
 }

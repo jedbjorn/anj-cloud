@@ -604,7 +604,7 @@ class RecoveryCopies {
     String destination, {
     String? trash,
   }) {
-    final temp = artifacts.reserve(path, 'recover-temp');
+    final temp = artifacts.reserve(path, 'recover-temp', stageFor: destination);
     final tempRecord = artifacts.record(temp)!;
     final op =
         Operation(
@@ -943,6 +943,12 @@ class RecoveryCopies {
     for (final record in artifacts.records.toList()) {
       if (record.data['dismissing'] != true) continue;
       if (record.data['directoryIdentity'] != stage) continue;
+      if (tree.phonePaused(
+        path: record.path,
+        staged: record.data['name'] as String?,
+      )) {
+        continue;
+      }
       final info = _info(record.data['name'] as String);
       if (info == null) {
         _finalize(record.staged!, record);
@@ -955,6 +961,7 @@ class RecoveryCopies {
             .where((o) => o.kind == 'recover')
             .toList()) {
       final name = op.data['name'] as String;
+      if (tree.phonePaused(path: op.path, staged: name)) continue;
       final record = artifacts.record(File(op.staged!));
       final info = _info(name);
       final renamed =

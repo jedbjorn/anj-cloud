@@ -1,3 +1,5 @@
+import '../ports/phone_folders.dart';
+
 /// Logical decoded relative names, before any future wire-name transformation.
 /// An excluded directory also excludes its descendants; other dotdirectories
 /// remain normal synchronized content. This is deliberately not a glob system.
@@ -43,7 +45,27 @@ bool _isMetadataPrefixed(String name) => _metadataPrefixes.any(
 /// one left behind by a crash is not uploaded (and setup removes it).
 final stagingProbeName = RegExp(r'^\.anj-cloud-probe-[0-9a-f]{32}$');
 
+/// Android's own temporary names in a phone folder (spec #52): a MediaStore
+/// write in progress (`.pending-…`) and the Files app's trash
+/// (`.trashed-…`). Never files: moving one to the phone's trash reads as a
+/// deletion. Only where this isolate maps the phone folders.
+const _androidTemporaryPrefixes = ['.pending-', '.trashed-'];
+
+bool _androidTemporary(String relative) =>
+    PhoneFolderLayout.active != null &&
+    inPhoneFolder(relative) &&
+    relative
+        .split('/')
+        .any((name) => _androidTemporaryPrefixes.any(name.startsWith));
+
+/// A phone folder item in the Files app's trash (spec #52): moving a file
+/// there is its deletion, never a parked move to an unsynchronized name.
+bool isAndroidTrashed(String relative) =>
+    _androidTemporary(relative) &&
+    relative.split('/').last.startsWith('.trashed-');
+
 bool isSyncExcluded(String relative) =>
+    _androidTemporary(relative) ||
     stagingProbeName.hasMatch(relative.split('/').first) ||
     relative
         .split('/')

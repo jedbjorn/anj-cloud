@@ -11,13 +11,15 @@ pkg="$(sed -n "s/^package: //p" <<<"$dump")"
 actual="$(sed -n "s/^uses-permission: name='\([^']*\)'.*/\1/p" <<<"$dump" | sort)"
 # INTERNET: the gateway. CAMERA: the invitation scan. Background sync (A4): the network
 # setting, WorkManager after reboot, the dataSync service and its notifications; WAKE_LOCK
-# comes with WorkManager. The in-app updater (A7) installs through PackageInstaller. The receiver permission is androidx.core's own signature
+# comes with WorkManager. The in-app updater (A7) installs through PackageInstaller. Phone
+# folders (spec #52) need All files access (MANAGE_EXTERNAL_STORAGE). The receiver permission is androidx.core's own signature
 # permission for unexported dynamic receivers.
 expected="$(printf '%s\n' android.permission.INTERNET android.permission.CAMERA \
   android.permission.ACCESS_NETWORK_STATE android.permission.RECEIVE_BOOT_COMPLETED \
   android.permission.FOREGROUND_SERVICE android.permission.FOREGROUND_SERVICE_DATA_SYNC \
   android.permission.POST_NOTIFICATIONS android.permission.WAKE_LOCK \
   android.permission.REQUEST_INSTALL_PACKAGES \
+  android.permission.MANAGE_EXTERNAL_STORAGE \
   "$pkg.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION" | sort)"
 if [ "$actual" != "$expected" ]; then
   echo "FAIL $APK permissions differ from the allowlist" >&2

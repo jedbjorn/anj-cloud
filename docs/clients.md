@@ -69,7 +69,21 @@ adb install 'anj-cloud-<version>.apk'
 
 On macOS use `shasum -a 256 -c` instead. Alternatively, transfer the checked APK to your phone and open it,
 allowing installs from that source. Android accepts updates only with the same signing certificate.
-The synced folder is chosen in shared storage, visible to file managers and other apps you authorize.
+
+**Phone folders.** Music, Videos and Documents are the phone's own `Music`, `Movies` and `Documents` folders in
+internal storage, synced both ways: any music player, video player or the Files app sees them, and anything
+already there (or copied there over USB from a PC) syncs up to your household. This needs Android's **All files
+access** for AnJ Cloud: the app explains it once and **Allow** opens the system setting. Without it those three
+folders are paused, never deleted, and the home screen says so with an **Allow** button; everything else keeps
+syncing. An existing install moves its Music, Videos and Documents into the phone's folders on the first start
+with access, without downloading them again. Names the phone cannot hold, such as `Why?.mp3`, appear there with
+lookalike characters (`Why？.mp3`) and keep their names everywhere else. A file that starts on the phone stays on the phone: it uploads and keeps its own **Keep on this device**
+choice, even in a folder that is Cloud-only, until you choose Cloud-only for it. Moving a file to the phone's trash
+deletes it in AnJ Cloud too (it lands in the household trash). Files over the server's upload limit stay on the
+phone, marked "Too large to upload yet". Everything else in AnJ Cloud stays private to the app: other apps reach
+it only through the folders you approve in **Apps with access**, while any app with media or file access can use
+the three phone folders. Uninstalling AnJ Cloud leaves the files in the phone's folders; a later install links
+them up again rather than duplicating them.
 
 To put files from the phone into AnJ Cloud, open a folder's **⋮** menu and choose **Add files…** or
 **Add folder…**, or share from any app (Gallery, Files) and pick **AnJ Cloud**. The items are copied, never

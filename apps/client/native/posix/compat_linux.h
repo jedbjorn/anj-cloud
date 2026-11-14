@@ -157,7 +157,10 @@ bool descriptor_path(int fd, std::string& out) {
 }
 // Decision #137 (2): the names a path's components have on disk. Linux
 // lookups are byte-exact, so a path that resolves is spelled as stored.
+// (Android's casefolded shared storage has its own, compat_android.h.)
+#ifndef ANJ_COMPAT_ANDROID
 std::string stored_path(int, const std::string& relative) { return relative; }
+#endif
 }  // namespace
 
 #endif

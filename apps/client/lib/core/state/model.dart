@@ -751,8 +751,16 @@ String tooLargeMessage(int? limit, {bool guess = false}) =>
     '${guess ? 'May be too large' : 'Too large'} for the server'
     '${limit == null ? '' : ' (limit ${sizeLabel(limit)})'}. It stays on this device.';
 
+/// The same for a file in a phone folder (spec #52 Large files): the
+/// gateway's limit holds until uploads of any size land (Feature #6).
+String phoneTooLargeMessage(int? limit, {bool guess = false}) =>
+    '${guess ? 'May be too large' : 'Too large'} to upload yet'
+    '${limit == null ? '' : ' (limit ${sizeLabel(limit)})'}. It stays on this phone.';
+
 bool isSizeRefusal(String status) =>
     status.startsWith('Too large for the server') ||
+    status.startsWith('Too large to upload yet') ||
+    status.startsWith('May be too large to upload yet') ||
     status.startsWith('May be too large for the server');
 
 /// How an upload failed below the HTTP status level, or with a server error.
