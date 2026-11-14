@@ -3,6 +3,7 @@
 // storage, and MappedRootFs (the routing the Android adapter uses) maps the
 // top folders Music, Videos and Documents into it while the rest of the root
 // stays private.
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -14,6 +15,7 @@ import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/sync/phone_folder_move.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/core/sync/sync_path_policy.dart';
+import 'package:anj_cloud/core/sync/worker.dart';
 import 'package:anj_cloud/platform/native/mapped_root_fs.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -450,6 +452,38 @@ void main() {
     expect(cloud.completedDownloads, downloads);
   });
 
+  test('finding 1: a phone folder renamed in case only keeps its contents; '
+      'its name comes back, nothing is deleted or downloaded again', () async {
+    start();
+    cloud.put('Music/Album/a.mp3', 'a');
+    cloud.put('Videos/v.mp4', 'v');
+    cloud.put('Documents/d.txt', 'd');
+    await passes();
+    final downloads = cloud.completedDownloads;
+    Directory('$base/Music').renameSync('$base/music');
+    Directory('$base/Movies').renameSync('$base/movies');
+    Directory('$base/Documents').renameSync('$base/DOCUMENTS');
+    await passes(4);
+    for (final name in ['music', 'movies', 'DOCUMENTS']) {
+      expect(exists('$base/$name'), isFalse, reason: name);
+    }
+    expect(phone('Music/Album/a.mp3').readAsStringSync(), 'a');
+    expect(phone('Movies/v.mp4').readAsStringSync(), 'v');
+    expect(phone('Documents/d.txt').readAsStringSync(), 'd');
+    // Killed between the two renames: finished at the next listing.
+    Directory('$base/Music').renameSync('$base/.anj-top-Music');
+    await passes(3);
+    expect(phone('Music/Album/a.mp3').readAsStringSync(), 'a');
+    expect(exists('$base/.anj-top-Music'), isFalse);
+    expect(cloud.deletes, 0);
+    expect(cloud.completedDownloads, downloads);
+    expect(
+      cloud.files.keys,
+      containsAll(['Music/Album/a.mp3', 'Videos/v.mp4', 'Documents/d.txt']),
+    );
+    expect(store.entries.values.where((e) => e.restoring), isEmpty);
+  });
+
   group('AC3 existing phone contents', () {
     test(
       'unique files upload, identical content links without an upload, '
@@ -511,6 +545,196 @@ void main() {
       privateRoot: '$files/anj-cloud',
       layout: makeLayout(),
     );
+
+    /// A private install holding [cloudFiles] (cloud path -> text), all
+    /// synchronized, plus [localOnly] never-synchronized private files.
+    Future<void> privateNames(
+      Map<String, String> cloudFiles, {
+      Map<String, String> localOnly = const {},
+    }) async {
+      cloudFiles.forEach(cloud.put);
+      final tree = RootTree.setup(files, 'phone', NativeRootFs());
+      names = CloudNames();
+      engine = SyncEngine(store, tree, NamedCloud(cloud, names), names: names);
+      open = true;
+      await passes();
+      localOnly.forEach((path, text) {
+        File('${tree.root.path}/$path')
+          ..parent.createSync(recursive: true)
+          ..writeAsStringSync(text, flush: true);
+      });
+      engine.close();
+      open = false;
+      store = Manifest(Directory('${fixture.path}/profile'));
+    }
+
+    test('finding 2: access granted while the app runs moves the private '
+        'folders first, then resumes them, without a restart', () async {
+      await privateInstall();
+      final downloads = cloud.completedDownloads;
+      start(paused: true);
+      final events = <Map>[];
+      final input = StreamController<Object?>();
+      final loop = WorkerLoop(
+        engine,
+        (event) => events.add(event as Map),
+        interval: const Duration(milliseconds: 50),
+      );
+      final done = loop.run(input.stream);
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(store.setting(phoneFolderMoveKey), isNot('done'));
+      expect(File('$files/anj-cloud/Music/Album/a.mp3').existsSync(), isTrue);
+      input.add({'action': 'phoneFolders', 'paused': false});
+      final deadline = DateTime.now().add(const Duration(seconds: 30));
+      while (DateTime.now().isBefore(deadline) &&
+          (store.setting(phoneFolderMoveKey) != 'done' ||
+              cloud.files['Documents/edit.txt'] == null ||
+              utf8.decode(cloud.files['Documents/edit.txt']!) !=
+                  'unsynced edit')) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      final moveState = store.setting(phoneFolderMoveKey);
+      final pausedAfter = engine.tree.phoneFolders!.paused;
+      input.add({'action': 'stop'});
+      await done;
+      await input.close();
+      open = false; // The loop closed the engine.
+      expect(moveState, 'done');
+      expect(pausedAfter, isFalse);
+      expect(phone('Music/Album/a.mp3').readAsStringSync(), 'song a');
+      expect(phone('Movies/v.mp4').readAsStringSync(), 'video');
+      for (final top in ['Music', 'Videos', 'Documents']) {
+        expect(exists('$files/anj-cloud/$top'), isFalse, reason: top);
+      }
+      expect(utf8.decode(cloud.files['Documents/edit.txt']!), 'unsynced edit');
+      expect(
+        events
+            .where((e) => e['event'] == 'mediaScan')
+            .expand((e) => e['paths']),
+        contains('$base/Music/Album/a.mp3'),
+      );
+      // Only the conflict check of the phone's different diff.mp3.
+      expect(cloud.completedDownloads - downloads, 1);
+      expect(cloud.deletes, 0);
+    });
+
+    test('finding 3: the move gives every item its phone name (#202) and '
+        'keeps its cloud name: no EPERM loop, no clash, nothing deleted or '
+        'uploaded again', () async {
+      final cloudFiles = {
+        'Music/Where Is My Mind?.mp3': 'pixies',
+        'Music/Live: 1999?/track.mp3': 'live',
+        'Music/a<b>c.mp3': 'angle',
+        'Music/say "hi".mp3': 'quote',
+        'Music/x|y*z.mp3': 'pipe star',
+        'Documents/Notes.txt': 'upper',
+        'Documents/notes.txt': 'lower',
+        'Documents/日本語のメモ.txt': 'japanese',
+        'Documents/🎵 playlist.txt': 'emoji',
+        'Documents/Already?.txt': 'question',
+        'Documents/Already？.txt': 'fullwidth',
+      };
+      await privateNames(cloudFiles, localOnly: {'Music/new?.mp3': 'mine'});
+      final downloads = cloud.completedDownloads;
+      final before = Map.of(cloud.versions);
+      move().run();
+      expect(store.setting(phoneFolderMoveKey), 'done');
+      expect(phone('Music/Where Is My Mind？.mp3').readAsStringSync(), 'pixies');
+      expect(phone('Music/Live： 1999？/track.mp3').readAsStringSync(), 'live');
+      expect(phone('Music/a＜b＞c.mp3').readAsStringSync(), 'angle');
+      expect(phone('Music/say ＂hi＂.mp3').readAsStringSync(), 'quote');
+      expect(phone('Music/x｜y＊z.mp3').readAsStringSync(), 'pipe star');
+      expect(phone('Music/new？.mp3').readAsStringSync(), 'mine');
+      expect(phone('Documents/日本語のメモ.txt').readAsStringSync(), 'japanese');
+      expect(phone('Documents/🎵 playlist.txt').readAsStringSync(), 'emoji');
+      // The case clash and the fullwidth clash: the rule's names, all kept.
+      final docs = {
+        for (final f in Directory('$base/Documents').listSync())
+          f.path.split('/').last: (f as File).readAsStringSync(),
+      };
+      final expected = NameRule.localNames([
+        for (final path in cloudFiles.keys.where(
+          (k) => k.startsWith('Documents/'),
+        ))
+          NameEntry(
+            path.substring('Documents/'.length),
+            fileId: cloud.fileIds[path],
+          ),
+      ], NameOs.phone);
+      for (final MapEntry(key: cloudName, value: local) in expected.entries) {
+        expect(docs[local], cloudFiles['Documents/$cloudName'], reason: local);
+      }
+      expect(docs.length, 6);
+      expect(
+        Directory('$files/anj-cloud/Music').existsSync() ||
+            Directory('$files/anj-cloud/Documents').existsSync(),
+        isFalse,
+      );
+      // Rows moved with their items and kept their cloud names.
+      expect(
+        store.entries['Music/Where Is My Mind？.mp3']?.cloudName,
+        'Where Is My Mind?.mp3',
+      );
+      expect(store.entries.containsKey('Music/Where Is My Mind?.mp3'), isFalse);
+      start();
+      await passes(4);
+      expect(cloud.deletes, 0);
+      expect(cloud.completedDownloads, downloads);
+      for (final path in cloudFiles.keys) {
+        expect(cloud.versions[path], before[path], reason: '$path untouched');
+      }
+      // No synchronized item reached the cloud under a phone name ...
+      expect(
+        cloud.files.keys.where(
+          (k) =>
+              k.contains('？') && !k.contains('Already') && !k.contains('new'),
+        ),
+        isEmpty,
+      );
+      // ... and a file the cloud never had takes its phone name there (the
+      // reverse direction: a new local name is the new cloud name).
+      expect(utf8.decode(cloud.files['Music/new？.mp3']!), 'mine');
+      expect(store.entries.values.where((e) => e.conflict != null), isEmpty);
+    });
+
+    for (final kill in ['conflict-installed', 'recorded']) {
+      test('finding 4: killed at "$kill", the move keeps exactly one '
+          'conflict copy', () async {
+        await privateInstall();
+        // The phone already holds other bytes where the unsynced edit goes.
+        write(phone('Documents/edit.txt'), 'the phone version');
+        var once = false;
+        final first = move()
+          ..debugStep = (step, path) {
+            if (step == kill && path == 'Documents/edit.txt' && !once) {
+              once = true;
+              throw const FileSystemException('killed');
+            }
+          };
+        expect(first.run, throwsA(isA<FileSystemException>()));
+        expect(once, isTrue);
+        move().run();
+        move().run();
+        final copies = Directory('$base/Documents')
+            .listSync()
+            .map((e) => e.path.split('/').last)
+            .where((n) => n.startsWith('edit.txt.conflict-'))
+            .toList();
+        expect(copies, hasLength(1));
+        expect(
+          File('$base/Documents/${copies.single}').readAsStringSync(),
+          'unsynced edit',
+        );
+        expect(
+          phone('Documents/edit.txt').readAsStringSync(),
+          'the phone version',
+        );
+        expect(
+          File('$files/anj-cloud/Documents/edit.txt').existsSync(),
+          isFalse,
+        );
+      });
+    }
 
     test('every file ends up in the phone folders once, the unsynced edit is '
         'uploaded, nothing is downloaded, the private folders are gone; a '

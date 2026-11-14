@@ -152,7 +152,7 @@ def main():
     parser.add_argument("--project", required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--phase", choices=("phone", "move"), required=True)
-    parser.add_argument("--only", default="ac3,ac2,ac6,ac5",
+    parser.add_argument("--only", default="ac3,ac2,case,ac6,ac5",
                         help="phase phone: the rows to run, comma-separated (default all)")
     args = parser.parse_args()
     only = set(args.only.split(","))
@@ -462,6 +462,33 @@ def main():
                        is True, how=how, trash=[n for n in trash_names() if "trash" in n][:5])
                 no_odd_names("after AC2")
 
+            # --- Review finding 1: a top folder renamed in case only on the phone ------------
+            if "case" in only:
+                put(f"Videos/{run}/case.mp4", media["clip.mp4"])
+                poke()
+                wait(lambda: phone.sha(f"Movies/{run}/case.mp4") == sha(media["clip.mp4"]))
+                ours = sorted(n for n in server_names("") if run in n and not n.endswith("/"))
+                listing = {}
+                for phone_name in ("Music", "Movies", "Documents"):
+                    # As the Files app renames it (two steps on case-insensitive storage).
+                    phone.sh("mv", f"'{SD}/{phone_name}'", f"'{SD}/.f27-case'")
+                    phone.sh("mv", f"'{SD}/.f27-case'", f"'{SD}/{phone_name.lower()}'")
+                    listing[phone_name] = phone.sh("ls", SD)
+                poke()
+                time.sleep(45)
+                poke()
+                time.sleep(30)
+                top = phone.sh("ls", SD).split()
+                check("finding 1: Music, Movies and Documents renamed in case only on the phone get "
+                      "their names back", all(n in top for n in ("Music", "Movies", "Documents"))
+                      and not any(n in top for n in ("music", "movies", "documents")),
+                      renamed=[n for n in listing.values()][-1].split()[:30], now=top[:30])
+                after = sorted(n for n in server_names("") if run in n and not n.endswith("/"))
+                check("finding 1: their contents stay listed: nothing is deleted in the cloud",
+                      set(ours) <= set(after), missing=sorted(set(ours) - set(after)))
+                check("finding 1: and nothing on the phone is lost",
+                      phone.sha(f"Movies/{run}/case.mp4") == sha(media["clip.mp4"])
+                      and phone.sha(f"Music/{run}/ac3-same.mp3") == sha(media["song.mp3"]))
             # --- AC6: a large phone file -------------------------------------------------------
             if "ac6" in only:
                 big = f"Movies/{run}/big.mkv"
@@ -536,6 +563,9 @@ def main():
             # --- AC4: moving an existing install ------------------------------------------------
             songs = {f"Music/{run}/Album/song{i:02d}.wav": os.urandom(4 * MIB) for i in range(20)}
             files = {**songs,
+                     f"Music/{run}/Where Is My Mind?.mp3": media["other.mp3"],
+                     f"Documents/{run}/Notes.txt": b"older, upper case\n",
+                     f"Documents/{run}/notes.txt": b"newer, lower case\n",
                      f"Music/{run}/play.mp3": media["song.mp3"],
                      f"Videos/{run}/clip.mp4": media["clip.mp4"],
                      f"Documents/{run}/edit.txt": b"before the edit\n"}
@@ -566,13 +596,25 @@ def main():
             time.sleep(10)
             check("AC4: main: the edit is unsynced (sync paused)",
                    server_sha(f"Documents/{run}/edit.txt") == sha(b"before the edit\n"))
-            private_before = {p: u.run_as("sha256sum", f"files/anj-cloud/{p}").split(" ")[0] for p in files}
+            private_before = {p: u.run_as("sha256sum", f"'files/anj-cloud/{p}'").split(" ")[0] for p in files}
+            server_before = {p: etag(p) for p in files}
             since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            # The update, with access granted, killed mid-move.
+            # The update, as a user meets it: no access yet, the explanation, Allow, the
+            # grant in Android's settings, back to the app (which keeps running).
             u.adb("install", "-r", "-t", str(u.APKS / "app.apk"), timeout=300)
-            u.adb("shell", "appops", "set", PKG, "MANAGE_EXTERNAL_STORAGE", "allow")
             u.adb("logcat", "-c")
+            u.launch()
+            check("AC4: after the update, without access: the explanation screen; nothing moved",
+                  u.find(r"Android calls this All files access", timeout=90) is not None
+                  and "Music" in u.run_as("ls", "files/anj-cloud"))
+            u.tap(r"^Allow$", timeout=20)
+            time.sleep(3)
+            settings = u.focused()
+            u.adb("shell", "appops", "set", PKG, "MANAGE_EXTERNAL_STORAGE", "allow")
+            time.sleep(1)
+            alive = bool(u.adb("shell", "pidof", PKG, check=False).strip())
             u.adb("shell", "am", "start", "-n", f"{PKG}/cloud.anj.anj_cloud.MainActivity")
+            facts["grant"] = {"settings_in_front": settings, "app_kept_running": alive}
             first = wait(lambda: phone.sh("ls", f"'{SD}/Music/{run}/Album'").count("song") >= 1, timeout=120,
                          every=0.2)
             u.adb("shell", "am", "force-stop", PKG)
@@ -587,11 +629,18 @@ def main():
                                for t in ("Music", "Videos", "Documents")), timeout=300) is True,
                    root=u.run_as("ls", "files/anj-cloud"))
             phone_paths = {p: p.replace("Videos/", "Movies/", 1) for p in files}
+            # The phone name rule (#202): the forbidden character's lookalike; of the case
+            # pair the older keeps its name.
+            phone_paths[f"Music/{run}/Where Is My Mind?.mp3"] = f"Music/{run}/Where Is My Mind？.mp3"
+            phone_paths[f"Documents/{run}/notes.txt"] = f"Documents/{run}/notes (2).txt"
             hashes = {p: phone.sha(phone_paths[p]) for p in files}
             check("AC4: every file is in the phone folders exactly once, by hash",
                    all(hashes[p] == private_before[p] for p in files)
                    and phone.sh("ls", f"'{SD}/Music/{run}/Album'").count("song") == len(songs),
                    mismatched=[p for p in files if hashes[p] != private_before[p]])
+            check("finding 2: the grant while the app ran moved the folders (no restart needed "
+                  "for it; this run also killed and restarted it mid-move)",
+                  facts["grant"]["app_kept_running"], **facts["grant"])
             def notice_owed():
                 return u.run_as("sqlite3", "files/anj-profile/default/manifest.sqlite",
                                 "\"select value from settings where key='phoneFolderMoveNoticeV1'\"").strip()
@@ -605,6 +654,12 @@ def main():
             check("AC4: the unsynced edit is uploaded afterwards",
                    wait(lambda: server_sha(f"Documents/{run}/edit.txt") == sha(edited), timeout=180) is True)
             time.sleep(20)
+            unchanged = [p for p in files if not p.endswith("edit.txt")]
+            check("finding 3: the renamed and case-clashed files keep their cloud names and versions; "
+                  "no cloud copy under a phone name",
+                  all(etag(p) == server_before[p] for p in unchanged)
+                  and not [n for n in server_names("") if "？" in n or "(2)" in n],
+                  changed=[p for p in unchanged if etag(p) != server_before[p]])
             log = gateway_log(since)
             (u.OUT / "gateway-since-update.txt").write_text(log)
             control = gateway_log(phase_start)
@@ -636,6 +691,11 @@ def main():
         try:
             for folder in (f"Music/{run}", f"Videos/{run}", f"Documents/{run}", f"{run}-loose.txt"):
                 delete(folder)
+            # The case row renamed the emulator's own folders: never left renamed.
+            for name in ("Music", "Movies", "Documents"):
+                if not phone.exists(name) and phone.exists(name.lower()):
+                    phone.sh("mv", f"'{SD}/{name.lower()}'", f"'{SD}/.f27-case'")
+                    phone.sh("mv", f"'{SD}/.f27-case'", f"'{SD}/{name}'")
             phone.sh("rm", "-rf", f"'{SD}/Music/{run}'", f"'{SD}/Movies/{run}'", f"'{SD}/Documents/{run}'")
         finally:
             devices = op("devices") if invite is not None else []

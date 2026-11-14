@@ -22,6 +22,7 @@ import '../local/root_identity.dart';
 import '../local/root_tree.dart';
 import '../local/staging_location.dart';
 import '../ports/phone_folders.dart';
+import '../ports/root_filesystem.dart';
 import '../ports/root_location.dart';
 import 'phone_folder_move.dart';
 import '../../platform/adapters.dart';
@@ -95,30 +96,12 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
       // The one-time move of an existing install's private Music, Videos
       // and Documents into the phone's folders, before anything syncs
       // (spec #52 Moving an Existing Install). Resumes after a crash.
-      if (phone != null && !phone.paused) {
-        try {
-          PhoneFolderMove(
-            manifest,
-            native,
-            privateRoot: rootPath,
-            layout: phone,
-            onProgress: (message) =>
-                output.send({'event': 'checking', 'message': message}),
-          ).run();
-        } on FileSystemException catch (error) {
-          // Unfinished: the private copies are still there, so the phone
-          // folders stay paused for this run (nothing is inferred from a
-          // half-moved folder) and the move resumes at the next start.
-          (native as PhoneFolderRouting).setPaused(true);
-          output.send({
-            'event': 'phoneFolders',
-            'problem':
-                "Music, Videos and Documents could not be moved to your "
-                "phone's folders yet (${error.message}). They are paused; "
-                'nothing was deleted, and the move continues at the next '
-                'start.',
-          });
-        }
+      if (phone != null &&
+          !phone.paused &&
+          !runPhoneFolderMove(manifest, native, rootPath, phone, output.send)) {
+        // Unfinished: the private copies are still there, so the phone
+        // folders stay paused (nothing is inferred from a half-moved folder).
+        (native as PhoneFolderRouting).setPaused(true);
       }
       tree = RootTree(Directory(root), Directory(settled), native);
       refusal = policy.refuseRoot(rootPath, fd: tree.fd);
@@ -226,6 +209,45 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
     await loop.run(input);
   } finally {
     renewal?.stop();
+  }
+}
+
+/// Runs or resumes the one-time move of the private Music, Videos and
+/// Documents into the phone's folders (spec #52), at start or when All files
+/// access arrives while the app runs. False when it could not finish: the
+/// private copies stay, the caller keeps the folders paused, and the move
+/// resumes at the next start or grant.
+bool runPhoneFolderMove(
+  Manifest manifest,
+  RootFilesystem native,
+  String privateRoot,
+  PhoneFolderLayout layout,
+  void Function(Object?) send,
+) {
+  final move = PhoneFolderMove(
+    manifest,
+    native,
+    privateRoot: privateRoot,
+    layout: layout,
+    onProgress: (message) => send({'event': 'checking', 'message': message}),
+  );
+  try {
+    move.run();
+    send({'event': 'phoneFolders', 'problem': null});
+    return true;
+  } on FileSystemException catch (error) {
+    send({
+      'event': 'phoneFolders',
+      'problem':
+          "Music, Videos and Documents could not be moved to your phone's "
+          'folders yet (${error.message}). They are paused; nothing was '
+          'deleted, and the move continues at the next start.',
+    });
+    return false;
+  } finally {
+    if (move.placed.isNotEmpty) {
+      send({'event': 'mediaScan', 'paths': move.placed});
+    }
   }
 }
 
@@ -636,6 +658,18 @@ class WorkerLoop {
     final routing = engine.tree.phoneFolders;
     _phonePaused = null;
     if (paused == null || routing == null || routing.paused == paused) return;
+    // Access arrived: the private folders move first (the normal update
+    // flow grants access while the app runs); unfinished, they stay paused.
+    if (!paused &&
+        !runPhoneFolderMove(
+          engine.manifest,
+          engine.tree.native,
+          engine.tree.root.path,
+          routing.layout,
+          send,
+        )) {
+      return;
+    }
     routing.setPaused(paused);
     await engine.restartWatchingAfterPhoneFolders();
     if (!routing.paused) engine.requestFullVerification();

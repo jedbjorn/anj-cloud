@@ -118,7 +118,7 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
       if (top == null) return (fd, path);
       final base = _base;
       if (paused || base == null) _refusePaused(path);
-      return (base, '${phoneFolderNames[top]}${path.substring(top.length)}');
+      return (base, '${_phoneOf(top)}${path.substring(top.length)}');
     }
     if (fd == _stage && path.startsWith(sharedStagingTag)) {
       final shared = _shared;
@@ -132,12 +132,20 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
       fd == _root && _topOf(path) != null ||
       fd == _stage && path.startsWith(sharedStagingTag);
 
+  /// The folder name the top folder [top] has in shared storage now.
+  String _phoneOf(String top) {
+    final phone = phoneFolderNames[top]!;
+    return _stored[phone] ?? phone;
+  }
+
   /// The engine path of the phone path [phone] (`Movies/x` -> `Videos/x`).
-  static String _engine(String phone) {
+  String _engine(String phone) {
     final slash = phone.indexOf('/');
     final first = slash < 0 ? phone : phone.substring(0, slash);
-    for (final MapEntry(key: top, value: name) in phoneFolderNames.entries) {
-      if (name == first) return '$top${phone.substring(first.length)}';
+    for (final top in phoneFolderNames.keys) {
+      if (_phoneOf(top) == first) {
+        return '$top${phone.substring(first.length)}';
+      }
     }
     return phone;
   }
@@ -188,12 +196,7 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
 
   ({List<Map<String, dynamic>> items, List<Map<String, dynamic>> watches})
   _area(Pointer<Void>? handle, String top, bool recursive) {
-    final listed = super.watchScan(
-      handle,
-      _base!,
-      phoneFolderNames[top]!,
-      recursive,
-    );
+    final listed = super.watchScan(handle, _base!, _phoneOf(top), recursive);
     return (
       items: listed.items.map(_renamed).toList(),
       watches: listed.watches.map(_renamed).toList(),
@@ -203,9 +206,70 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
   bool _privateTop(Map<String, dynamic> item) =>
       _topOf(item['path'] as String) != null;
 
+  /// A phone folder renamed in case only (Files: `Music` to `music`) is
+  /// still the top folder: its name is restored before any listing, so its
+  /// contents are never read as gone (#150 / #163: a top folder's rename
+  /// never propagates). Shared storage compares names case-insensitively, so
+  /// the rename goes through `.anj-top-<name>`; one left by a crash between
+  /// the two steps is finished here. A folder that cannot be renamed back is
+  /// listed and reached under its stored spelling, as the top folder.
+  void _canonicalTops() {
+    final base = _base;
+    if (base == null) return;
+    List<Map<String, dynamic>> children;
+    try {
+      children = super.watchScan(null, base, '', false).items;
+    } on FileSystemException {
+      return;
+    }
+    final names = {
+      for (final item in children)
+        if (item['kind'] == 'directory') item['path'] as String,
+    };
+    for (final phone in phoneFolderNames.values) {
+      if (names.contains(phone)) {
+        _stored.remove(phone);
+        continue;
+      }
+      final parked = '.anj-top-$phone';
+      final variant = names.contains(parked)
+          ? parked
+          : names
+                .where((n) => n.toLowerCase() == phone.toLowerCase())
+                .firstOrNull;
+      if (variant == null) continue; // Gone: the engine creates it again.
+      try {
+        var from = variant;
+        if (from != parked) {
+          super.renameExclusive(
+            base,
+            from,
+            parked,
+            super.directoryIdentity(base, from),
+          );
+          from = parked;
+        }
+        super.renameExclusive(
+          base,
+          from,
+          phone,
+          super.directoryIdentity(base, from),
+        );
+        _stored.remove(phone);
+        _media.add('${layout.base}/$phone');
+      } on FileSystemException {
+        _stored[phone] = variant;
+      }
+    }
+  }
+
+  /// Phone folders that could not be renamed back: name -> stored spelling.
+  final Map<String, String> _stored = {};
+
   @override
   List<Map<String, dynamic>> scan(int fd) {
     if (fd == _root) {
+      if (!paused) _canonicalTops();
       final items = super.scan(fd).where((i) => !_privateTop(i)).toList();
       if (!paused) {
         for (final top in phoneFolderNames.keys) {
@@ -228,6 +292,9 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
   @override
   ({List<Map<String, dynamic>> items, List<Map<String, dynamic>> watches})
   watchScan(Pointer<Void>? handle, int root, String path, bool recursive) {
+    if (root == _root && !paused && (path.isEmpty || _topOf(path) != null)) {
+      _canonicalTops();
+    }
     if (root == _root && path.isEmpty) {
       final private = super.watchScan(handle, root, path, recursive);
       final items = private.items.where((i) => !_privateTop(i)).toList();
