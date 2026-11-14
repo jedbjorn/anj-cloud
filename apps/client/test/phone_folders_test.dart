@@ -539,6 +539,37 @@ void main() {
     expect(store.entries.values.where((e) => e.restoring), isEmpty);
   });
 
+  test('review round 3: Cloud-only chosen while the first upload still fails '
+      'is kept: after the upload the file is released and never kept again, '
+      'also after a restart', () async {
+    applyFirstSyncChoice(store, ['Documents', 'Music', 'Videos'], {});
+    start();
+    await passes();
+    cloud.uploadError = const CloudFailure('injected upload failure');
+    write(phone('Music/new.mp3'), 'from another app');
+    await passes(2);
+    expect(store.entries['Music/new.mp3']?.override, Retention.local);
+    expect(cloud.files.keys, isNot(contains('Music/new.mp3')));
+    // The user frees it before it has uploaded once.
+    engine.setRetention('Music/new.mp3', Retention.cloud);
+    await passes(3);
+    expect(store.entries['Music/new.mp3']?.override, isNot(Retention.local));
+    cloud.uploadError = null;
+    engine.uploads.retryAll();
+    await passes(5);
+    expect(utf8.decode(cloud.files['Music/new.mp3']!), 'from another app');
+    expect(exists('$base/Music/new.mp3'), isFalse);
+    expect(store.entries['Music/new.mp3']?.override, isNot(Retention.local));
+    // Across a restart: still released, not kept again.
+    engine.close();
+    open = false;
+    store = Manifest(Directory('${fixture.path}/profile'));
+    start();
+    await passes(4);
+    expect(exists('$base/Music/new.mp3'), isFalse);
+    expect(store.entries['Music/new.mp3']?.override, isNot(Retention.local));
+  });
+
   test('#203: under a Cloud-only Music a phone file uploads and stays, a '
       'cloud file is not downloaded, and freeing the phone file explicitly '
       'still works', () async {
@@ -784,6 +815,33 @@ void main() {
       );
       expect(utf8.decode(cloud.files['Music/new?.mp3']!), 'mine');
       expect(store.entries.values.where((e) => e.conflict != null), isEmpty);
+    });
+
+    test('review round 3: a synced file with an unsynced edit in a Cloud-only '
+        'folder, moved under the same path, gets its own Keep choice: the '
+        'edit uploads and the file stays on the phone', () async {
+      cloud.put('Music/song.mp3', 'synced');
+      final tree = RootTree.setup(files, 'phone', NativeRootFs());
+      names = CloudNames();
+      engine = SyncEngine(store, tree, NamedCloud(cloud, names), names: names);
+      open = true;
+      await passes();
+      File('${tree.root.path}/Music/song.mp3')
+          .writeAsStringSync('unsynced edit', flush: true);
+      engine.close();
+      open = false;
+      store = Manifest(Directory('${fixture.path}/profile'));
+      // Music is Cloud-only now; the edited file was still on the device.
+      store.entries['Music']!.override = Retention.cloud;
+      store.save();
+      expect(store.entries['Music/song.mp3']?.override, isNull);
+      move().run();
+      expect(store.entries['Music/song.mp3']?.override, Retention.local);
+      start();
+      await passes(6);
+      expect(utf8.decode(cloud.files['Music/song.mp3']!), 'unsynced edit');
+      expect(phone('Music/song.mp3').readAsStringSync(), 'unsynced edit');
+      expect(store.entries['Music/song.mp3']?.override, Retention.local);
     });
 
     for (final withRow in [false, true]) {

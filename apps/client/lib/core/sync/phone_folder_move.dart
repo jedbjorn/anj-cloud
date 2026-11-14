@@ -482,7 +482,15 @@ class PhoneFolderMove {
   /// carrying it, so a file the cloud never had still arrives there under
   /// the name it had (`new?.mp3` on the phone as `new？.mp3`).
   void _rekey(String from, String to, Map<String, dynamic>? journal) {
-    if (from == to) return;
+    if (from == to) {
+      // Placed on the phone under the same path: it stays there too (#203,
+      // review round 3), unless the user made a choice of its own.
+      final row = manifest.entries[from];
+      if (row != null && row.kind == ItemKind.file) {
+        row.override ??= Retention.local;
+      }
+      return;
+    }
     final name = journal?['name'] as String? ?? p.posix.basename(from);
     final old = manifest.entries[from];
     if (!manifest.entries.containsKey(to)) {

@@ -1086,22 +1086,23 @@ class SyncEngine {
       inPhoneFolder(path);
   bool _phonePausedThisPass = false;
 
-  /// A file that starts on the phone stays on the phone (spec #52, decision
-  /// #203): the first time sync records a phone-folder file with no cloud
-  /// version and no choice of its own, it gets its own Keep on this device
-  /// choice, whatever its folder's. It uploads and is never released
-  /// automatically; Cloud-only frees it when the user chooses. Files that
-  /// come from the cloud already have a version and follow their folder.
-  void _keepPhoneOrigin(Entry entry, LocalItem item) {
-    if (item.kind != ItemKind.file ||
-        entry.kind != ItemKind.file ||
-        entry.etag != null ||
-        entry.override != null ||
-        tree.phoneFolders == null ||
-        !inPhoneFolder(item.path)) {
-      return;
+  /// The row sync makes when it first records the local item [path]. A file
+  /// that starts on the phone stays on the phone (spec #52, decision #203):
+  /// a phone-folder file gets its own Keep on this device choice here, once,
+  /// whatever its folder's. It uploads and is never released automatically.
+  /// Nothing infers the choice again later (review round 3): a Cloud-only
+  /// the user picks afterwards is stored as "follows a Cloud-only folder"
+  /// (no own choice) and stays that way, across restarts too. Files that
+  /// come from the cloud get their rows from the listing and follow their
+  /// folder.
+  Entry _firstRow(String path, ItemKind kind) {
+    final entry = Entry(path, kind);
+    if (kind == ItemKind.file &&
+        tree.phoneFolders != null &&
+        inPhoneFolder(path)) {
+      entry.override = Retention.local;
     }
-    entry.override = Retention.local;
+    return entry;
   }
 
   /// Android's `.nomedia` marker and `.thumbnails` cache in a phone folder
@@ -4629,9 +4630,8 @@ class SyncEngine {
     for (final item in local.values) {
       final entry = manifest.entries.putIfAbsent(
         item.path,
-        () => Entry(item.path, item.kind),
+        () => _firstRow(item.path, item.kind),
       );
-      _keepPhoneOrigin(entry, item);
       if (entry.kind != item.kind) {
         conflict(entry, 'Local item type changed; review both versions.');
         continue;
@@ -4680,7 +4680,10 @@ class SyncEngine {
     for (final path in tree.busy) {
       if (!isSyncExcluded(path) &&
           !NameRule.isTemporary(p.posix.basename(path))) {
-        manifest.entries.putIfAbsent(path, () => Entry(path, ItemKind.file));
+        manifest.entries.putIfAbsent(
+          path,
+          () => _firstRow(path, ItemKind.file),
+        );
       }
     }
     for (final entry in manifest.entries.values) {
