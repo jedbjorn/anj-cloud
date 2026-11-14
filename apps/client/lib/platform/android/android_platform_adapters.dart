@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import '../../core/ports/phone_folders.dart';
 import '../../core/ports/autostart.dart';
 import '../../core/ports/change_watcher.dart';
 import '../../core/ports/desktop_launcher.dart';
@@ -30,7 +31,14 @@ class AndroidPlatformAdapters implements PlatformAdapters {
   const AndroidPlatformAdapters();
 
   @override
-  RootFilesystem rootFilesystem([String? library]) => AndroidRootFs(library);
+  RootFilesystem rootFilesystem([String? library]) {
+    // The sync worker maps the phone folders (spec #52); elsewhere the
+    // plain app-private root.
+    final phone = PhoneFolderLayout.active;
+    return phone == null
+        ? AndroidRootFs(library)
+        : AndroidPhoneRootFs(phone, library);
+  }
 
   @override
   SecretStore secretStore() => KeystoreSecrets();

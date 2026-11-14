@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# Spec #52 AC0 on the emulator, in the app (task #44). Payload of anj-emu-run:
+# Spec #52 AC0, in the app (task #44). On the emulator, as a payload of anj-emu-run:
 #   ANJ_APK=<apk built with -t integration_test/android_phone_folders_ac0_test.dart> OUT=<dir> \
 #     anj-emu-run <TAG> <n> tool/android/ac0/emu_ac0_app.sh
+# On the Pixel (the P part, with the FnB present, #108 Q8): an arm64 build of the same probe
+#   ANJ_APK_PLATFORM=android-arm64 ANJ_TAG=<lane> tool/android/build_apk.sh <n> \
+#     -t integration_test/android_phone_folders_ac0_test.dart
+# and this script through the toolchain's adb shim, with a USB/MTP copy from the PC:
+#   ADB=~/.local/share/anj-cloud/toolchains/android/bin/adb ANJ_AC0_MTP=1 \
+#     ANJ_APK=<apk> OUT=<dir> tool/android/ac0/emu_ac0_app.sh
+# With ANJ_AC0_MTP=1 the script waits (5 minutes at most) while the FnB copies any file named
+# mtp-<anything> from the PC into the work folder it prints (Music/anj-ac0-<n>) over USB file
+# transfer. The reboot check runs only on an emulator (or with ANJ_AC0_REBOOT=1).
 # Grants All files access, starts the probe, answers its hand-offs (media-library
 # queries before and after a scan request, changes by another uid through adb shell,
 # revocation while it runs), starts a fresh install without access, and compares the
@@ -73,6 +82,13 @@ run() { # run <label> <appops mode>: a fresh install each time
       sh "echo kept > '$work/kept-by-shell.txt'"
       sh "mkdir '$work/shell-dir'"
       sh touch "$work/.go-other"
+      wait_line wait-mtp 60 > /dev/null
+      if [ "${ANJ_AC0_MTP:-0}" = 1 ]; then
+        echo ">>> Copy a file named mtp-<anything> from the PC into $work over USB now (5 min)." >&2
+        end=$(( $(date +%s) + 300 ))
+        until sh "ls '$work'" | grep -q '^mtp-' || [ "$(date +%s)" -ge "$end" ]; do sleep 2; done
+      fi
+      sh touch "$work/.go-mtp"
       wait_line wait-revoke 60 > /dev/null
       sh appops set "$PKG" MANAGE_EXTERNAL_STORAGE deny
       sleep 2
@@ -101,8 +117,9 @@ run with-access allow
 sleep 3
 run without-access deny
 # Identity of the phone folders across a reboot: the FUSE volume has no on-disk fsid,
-# so the boundary keys it by st_dev; do st_dev and the inode survive a reboot?
-{
+# so the boundary keys it by st_dev; do st_dev and the inode survive a reboot? Emulator only
+# unless asked (a real phone reboots only with its owner's say-so).
+if [ "$(sh getprop ro.kernel.qemu)" = 1 ] || [ "${ANJ_AC0_REBOOT:-0}" = 1 ]; then {
   echo "# identity before reboot (st_dev inode)"
   sh "stat -c '%d %i %n' /storage/emulated/0/Music /storage/emulated/0/Movies /storage/emulated/0/Documents"
   "$ADB" reboot
@@ -111,7 +128,7 @@ run without-access deny
   sleep 5
   echo "# identity after reboot"
   sh "stat -c '%d %i %n' /storage/emulated/0/Music /storage/emulated/0/Movies /storage/emulated/0/Documents"
-} > "$OUT/reboot.txt" 2>&1
+} > "$OUT/reboot.txt" 2>&1; else echo "reboot check skipped (not an emulator)" > "$OUT/reboot.txt"; fi
 grep -E 'avc: denied|SIGSYS' "$OUT"/logcat-*.txt | grep -i "$PKG\|anj\|untrusted" > "$OUT/denials.txt" || true
 sh "rm -rf /storage/emulated/0/Music/anj-ac0-* /storage/emulated/0/Music/anj-ac0-seen /storage/emulated/0/Documents/anj-ac0-* /storage/emulated/0/.anj-cloud-staging /storage/emulated/0/Android/media/$PKG"
 "$ADB" uninstall "$PKG" > /dev/null 2>&1 || true

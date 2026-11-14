@@ -4,6 +4,7 @@ import 'package:path/path.dart' as p;
 
 import 'artifacts.dart';
 import '../gateway/cloud_api.dart';
+import '../ports/phone_folders.dart';
 import '../ports/release_guard.dart';
 import '../state/manifest.dart';
 import '../state/model.dart';
@@ -648,7 +649,11 @@ class EditCompletion {
               (o) => <String, dynamic>{
                 'artifact': o.id,
                 'from': o.data['name'],
-                'to': 'finished-${uniqueId()}',
+                // The same staging folder as its source (spec #52: a
+                // phone folder's tagged name stays in shared staging).
+                'to':
+                    '${(o.data['name'] as String).startsWith(sharedStagingTag) ? sharedStagingTag : ''}'
+                    'finished-${uniqueId()}',
                 'identity': o.data['identity'],
                 'hash': hashes[o.id],
                 'proofKind': chains.containsKey(o.id)

@@ -60,7 +60,7 @@ rule (as macOS does)", and that "ordinary non-Latin and special-character names"
 `/storage/emulated/0/Music` under its name. As specified, it would fail to download
 there, which also breaks "never refuse ordinary real-world names".
 
-Options for the Planner (not chosen here):
+Options put to the Planner (decision #202 chose option 1, for files and folders alike):
 
 1. **Apply the Windows character step of the local-name rule (spec #49 R3 step 1) to
    the three phone folders**, beside the case-clash step: on the phone the seven
@@ -75,12 +75,25 @@ Options for the Planner (not chosen here):
 3. **Rename in the cloud** with the cloud cleanup rule. Changes the name on every
    device; contradicts "the cloud names are unchanged".
 
-## Next steps after the Planner's decision
+## What the engine work built on these facts
 
-The engine work (tasks #45 to #47) builds on the facts above: staging in
+Tasks #45 to #47 build on the facts above: staging in
 `Android/media/<pkg>/anj-staging` with `.nomedia` (removed with the app), a
 shared-storage form of the owned-staging check, the stamp-only guard for the mapped
 folders (#108 Q15), case-insensitive name handling there, scan requests after every
 change, and the paused state driven by the permission check. The Pixel part of AC0
-reruns the probe with an arm64 build (`--target-platform android-arm64`) through the
-toolchain adb shim, adding a USB/MTP copy for the inotify row.
+reruns the probe with an arm64 build through the toolchain adb shim, adding a USB/MTP copy
+for the inotify row (`ANJ_AC0_MTP=1`; the reboot check runs only on an emulator unless
+`ANJ_AC0_REBOOT=1`):
+
+```sh
+ANJ_APK_PLATFORM=android-arm64 ANJ_TAG=<lane> tool/android/build_apk.sh <n> \
+  -t integration_test/android_phone_folders_ac0_test.dart
+cp build/app/outputs/flutter-apk/app-debug.apk /tmp/ac0-arm64.apk
+ADB=~/.local/share/anj-cloud/toolchains/android/bin/adb ANJ_AC0_MTP=1 \
+  ANJ_APK=/tmp/ac0-arm64.apk OUT=<dir> tool/android/ac0/emu_ac0_app.sh
+```
+
+When the script prints the work folder, copy any file named `mtp-<anything>` from the PC
+into it over USB file transfer. The probe installs and finally uninstalls the QA build, and
+removes its work folders.

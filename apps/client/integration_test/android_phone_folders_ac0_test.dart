@@ -66,6 +66,26 @@ int rename2(String from, String to, int flags) {
   }
 }
 
+typedef _FcntlC = Int32 Function(Int32, Int32, VarArgs<(Int32,)>);
+typedef _FcntlD = int Function(int, int, int);
+final _fcntl = libc.lookupFunction<_FcntlC, _FcntlD>('fcntl');
+
+/// F_SETLEASE F_WRLCK on a read-only descriptor of [path]: 0 or the errno.
+int setLease(String path) {
+  const fSetLease = 1024, fWrLck = 1, fUnLck = 2;
+  final p = path.toNativeUtf8();
+  try {
+    final fd = _open(p, oRdonly);
+    if (fd < 0) return _errno().value;
+    final r = _fcntl(fd, fSetLease, fWrLck) == 0 ? 0 : _errno().value;
+    if (r == 0) _fcntl(fd, fSetLease, fUnLck);
+    _close(fd);
+    return r;
+  } finally {
+    malloc.free(p);
+  }
+}
+
 int fsyncDir(String path) {
   final p = path.toNativeUtf8();
   try {
@@ -102,9 +122,9 @@ List<int> wav() {
   return b.takeBytes();
 }
 
-Future<void> waitForGo(String dir, String what) async {
+Future<void> waitForGo(String dir, String what, {int seconds = 90}) async {
   final go = File('$dir/.go-$what');
-  final deadline = DateTime.now().add(const Duration(seconds: 90));
+  final deadline = DateTime.now().add(Duration(seconds: seconds));
   while (!go.existsSync() && DateTime.now().isBefore(deadline)) {
     await Future<void>.delayed(const Duration(milliseconds: 300));
   }
@@ -455,7 +475,11 @@ void main() {
       }
     }
 
-    // Lease: the Linux release guard (F_SETLEASE F_WRLCK) on a phone file.
+    // Lease: the primitive itself (F_SETLEASE F_WRLCK on a read descriptor),
+    // and what the release guard does with a phone file (spec #52 uses the
+    // weaker unchanged-content guard where the lease is refused).
+    final lease = setLease('$workPath/excl.txt');
+    say('lease', lease == 0 ? 'ok' : 'fail', 'F_SETLEASE F_WRLCK errno=$lease');
     try {
       final guard = fs.releaseGuard();
       final info = guard.info(music, '$work/excl.txt');
@@ -463,12 +487,16 @@ void main() {
       final g = guard.guard(music, '$work/excl.txt', info, links: info.links);
       guard.close(g);
       say(
-        'lease',
-        'ok',
-        'anj_guard_open (F_SETLEASE F_WRLCK) on a phone file works',
+        'guard',
+        'info',
+        'the release guard holds a phone file (weaker guard where no lease)',
       );
     } catch (e) {
-      say('lease', 'fail', describe(e));
+      say(
+        'guard',
+        'info',
+        'the release guard refuses a phone file: ${describe(e)}',
+      );
     }
     // A file another uid created (adb shell) is the common case for a lease.
     final fsyncResult = fsyncDir(workPath);
@@ -510,25 +538,31 @@ void main() {
       events.join(' '),
     );
     // A lease on the file adb shell wrote (another owner).
-    try {
-      final guard = fs.releaseGuard();
-      final info = guard.info(music, '$work/kept-by-shell.txt');
-      final g = guard.guard(
-        music,
-        '$work/kept-by-shell.txt',
-        info,
-        links: info.links,
-      );
-      guard.close(g);
-      say('lease_other_owner', 'ok', 'owned=${info.owned}');
-    } catch (e) {
-      say('lease_other_owner', 'fail', describe(e));
-    }
+    final other = setLease('$workPath/kept-by-shell.txt');
+    say('lease_other_owner', other == 0 ? 'ok' : 'fail', 'errno=$other');
+
+    // USB/MTP from a PC (the Pixel part of AC0; the emulator script skips it):
+    // the script waits until a file whose name starts `mtp-` appears.
+    final mtp = <String>[];
+    final watching = Directory(workPath)
+        .watch()
+        .listen((e) => mtp.add('${e.type}:${e.path.split('/').last}'));
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    say('wait-mtp', 'info', workPath);
+    await waitForGo(workPath, 'mtp', seconds: 330);
+    await Future<void>.delayed(const Duration(seconds: 3));
+    await watching.cancel();
+    final copied = mtp.where((e) => e.contains(':mtp-')).toList();
+    say(
+      'inotify_mtp',
+      copied.isEmpty ? 'info' : 'ok',
+      copied.isEmpty ? 'no USB/MTP copy in this run' : mtp.join(' '),
+    );
 
     // Revocation while running: Android kills the app ("MANAGE_EXTERNAL_STORAGE
     // changed"); the script records it. The no-access view is the second start.
     say('wait-revoke', 'info', workPath);
     await Future<void>.delayed(const Duration(seconds: 8));
     say('done', 'info', workPath);
-  }, timeout: const Timeout(Duration(minutes: 8)));
+  }, timeout: const Timeout(Duration(minutes: 15)));
 }

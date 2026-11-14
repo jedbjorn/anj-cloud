@@ -24,6 +24,8 @@ object SyncHost {
         loader.ensureInitializationComplete(app, null)
         val engine = FlutterEngine(app)
         DeviceChannel.register(app, engine.dartExecutor.binaryMessenger)
+        // Phone folders (spec #52): All files access, its settings page and media scans.
+        PhoneFoldersChannel.register(app, engine.dartExecutor.binaryMessenger)
         // Before the entry point runs, so a background run that started the process finds it.
         BackgroundChannel.install(app, engine)
         UpdateChannel.register(app, engine)

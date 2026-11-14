@@ -21,7 +21,9 @@ import '../gateway/sharing.dart';
 import '../local/root_identity.dart';
 import '../local/root_tree.dart';
 import '../local/staging_location.dart';
+import '../ports/phone_folders.dart';
 import '../ports/root_location.dart';
+import 'phone_folder_move.dart';
 import '../../platform/adapters.dart';
 import '../update/release.dart';
 import 'sync_activity.dart';
@@ -37,6 +39,11 @@ const rootCheckMessage = 'Checking folder after update…';
 Future<void> syncWorker(Map<String, Object?> initial) async {
   final output = initial['output'] as SendPort;
   final input = ReceivePort();
+  // Android's phone folders (spec #52): the root filesystem maps Music,
+  // Videos and Documents into shared storage.
+  final phone = PhoneFolderLayout.active = PhoneFolderLayout.fromJson(
+    initial['phoneFolders'],
+  );
   final native = platformAdapters().rootFilesystem(
     initial['nativeLibrary'] as String?,
   );
@@ -83,6 +90,34 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
           settled = settleStaging(manifest, profilePath, native);
         } on Object {
           settled = manifest.setting('staging') ?? staging;
+        }
+      }
+      // The one-time move of an existing install's private Music, Videos
+      // and Documents into the phone's folders, before anything syncs
+      // (spec #52 Moving an Existing Install). Resumes after a crash.
+      if (phone != null && !phone.paused) {
+        try {
+          PhoneFolderMove(
+            manifest,
+            native,
+            privateRoot: rootPath,
+            layout: phone,
+            onProgress: (message) =>
+                output.send({'event': 'checking', 'message': message}),
+          ).run();
+        } on FileSystemException catch (error) {
+          // Unfinished: the private copies are still there, so the phone
+          // folders stay paused for this run (nothing is inferred from a
+          // half-moved folder) and the move resumes at the next start.
+          (native as PhoneFolderRouting).setPaused(true);
+          output.send({
+            'event': 'phoneFolders',
+            'problem':
+                "Music, Videos and Documents could not be moved to your "
+                "phone's folders yet (${error.message}). They are paused; "
+                'nothing was deleted, and the move continues at the next '
+                'start.',
+          });
         }
       }
       tree = RootTree(Directory(root), Directory(settled), native);
@@ -708,6 +743,10 @@ class WorkerLoop {
   /// readiness changed. Every command is answered ([force]), so the UI sees
   /// each outcome even when it repeats the previous one.
   Future<void> emit({bool force = false}) async {
+    // The media library is told exactly which phone paths changed (spec
+    // #52, AC0: path writes are not indexed by themselves).
+    final scans = engine.tree.phoneFolders?.drainMediaScans() ?? const [];
+    if (scans.isNotEmpty) send({'event': 'mediaScan', 'paths': scans});
     final entries = <Map<String, Object?>>[];
     for (final entry in engine.manifest.entries.values) {
       entries.add(await projectEntry(engine, entry));
@@ -1101,6 +1140,21 @@ class WorkerLoop {
             ));
             schedule.requestNow();
             engine.requestFullVerification();
+            _passWanted = true;
+          }
+        case 'phoneFolders':
+          // All files access granted or lost while the app runs (spec #52).
+          // Granted: one full verification of everything; the top-folder
+          // rules (#150 / #163) decide about a folder that changed meanwhile.
+          final routing = engine.tree.phoneFolders;
+          if (routing != null) {
+            final paused = command['paused'] == true;
+            if (routing.paused != paused) {
+              routing.setPaused(paused);
+              await engine.restartWatchingAfterPhoneFolders();
+              if (!routing.paused) engine.requestFullVerification();
+            }
+            schedule.requestNow();
             _passWanted = true;
           }
         case 'network':

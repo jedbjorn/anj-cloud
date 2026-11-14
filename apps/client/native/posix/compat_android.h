@@ -27,6 +27,7 @@
 #define ANJ_COMPAT_ANDROID 1
 #include "compat_linux.h"
 
+#include <dirent.h>
 #include <time.h>
 #include <atomic>
 #include <memory>
@@ -103,6 +104,73 @@ int open_root_directory(const char* path) {
   close(current);
   errno = saved;
   return fd;
+}
+
+// Shared storage (spec #52, AC0 on the emulator): MediaProvider's FUSE mount
+// at /storage/emulated. Every file and folder there shows MediaProvider's
+// uid and group-shared modes (0770/0660), and chmod changes neither, so
+// neither ownership nor a 0700 mode can be required of a staging folder
+// there, and F_SETLEASE is refused (EACCES: the caller never owns the file).
+constexpr long kFuseSuperMagic = 0x65735546;
+bool on_shared_storage(int fd) {
+  struct statfs s = {};
+  int saved = errno;
+  bool fuse = fstatfs(fd, &s) == 0 && static_cast<long>(s.f_type) == kFuseSuperMagic;
+  errno = saved;
+  return fuse;
+}
+
+// Decision #137 (2) on Android: app storage is byte-exact, but shared
+// storage (the phone folders, spec #52) is casefolded (AC0: "case.txt" opens
+// "Case.txt"), so a path that resolves may be spelled differently on disk,
+// as on APFS. Each component beneath a shared-storage folder is looked up in
+// its folder's listing: the exact name, else the one entry naming the same
+// item (ASCII case, else the inode); the path as given when a lookup fails.
+std::string stored_component(int dir, const std::string& part) {
+  struct stat want = {};
+  if (fstatat(dir, part.c_str(), &want, AT_SYMLINK_NOFOLLOW) != 0) return part;
+  int listing = openat(dir, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (listing < 0) return part;
+  DIR* d = fdopendir(listing);
+  if (!d) { close(listing); return part; }
+  auto lower = [](std::string v) {
+    for (auto& c : v) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    return v;
+  };
+  const std::string key = lower(part);
+  std::string by_case, by_inode;
+  bool exact = false;
+  while (struct dirent* e = readdir(d)) {
+    std::string name(e->d_name);
+    if (name == part) { exact = true; break; }
+    if (by_case.empty() && lower(name) == key) by_case = name;
+    if (by_inode.empty() && e->d_ino == want.st_ino && name != "." && name != "..") by_inode = name;
+  }
+  closedir(d);
+  if (exact) return part;
+  if (!by_case.empty()) return by_case;
+  return by_inode.empty() ? part : by_inode;
+}
+std::string stored_path(int root, const std::string& relative) {
+  if (!on_shared_storage(root)) return relative;
+  std::string out;
+  int dir = dup(root);
+  size_t start = 0;
+  while (dir >= 0 && start <= relative.size()) {
+    size_t end = relative.find('/', start);
+    std::string part = relative.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    std::string stored = stored_component(dir, part);
+    out += stored;
+    if (end == std::string::npos) break;
+    out += '/';
+    int next = open_beneath(dir, stored.c_str(), O_RDONLY | O_DIRECTORY);
+    close(dir);
+    dir = next;
+    start = end + 1;
+  }
+  if (dir < 0) return relative;
+  close(dir);
+  return out;
 }
 
 // Prefix of the private copy link_file makes; lib/core/sync/artifacts.dart

@@ -1,6 +1,8 @@
 import '../../core/ports/release_guard.dart';
 import '../../core/ports/root_filesystem.dart';
 import '../../core/sync/open_documents.dart';
+import '../../core/ports/phone_folders.dart';
+import '../native/mapped_root_fs.dart';
 import '../native/native_root_fs.dart';
 
 /// The longest an Android root goes without a full verification pass while
@@ -31,6 +33,27 @@ class AndroidRootFs extends NativeRootFs {
 
   /// linkat is refused in the app sandbox (A1): ordinary installs rename the
   /// staged file (decision #123 (2)).
+  @override
+  bool get hardLinks => false;
+
+  @override
+  WritebackParameters? writeback({String? directory}) =>
+      directory == null ? null : super.writeback(directory: directory);
+}
+
+/// [AndroidRootFs] with the phone folders mapped (spec #52): Music, Videos
+/// and Documents resolve in shared storage ([MappedRootFs]); the rest of
+/// the root stays app-private. The same Android facts as [AndroidRootFs].
+class AndroidPhoneRootFs extends MappedRootFs {
+  AndroidPhoneRootFs(PhoneFolderLayout layout, [String? library])
+    : super(layout, library, 'Linux errno', androidFullVerificationInterval);
+
+  /// The mapped guard, behind the documents provider's open-descriptor
+  /// registry; in shared storage, where no lease can be taken, the native
+  /// guard is the weaker unchanged-content guard (#108 Q15).
+  @override
+  ReleaseGuard releaseGuard() => RegisteredReleaseGuard(super.releaseGuard());
+
   @override
   bool get hardLinks => false;
 

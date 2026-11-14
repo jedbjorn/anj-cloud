@@ -119,7 +119,8 @@ storage-sensitive suites against the host build of the Android boundary
 
 | Port | Android (`lib/platform/android/`) |
 |---|---|
-| `RootFilesystem`, `ReleaseGuard` | `AndroidRootFs` over the shared binding; `libanj_rootfs.so` from `native/posix` with `compat_android.h`: a component-by-component `O_NOFOLLOW` walk instead of openat2 (seccomp kills it), `link_file` copies instead of linkat (EACCES); the same 53 exports |
+| `RootFilesystem`, `ReleaseGuard` | `AndroidRootFs` over the shared binding; `libanj_rootfs.so` from `native/posix` with `compat_android.h`: a component-by-component `O_NOFOLLOW` walk instead of openat2 (seccomp kills it), `link_file` copies instead of linkat (EACCES); the same 53 exports. In the sync worker `AndroidPhoneRootFs` (a `MappedRootFs`) maps the phone folders (spec #52, below) |
+| `PhoneFolderRouting`, `PhoneFolderAccess` (`core/ports/phone_folders.dart`) | `MappedRootFs` (`lib/platform/native/`, shared so the Linux tests run it); `AndroidPhoneFolders` over `PhoneFoldersChannel.kt` (All files access, its settings page, media scans, Show in folder) |
 | `ChangeWatcherFactory` | `AndroidChangeWatchers`: the shared inotify watcher; ENOSPC leaves a subtree to the stat audit and asks for one full verification |
 | `DesktopSession` | `AndroidSession`: the profile flock; no tray, no activation, window controls do nothing |
 | `SecretStore` | `KeystoreSecrets`: an AES key wrapped by a non-exportable Android Keystore RSA key, `resetOnError: false` (#130 (2)) |
@@ -231,6 +232,57 @@ Application owns one cached FlutterEngine (`SyncHost.kt`) that runs the Dart
 entry and with it the sync worker; the activity attaches to it and never
 destroys it. On Android `main()` runs `mobileMain()`: the profile is
 `<files>/anj-profile/default`, the root `<files>/anj-cloud` and its staging
+
+### Phone folders (spec #52, decisions #201 and #202)
+
+The cloud's Music, Videos and Documents live in the phone's own `Music`, `Movies` and
+`Documents` folders in shared storage (`/storage/emulated/0`), one copy synced both ways;
+the rest of the root stays in `<files>/anj-cloud`. AC0 on the emulator
+(`docs/phone-folders-ac0.md`) qualified the primitives this rests on.
+
+- **One engine root.** Engine paths keep the cloud's top names. The worker reads a
+  `PhoneFolderLayout` from its start message (`ClientController` asks `PhoneFolderAccess`
+  first) and sets `PhoneFolderLayout.active`, so the Android adapter returns
+  `AndroidPhoneRootFs`. `RootTree` attaches its root and staging descriptors to it
+  (`PhoneFolderRouting.attach`); from then on a path beneath the root whose first component
+  is a top folder resolves beneath one descriptor of shared storage (`Videos` -> `Movies`),
+  listings merge the private root with the three phone folders (private folders of those
+  names are never listed), and a rename between the private root and a phone folder is
+  refused with EXDEV. Everything stays descriptor-relative and no-follow (shared storage
+  cannot hold symlinks at all). The Android watcher trusts inotify there (AC0: another
+  app's changes are reported) although FUSE is otherwise a silent filesystem.
+- **Two staging folders.** A staging name chosen for a phone path carries `phone-`
+  (`RootTree.stageName`, `Artifacts.reserve`, folder creation, Finish editing's renames)
+  and lives in `<shared storage>/Android/media/<package>/anj-staging` (`.nomedia`), on the
+  phone folders' volume, so installs stay no-replace renames. Records keep the private
+  staging path with the tagged name; `RootTree.stagedFile` and `MappedRootFs` resolve it.
+  The native owned-staging check accepts that folder on Android's shared storage
+  (`on_shared_storage`, `compat_android.h`): every file there shows MediaProvider's uid
+  and group-shared modes, and chmod changes nothing. A private staged file installed into
+  a phone folder (made before the mapping) is copied durably into shared staging first.
+- **Guard.** `F_SETLEASE` is refused on shared storage (EACCES); `anj_guard_open` then
+  keeps a weak guard (Android build only, `guard_lease.inc`): the file must keep its
+  identity, size and modification time until release, behind `RegisteredReleaseGuard`'s
+  open-descriptor registry (#108 Q15, weaker than the lease).
+- **Names.** `NameOs.phone` inside the three folders: R3 step 1 and the case clash
+  (`SyncEngine.nameOsIn`). `.pending-` and `.trashed-` names there are excluded
+  (`isSyncExcluded`, only where the layout is active); a move to `.trashed-…` is a
+  deletion, not a parked move; `.nomedia` and `.thumbnails` sync only with a cloud row.
+- **Paused.** `PhoneFolderLayout.paused` (no All files access, or shared storage not
+  mounted) keeps the three folders out of every listing and refuses every operation on
+  them; `SyncEngine._held` holds every path in them and `_keepTopFolders` skips them, so
+  nothing is uploaded, downloaded, deleted or inferred deleted. The controller asks again
+  on every app open and before a background run and sends `phoneFolders` to the worker,
+  which resumes with a full verification. Revoking access kills the app.
+- **Media library.** `MappedRootFs` records each phone path an install, rename or removal
+  touched; the worker sends them as `mediaScan` and the controller asks
+  `MediaScannerConnection.scanFile` (AC0: writes by path are otherwise invisible).
+- **The move.** `PhoneFolderMove` (`core/sync/phone_folder_move.dart`) runs in the worker
+  before the root opens, only with access; see the README.
+- **Provider.** `DocumentsService.hidden` drops the three folders from the provider:
+  absent from listings and the folder picker, their ids resolve to nothing, approvals
+  inside them are removed. Working copies stay reachable by per-document grant. Show in
+  folder opens the Files app at the phone folder (`com.android.externalstorage.documents`).
 
 ## Windows (spec #32)
 

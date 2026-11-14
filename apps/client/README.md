@@ -160,6 +160,71 @@ synthetic data, remove that fixture directory to discard its local test data.
 This does not remove gateway devices/accounts or their cloud content. Device
 revocation and cloud fixture cleanup belong to the gateway's operator tooling.
 
+## Phone folders on Android
+
+Spec #52 (decisions #201, #202). On Android the cloud's **Music**, **Videos** and
+**Documents** are the phone's own folders in internal shared storage, one copy synced
+both ways: Music is `/storage/emulated/0/Music`, Videos is `/storage/emulated/0/Movies`
+and Documents is `/storage/emulated/0/Documents`. The app shows the cloud names;
+everything else (root-level files, `Shared/`, other top-level folders) stays app-private
+in `<files>/anj-cloud` behind the documents provider and "Apps with access".
+
+- **Engine paths stay cloud-shaped.** The engine still sees `Music/…`, `Videos/…` and
+  `Documents/…`; `MappedRootFs` (`lib/platform/native/mapped_root_fs.dart`, the Android
+  adapter `AndroidPhoneRootFs`) resolves those three top folders beneath one descriptor of
+  shared storage (`Videos` becomes `Movies` there) and passes every other path to the
+  private root. Nothing outside the three phone folders is listed or touched.
+- **Staging on the same volume.** Bytes for a phone folder are staged in
+  `<shared storage>/Android/media/<package>/anj-staging` (with `.nomedia`, removed with the
+  app); their staging names carry the `phone-` tag (`RootTree.stageName`), so every
+  install is an atomic no-replace rename on the phone folders' volume (AC0: renames from
+  app-private storage fail with EXDEV). Bytes staged privately before the folders were
+  mapped (an open working copy, a recovery copy) are copied durably into shared staging
+  and renamed into place from there, never replacing a file.
+- **Names.** Shared storage refuses `" * : < > ? |` and controls in file names and
+  compares names case-insensitively, so inside the three folders the per-device name rule
+  applies R3 step 1 (fullwidth lookalikes, Control Pictures) and the case-clash step
+  (`NameOs.phone`): `Where Is My Mind?.mp3` is `Where Is My Mind？.mp3` on the phone and
+  keeps its cloud name. Android's `.pending-…` and `.trashed-…` names are not files (a
+  move to the Files app's trash syncs as a deletion); `.nomedia` and `.thumbnails` sync
+  only when the cloud already has them.
+- **Media library.** Writes by path stay invisible to other apps until scanned (AC0), so
+  after each install, rename or removal in a phone folder the app asks the media scanner
+  for exactly those paths (`mediaScan` worker event, `MediaScannerConnection.scanFile`).
+- **Open files.** Shared storage refuses every lease, so the release guard there is the
+  #108 Q15 fallback: the app's own open-file tracking plus an unchanged size and
+  modification time from guard open to release (weaker than the lease: a reader that
+  opens and closes inside the window is not seen).
+- **All files access.** The folders need `MANAGE_EXTERNAL_STORAGE`, explained once at
+  pairing or after the update ("Allow" opens the system page). Without it, or while shared
+  storage is unavailable, the three folders are **paused**: absent from every listing,
+  nothing under them uploaded, downloaded, deleted or inferred deleted, and the home screen
+  says "Music, Videos and Documents are paused: allow All files access". Only the explicit
+  `isExternalStorageManager()` check decides (checked before the worker starts, on every
+  app open and before a background run): without access Android still lists the folders,
+  with other apps' files hidden. Revoking access makes Android stop the app; the next start
+  checks again. Access returning runs one full verification.
+- **Moving an existing install.** The first start with access moves the private `Music`,
+  `Videos` and `Documents` into the phone folders before anything syncs
+  (`PhoneFolderMove`): each file is copied through shared staging, verified by hash,
+  renamed into place without replacing anything, and only then removed privately; a crash
+  or kill resumes. A phone file already at that path with the same bytes links; different
+  bytes are both kept (the cloud's conflict rule decides on the next pass). Unsynced edits
+  upload afterwards; nothing is downloaded again. The status line says once "Music, Videos
+  and Documents are now in your phone's folders."
+- **Large files.** Above the gateway's upload limit a phone file stays on the phone and its
+  row says "Too large to upload yet".
+- **Settings.** The menu's **Phone folders** page shows each folder's place; **Apps with
+  access** starts with "Music, Videos and Documents are in your phone's own folders. Apps
+  with media or file access can use them. The approvals below cover your other folders."
+  Approvals for folders inside the three are removed, and their provider document ids
+  resolve to nothing.
+
+Proof: `test/phone_folders_test.dart` (H, also run against the Android boundary build by
+`tool/android_variant_suites.sh`), `tool/android/ac0/` and
+`integration_test/android_phone_folders_ac0_test.dart` (AC0), and
+`tool/android/emu_phone_folders.py` (AC2 to AC6 on the emulator).
+
 ## Pairing and open files
 
 Code-only pairing (decision #151, spec #35): the pair dialog asks for the
@@ -394,6 +459,8 @@ gives every cloud item a local name on this OS, once per listing:
   `a：b？.txt`, `x.` as `x`, and of `Report.pdf` and `report.pdf` the older
   item keeps the name and the other is `report (2).pdf`; on macOS only case
   and normalization clashes are suffixed; Linux holds every name verbatim.
+  Android's phone folders (spec #52) take Windows' characters step and the
+  case clash ([Phone folders on Android](#phone-folders-on-android)).
   The cloud name never changes.
 
 The manifest is keyed by local path; each entry records the cloud name it

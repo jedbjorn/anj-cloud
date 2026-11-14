@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/services.dart';
 
+import '../../core/ports/phone_folders.dart';
 import '../../core/access/access_store.dart';
 import '../../core/access/documents_service.dart';
 import '../../core/ports/desktop_launcher.dart';
@@ -22,6 +23,8 @@ class AndroidDocuments implements GrantRevoker, PlatformApps {
             AccessStore(Directory(profile)),
             revoker: this,
             platformApps: this,
+            // Music, Videos and Documents are phone folders (spec #52).
+            hidden: inPhoneFolder,
           )
           ..onChildrenChanged = _changed
           ..onLocalChange = _prompt;
@@ -192,6 +195,8 @@ class AndroidDocuments implements GrantRevoker, PlatformApps {
 /// folder opens the Files app at that folder. Either reports false when no
 /// app accepts it, and the shared UI says so.
 class AndroidLauncher extends DesktopLauncher {
+  static const _phoneFolders = MethodChannel('cloud.anj/phone_folders');
+
   /// Only the `w:` provider document is handed out (decision #184).
   @override
   bool get handsOutThroughProvider => true;
@@ -212,6 +217,19 @@ class AndroidLauncher extends DesktopLauncher {
     String relative,
     String rootIdentity,
   ) async {
+    // A phone folder (spec #52): the Files app at the phone's own folder.
+    final top = relative.split('/').first;
+    if (phoneFolderNames.containsKey(top)) {
+      try {
+        return await _phoneFolders.invokeMethod<bool>('showFolder', {
+              'path':
+                  '${phoneFolderNames[top]}${relative.substring(top.length)}',
+            }) ??
+            false;
+      } on PlatformException {
+        return false;
+      }
+    }
     final bridge = AndroidDocuments.instance;
     if (bridge == null) return false;
     try {

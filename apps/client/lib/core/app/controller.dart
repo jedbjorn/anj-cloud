@@ -20,6 +20,7 @@ import '../sync/top_folders.dart';
 import '../local/desktop_shortcut.dart';
 import '../local/root_move.dart';
 import '../local/root_tree.dart';
+import '../ports/phone_folders.dart';
 import '../ports/desktop_launcher.dart';
 import '../ports/documents.dart';
 import '../ports/root_placement.dart';
@@ -45,6 +46,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     this.defaultNetworkPolicy,
     this.fetchTimeout = fetchReplyTimeout,
     this.workerEntry = syncWorker,
+    this.phoneFolders,
   }) : secrets = secrets ?? platformAdapters().secretStore(),
        launcher =
            launcher ??
@@ -53,6 +55,67 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
        deviceLabel = deviceLabel ?? platformAdapters().deviceLabel;
   final Directory profile;
   late final iconColors = IconColors(profile);
+
+  /// Android's phone folders (spec #52): Music, Videos and Documents in the
+  /// phone's own folders; null on every other platform.
+  final PhoneFolderAccess? phoneFolders;
+
+  /// The phone folders as last checked; null before the first check or
+  /// without [phoneFolders].
+  PhoneFolderLayout? phoneFolderLayout;
+
+  /// Whether the phone folders are paused (no All files access, or shared
+  /// storage unavailable): the home screen's attention line.
+  bool get phoneFoldersPaused => phoneFolderLayout?.paused ?? false;
+
+  /// A move of the private folders that could not finish (the worker's
+  /// report), shown until a later start finishes it.
+  String? phoneFolderProblem;
+
+  /// Asks Android again (app opened, settings left): a change is sent to
+  /// the running worker, which resumes the folders with a full
+  /// verification or pauses them. Revoking access kills the app, so a
+  /// running worker only ever sees access come back.
+  Future<void> checkPhoneFolders() async {
+    final access = phoneFolders;
+    if (access == null) return;
+    final PhoneFolderLayout now;
+    try {
+      now = await access.check();
+    } on Object {
+      return;
+    }
+    final changed = phoneFolderLayout?.paused != now.paused;
+    phoneFolderLayout = now;
+    if (!changed) return;
+    _input?.send({'action': 'phoneFolders', 'paused': now.paused});
+    notifyListeners();
+  }
+
+  Future<void> openAllFilesAccess() async => await phoneFolders?.openSettings();
+
+  /// Whether the All files access explanation (spec #52) was answered on
+  /// this profile; it shows once, at pairing or after the update that
+  /// brings phone folders, and the paused line stays after that.
+  bool get phoneFoldersAsked =>
+      File(p.join(profile.path, 'phone-folders-asked')).existsSync();
+  set phoneFoldersAsked(bool value) {
+    final marker = File(p.join(profile.path, 'phone-folders-asked'));
+    if (value) {
+      marker.writeAsStringSync('1');
+    } else if (marker.existsSync()) {
+      marker.deleteSync();
+    }
+    notifyListeners();
+  }
+
+  /// Whether the explanation screen is due now: paired, folders paused,
+  /// not answered yet.
+  bool get phoneFoldersScreenDue =>
+      phoneFolders != null &&
+      pairingState == 'paired' &&
+      phoneFoldersPaused &&
+      !phoneFoldersAsked;
   final SecretStore secrets;
   final DesktopLauncher launcher;
 
@@ -480,6 +543,12 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         case 'activity':
           _syncing = (event['paths'] as List).cast<String>().toSet();
           notifyListeners();
+        case 'mediaScan':
+          final paths = (event['paths'] as List).cast<String>();
+          unawaited(phoneFolders?.scan(paths).catchError((Object _) {}));
+        case 'phoneFolders':
+          phoneFolderProblem = event['problem'] as String?;
+          notifyListeners();
         case 'checking':
           // Startup is reading files to verify the folder (legacy identity).
           _checking = true;
@@ -607,6 +676,16 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         _stopped?.complete();
         notifyListeners();
       });
+    // The phone folders as Android reports them now (spec #52): paused
+    // without All files access, before the worker opens anything.
+    final access = phoneFolders;
+    if (access != null) {
+      try {
+        phoneFolderLayout = await access.check();
+      } on Object {
+        phoneFolderLayout = null;
+      }
+    }
     _worker = await Isolate.spawn(
       workerEntry,
       <String, Object?>{
@@ -616,6 +695,17 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         'nativeLibrary': nativeLibrary,
         'settleStaging': placement.stagingInProfile,
         'networkPolicy': defaultNetworkPolicy,
+        // Without a check (it failed), the folders stay paused.
+        if (access != null)
+          'phoneFolders':
+              (phoneFolderLayout ??
+                      const PhoneFolderLayout(
+                        base: '/storage/emulated/0',
+                        staging:
+                            '/storage/emulated/0/Android/media/anj-staging',
+                        paused: true,
+                      ))
+                  .toJson(),
       },
       onExit: _workerStatus!.sendPort,
       onError: _workerStatus!.sendPort,

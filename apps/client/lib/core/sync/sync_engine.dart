@@ -18,8 +18,10 @@ import 'folder_creation.dart';
 import 'name_policy.dart';
 import 'cloud_names.dart';
 import 'name_rule.dart';
+import 'phone_folder_move.dart';
 import '../../platform/watchers.dart';
 import '../ports/change_watcher.dart';
+import '../ports/phone_folders.dart';
 import '../ports/root_filesystem.dart';
 import 'pass_metrics.dart';
 import 'recovery_copies.dart';
@@ -375,6 +377,17 @@ class SyncEngine {
   }
 
   Duration _waitTimeout = const Duration(seconds: 30);
+
+  /// The phone folders were paused or resumed while running (spec #52): the
+  /// watcher starts again over the root as it is listed now, so the first
+  /// scan is a full audit with watches on what is there.
+  Future<void> restartWatchingAfterPhoneFolders() async {
+    final current = watcher;
+    if (current == null) return;
+    current.close();
+    watcher = null;
+    await startWatching(waitTimeout: _waitTimeout);
+  }
 
   /// A watcher that died is replaced at most [watchRestartLimit] times, the
   /// first attempt [watchRestartDelay] after the failure was noticed. In
@@ -1055,6 +1068,34 @@ class SyncEngine {
   /// (spec #49 R3). Test seam.
   NameOs nameOs = NameRule.current;
 
+  /// The local-name rule for the items of the cloud folder [folder] ('.'
+  /// is the root): inside the phone folders, the phone's own (spec #52,
+  /// decision #202), elsewhere [nameOs].
+  NameOs nameOsIn(String folder) =>
+      tree.phoneFolders != null && folder != '.' && inPhoneFolder(folder)
+      ? NameOs.phone
+      : nameOs;
+
+  /// Whether [path] is in a phone folder that is paused (spec #52: no All
+  /// files access, or shared storage unavailable).
+  bool phoneFolderPaused(String path) =>
+      tree.phoneFolders?.paused == true && inPhoneFolder(path);
+
+  /// Android's `.nomedia` marker and `.thumbnails` cache in a phone folder
+  /// (spec #52 Folder Mapping): ignored unless the cloud already has that
+  /// item (a row with a version), so sync never creates them in the cloud.
+  bool _phoneHidden(String path) {
+    if (tree.phoneFolders == null || !inPhoneFolder(path)) return false;
+    final parts = path.split('/');
+    for (var i = 1; i < parts.length; i++) {
+      if (parts[i] == '.nomedia' || parts[i] == '.thumbnails') {
+        return manifest.entries[parts.sublist(0, i + 1).join('/')]?.etag ==
+            null;
+      }
+    }
+    return false;
+  }
+
   /// Whether a row says its full path is over [win32MaxPath] characters
   /// ([longPathNote]; Windows). Test seam.
   bool notesLongPaths = Platform.isWindows;
@@ -1290,6 +1331,9 @@ class SyncEngine {
     // A file another program holds open (SC-048 F5): nothing is inferred
     // or transferred for it this pass.
     if (tree.busy.contains(path)) return true;
+    // Paused phone folders (spec #52): nothing under them is uploaded,
+    // downloaded, deleted or inferred deleted until access returns.
+    if (phoneFolderPaused(path)) return true;
     final mount = mountOf(path);
     return (mount != null && _heldMounts.contains(mount)) ||
         _heldTargets.any((target) => withinOrAt(target, path));
@@ -2083,6 +2127,9 @@ class SyncEngine {
   void _keepTopFolders(Map<String, LocalItem> rawLocal) {
     _topsRestoredThisPass.clear();
     for (final top in topFolders) {
+      // A paused phone folder is not listed at all: neither gone nor
+      // replaced, and never re-created here (spec #52).
+      if (phoneFolderPaused(top)) continue;
       // Renamed in case only (on a case-insensitive volume the folder is
       // then listed only under the new spelling): renamed back.
       var item = rawLocal[top] ?? _respellTop(top, rawLocal);
@@ -2633,6 +2680,11 @@ class SyncEngine {
   /// The status-line notice for top folders deleted here (one per
   /// deletion: while restoring, and once when back); null without one.
   String? _topFolderNote() {
+    // The phone folders' one-time move finished (spec #52 step 5): once.
+    if (manifest.setting(phoneFolderNoticeKey) == '1') {
+      _topLocalNotes.add(phoneFoldersMovedNotice);
+      manifest.setSetting(phoneFolderNoticeKey, '0');
+    }
     final once = _topLocalNotes.join(' ');
     _topLocalNotes.clear();
     final deleted = _topDeletionNote();
@@ -3107,7 +3159,11 @@ class SyncEngine {
     // item stays where it was (spec #33 I1 step 5).
     final excluded = {
       for (final item in raw.values)
-        if (isSyncExcluded(item.path) && item.identity != null)
+        // A phone file moved to the Files app's trash is deleted instead
+        // (spec #52): its removal is inferred as any other.
+        if (isSyncExcluded(item.path) &&
+            !isAndroidTrashed(item.path) &&
+            item.identity != null)
           item.identity!: item,
     };
     if (excluded.isEmpty) return;
@@ -4227,7 +4283,8 @@ class SyncEngine {
   ) {
     _unplaceable.clear();
     final os = nameOs;
-    final perDevice = os == NameOs.windows || os == NameOs.macos;
+    final perDevice =
+        os == NameOs.windows || os == NameOs.macos || tree.phoneFolders != null;
     bool respelled(String path) => NamePolicy.nfc(path) != path;
     final normalizing =
         rawLocal.keys.any(respelled) || manifest.entries.keys.any(respelled);
@@ -4251,7 +4308,7 @@ class SyncEngine {
             );
       }
       for (final MapEntry(key: folder, value: items) in folders.entries) {
-        final names = NameRule.localNames(items, os);
+        final names = NameRule.localNames(items, nameOsIn(folder));
         if (names.entries.any((v) => v.key != v.value)) local[folder] = names;
       }
     }
@@ -4443,7 +4500,8 @@ class SyncEngine {
         (v) =>
             !isSyncExcluded(v.key) &&
             !pendingFolder(v.key) &&
-            !_temporary(v.value),
+            !_temporary(v.value) &&
+            !_phoneHidden(v.key),
       ),
     );
     // A temporary file keeps no row (decision #195), even while it stays on
@@ -6496,7 +6554,7 @@ class SyncEngine {
             folder: known.kind == ItemKind.directory,
           ),
     ],
-    nameOs,
+    nameOsIn(parent.isEmpty ? '.' : parent),
     folder: folder,
   );
 
@@ -7311,8 +7369,7 @@ class SyncEngine {
           tree.stageFd,
           record.data['name'] as String,
         );
-        if (info.identity == live &&
-            info.identity == record.data['identity']) {
+        if (info.identity == live && info.identity == record.data['identity']) {
           continue;
         }
         var kind = artifactKind(record.data['role'] as String?);

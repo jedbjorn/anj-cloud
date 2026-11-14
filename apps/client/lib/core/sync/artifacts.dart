@@ -36,9 +36,17 @@ class Artifacts {
       manifest.operations.values.where((o) => o.kind == 'artifact');
   Operation? record(File file) =>
       records.where((o) => o.staged == tree.durablePath(file)).firstOrNull;
-  File reserve(String path, String role, {bool create = true}) {
+
+  /// [stageFor]: the root path the bytes will be installed at, when it is
+  /// not [path] (it decides the staging folder, spec #52).
+  File reserve(
+    String path,
+    String role, {
+    bool create = true,
+    String? stageFor,
+  }) {
     final name =
-        '$role-${uniqueId()}${role == 'working' ? '-${p.posix.basename(path)}' : ''}';
+        '${tree.stageName(role, forPath: stageFor ?? path)}${role == 'working' ? '-${p.posix.basename(path)}' : ''}';
     final file = File(p.join(tree.staging.path, name));
     final op =
         Operation(

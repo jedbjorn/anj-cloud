@@ -604,7 +604,7 @@ class RecoveryCopies {
     String destination, {
     String? trash,
   }) {
-    final temp = artifacts.reserve(path, 'recover-temp');
+    final temp = artifacts.reserve(path, 'recover-temp', stageFor: destination);
     final tempRecord = artifacts.record(temp)!;
     final op =
         Operation(

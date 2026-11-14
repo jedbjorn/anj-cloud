@@ -23,6 +23,7 @@ import '../core/ports/documents.dart';
 import 'apps_access_page.dart';
 import 'library_toolbar.dart';
 import 'library_view.dart';
+import 'phone_folders_screen.dart';
 import 'shortcuts.dart';
 import 'trash_page.dart';
 import 'library_entry_card.dart';
@@ -70,6 +71,7 @@ enum _AppAction {
   notifications,
   updates,
   appsAccess,
+  phoneFolders,
   quit,
 }
 
@@ -847,6 +849,10 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
           ),
         );
       }
+      // All files access, explained once (spec #52).
+      if (controller.phoneFoldersScreenDue) {
+        return PhoneFoldersScreen(controller: controller);
+      }
       final adminNotice = controller.adminNotice;
       if (adminNotice != null) {
         controller.adminNotice = null;
@@ -986,8 +992,17 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                       case _AppAction.appsAccess:
                         Navigator.of(context).push(
                           MaterialPageRoute<void>(
+                            builder: (_) => AppsAccessPage(
+                              access: widget.appAccess!,
+                              phoneFolders: controller.phoneFolders != null,
+                            ),
+                          ),
+                        );
+                      case _AppAction.phoneFolders:
+                        Navigator.of(context).push(
+                          MaterialPageRoute<void>(
                             builder: (_) =>
-                                AppsAccessPage(access: widget.appAccess!),
+                                PhoneFoldersPage(controller: controller),
                           ),
                         );
                       case _AppAction.autostart:
@@ -1036,6 +1051,12 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                       const PopupMenuItem(
                         value: _AppAction.notifications,
                         child: Text('Notifications are off: allow'),
+                      ),
+                    if (controller.phoneFolders != null)
+                      const PopupMenuItem(
+                        key: ValueKey('open-phone-folders'),
+                        value: _AppAction.phoneFolders,
+                        child: Text('Phone folders'),
                       ),
                     if (widget.appAccess != null)
                       const PopupMenuItem(
@@ -1165,6 +1186,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                           ),
                         if (controller.folderMessage != null)
                           Text(controller.folderMessage!),
+                        PhoneFoldersNotice(controller: controller),
                         if (controller.certificateWarning != null)
                           Text(controller.certificateWarning!),
                         if (lifecycle?.note != null) Text(lifecycle!.note!),

@@ -4,6 +4,7 @@ import 'dart:math';
 
 import 'package:path/path.dart' as p;
 
+import '../ports/phone_folders.dart';
 import '../ports/root_filesystem.dart';
 import '../state/model.dart';
 import '../sync/name_policy.dart';
@@ -45,7 +46,22 @@ class RootTree {
     staging.createSync(recursive: true);
     native.privateDir(staging.path);
     stageFd = native.openRoot(staging.path);
+    phoneFolders?.attach(fd, stageFd);
   }
+
+  /// The phone folders' routing (spec #52), where this root maps them.
+  PhoneFolderRouting? get phoneFolders {
+    final Object routing = native;
+    return routing is PhoneFolderRouting ? routing : null;
+  }
+
+  /// A fresh staging name for bytes that belong at the root path [forPath]:
+  /// in a phone folder ([PhoneFolderRouting]) the name carries
+  /// [sharedStagingTag], so the bytes are staged on the phone folders' own
+  /// volume and installs stay same-volume renames.
+  String stageName(String label, {String? forPath}) =>
+      '${forPath != null && phoneFolders != null && inPhoneFolder(forPath) ? sharedStagingTag : ''}'
+      '$label-${uniqueId()}';
   final Directory root;
   final Directory staging;
   final RootFilesystem native;
@@ -102,8 +118,11 @@ class RootTree {
           : stagingFor(root, profileDir, profileId, native),
       native,
     );
-    for (final name in ['Music', 'Videos', 'Documents']) {
-      tree.ensureDirectory(name, keptTop: true);
+    // Paused phone folders (spec #52) are neither listed nor created.
+    if (tree.phoneFolders?.paused != true) {
+      for (final name in ['Music', 'Videos', 'Documents']) {
+        tree.ensureDirectory(name, keptTop: true);
+      }
     }
     return tree;
   }
@@ -686,7 +705,8 @@ class RootTree {
   String directoryLocation(String relative) {
     validateRelative(relative);
     native.checkRoot(fd, root.path);
-    final path = p.join(root.path, relative);
+    final path =
+        phoneFolders?.absolutePath(relative) ?? p.join(root.path, relative);
     final selected = native.openRoot(
       path,
     ); // Rejects symlinks in every component.
@@ -747,8 +767,8 @@ class RootTree {
     }
   }
 
-  File newStagedFile([String label = 'transfer']) =>
-      File(p.join(staging.path, '$label-${uniqueId()}'));
+  File newStagedFile([String label = 'transfer', String? forPath]) =>
+      File(p.join(staging.path, stageName(label, forPath: forPath)));
   String snapshotFile(
     String relative,
     File target, {
@@ -765,7 +785,7 @@ class RootTree {
     final parent = p.posix.dirname(relative);
     if (parent != '.') ensureDirectory(parent);
     try {
-      native.install(fd, relative, stage.path);
+      native.install(fd, relative, stagedPath(stage.path));
     } finally {
       own(relative);
     }
@@ -776,23 +796,45 @@ class RootTree {
   File preserve(String relative) {
     validateRelative(relative);
     native.checkRoot(fd, root.path);
-    final copy = newStagedFile('preserved');
+    final copy = newStagedFile('preserved', relative);
     try {
-      native.quarantine(fd, relative, copy.path);
+      native.quarantine(fd, relative, stagedPath(copy.path));
     } finally {
       own(relative);
     }
     return copy;
   }
 
+  /// Where the bytes of the staged [path] are for a native call: [path]
+  /// itself in private staging, the shared staging path for a phone folder's
+  /// tagged name (spec #52).
+  String stagedPath(String path) =>
+      p.basename(path).startsWith(sharedStagingTag) && phoneFolders != null
+      ? stagedFile(path).path
+      : path;
+
   File stagedFile(String path) {
     final name = p.basename(path);
     validateRelative(name);
     final through = native.stagePath(stageFd);
-    if (p.dirname(path) != staging.path && p.dirname(path) != through) {
+    final shared = phoneFolders?.sharedStagePath;
+    if (p.dirname(path) != staging.path &&
+        p.dirname(path) != through &&
+        (shared == null || p.dirname(path) != shared)) {
       throw const FileSystemException(
         'File is outside this private staging directory.',
       );
+    }
+    // A phone folder's staged bytes (spec #52): the record keeps the
+    // private staging path with the tagged name; the bytes are in shared
+    // staging.
+    if (name.startsWith(sharedStagingTag) && phoneFolders != null) {
+      if (shared == null) {
+        throw const FileSystemException(
+          'Music, Videos and Documents are paused: allow All files access',
+        );
+      }
+      return File('$shared/$name');
     }
     return File('$through/$name');
   }
