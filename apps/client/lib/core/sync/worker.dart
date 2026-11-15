@@ -280,6 +280,14 @@ Timer _timerAtLeast(Duration delay, void Function() callback) {
 /// still running after [abortGrace] is abandoned by closing the cloud
 /// client (its durable intent is retried by the next start).
 class WorkerLoop {
+  /// The line under "Reconnecting" from start until the first pass ends.
+  static const startingMessage =
+      'Showing files from the last sync. Checking for changes.';
+
+  /// Until the first pass ends the server has not been heard from: the
+  /// stored library shows as Reconnecting.
+  late bool _connecting = !unpaired;
+
   WorkerLoop(
     this.engine,
     this.send, {
@@ -557,6 +565,12 @@ class WorkerLoop {
       _queue.add(command);
       _wake();
     });
+    // The library the manifest already holds, before the first pass: that
+    // pass is a full verification (decisions #130, #135) and a cloud
+    // listing, a minute or more on a phone, and the app has nothing to show
+    // until a state arrives.
+    if (!_paused) engine.message = startingMessage;
+    await emit(force: true);
     try {
       while (!_stopping) {
         if (_queue.isNotEmpty) {
@@ -702,6 +716,7 @@ class WorkerLoop {
       engine.message = 'Pending: $error';
     } finally {
       _inPass = false;
+      _connecting = false;
     }
     await _applyPhoneFolders();
     // A pause handled during the pass leaves its message to the paused scan.
@@ -766,6 +781,11 @@ class WorkerLoop {
   /// Runs at each candidate-path boundary during a pass.
   Future<bool> _between() async {
     await Future<void>.delayed(Duration.zero);
+    // The server answered: the rest of the first pass is ordinary sync.
+    if (_connecting && engine.remoteListed) {
+      _connecting = false;
+      await emit();
+    }
     var handled = false;
     while (_queue.isNotEmpty && !_stopping) {
       await _handle(_queue.removeFirst());
@@ -817,7 +837,7 @@ class WorkerLoop {
       'transfersHeld': engine.transfersHeld,
       'status': deriveStatus(
         paused: _paused,
-        offline: schedule.offline,
+        offline: schedule.offline || _connecting,
         unpaired: unpaired,
         message: engine.message,
         entries: engine.manifest.entries.values,

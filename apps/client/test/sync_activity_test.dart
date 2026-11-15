@@ -389,6 +389,46 @@ void main() {
       },
     );
 
+    test('a restarted worker shows the stored library before its first pass '
+        'ends', () async {
+      File('${tree.root.path}/kept.txt').writeAsStringSync('kept');
+      final first = <Map>[];
+      final run = start(FakeCloud(), first);
+      await eventually(
+        () => first.any(
+          (e) =>
+              e['event'] == 'state' &&
+              (e['entries'] as List).any(
+                (v) =>
+                    v['path'] == 'kept.txt' && v['status'] == 'current local',
+              ),
+        ),
+      );
+      run.input.add({'action': 'stop'});
+      await run.done;
+      // The next start's first pass is held on an upload.
+      File('${tree.root.path}/new.txt').writeAsStringSync('new');
+      final cloud = _HeldCloud();
+      final events = <Map>[];
+      final worker = start(cloud, events);
+      await eventually(() => cloud.held.isNotEmpty);
+      final states = events.where((e) => e['event'] == 'state').toList();
+      final state = states.first;
+      expect(state['passes'], 0);
+      expect(state['status'], SyncStatus.offline.name, reason: 'Reconnecting');
+      expect(state['message'], WorkerLoop.startingMessage);
+      expect(
+        (state['entries'] as List).map((v) => v['path']),
+        contains('kept.txt'),
+      );
+      // Listed before the held upload: no longer Reconnecting mid-pass.
+      expect(states.last['passes'], 0);
+      expect(states.last['status'], isNot(SyncStatus.offline.name));
+      cloud.release!.complete();
+      worker.input.add({'action': 'stop'});
+      await worker.done;
+    });
+
     test(
       'many transfers coalesce into a few events, not one per file',
       () async {
@@ -459,8 +499,13 @@ void main() {
           gate: gate,
         );
         worker = (loop: loop, done: loop.run(input.stream), input: input);
-        // Pass 1 synchronizes Photos/old.jpg.
-        await eventually(() => listed('Photos/old.jpg'));
+        // Pass 1 synchronizes Photos/old.jpg. Its row is already sent
+        // mid-pass (once the cloud is listed): wait for the pass to end.
+        await eventually(
+          () =>
+              listed('Photos/old.jpg') &&
+              ((lastState()?['passes'] as int?) ?? 0) >= 1,
+        );
         // The user drops a new photo; the next pass holds its upload.
         cloud.release = Completer<void>();
         File('${tree.root.path}/Photos/new.jpg').writeAsStringSync('new');
