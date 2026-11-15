@@ -280,6 +280,9 @@ Timer _timerAtLeast(Duration delay, void Function() callback) {
 /// still running after [abortGrace] is abandoned by closing the cloud
 /// client (its durable intent is retried by the next start).
 class WorkerLoop {
+  /// The status line from start until the first pass ends.
+  static const startingMessage = 'Checking for changes since the last start.';
+
   WorkerLoop(
     this.engine,
     this.send, {
@@ -557,6 +560,12 @@ class WorkerLoop {
       _queue.add(command);
       _wake();
     });
+    // The library the manifest already holds, before the first pass: that
+    // pass is a full verification (decisions #130, #135) and a cloud
+    // listing, a minute or more on a phone, and the app has nothing to show
+    // until a state arrives.
+    if (!_paused) engine.message = startingMessage;
+    await emit(force: true);
     try {
       while (!_stopping) {
         if (_queue.isNotEmpty) {

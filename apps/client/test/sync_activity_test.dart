@@ -389,6 +389,41 @@ void main() {
       },
     );
 
+    test('a restarted worker shows the stored library before its first pass '
+        'ends', () async {
+      File('${tree.root.path}/kept.txt').writeAsStringSync('kept');
+      final first = <Map>[];
+      final run = start(FakeCloud(), first);
+      await eventually(
+        () => first.any(
+          (e) =>
+              e['event'] == 'state' &&
+              (e['entries'] as List).any(
+                (v) =>
+                    v['path'] == 'kept.txt' && v['status'] == 'current local',
+              ),
+        ),
+      );
+      run.input.add({'action': 'stop'});
+      await run.done;
+      // The next start's first pass is held on an upload.
+      File('${tree.root.path}/new.txt').writeAsStringSync('new');
+      final cloud = _HeldCloud();
+      final events = <Map>[];
+      final worker = start(cloud, events);
+      await eventually(() => cloud.held.isNotEmpty);
+      final state = events.firstWhere((e) => e['event'] == 'state');
+      expect(state['passes'], 0);
+      expect(state['message'], WorkerLoop.startingMessage);
+      expect(
+        (state['entries'] as List).map((v) => v['path']),
+        contains('kept.txt'),
+      );
+      cloud.release!.complete();
+      worker.input.add({'action': 'stop'});
+      await worker.done;
+    });
+
     test(
       'many transfers coalesce into a few events, not one per file',
       () async {

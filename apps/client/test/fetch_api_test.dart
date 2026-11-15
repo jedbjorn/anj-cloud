@@ -461,7 +461,8 @@ void main() {
           .where((e) => e['event'] == 'fetchResult' && e['request'] == request)
           .firstOrNull;
       try {
-        await until(() => loop.emitted > 0);
+        // The start-up pass's state, not the one sent before it.
+        await until(() => engine.passes > 0 && loop.emitted > 1);
         final emitted = loop.emitted;
         input.add({'action': 'fetch', 'op': 'list', 'request': 'q1'});
         await until(() => answer('q1') != null);
