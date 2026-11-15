@@ -499,8 +499,13 @@ void main() {
           gate: gate,
         );
         worker = (loop: loop, done: loop.run(input.stream), input: input);
-        // Pass 1 synchronizes Photos/old.jpg.
-        await eventually(() => listed('Photos/old.jpg'));
+        // Pass 1 synchronizes Photos/old.jpg. Its row is already sent
+        // mid-pass (once the cloud is listed): wait for the pass to end.
+        await eventually(
+          () =>
+              listed('Photos/old.jpg') &&
+              ((lastState()?['passes'] as int?) ?? 0) >= 1,
+        );
         // The user drops a new photo; the next pass holds its upload.
         cloud.release = Completer<void>();
         File('${tree.root.path}/Photos/new.jpg').writeAsStringSync('new');
