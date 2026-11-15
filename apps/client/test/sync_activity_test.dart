@@ -412,13 +412,18 @@ void main() {
       final events = <Map>[];
       final worker = start(cloud, events);
       await eventually(() => cloud.held.isNotEmpty);
-      final state = events.firstWhere((e) => e['event'] == 'state');
+      final states = events.where((e) => e['event'] == 'state').toList();
+      final state = states.first;
       expect(state['passes'], 0);
+      expect(state['status'], SyncStatus.offline.name, reason: 'Reconnecting');
       expect(state['message'], WorkerLoop.startingMessage);
       expect(
         (state['entries'] as List).map((v) => v['path']),
         contains('kept.txt'),
       );
+      // Listed before the held upload: no longer Reconnecting mid-pass.
+      expect(states.last['passes'], 0);
+      expect(states.last['status'], isNot(SyncStatus.offline.name));
       cloud.release!.complete();
       worker.input.add({'action': 'stop'});
       await worker.done;
