@@ -194,7 +194,7 @@ void main() {
           isEmpty,
         );
         final message = engine.message;
-        expect(message, startsWith('Offline:'));
+        expect(message, startsWith("Can't reach the server."));
         expect(message, contains('Pending work is retained'));
         expect(
           message,

@@ -668,15 +668,6 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
   Future<void> pairing(BuildContext context) =>
       showPairing(context, controller);
 
-  static IconData _statusIcon(SyncStatus status) => switch (status) {
-    SyncStatus.upToDate => Icons.cloud_done_outlined,
-    SyncStatus.syncing => Icons.cloud_sync_outlined,
-    SyncStatus.paused => Icons.pause_circle_outline,
-    SyncStatus.offline => Icons.cloud_off_outlined,
-    SyncStatus.waiting => Icons.wifi_off_outlined,
-    SyncStatus.attention => Icons.error_outline,
-  };
-
   void showError(BuildContext context, String text) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
 
@@ -1153,22 +1144,10 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                           ),
                           const SizedBox(height: 10),
                         ],
-                        Row(
-                          children: [
-                            Icon(_statusIcon(header.status), size: 18),
-                            const SizedBox(width: 8),
-                            Flexible(
-                              child: Text(
-                                header.label,
-                                key: const ValueKey('sync-status'),
-                                style: Theme.of(context).textTheme.labelLarge,
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          lifecycle?.quitting ?? false
+                        _StatusLine(
+                          status: header.status,
+                          label: header.label,
+                          message: lifecycle?.quitting ?? false
                               ? 'Quitting: stopping sync safely...'
                               : controller.message,
                         ),
@@ -1803,4 +1782,67 @@ class _AppBarAction extends StatelessWidget {
           icon: Icon(icon),
           label: Text(label),
         );
+}
+
+/// The header's status and the line under it. Reconnecting (the cloud is
+/// unreachable and retried on its own) is amber, the attention badge's
+/// colours, so a wait reads as a warning rather than plain text.
+class _StatusLine extends StatelessWidget {
+  const _StatusLine({
+    required this.status,
+    required this.label,
+    required this.message,
+  });
+
+  final SyncStatus status;
+  final String label;
+  final String message;
+
+  static IconData _icon(SyncStatus status) => switch (status) {
+    SyncStatus.upToDate => Icons.cloud_done_outlined,
+    SyncStatus.syncing => Icons.cloud_sync_outlined,
+    SyncStatus.paused => Icons.pause_circle_outline,
+    SyncStatus.offline => Icons.cloud_off_outlined,
+    SyncStatus.waiting => Icons.wifi_off_outlined,
+    SyncStatus.attention => Icons.error_outline,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final amber = status == SyncStatus.offline
+        ? BadgePalette.of(context).attention
+        : null;
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(_icon(status), size: 18, color: amber?.foreground),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                label,
+                key: const ValueKey('sync-status'),
+                style: Theme.of(context).textTheme.labelLarge
+                    ?.copyWith(color: amber?.foreground),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(message, style: TextStyle(color: amber?.foreground)),
+      ],
+    );
+    if (amber == null) return content;
+    return Container(
+      key: const ValueKey('sync-status-reconnecting'),
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: amber.background,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: content,
+    );
+  }
 }

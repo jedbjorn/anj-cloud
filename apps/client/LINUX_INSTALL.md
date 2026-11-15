@@ -129,7 +129,7 @@ Different profiles may be launched directly with explicit `--profile-dir`.
 ## Tray, closing and quitting
 
 Sync runs independently of the window. AnJ Cloud shows a system tray item
-(StatusNotifierItem) with its status (Up to date, Syncing, Paused, Offline,
+(StatusNotifierItem) with its status (Up to date, Syncing, Paused, Reconnecting,
 Needs attention), **Open**, **Pause sync / Resume sync** and **Quit**. The same
 actions are in the window's menu.
 

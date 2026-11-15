@@ -1145,13 +1145,14 @@ class WorkerLoop {
         case 'tick':
           // An explicit retry: held uploads (backoff, size refusals) too.
           engine.uploads.retryAll();
-          schedule.requestNow();
+          schedule.reconnect();
           _passWanted = true;
         case 'visible':
           // The window was shown: list the cloud now (not while paused).
           // Android's app opening also verifies every file (#130 (3)): its
           // entry sends 'verify'. The always-on desktop does not (#135).
-          schedule.requestNow();
+          // Unreachable, the next retry is seconds away, not minutes.
+          schedule.reconnect();
           if (command['verify'] == true) engine.requestFullVerification();
           _passWanted = true;
         case 'background':
@@ -1204,9 +1205,14 @@ class WorkerLoop {
             _passWanted = true;
           }
         case 'network':
-          // The platform's connectivity report (Android).
+          // The platform's connectivity report (Android). A network that
+          // just became usable ends an offline wait at once.
           _onWifi = command['wifi'] == true;
           _applyNetwork();
+          if (command['online'] == true && schedule.offline && !_paused) {
+            schedule.reconnect();
+            _passWanted = true;
+          }
         case 'networkPolicy':
           final value = command['value'];
           if (value != 'wifi' && value != 'any') {
@@ -1226,7 +1232,7 @@ class WorkerLoop {
           _setPaused(false);
           // Pause then Resume is the user's way to retry held uploads.
           engine.uploads.retryAll();
-          schedule.requestNow();
+          schedule.reconnect();
           _passWanted = true;
         case 'bulk':
           final result = engine.applyBulk(

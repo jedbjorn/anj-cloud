@@ -218,6 +218,29 @@ void main() {
       expect(s.untilDue, const Duration(seconds: 30));
     });
 
+    test('reconnect restarts the backoff from its base', () {
+      final s = schedule();
+      for (var i = 0; i < 8; i++) {
+        s.completed(listed: false, failed: true);
+        now += s.untilDue;
+      }
+      expect(s.untilDue, Duration.zero);
+      s.completed(listed: false, failed: true);
+      expect(s.untilDue.inSeconds, greaterThanOrEqualTo(225));
+      // App opened or network back: list now; a failure waits ~5 s, not 5 min.
+      s.reconnect();
+      expect(s.policy(), RemotePolicy.always);
+      s.completed(listed: false, failed: true);
+      expect(s.offline, isTrue);
+      expect(s.untilDue.inMilliseconds, inInclusiveRange(3750, 6250));
+      // requestNow alone keeps the long wait (a background run, a command).
+      now += s.untilDue;
+      s.completed(listed: false, failed: true);
+      s.requestNow();
+      s.completed(listed: false, failed: true);
+      expect(s.untilDue.inMilliseconds, greaterThanOrEqualTo(15000));
+    });
+
     test('jitter spreads retries of many clients', () {
       final values = <int>{};
       for (var seed = 0; seed < 20; seed++) {
@@ -378,7 +401,7 @@ void main() {
     });
 
     test('offline: backoff grows, local edits do not force listings, '
-        'status is Offline', () async {
+        'status is offline (Reconnecting)', () async {
       final cloud = CountingCloud()..online = false;
       final run = startLoop(
         cloud,
@@ -403,6 +426,70 @@ void main() {
       expect(lastState(run.events)!['status'], 'offline');
       run.input.add({'action': 'stop'});
       await run.done.timeout(const Duration(seconds: 10));
+    });
+  });
+
+  test('network back while offline lists at once', () async {
+    final cloud = CountingCloud()..online = false;
+    final run = startLoop(
+      cloud,
+      interval: const Duration(milliseconds: 20),
+      schedule: RemoteSchedule(
+        backoffBase: const Duration(minutes: 1),
+        random: Random(1),
+      ),
+    );
+    await eventually(() => cloud.snapshots >= 1);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    final before = cloud.snapshots;
+    expect(before, 1, reason: 'the backoff holds the next listing');
+    // A report that is not a regained network keeps the wait.
+    run.input.add({'action': 'network', 'wifi': true, 'online': false});
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(cloud.snapshots, before);
+    cloud.online = true;
+    run.input.add({'action': 'network', 'wifi': true, 'online': true});
+    await eventually(() => cloud.snapshots > before);
+    await eventually(() => lastState(run.events)!['status'] != 'offline');
+    run.input.add({'action': 'stop'});
+    await run.done.timeout(const Duration(seconds: 10));
+  });
+
+  group('unreachableMessage', () {
+    test('a failed host lookup reads as plain words', () {
+      final text = unreachableMessage(
+        const SocketException(
+          "Failed host lookup: 'family.anj-cloud.dev'",
+          osError: OSError('No address associated with hostname', 7),
+        ),
+      );
+      expect(text, startsWith("Can't reach the server."));
+      expect(text, contains('may be offline'));
+      expect(text, contains('Retrying automatically.'));
+      expect(text, isNot(contains('SocketException')));
+      expect(text, isNot(contains('errno')));
+    });
+
+    test('refused, TLS and interrupted connections', () {
+      expect(
+        unreachableMessage(const SocketException('Connection refused')),
+        contains('the server may be down'),
+      );
+      expect(
+        unreachableMessage(const HandshakeException('bad certificate')),
+        contains('secure connection'),
+      );
+      expect(
+        unreachableMessage(const HttpException('Connection closed')),
+        contains('interrupted'),
+      );
+    });
+
+    test("the server's or the client's own message is kept", () {
+      expect(
+        unreachableMessage(const CloudFailure('Cloud storage is full.')),
+        "Can't reach the server. Cloud storage is full.",
+      );
     });
   });
 
