@@ -452,7 +452,7 @@ void main() {
       engine.auditInterval = Duration.zero;
       for (var i = 0; i < 3; i++) {
         await engine.tick();
-        expect(engine.message, startsWith('Offline'));
+        expect(engine.message, startsWith("Can't reach the server"));
       }
       expect(engine.rowAudits, audits + 1);
       cloud.online = true;

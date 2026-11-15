@@ -183,7 +183,10 @@ class AndroidBackground extends ChangeNotifier implements MobileSettings {
         await controller.checkPhoneFolders();
         return controller.backgroundRun();
       case 'network':
-        controller.reportNetwork(wifi: args['wifi'] == true);
+        controller.reportNetwork(
+          wifi: args['wifi'] == true,
+          online: args['online'] == true,
+        );
         return null;
       case 'foreground':
         // The app is in the foreground and the runner's service cap was

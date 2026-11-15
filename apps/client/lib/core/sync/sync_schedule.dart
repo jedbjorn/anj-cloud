@@ -14,6 +14,8 @@ import 'sync_engine.dart';
 /// nothing happens, at once when asked (window shown, resume, explicit tick),
 /// every [fast] for [fastWindow] after this client changed something, and
 /// with exponential backoff plus jitter while the cloud is unreachable.
+/// Opening the app, an explicit retry and the network coming back restart
+/// that backoff from [backoffBase] ([reconnect]).
 /// Local changes still trigger a listing between due times, except while
 /// backing off. Paused workers do not consult the schedule at all.
 class RemoteSchedule {
@@ -45,6 +47,9 @@ class RemoteSchedule {
   Duration? _fastUntil;
   int _failures = 0;
 
+  /// Failures since the backoff last restarted: sets the next delay.
+  int _step = 0;
+
   /// Consecutive failed listings; non-zero means the cloud is unreachable.
   int get failures => _failures;
   bool get offline => _failures > 0;
@@ -65,6 +70,14 @@ class RemoteSchedule {
   /// even while backing off (the backoff resumes if it fails again).
   void requestNow() => _due = _clock();
 
+  /// The user is looking (app opened, explicit retry) or the network just
+  /// came back: list now and, if that fails too, retry after [backoffBase]
+  /// rather than after the long wait reached while nobody was looking.
+  void reconnect() {
+    _step = 0;
+    requestNow();
+  }
+
   /// This client changed something: confirm quickly for a short while.
   void mutated() {
     final now = _clock();
@@ -78,7 +91,8 @@ class RemoteSchedule {
     final now = _clock();
     if (failed) {
       _failures++;
-      final exponent = min(_failures - 1, 16);
+      _step++;
+      final exponent = min(_step - 1, 16);
       var delay = backoffBase * (1 << exponent);
       if (delay > backoffMax) delay = backoffMax;
       // +-25% jitter so many clients do not retry in lockstep.
@@ -86,6 +100,7 @@ class RemoteSchedule {
       _due = now + delay * factor;
     } else if (listed) {
       _failures = 0;
+      _step = 0;
       final fastUntil = _fastUntil;
       final quick = fast < idle ? fast : idle;
       _due = now + (fastUntil != null && now < fastUntil ? quick : idle);
@@ -203,7 +218,9 @@ enum SyncStatus {
   upToDate('Up to date'),
   syncing('Syncing'),
   paused('Paused'),
-  offline('Offline'),
+
+  /// The cloud is unreachable; the worker keeps retrying on its own.
+  offline('Reconnecting'),
 
   /// Android "Wi-Fi only" on mobile data with files to transfer (#108 Q4).
   waiting('Waiting for Wi-Fi'),

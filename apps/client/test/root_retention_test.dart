@@ -306,7 +306,7 @@ void main() {
     expect(store.setting('retention'), 'local');
     expect(engine.retention('unpaired.txt'), Retention.local);
     expect(local('unpaired.txt').readAsStringSync(), 'keep local bytes');
-    expect(engine.message, startsWith('Offline:'));
+    expect(engine.message, startsWith("Can't reach the server."));
   });
 
   for (final phase in ['before-commit', 'after-commit']) {

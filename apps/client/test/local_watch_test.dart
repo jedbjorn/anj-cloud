@@ -440,7 +440,7 @@ void main() {
     }
     await engine.tick();
     expect(engine.lastPass!.localScan, 'full');
-    expect(engine.message, startsWith('Offline'));
+    expect(engine.message, startsWith("Can't reach the server"));
     for (var i = 0; i < 5; i++) {
       await engine.tick();
       expect(engine.lastPass!.localScan, 'partial');

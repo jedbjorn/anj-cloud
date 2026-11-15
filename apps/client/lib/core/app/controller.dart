@@ -846,9 +846,11 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
 
   /// The platform's connectivity report (Android): on Wi-Fi or Ethernet, or
   /// not. Kept and re-sent to every worker start, so a worker never guesses.
-  void reportNetwork({required bool wifi}) {
+  /// [online]: the network was just reported usable, so an offline worker
+  /// retries now; not kept.
+  void reportNetwork({required bool wifi, bool online = false}) {
     _onWifi = wifi;
-    _input?.send({'action': 'network', 'wifi': wifi});
+    _input?.send({'action': 'network', 'wifi': wifi, 'online': online});
   }
 
   /// "Wi-Fi only" ('wifi') or "Wi-Fi or mobile data" ('any'), persisted in

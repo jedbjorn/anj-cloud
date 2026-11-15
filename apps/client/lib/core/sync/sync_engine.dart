@@ -42,6 +42,24 @@ import 'upload_backoff.dart';
 /// work is waiting, or never (offline backoff).
 enum RemotePolicy { always, ifLocalWork, never }
 
+/// What a failed cloud listing means, in plain words: the status line under
+/// "Reconnecting". A connection failure never shows its raw exception; a
+/// failure the server or the client stated keeps its own message.
+String unreachableMessage(Object error) {
+  const retrying = 'Retrying automatically.';
+  final reason = switch (error) {
+    CloudFailure() => '$error',
+    SocketException(:final message) when message.contains('host lookup') =>
+      'This device may be offline. $retrying',
+    SocketException() =>
+      'This device may be offline, or the server may be down. $retrying',
+    TlsException() => 'A secure connection could not be made. $retrying',
+    IOException() => 'The connection was interrupted. $retrying',
+    _ => '$error',
+  };
+  return "Can't reach the server. $reason";
+}
+
 class SyncEngine {
   SyncEngine(
     this.manifest,
@@ -4776,7 +4794,8 @@ class SyncEngine {
     } catch (error) {
       remoteFailed = true;
       message =
-          'Offline: $error${folderWarning == null ? '' : '. $folderWarning'}';
+          '${unreachableMessage(error)}'
+          '${folderWarning == null ? '' : ' $folderWarning'}';
       return 0;
     }
     if (!rootAvailable()) {

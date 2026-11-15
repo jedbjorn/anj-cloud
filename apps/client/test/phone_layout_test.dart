@@ -11,6 +11,8 @@ import 'dart:ui' as ui;
 
 import 'package:anj_cloud/core/app/pairing_inputs.dart';
 import 'package:anj_cloud/core/sync/first_sync.dart';
+import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
 import 'package:anj_cloud/ui/admin_section.dart';
 import 'package:anj_cloud/ui/app.dart';
 import 'package:flutter/material.dart';
@@ -560,5 +562,43 @@ void main() {
     expect(target.hitTestable(), findsOneWidget, reason: 'target reachable');
     expect(status.hitTestable(), findsNothing, reason: 'header scrolled away');
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('unreachable cloud: amber Reconnecting in plain words', (
+    tester,
+  ) async {
+    final phone = await _open(tester, sizes['360x800']!, 1.0);
+    final controller = phone.controller
+      ..status = SyncStatus.offline
+      ..message = unreachableMessage(
+        const SocketException(
+          "Failed host lookup: 'family.anj-cloud.dev'",
+          osError: OSError('No address associated with hostname', 7),
+        ),
+      );
+    controller.notifyListeners();
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('sync-status-reconnecting')),
+      findsOneWidget,
+    );
+    final label = tester.widget<Text>(
+      find.byKey(const ValueKey('sync-status')),
+    );
+    expect(label.data, 'Reconnecting');
+    expect(label.style?.color, const Color(0xff5a4100));
+    expect(find.textContaining('SocketException'), findsNothing);
+    expect(find.textContaining('may be offline'), findsOneWidget);
+    await _check(tester, '360x800-reconnecting');
+
+    controller
+      ..status = SyncStatus.upToDate
+      ..message = 'Up to date.';
+    controller.notifyListeners();
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('sync-status-reconnecting')),
+      findsNothing,
+    );
   });
 }
