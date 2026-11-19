@@ -1315,6 +1315,19 @@ class WorkerLoop {
                     (command['sessions'] as List).cast<Map>(),
                   ),
           });
+        case 'dismissEditorWarnings':
+        case 'undoEditorWarnings':
+          final undo = action == 'undoEditorWarnings';
+          send({
+            'event': 'editorCopiesResult',
+            'message': !undo && _phonePaused == true
+                ? 'Phone storage is unavailable. Check All files access.'
+                : engine.changeMissingEditorWarnings(
+                    command['path'] as String,
+                    (command['sessions'] as List).cast<Map>(),
+                    undo: undo,
+                  ),
+          });
         case 'removeOpenedCopy':
           // Details' Remove opened copy (decision #184): each unchanged copy.
           for (final copy in (command['sessions'] as List? ?? const [])) {
@@ -1360,6 +1373,13 @@ class WorkerLoop {
         send({
           'event': 'editorCopiesResult',
           'message': 'Could not confirm that editor copies were cleared. Check the file and try again.',
+        });
+        return;
+      }
+      if (action == 'dismissEditorWarnings' || action == 'undoEditorWarnings') {
+        send({
+          'event': 'editorCopiesResult',
+          'message': 'Could not save the editor warning change. Check the file and try again.',
         });
         return;
       }

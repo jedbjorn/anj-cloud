@@ -4937,10 +4937,13 @@ class SyncEngine {
       work.data.remove('presentationError');
       final file = artifacts.resolve(work.staged!);
       if (!file.existsSync()) {
-        entry.status = MissingEditorCopies.missingWarning;
-        work.data['presentationError'] = entry.status;
+        if (!missingEditors.applies(entry.path)) {
+          entry.status = MissingEditorCopies.missingWarning;
+        }
+        work.data['presentationError'] = MissingEditorCopies.missingWarning;
         continue;
       }
+      missingEditors.observePresent(work);
       String hash;
       try {
         tree.native.checkRoot(tree.stageFd, tree.staging.path);
@@ -7378,6 +7381,25 @@ class SyncEngine {
     ].join(' ');
   }
 
+  String changeMissingEditorWarnings(
+    String path,
+    List<Map> claims, {
+    required bool undo,
+  }) {
+    final entry = manifest.entries[path];
+    if (entry == null ||
+        entry.kind != ItemKind.file ||
+        !missingEditors.applies(path)) {
+      return 'The file is no longer available for editor copy recovery.';
+    }
+    return missingEditors.changeWarnings(
+      entry,
+      editing.binding,
+      claims,
+      undo: undo,
+    );
+  }
+
   List<Map<String, Object?>> workingCopies(String path) {
     final entry = manifest.entries[path];
     final recoverable = entry != null && missingEditors.applies(path);
@@ -7423,9 +7445,14 @@ class SyncEngine {
           }
           if (recoverable) {
             result['finishEligible'] = result['preview'] != null;
+            MissingEditorInspection? proof;
+            if (result['preview'] != null) missingEditors.observePresent(op);
             if (result['edited'] == true && result['preview'] == null) {
-              final proof = missingEditors.inspect(entry, op);
+              proof = missingEditors.inspect(entry, op);
               if (proof.reason case final reason?) {
+                if (reason == MissingEditorCopies.copyPresent) {
+                  missingEditors.observePresent(op);
+                }
                 result['missingEditorProblem'] = reason;
               } else {
                 result['missingEditorClaim'] = {
@@ -7439,6 +7466,15 @@ class SyncEngine {
                   'fileId': entry.fileId,
                 };
               }
+            }
+            result.addAll(
+              missingEditors.projectNotice(entry, op, editing.binding, proof),
+            );
+            if (result['edited'] == true &&
+                result['preview'] != null &&
+                missingEditors.returned(op)) {
+              result['missingEditorProblem'] =
+                  'An editor copy has returned. Review its changes.';
             }
           }
           return result;
@@ -7469,7 +7505,10 @@ class SyncEngine {
     return _artifactIndex[path] ?? const [];
   }
 
-  Map<String, Object?> localArtifacts(String path) {
+  Map<String, Object?> localArtifacts(
+    String path, {
+    Set<String> dismissedMissingArtifacts = const {},
+  }) {
     var count = 0;
     var bytes = 0;
     var uncertain = false;
@@ -7514,8 +7553,11 @@ class SyncEngine {
         if (inodes.add(info.identity)) bytes += info.size;
         files.add({'path': record.staged, 'size': info.size, 'kind': kind});
         if (info.identity != record.data['identity']) uncertain = true;
-      } on FileSystemException {
-        uncertain = true;
+      } on FileSystemException catch (error) {
+        if (error.osError?.errorCode != 2 ||
+            !dismissedMissingArtifacts.contains(record.id)) {
+          uncertain = true;
+        }
       }
     }
     return {

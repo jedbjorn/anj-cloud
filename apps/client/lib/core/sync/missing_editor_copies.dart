@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -9,6 +10,13 @@ import '../state/model.dart';
 import 'artifacts.dart';
 import 'open_documents.dart';
 
+typedef MissingEditorInspection = ({
+  String? directory,
+  Operation? owner,
+  String? reason,
+  bool legacy,
+});
+
 /// Explicit repair of missing working-copy records in Android phone folders.
 /// The same inspection supplies the row's offer and checks the confirmation.
 class MissingEditorCopies {
@@ -19,13 +27,12 @@ class MissingEditorCopies {
   final Artifacts artifacts;
 
   static const missingWarning = 'Working copy missing; root/cloud retained';
+  static const copyPresent = 'The editor copy is present.';
+  static const _noticeKey = 'missingEditorNotice';
 
   bool applies(String path) => tree.phoneFolders != null && inPhoneFolder(path);
 
-  ({String? directory, Operation? owner, String? reason}) inspect(
-    Entry entry,
-    Operation work,
-  ) {
+  MissingEditorInspection inspect(Entry entry, Operation work) {
     final routing = tree.phoneFolders!;
     final staged = work.staged;
     final name = staged == null ? '' : p.basename(staged);
@@ -50,10 +57,10 @@ class MissingEditorCopies {
     } on FileSystemException {
       return _keep('The editor staging folder is unavailable or has changed.');
     }
+    if (_absenceProblem(name) case final problem?) return _keep(problem);
     if (openDocuments.isWorkingCopyOpen(name)) {
       return _keep('An app still has the editor copy open.');
     }
-    if (_absenceProblem(name) case final problem?) return _keep(problem);
 
     final neighbors = manifest.operations.values
         .where(
@@ -112,28 +119,30 @@ class MissingEditorCopies {
         'Finishing, upload or recovery work still refers to this copy.',
       );
     }
-    if (shared) {
-      final recorded = owner?.data['sharedDirectoryIdentity'];
-      if (recorded == null) {
-        return _keep(
-          'The original editor staging folder could not be verified.',
-        );
-      }
-      if (recorded != directory) {
-        return _keep('The editor staging folder has changed.');
-      }
+    final recorded = shared
+        ? owner?.data['sharedDirectoryIdentity']
+        : privateIdentity;
+    if (recorded != null && recorded != directory) {
+      return _keep('The editor staging folder has changed.');
     }
     final tokens = work.data[providerOpenTokensKey];
-    if (tokens is! List) {
-      return _keep('Could not verify that all apps closed this editor copy.');
-    }
-    if (tokens.isNotEmpty) {
+    if (tokens is List && tokens.isNotEmpty) {
       return _keep('An app may still have the editor copy open.');
     }
     if (_checkAbsence(name, directory) case final problem?) {
       return _keep(problem);
     }
-    return (directory: directory, owner: owner, reason: null);
+    final reason = recorded == null
+        ? 'The original editor staging folder could not be verified.'
+        : tokens is! List
+        ? 'Could not verify that all apps closed this editor copy.'
+        : null;
+    return (
+      directory: directory,
+      owner: owner,
+      reason: reason,
+      legacy: reason != null,
+    );
   }
 
   String? _checkAbsence(String name, String directory) {
@@ -152,7 +161,7 @@ class MissingEditorCopies {
   String? _absenceProblem(String name) {
     try {
       artifacts.native.info(tree.stageFd, name);
-      return 'The editor copy is present.';
+      return copyPresent;
     } on FileSystemException catch (error) {
       // A lookup of one basename against the verified staging descriptor.
       return error.osError?.errorCode == 2
@@ -164,9 +173,156 @@ class MissingEditorCopies {
   static bool _names(String? staged, String name) =>
       staged != null && p.basename(staged) == name;
 
-  static ({String? directory, Operation? owner, String? reason}) _keep(
-    String reason,
-  ) => (directory: null, owner: null, reason: reason);
+  static MissingEditorInspection _keep(String reason) =>
+      (directory: null, owner: null, reason: reason, legacy: false);
+
+  String _condition(Operation work, MissingEditorInspection proof) =>
+      jsonEncode([
+        work.staged,
+        work.data['handedAt'],
+        proof.directory,
+        proof.owner?.id,
+        proof.owner?.data['identity'],
+        proof.reason,
+      ]);
+
+  Map? _notice(Operation work) => work.data[_noticeKey] as Map?;
+
+  Object? _fileIdentity(Entry entry) => entry.fileId ?? entry.localIdentity;
+
+  void observePresent(Operation work) {
+    final notice = _notice(work);
+    if (notice == null || notice['returned'] == true) return;
+    // A return ends this missing notice, even if the name disappears again.
+    _saveNotices({
+      work: notice['dismissed'] == true ? {'returned': true} : null,
+    });
+  }
+
+  Map<String, Object?> projectNotice(
+    Entry entry,
+    Operation work,
+    String binding,
+    MissingEditorInspection? proof,
+  ) {
+    var notice = _notice(work);
+    final file = _fileIdentity(entry);
+    if (notice?['binding'] != binding || notice?['file'] != file) {
+      notice = null;
+    }
+    final legacy = proof?.legacy == true;
+    if (legacy) {
+      final condition = _condition(work, proof!);
+      if (notice?['condition'] != condition) {
+        notice = {
+          'binding': binding,
+          'file': file,
+          'condition': condition,
+          'revision': uniqueId(),
+        };
+        _saveNotices({work: notice});
+      }
+    }
+    if (notice?['revision'] == null ||
+        (!legacy && notice?['dismissed'] != true)) {
+      return const {};
+    }
+    final dismissed = notice!['dismissed'] == true;
+    final claim = {
+      'binding': binding,
+      'file': file,
+      'id': work.id,
+      'path': work.staged,
+      'revision': notice['revision'],
+    };
+    return {
+      if (dismissed)
+        'undoEditorWarningClaim': claim
+      else
+        'dismissEditorWarningClaim': claim,
+      if (legacy && dismissed) 'editorWarningDismissed': true,
+      if (legacy && dismissed && proof!.owner != null)
+        'dismissedMissingArtifact': proof.owner!.id,
+    };
+  }
+
+  bool returned(Operation work) => _notice(work)?['returned'] == true;
+
+  String changeWarnings(
+    Entry entry,
+    String binding,
+    List<Map> claims, {
+    required bool undo,
+  }) {
+    final changes = <Operation, Object?>{};
+    final kept = <String>{};
+    final file = _fileIdentity(entry);
+    for (final claim in claims) {
+      final work = manifest.operations[claim['id']];
+      if (claim['binding'] != binding ||
+          claim['file'] != file ||
+          work == null ||
+          work.kind != 'working' ||
+          work.path != entry.path ||
+          work.staged != claim['path']) {
+        kept.add('The file, paired profile or editor session changed.');
+        continue;
+      }
+      final notice = _notice(work);
+      if (notice == null ||
+          notice['binding'] != binding ||
+          notice['file'] != file ||
+          notice['revision'] is! String ||
+          notice['revision'] != claim['revision'] ||
+          (notice['dismissed'] == true) != undo) {
+        kept.add('The editor warning changed. Review the current copies.');
+        continue;
+      }
+      if (!undo) {
+        final proof = inspect(entry, work);
+        if (proof.reason == copyPresent) observePresent(work);
+        if (!proof.legacy || _condition(work, proof) != notice['condition']) {
+          kept.add(
+            proof.legacy || proof.reason == null
+                ? 'The editor warning changed. Review the current copies.'
+                : proof.reason!,
+          );
+          continue;
+        }
+      }
+      changes[work] = {...notice, 'revision': uniqueId(), 'dismissed': !undo};
+    }
+    if (changes.isNotEmpty) _saveNotices(changes);
+    final count = changes.length;
+    return [
+      if (count > 0)
+        '${undo ? 'Restored' : 'Dismissed'} $count editor ${count == 1 ? 'warning' : 'warnings'}.',
+      if (kept.isNotEmpty) kept.join(' '),
+      if (count == 0 && kept.isEmpty) 'No editor warnings changed.',
+    ].join(' ');
+  }
+
+  void _saveNotices(Map<Operation, Object?> states) {
+    final previous = {for (final work in states.keys) work: _notice(work)};
+    void apply(Map<Operation, Object?> updates) {
+      for (final MapEntry(key: work, value: value) in updates.entries) {
+        if (value == null) {
+          work.data.remove(_noticeKey);
+        } else {
+          work.data[_noticeKey] = value;
+        }
+      }
+    }
+
+    apply(states);
+    try {
+      manifest.save();
+    } catch (_) {
+      apply(previous);
+      rethrow;
+    }
+    manifest.commitPoint();
+  }
 
   /// Confirmation runs synchronously on the owning worker. The manifest
   /// saves all accepted retirements in one transaction, with no file I/O

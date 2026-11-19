@@ -53,6 +53,14 @@ Future<Map<String, Object?>> projectEntry(
 ) async {
   final operations = engine.manifest.operationsAt(entry.path).toList();
   final copies = engine.workingCopies(entry.path);
+  final syncWork = operations.any(
+    (operation) =>
+        const {'upload', 'delete', 'preserve'}.contains(operation.kind),
+  );
+  final dismissedArtifacts = {
+    for (final copy in copies)
+      if (copy['dismissedMissingArtifact'] case final String id) id,
+  };
   final errors = {
     // Too large for the server: shown, and amber, until the file changes.
     if (isSizeRefusal(entry.status)) entry.status,
@@ -71,11 +79,21 @@ Future<Map<String, Object?>> projectEntry(
     if (copies.any((copy) => copy['missingEditorClaim'] != null))
       'Some editor copies are missing.',
     for (final copy in copies)
-      if (copy['missingEditorProblem'] case final String reason) reason,
+      if (copy['editorWarningDismissed'] != true &&
+          copy['missingEditorProblem'] is String)
+        copy['missingEditorProblem'] as String,
+    if (syncWork &&
+        copies.any((copy) => copy['editorWarningDismissed'] == true))
+      'Sync work is pending.',
   }.toList();
   final release = releaseNote(engine, entry, operations);
   return (entry.toJson()
       ..removeWhere((key, _) => Entry.indexKeys.contains(key)))
+    ..['status'] =
+        entry.status == MissingEditorCopies.missingWarning &&
+            engine.missingEditors.applies(entry.path)
+        ? (entry.expectedPresent ? 'current local' : 'cloud-only')
+        : entry.status
     ..['selectionVersion'] = engine.selectionVersion(entry)
     // Shown names are cloud names (spec #49); `path` stays the row's key.
     ..['cloudPath'] = engine.names.cloudPath(entry.path)
@@ -100,12 +118,7 @@ Future<Map<String, Object?>> projectEntry(
     ..['finishPending'] = operations.any(
       (operation) => operation.kind == 'finish-editing',
     )
-    ..['syncPending'] =
-        errors.isNotEmpty ||
-        operations.any(
-          (operation) =>
-              ['upload', 'delete', 'preserve'].contains(operation.kind),
-        )
+    ..['syncPending'] = errors.isNotEmpty || syncWork
     ..['presentationErrors'] = errors
     // Information only: it syncs as any other row.
     ..['releaseNote'] = release
@@ -130,7 +143,10 @@ Future<Map<String, Object?>> projectEntry(
     ..['hasRecovery'] = operations.any(
       (operation) => operation.kind == 'retained',
     )
-    ..['localArtifacts'] = engine.localArtifacts(entry.path)
+    ..['localArtifacts'] = engine.localArtifacts(
+      entry.path,
+      dismissedMissingArtifacts: dismissedArtifacts,
+    )
     // Retained recovery copies Recover and Dismiss act on (spec #25).
     ..['recoveryCopies'] = engine.recovery.describe(entry.path)
     ..['canRecoverLocalVariants'] = await engine.canRecoverLocalVariants(

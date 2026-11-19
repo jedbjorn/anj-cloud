@@ -177,6 +177,10 @@ class _Fixture {
         );
       }
       if (paused || mixed) store.setSetting('paused', '1');
+      if (legacy) {
+        store.entries[_path]!.status =
+            'Working copy missing; root/cloud retained';
+      }
       store.save();
     } finally {
       engine.close();
@@ -245,6 +249,28 @@ Future<void> _openClear(WidgetTester tester) async {
 
 Future<void> _confirmClear(WidgetTester tester) async {
   await tester.tap(find.text('Clear copies'));
+  await tester.pumpAndSettle();
+}
+
+Future<void> _openDismiss(WidgetTester tester) async {
+  await tester.tap(find.widgetWithText(TextButton, 'Dismiss warning'));
+  await tester.pumpAndSettle();
+}
+
+Future<void> _confirmDismiss(WidgetTester tester) async {
+  await tester.tap(find.widgetWithText(TextButton, 'Dismiss'));
+  await tester.pumpAndSettle();
+}
+
+Future<void> _openDetails(WidgetTester tester) async {
+  await tester.tap(
+    find.descendant(
+      of: find.byKey(const ValueKey('row:$_path')),
+      matching: find.byTooltip('File actions'),
+    ),
+  );
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('Details and preserved copies'));
   await tester.pumpAndSettle();
 }
 
@@ -342,6 +368,218 @@ void main() {
     expect(_digest(fixture.original), before);
     expect(fixture.row['effectiveRetention'], 'local');
     expect(_attention(tester, 'Music'), isFalse);
+  });
+
+  testWidgets('build 177 warnings dismiss and undo in Details after restart', (
+    tester,
+  ) async {
+    await tester.runAsync(() => fixture.seed(legacy: true));
+    final before = _digest(fixture.original);
+    await _mount(tester, fixture);
+    final claims = editorWarningClaims(fixture.row);
+    expect(claims, hasLength(2));
+    expect(missingEditorClaims(fixture.row), isEmpty);
+    expect(find.text('Finish editing'), findsNothing);
+    expect(_attention(tester, _path), isTrue);
+    expect(_attention(tester, 'Music'), isTrue);
+    final originalRecords = <String, Map<String, Object?>>{};
+    fixture.read((store) {
+      for (final (id, owner, _) in fixture.absent) {
+        originalRecords[id] = store.operations[id]!.toJson();
+        originalRecords[owner] = store.operations[owner]!.toJson();
+      }
+    });
+
+    await _openDismiss(tester);
+    expect(
+      find.textContaining('2 missing editor copy warnings for $_path'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('Details and preserved copies'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(editorWarningClaims(fixture.row), claims);
+    expect(_attention(tester, 'Music'), isTrue);
+    fixture.read((store) {
+      for (final entry in originalRecords.entries) {
+        expect(store.operations[entry.key]!.toJson(), entry.value);
+      }
+    });
+
+    await _openDismiss(tester);
+    await _confirmDismiss(tester);
+    await tester.runAsync(() async {
+      await _Fixture.until(
+        () => editorWarningClaims(fixture.row, undo: true).length == 2,
+      );
+      await fixture.controller.stop();
+      expect(
+        File('${fixture.profile.path}/cloud-mutations').readAsStringSync(),
+        '0,0,0',
+      );
+      await fixture.controller.start();
+      await fixture.controller.backgroundRun(
+        timeout: const Duration(seconds: 5),
+      );
+      await _Fixture.until(
+        () => editorWarningClaims(fixture.row, undo: true).length == 2,
+      );
+    });
+    await tester.pumpAndSettle();
+    expect(_attention(tester, _path), isFalse);
+    expect(_attention(tester, 'Music'), isFalse);
+    expect(fileBadge(fixture.row), 'Local');
+    expect(_digest(fixture.original), before);
+    fixture.read((store) {
+      final row = store.entries[_path]!;
+      expect(row.override, Retention.local);
+      expect(row.workingCopy, isNotNull);
+      for (final (id, owner, _) in fixture.absent) {
+        final current = store.operations[id]!.toJson();
+        final original = originalRecords[id]!;
+        expect(
+          (current['data'] as Map)..remove('missingEditorNotice'),
+          (original['data'] as Map)..remove('missingEditorNotice'),
+        );
+        expect(store.operations[owner]!.toJson(), originalRecords[owner]);
+      }
+    });
+
+    await _openDetails(tester);
+    expect(
+      find.textContaining('Warning dismissed', findRichText: true),
+      findsOneWidget,
+    );
+    for (final (_, _, file) in fixture.absent) {
+      expect(
+        find.textContaining(p.basename(file.path), findRichText: true),
+        findsOneWidget,
+      );
+    }
+    await tester.tap(find.text('Undo'));
+    await tester.pumpAndSettle();
+    await tester.runAsync(() async {
+      await _Fixture.until(() => editorWarningClaims(fixture.row).length == 2);
+      fixture.controller.command(
+        'dismissEditorWarnings',
+        _path,
+        sessions: claims,
+      );
+      await _Fixture.until(
+        () => fixture.editorResult.contains('editor warning changed'),
+      );
+    });
+    await tester.pumpAndSettle();
+    expect(editorWarningClaims(fixture.row), hasLength(2));
+    expect(_attention(tester, _path), isTrue);
+    expect(_attention(tester, 'Music'), isTrue);
+  });
+
+  testWidgets(
+    'dismiss rechecks a returning legacy copy after confirmation opens',
+    (tester) async {
+      await tester.runAsync(
+        () => fixture.seed(legacy: true, paused: true, parkFirstCopy: true),
+      );
+      await _mount(tester, fixture);
+      final (id, owner, file) = fixture.absent.first;
+      await _openDismiss(tester);
+      fixture.parkedCopy.renameSync(file.path);
+      file.writeAsStringSync('returned editor changes');
+      await _confirmDismiss(tester);
+      await tester.runAsync(
+        () => _Fixture.until(
+          () => fixture.editorResult.contains('The editor copy is present.'),
+        ),
+      );
+      expect(fixture.editorResult, contains('Dismissed 1 editor warning.'));
+      await tester.pumpAndSettle();
+      expect(find.text('Finish editing'), findsOneWidget);
+      expect(
+        editorWarningClaims(
+          fixture.row,
+          undo: true,
+        ).map((claim) => claim['id']),
+        [fixture.absent.last.$1],
+      );
+      fixture.read((store) {
+        expect(store.operations[id], isNotNull);
+        expect(store.operations[owner], isNotNull);
+      });
+      expect(file.readAsStringSync(), 'returned editor changes');
+      expect(fixture.original.readAsStringSync(), _original);
+    },
+  );
+
+  testWidgets('dismissed warnings leave new work and loss of access visible', (
+    tester,
+  ) async {
+    await tester.runAsync(() => fixture.seed(legacy: true, paused: true));
+    await _mount(tester, fixture);
+    final claims = editorWarningClaims(fixture.row);
+    await _openDismiss(tester);
+    await _confirmDismiss(tester);
+    await tester.runAsync(() async {
+      await _Fixture.until(
+        () => editorWarningClaims(fixture.row, undo: true).length == 2,
+      );
+      await fixture.controller.stop();
+      fixture.read((store) {
+        store.operations['pending-upload'] = Operation(
+          'pending-upload',
+          'upload',
+          _path,
+        );
+        store.operations['new-legacy-session'] = Operation(
+          'new-legacy-session',
+          'working',
+          _path,
+          staged: p.join(store.setting('staging')!, 'phone-working-new'),
+        );
+        store.save();
+      });
+      await fixture.controller.start();
+      await _Fixture.until(
+        () =>
+            editorWarningClaims(fixture.row)
+                .any((claim) => claim['id'] == 'new-legacy-session'),
+      );
+      fixture.controller.command(
+        'dismissEditorWarnings',
+        _path,
+        sessions: claims,
+      );
+      await _Fixture.until(
+        () => fixture.editorResult.contains('editor warning changed'),
+      );
+    });
+    await tester.pumpAndSettle();
+    expect(editorWarningClaims(fixture.row).map((claim) => claim['id']), [
+      'new-legacy-session',
+    ]);
+    expect(
+      fixture.row['presentationErrors'],
+      contains('Sync work is pending.'),
+    );
+    expect(_attention(tester, _path), isTrue);
+    expect(_attention(tester, 'Music'), isTrue);
+    fixture.access.granted = false;
+    await tester.runAsync(() async {
+      await fixture.controller.checkPhoneFolders();
+      await _Fixture.until(
+        () => (fixture.row['presentationErrors'] as List).any(
+          (line) => '$line'.contains('All files access'),
+        ),
+      );
+    });
+    await tester.pumpAndSettle();
+    expect(_attention(tester, 'Music'), isTrue);
+    expect(editorWarningClaims(fixture.row), isEmpty);
+    expect(editorWarningClaims(fixture.row, undo: true), hasLength(2));
+    fixture.read((store) {
+      expect(store.operations['pending-upload'], isNotNull);
+      expect(store.operations['new-legacy-session'], isNotNull);
+    });
   });
 
   testWidgets('Finish editing confirms only the present sibling', (
@@ -526,6 +764,15 @@ void main() {
       fixture.row['presentationErrors'],
       contains('The original editor staging folder could not be verified.'),
     );
+    final claims = editorWarningClaims(fixture.row);
+    expect(claims, hasLength(3));
+    await _openDismiss(tester);
+    await _confirmDismiss(tester);
+    await tester.runAsync(
+      () => _Fixture.until(
+        () => editorWarningClaims(fixture.row, undo: true).length == 3,
+      ),
+    );
     expect(
       File(p.join(originalStage.path, p.basename(edit.path)))
           .readAsStringSync(),
@@ -541,6 +788,21 @@ void main() {
         expect(store.operations[artifactId], isNotNull);
       }
     });
+    await tester.runAsync(() async {
+      await fixture.controller.stop();
+      Directory(stage).deleteSync(recursive: true);
+      originalStage.renameSync(stage);
+      await fixture.controller.start();
+      await _Fixture.until(
+        () => (fixture.row['presentationErrors'] as List).contains(
+          'An editor copy has returned. Review its changes.',
+        ),
+      );
+    });
+    await tester.pumpAndSettle();
+    expect(find.text('Finish editing'), findsOneWidget);
+    expect(_attention(tester, 'Music'), isTrue);
+    expect(edit.readAsStringSync(), 'unsynced editor changes');
   });
 
   testWidgets('a legacy directory alone does not prove editor closure', (
@@ -642,6 +904,7 @@ void main() {
       expect(missingEditorClaims(fixture.row).map((claim) => claim['id']), [
         fixture.absent.last.$1,
       ]);
+      expect(editorWarningClaims(fixture.row), isEmpty);
       await _openClear(tester);
       await _confirmClear(tester);
       await tester.runAsync(

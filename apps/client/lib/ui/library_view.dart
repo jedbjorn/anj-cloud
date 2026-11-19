@@ -112,6 +112,16 @@ List<Map<String, dynamic>> missingEditorClaims(Map<String, dynamic> entry) => [
       Map<String, dynamic>.from(claim),
 ];
 
+List<Map<String, dynamic>> editorWarningClaims(
+  Map<String, dynamic> entry, {
+  bool undo = false,
+}) => [
+  for (final copy in editedCopies(entry))
+    if (copy[undo ? 'undoEditorWarningClaim' : 'dismissEditorWarningClaim']
+        case final Map claim)
+      Map<String, dynamic>.from(claim),
+];
+
 /// Unchanged working copies: opened, never written. Details offers Remove
 /// opened copy for them (decision #184).
 List<Map> openedCopies(Map<String, dynamic> entry) => [
@@ -120,7 +130,8 @@ List<Map> openedCopies(Map<String, dynamic> entry) => [
 ];
 
 bool hasEditing(Map<String, dynamic> entry) =>
-    editedCopies(entry).isNotEmpty || entry['finishPending'] == true;
+    editedCopies(entry).any((copy) => copy['editorWarningDismissed'] != true) ||
+    entry['finishPending'] == true;
 
 const terminalDeletionStatuses = {
   'deleted',
