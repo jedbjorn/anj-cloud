@@ -12,6 +12,7 @@ import 'artifacts.dart';
 import 'evictions.dart';
 import 'open_documents.dart';
 import 'edit_completion.dart';
+import 'missing_editor_copies.dart';
 import 'excluded_tracking.dart';
 import 'file_adder.dart';
 import 'folder_creation.dart';
@@ -127,6 +128,11 @@ class SyncEngine {
     manifest,
     tree,
     cloud,
+    artifacts,
+  );
+  late final MissingEditorCopies missingEditors = MissingEditorCopies(
+    manifest,
+    tree,
     artifacts,
   );
   late final StagingRelease releases = StagingRelease(
@@ -4931,10 +4937,13 @@ class SyncEngine {
       work.data.remove('presentationError');
       final file = artifacts.resolve(work.staged!);
       if (!file.existsSync()) {
-        entry.status = 'Working copy missing; root/cloud retained';
-        work.data['presentationError'] = entry.status;
+        if (!missingEditors.applies(entry.path)) {
+          entry.status = MissingEditorCopies.missingWarning;
+        }
+        work.data['presentationError'] = MissingEditorCopies.missingWarning;
         continue;
       }
+      missingEditors.observePresent(work);
       String hash;
       try {
         tree.native.checkRoot(tree.stageFd, tree.staging.path);
@@ -5831,12 +5840,11 @@ class SyncEngine {
   /// closed it and still save to it later, so such a copy is kept until the
   /// user removes it ([removeOpenedCopy]). A copy is left for
   /// [workingCopyGrace] after its last hand-out (an app may read, close and
-  /// save later). The release is the guarded staging release (the lease, and
-  /// on Android the open-descriptor registry, refuse a copy an app holds
-  /// open; the bytes must still hash to the version that was handed out), so
-  /// an open copy is retried by a later pass and a changed one is never
-  /// discarded. Busy copies are not reported as pending releases: a song
-  /// playing is not a sync problem.
+  /// save later). Release is guarded and the bytes must still hash to the
+  /// version handed out. Mapped Android copies also require durable provider
+  /// closure. A later pass retries open copies and keeps changed copies.
+  /// Busy copies are not reported as pending releases: a song playing is
+  /// not a sync problem.
   void reclaimUnchangedWorkingCopies() {
     for (final work
         in manifest.operations.values
@@ -5844,25 +5852,28 @@ class SyncEngine {
             .toList()) {
       final staged = work.staged;
       final entry = manifest.entries[work.path];
-      if (staged == null || work.hash == null) continue;
-      final record = artifacts.record(artifacts.resolve(staged));
-      final name = p.basename(staged);
-      bool present() {
-        try {
-          artifacts.native.info(tree.stageFd, name);
-          return true;
-        } on FileSystemException catch (error) {
-          return error.osError?.errorCode != 2;
-        }
+      if (staged == null ||
+          work.hash == null ||
+          tree.phonePaused(path: work.path, staged: staged)) {
+        continue;
       }
-
+      final record = artifacts.record(artifacts.resolve(staged));
       if (work.data['reclaiming'] == true) {
-        // Interrupted after the guarded unlink: the durable release intent
-        // (or its already finalized record) proves the bytes were these.
-        if (!present() &&
-            (record == null || record.data['releasing'] == work.hash)) {
+        final intentMatches = record?.data['releasing'] == work.hash;
+        if (_mappedWorkingCopy(work)) {
+          // The intent predates unlink. A missing name after restart can
+          // also mean the directory or file moved. Keep both records for
+          // recovery and let a fresh release verify any copy still present.
+          if (record != null &&
+              record.data['role'] == 'working' &&
+              intentMatches) {
+            record.data.remove('releasing');
+          }
+        } else if ((record == null || intentMatches) &&
+            _reclaimedNameAbsent(p.basename(staged))) {
           if (record != null) manifest.operations.remove(record.id);
           _workingReclaimed(work, entry);
+          manifest.save();
           continue;
         }
         work.data.remove('reclaiming');
@@ -5870,6 +5881,20 @@ class SyncEngine {
       }
       if (!_providerOnly(work) || !_graceOver(work)) continue;
       _releaseWorking(work, record, entry);
+    }
+  }
+
+  bool _mappedWorkingCopy(Operation work) =>
+      missingEditors.applies(work.path) ||
+      (tree.phoneFolders != null &&
+          work.staged != null &&
+          p.basename(work.staged!).startsWith(sharedStagingTag));
+
+  bool _reclaimedNameAbsent(String name) {
+    try {
+      return releases.info(name) == null;
+    } on FileSystemException {
+      return false;
     }
   }
 
@@ -5899,13 +5924,22 @@ class SyncEngine {
 
   /// Releases unchanged working copy [work] through the guarded staging
   /// release; null when it is not eligible (changed, finishing, conflicted
-  /// or not exclusively owned). A durable `reclaiming` mark covers a crash
-  /// between the unlink and the session's removal.
+  /// or not exclusively owned). An interrupted release can leave durable
+  /// intent behind. A successful unlink removes both records together.
   ReleaseOutcome? _releaseWorking(
     Operation work,
     Operation? record,
     Entry? entry,
   ) {
+    final tokens = work.data[providerOpenTokensKey];
+    if (tokens is List && tokens.isNotEmpty) return ReleaseOutcome.busy;
+    final mapped = _mappedWorkingCopy(work);
+    if (mapped &&
+        (tokens is! List ||
+            work.data[providerClosureUnknownKey] == true ||
+            work.data['handout'] != 'provider')) {
+      return ReleaseOutcome.uncertain;
+    }
     if (work.hash == null ||
         artifacts.workingEdited(work) ||
         record == null ||
@@ -5922,15 +5956,19 @@ class SyncEngine {
     manifest.save();
     ReleaseOutcome outcome;
     try {
-      outcome = releases.release(record, work.hash!);
+      outcome = releases.release(
+        record,
+        work.hash!,
+        onReleased: () => _workingReclaimed(work, entry),
+      );
     } on FileSystemException {
       outcome = ReleaseOutcome.busy;
     }
-    if (outcome == ReleaseOutcome.released) {
-      _workingReclaimed(work, entry);
-      return outcome;
-    }
+    if (outcome == ReleaseOutcome.released) return outcome;
     work.data.remove('reclaiming');
+    if (mapped && record.data['releasing'] == work.hash) {
+      record.data.remove('releasing');
+    }
     // Bytes that no longer hash to the handed-out version are an edit.
     if (outcome == ReleaseOutcome.differs) work.data['edited'] = true;
     manifest.save();
@@ -5980,12 +6018,11 @@ class SyncEngine {
           !manifest.operationsAt(entry.path).any((o) => o.kind == 'working') &&
           (status.startsWith('Cloud pending: editor working copies') ||
               status == openedCopyKept ||
-              status == 'Working copy missing; root/cloud retained')) {
+              status == MissingEditorCopies.missingWarning)) {
         entry.status = 'cloud-only';
       }
       markDirty(entry.path);
     }
-    manifest.save();
   }
 
   /// A deletion copy made by an earlier version is recognised only when it is
@@ -7274,14 +7311,20 @@ class SyncEngine {
       await cloud.download(path, copy, etag: entry.etag!);
       hash = await fileHash(copy, 'open');
     }
-    final op = Operation(
-      uniqueId(),
-      'working',
-      path,
-      expectedEtag: entry.etag,
-      staged: tree.durablePath(copy),
-      hash: hash,
-    )..data['handout'] = providerTracked ? 'provider' : 'untracked';
+    final op =
+        Operation(
+            uniqueId(),
+            'working',
+            path,
+            expectedEtag: entry.etag,
+            staged: tree.durablePath(copy),
+            hash: hash,
+          )
+          ..data = {
+            'handout': providerTracked ? 'provider' : 'untracked',
+            if (providerTracked && missingEditors.applies(path))
+              providerOpenTokensKey: <String>[],
+          };
     manifest.operations[op.id] = op;
     markDirty(path);
     artifacts.complete(copy, hash: hash, etag: entry.etag);
@@ -7331,12 +7374,66 @@ class SyncEngine {
     manifest.save();
   }
 
+  String clearMissingEditorCopies(String path, List<Map> claims) {
+    final entry = manifest.entries[path];
+    if (entry == null ||
+        entry.kind != ItemKind.file ||
+        !missingEditors.applies(path)) {
+      return 'The file is no longer available for editor copy recovery.';
+    }
+    final binding = editing.binding;
+    final current = claims
+        .where(
+          (claim) =>
+              claim['binding'] == binding && claim['fileId'] == entry.fileId,
+        )
+        .toList();
+    final result = missingEditors.clear(entry, current);
+    final changed = claims.length - current.length;
+    final reasons = {
+      ...result.kept,
+      if (changed > 0) 'The file or paired profile changed.',
+    };
+    final count = result.cleared;
+    final kept = changed + result.kept.length;
+    return [
+      if (count == 1) 'Cleared 1 missing editor copy.',
+      if (count > 1) 'Cleared $count missing editor copies.',
+      if (kept > 0)
+        'Kept $kept editor ${kept == 1 ? 'copy' : 'copies'}. ${reasons.join(' ')}',
+      if (count == 0 && kept == 0) 'These editor copies were already cleared.',
+    ].join(' ');
+  }
+
+  String changeMissingEditorWarnings(
+    String path,
+    List<Map> claims, {
+    required bool undo,
+  }) {
+    final entry = manifest.entries[path];
+    if (entry == null ||
+        entry.kind != ItemKind.file ||
+        !missingEditors.applies(path)) {
+      return 'The file is no longer available for editor copy recovery.';
+    }
+    return missingEditors.changeWarnings(
+      entry,
+      editing.binding,
+      claims,
+      undo: undo,
+    );
+  }
+
   List<Map<String, Object?>> workingCopies(String path) {
+    final entry = manifest.entries[path];
+    final recoverable = entry != null && missingEditors.applies(path);
     return [
       for (final op
           in manifest
               .operationsAt(path)
-              .where((o) => o.kind == 'working' && o.staged != null))
+              .where(
+                (o) => o.kind == 'working' && (o.staged != null || recoverable),
+              ))
         () {
           final result = <String, Object?>{
             'id': op.id,
@@ -7347,25 +7444,62 @@ class SyncEngine {
             'edited': artifacts.workingEdited(op),
           };
           try {
-            final file = artifacts.resolve(op.staged!);
-            final owned = artifacts.record(file);
-            if (owned?.data['directoryIdentity'] ==
-                tree.native.identity(tree.stageFd)) {
-              final preview = artifacts.native.preview(
-                tree.stageFd,
-                p.basename(file.path),
-              );
-              result['size'] = preview.size;
-              result['modified'] = DateTime.fromMillisecondsSinceEpoch(
-                preview.modifiedMs,
-              ).toLocal().toString();
-              result['preview'] = {
-                ...preview.toJson(),
-                'directoryIdentity': tree.native.identity(tree.stageFd),
-              };
+            final staged = op.staged;
+            if (staged != null) {
+              final file = artifacts.resolve(staged);
+              final owned = artifacts.record(file);
+              if (owned?.data['directoryIdentity'] ==
+                  tree.native.identity(tree.stageFd)) {
+                final preview = artifacts.native.preview(
+                  tree.stageFd,
+                  p.basename(file.path),
+                );
+                result['size'] = preview.size;
+                result['modified'] = DateTime.fromMillisecondsSinceEpoch(
+                  preview.modifiedMs,
+                ).toLocal().toString();
+                result['preview'] = {
+                  ...preview.toJson(),
+                  'directoryIdentity': tree.native.identity(tree.stageFd),
+                };
+              }
             }
           } on FileSystemException {
             // Keep the location visible even if the owned file is unavailable.
+          }
+          if (recoverable) {
+            result['finishEligible'] = result['preview'] != null;
+            MissingEditorInspection? proof;
+            if (result['preview'] != null) missingEditors.observePresent(op);
+            if (result['edited'] == true && result['preview'] == null) {
+              proof = missingEditors.inspect(entry, op);
+              if (proof.reason case final reason?) {
+                if (reason == MissingEditorCopies.copyPresent) {
+                  missingEditors.observePresent(op);
+                }
+                result['missingEditorProblem'] = reason;
+              } else {
+                result['missingEditorClaim'] = {
+                  'id': op.id,
+                  'path': op.staged,
+                  'handedAt': op.data['handedAt'],
+                  'directory': proof.directory,
+                  'owner': proof.owner?.id,
+                  'ownerIdentity': proof.owner?.data['identity'],
+                  'binding': editing.binding,
+                  'fileId': entry.fileId,
+                };
+              }
+            }
+            result.addAll(
+              missingEditors.projectNotice(entry, op, editing.binding, proof),
+            );
+            if (result['edited'] == true &&
+                result['preview'] != null &&
+                missingEditors.returned(op)) {
+              result['missingEditorProblem'] =
+                  'An editor copy has returned. Review its changes.';
+            }
           }
           return result;
         }(),
@@ -7395,7 +7529,10 @@ class SyncEngine {
     return _artifactIndex[path] ?? const [];
   }
 
-  Map<String, Object?> localArtifacts(String path) {
+  Map<String, Object?> localArtifacts(
+    String path, {
+    Set<String> dismissedMissingArtifacts = const {},
+  }) {
     var count = 0;
     var bytes = 0;
     var uncertain = false;
@@ -7440,8 +7577,11 @@ class SyncEngine {
         if (inodes.add(info.identity)) bytes += info.size;
         files.add({'path': record.staged, 'size': info.size, 'kind': kind});
         if (info.identity != record.data['identity']) uncertain = true;
-      } on FileSystemException {
-        uncertain = true;
+      } on FileSystemException catch (error) {
+        if (error.osError?.errorCode != 2 ||
+            !dismissedMissingArtifacts.contains(record.id)) {
+          uncertain = true;
+        }
       }
     }
     return {

@@ -170,6 +170,15 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
   }
 
   @override
+  String checkedSharedStagingIdentity() {
+    final base = _base, shared = _shared;
+    if (paused || base == null || shared == null) _refusePaused(layout.staging);
+    checkRoot(base, layout.base);
+    checkRoot(shared, layout.staging);
+    return identity(shared);
+  }
+
+  @override
   List<String> drainMediaScans() {
     final paths = _media.toList()..sort();
     _media.clear();

@@ -2,6 +2,13 @@ import 'dart:io';
 
 import '../ports/release_guard.dart';
 
+/// Outstanding Android provider hand-outs recorded on a working session.
+/// Legacy sessions have no field, so closure of their copies is unknown.
+const providerOpenTokensKey = 'providerOpenTokens';
+
+/// A legacy session may record new hand-outs while its earlier ones are unknown.
+const providerClosureUnknownKey = 'providerClosureUnknown';
+
 /// One descriptor the documents provider handed to another app.
 class OpenDocument {
   OpenDocument(this.path, this.identity, {required this.write, this.working});
@@ -32,6 +39,8 @@ class OpenDocuments {
   bool isOpen(String identity) =>
       _byToken.values.any((d) => d.identity == identity);
   bool isPathOpen(String path) => _byToken.values.any((d) => d.path == path);
+  bool isWorkingCopyOpen(String name) =>
+      _byToken.values.any((d) => d.working == name);
   int get length => _byToken.length;
 }
 

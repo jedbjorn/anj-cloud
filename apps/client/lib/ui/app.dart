@@ -43,11 +43,15 @@ String workingCopyDetails(Map<String, dynamic> entry) {
     return entry['workingCopy'] as String? ?? 'none';
   }
   final copies = editedCopies(entry);
+  return _editorCopyDetails(copies);
+}
+
+String _editorCopyDetails(List<Map> copies) {
   if (copies.isEmpty) return 'none';
   return copies
       .map(
         (copy) =>
-            "${copy['path']} (${copy['size'] == null ? 'size unavailable' : '${copy['size']} bytes'})${copy['modified'] == null ? '' : '\nSaved: ${copy['modified']}'}",
+            "${copy['path']} (${copy['size'] == null ? 'size unavailable' : '${copy['size']} bytes'})${copy['modified'] == null ? '' : '\nSaved: ${copy['modified']}'}${copy['undoEditorWarningClaim'] == null ? '' : '\nWarning dismissed'}",
       )
       .join('\n');
 }
@@ -588,8 +592,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     BuildContext context,
     Map<String, dynamic> entry,
   ) async {
-    final sessions = editedCopies(entry)
-        .where((c) => c['id'] is String)
+    final sessions = finishableCopies(entry)
         .map((c) => Map<String, dynamic>.from(c))
         .toList();
     if (sessions.isEmpty) return;
@@ -599,7 +602,7 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
         title: Text('Finish editing ${entry['cloudPath'] ?? entry['path']}'),
         scrollable: compactLayout(context),
         content: SelectableText(
-          'Saved changes sync automatically while your editor is open. Close every editor using these copies, then confirm that the listed current files are your completed edit results. The app will verify uploaded content before releasing eligible temporary files. Busy, conflicting or uncertain copies stay recoverable. Storage policy stays unchanged.\n\n${workingCopyDetails(entry)}',
+          'Saved changes sync automatically while your editor is open. Close every editor using these copies, then confirm that the listed current files are your completed edit results. The app will verify uploaded content before releasing eligible temporary files. Busy, conflicting or uncertain copies stay recoverable. Storage policy stays unchanged.\n\n${_editorCopyDetails(sessions)}',
         ),
         actions: [
           TextButton(
@@ -616,6 +619,52 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     if (confirmed == true) {
       controller.command(
         'finishEditing',
+        entry['path'] as String,
+        sessions: sessions,
+      );
+    }
+  }
+
+  Future<void> confirmMissingEditorAction(
+    BuildContext context,
+    Map<String, dynamic> entry, {
+    bool dismiss = false,
+  }) async {
+    final sessions = dismiss
+        ? editorWarningClaims(entry)
+        : missingEditorClaims(entry);
+    final count = sessions.length;
+    if (count == 0) return;
+    final name = entry['cloudPath'] ?? entry['path'];
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          dismiss ? 'Dismiss warning' : 'Clear missing editor copies',
+        ),
+        scrollable: compactLayout(context),
+        content: Text(
+          dismiss
+              ? 'Dismiss $count missing editor ${count == 1 ? 'copy warning' : 'copy warnings'} for $name? '
+                    'Your synced file stays in place. Find the retained sessions and Undo in Details and preserved copies.'
+              : 'Clear $count missing editor ${count == 1 ? 'copy' : 'copies'} for $name? '
+                    'This action cannot recover the missing temporary bytes. Your synced file stays in place.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(dismiss ? 'Dismiss' : 'Clear copies'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      controller.command(
+        dismiss ? 'dismissEditorWarnings' : 'clearMissingEditorCopies',
         entry['path'] as String,
         sessions: sessions,
       );
@@ -851,6 +900,16 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
           if (mounted) {
             ScaffoldMessenger.of(context)
                 .showSnackBar(SnackBar(content: Text(adminNotice)));
+          }
+        });
+      }
+      final editorCopyNotice = controller.editorCopyNotice;
+      if (editorCopyNotice != null) {
+        controller.editorCopyNotice = null;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            ScaffoldMessenger.of(context)
+                .showSnackBar(SnackBar(content: Text(editorCopyNotice)));
           }
         });
       }
@@ -1369,8 +1428,8 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                           final directory = row.directory;
                           final collapsed =
                               !filtering && _collapsed[_active]!.contains(path);
-                          final confirmable = editedCopies(entry)
-                              .any((copy) => copy['id'] is String);
+                          final confirmable = finishableCopies(entry)
+                              .isNotEmpty;
                           return LibraryEntryCard(
                             touchInput: widget.touchInput,
                             key: ValueKey('row:$path'),
@@ -1446,6 +1505,29 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                     ),
                                   )
                                 : null,
+                            clearMissingCopies:
+                                file && missingEditorClaims(entry).isNotEmpty
+                                ? TextButton(
+                                    onPressed: () => confirmMissingEditorAction(
+                                      context,
+                                      entry,
+                                    ),
+                                    child: const Text(
+                                      'Clear missing editor copies',
+                                    ),
+                                  )
+                                : null,
+                            dismissEditorWarning:
+                                file && editorWarningClaims(entry).isNotEmpty
+                                ? TextButton(
+                                    onPressed: () => confirmMissingEditorAction(
+                                      context,
+                                      entry,
+                                      dismiss: true,
+                                    ),
+                                    child: const Text('Dismiss warning'),
+                                  )
+                                : null,
                             menu: entry['synthetic'] == true
                                 ? null
                                 : PopupMenuButton<String>(
@@ -1490,6 +1572,11 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                         case 'both':
                                           controller.command('keepBoth', path);
                                         case 'details':
+                                          final undoWarnings =
+                                              editorWarningClaims(
+                                                entry,
+                                                undo: true,
+                                              );
                                           showDialog<void>(
                                             context: context,
                                             builder: (context) => AlertDialog(
@@ -1501,9 +1588,21 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                                 context,
                                               ),
                                               content: SelectableText(
-                                                'Status: ${entry['status']}\n${entry['conflict'] ?? ''}\nPreserved local copies:\n${(entry['preservedCopies'] as List? ?? []).join('\n')}\nEditor working copies (retained until Finish editing):\n${workingCopyDetails(entry)}\n${artifactSummary(entry) ?? 'Local staging files: ${(entry['localArtifacts'] as Map?) == null ? 'unknown' : 'none'}'}\nLocal temporary/recovery locations:\n${localRecoveryDetails(entry)}\nRemote conflict copy: ${entry['remoteCopy'] ?? 'none'}',
+                                                'Status: ${entry['status']}\n${entry['conflict'] ?? ''}\nPreserved local copies:\n${(entry['preservedCopies'] as List? ?? []).join('\n')}\nEditor working copies:\n${workingCopyDetails(entry)}\n${artifactSummary(entry) ?? 'Local staging files: ${(entry['localArtifacts'] as Map?) == null ? 'unknown' : 'none'}'}\nLocal temporary/recovery locations:\n${localRecoveryDetails(entry)}\nRemote conflict copy: ${entry['remoteCopy'] ?? 'none'}',
                                               ),
                                               actions: [
+                                                if (undoWarnings.isNotEmpty)
+                                                  TextButton(
+                                                    onPressed: () {
+                                                      Navigator.pop(context);
+                                                      controller.command(
+                                                        'undoEditorWarnings',
+                                                        path,
+                                                        sessions: undoWarnings,
+                                                      );
+                                                    },
+                                                    child: const Text('Undo'),
+                                                  ),
                                                 if (openedCopies(entry)
                                                     .isNotEmpty)
                                                   TextButton(

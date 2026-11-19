@@ -114,6 +114,8 @@ class LibraryEntryCard extends StatefulWidget {
     required this.onColorChanged,
     this.color,
     this.finish,
+    this.clearMissingCopies,
+    this.dismissEditorWarning,
     this.onRename,
     this.menu,
     this.selecting = false,
@@ -133,6 +135,8 @@ class LibraryEntryCard extends StatefulWidget {
   final ValueChanged<int?> onColorChanged;
   final int? color;
   final Widget? finish;
+  final Widget? clearMissingCopies;
+  final Widget? dismissEditorWarning;
 
   /// Shown for an item whose name is not allowed on other devices
   /// (decision #120): opens the Rename dialog.
@@ -458,6 +462,8 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
           label: const Text('Rename'),
         ),
       if (!widget.selecting) ?widget.finish,
+      if (!widget.selecting) ?widget.clearMissingCopies,
+      if (!widget.selecting) ?widget.dismissEditorWarning,
     ];
     final trailing = [
       if (entry['synthetic'] != true)
