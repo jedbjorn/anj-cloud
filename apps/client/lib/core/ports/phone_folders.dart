@@ -93,6 +93,14 @@ abstract interface class PhoneFolderRouting {
   /// null while paused.
   String? get sharedStagePath;
 
+  /// Proves the mounted volume and its staging directory still name the
+  /// attached descriptors. Throws if either is unavailable or replaced.
+  String checkedSharedStagingIdentity();
+
+  /// Whether this shared staging directory already had the app's marker
+  /// when first attached. Older working records only know the private ID.
+  bool get sharedStagingWasPresent;
+
   /// Phone paths changed by this boundary since the last call (installs,
   /// renames, removals): the media library is asked to scan exactly these
   /// (spec #52 Media library, AC0).

@@ -32,6 +32,8 @@ class OpenDocuments {
   bool isOpen(String identity) =>
       _byToken.values.any((d) => d.identity == identity);
   bool isPathOpen(String path) => _byToken.values.any((d) => d.path == path);
+  bool isWorkingCopyOpen(String name) =>
+      _byToken.values.any((d) => d.working == name);
   int get length => _byToken.length;
 }
 

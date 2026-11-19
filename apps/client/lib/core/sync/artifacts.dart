@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
+import '../ports/phone_folders.dart';
 import '../ports/release_guard.dart';
 import '../state/manifest.dart';
 import '../state/model.dart';
@@ -60,6 +61,9 @@ class Artifacts {
             'role': role,
             'name': name,
             'directoryIdentity': tree.native.identity(tree.stageFd),
+            if (role == 'working' && name.startsWith(sharedStagingTag))
+              'sharedDirectoryIdentity': tree.phoneFolders!
+                  .checkedSharedStagingIdentity(),
           };
     manifest.operations[op.id] = op;
     manifest.save();
@@ -199,9 +203,9 @@ class Artifacts {
     if (work.data['edited'] == true) return true;
     final staged = work.staged;
     if (staged == null) return true;
-    final owner = record(resolve(staged));
-    if (owner == null || owner.data['stamp'] == null) return true;
     try {
+      final owner = record(resolve(staged));
+      if (owner == null || owner.data['stamp'] == null) return true;
       return native.info(tree.stageFd, p.basename(staged)).stamp !=
           owner.data['stamp'];
     } on FileSystemException {

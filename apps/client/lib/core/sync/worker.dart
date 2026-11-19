@@ -1305,6 +1305,16 @@ class WorkerLoop {
           // Completion runs in the next pass, which starts immediately.
           engine.markDirty(command['path'] as String);
           _passWanted = true;
+        case 'clearMissingEditorCopies':
+          send({
+            'event': 'editorCopiesResult',
+            'message': _phonePaused == true
+                ? 'Kept editor copies. Phone storage is unavailable. Check All files access.'
+                : engine.clearMissingEditorCopies(
+                    command['path'] as String,
+                    (command['sessions'] as List).cast<Map>(),
+                  ),
+          });
         case 'removeOpenedCopy':
           // Details' Remove opened copy (decision #184): each unchanged copy.
           for (final copy in (command['sessions'] as List? ?? const [])) {
@@ -1346,6 +1356,13 @@ class WorkerLoop {
           _requestStop();
       }
     } catch (error) {
+      if (action == 'clearMissingEditorCopies') {
+        send({
+          'event': 'editorCopiesResult',
+          'message': 'Could not confirm that editor copies were cleared. Check the file and try again.',
+        });
+        return;
+      }
       if (action == 'bulk') {
         send({
           'event': 'bulkResult',

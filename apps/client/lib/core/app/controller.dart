@@ -287,6 +287,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
 
   /// Shown once after the role disappears ("Your admin role was removed.").
   String? adminNotice;
+  String? editorCopyNotice;
   Timer? _adminPoll;
   Isolate? _worker;
   SendPort? _input;
@@ -542,6 +543,9 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
               ?.complete(Map<String, dynamic>.from(event));
         case 'activity':
           _syncing = (event['paths'] as List).cast<String>().toSet();
+          notifyListeners();
+        case 'editorCopiesResult':
+          editorCopyNotice = event['message'] as String;
           notifyListeners();
         case 'mediaScan':
           final paths = (event['paths'] as List).cast<String>();

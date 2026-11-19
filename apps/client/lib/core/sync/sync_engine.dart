@@ -12,6 +12,7 @@ import 'artifacts.dart';
 import 'evictions.dart';
 import 'open_documents.dart';
 import 'edit_completion.dart';
+import 'missing_editor_copies.dart';
 import 'excluded_tracking.dart';
 import 'file_adder.dart';
 import 'folder_creation.dart';
@@ -127,6 +128,11 @@ class SyncEngine {
     manifest,
     tree,
     cloud,
+    artifacts,
+  );
+  late final MissingEditorCopies missingEditors = MissingEditorCopies(
+    manifest,
+    tree,
     artifacts,
   );
   late final StagingRelease releases = StagingRelease(
@@ -4931,7 +4937,7 @@ class SyncEngine {
       work.data.remove('presentationError');
       final file = artifacts.resolve(work.staged!);
       if (!file.existsSync()) {
-        entry.status = 'Working copy missing; root/cloud retained';
+        entry.status = MissingEditorCopies.missingWarning;
         work.data['presentationError'] = entry.status;
         continue;
       }
@@ -5844,7 +5850,11 @@ class SyncEngine {
             .toList()) {
       final staged = work.staged;
       final entry = manifest.entries[work.path];
-      if (staged == null || work.hash == null) continue;
+      if (staged == null ||
+          work.hash == null ||
+          tree.phonePaused(path: work.path, staged: staged)) {
+        continue;
+      }
       final record = artifacts.record(artifacts.resolve(staged));
       final name = p.basename(staged);
       bool present() {
@@ -5980,7 +5990,7 @@ class SyncEngine {
           !manifest.operationsAt(entry.path).any((o) => o.kind == 'working') &&
           (status.startsWith('Cloud pending: editor working copies') ||
               status == openedCopyKept ||
-              status == 'Working copy missing; root/cloud retained')) {
+              status == MissingEditorCopies.missingWarning)) {
         entry.status = 'cloud-only';
       }
       markDirty(entry.path);
@@ -7331,12 +7341,47 @@ class SyncEngine {
     manifest.save();
   }
 
+  String clearMissingEditorCopies(String path, List<Map> claims) {
+    final entry = manifest.entries[path];
+    if (entry == null ||
+        entry.kind != ItemKind.file ||
+        !missingEditors.applies(path)) {
+      return 'The file is no longer available for editor copy recovery.';
+    }
+    final binding = editing.binding;
+    final current = claims
+        .where(
+          (claim) =>
+              claim['binding'] == binding && claim['fileId'] == entry.fileId,
+        )
+        .toList();
+    final result = missingEditors.clear(entry, current);
+    final changed = claims.length - current.length;
+    final reasons = {
+      ...result.kept,
+      if (changed > 0) 'The file or paired profile changed.',
+    };
+    final count = result.cleared;
+    final kept = changed + result.kept.length;
+    return [
+      if (count == 1) 'Cleared 1 missing editor copy.',
+      if (count > 1) 'Cleared $count missing editor copies.',
+      if (kept > 0)
+        'Kept $kept editor ${kept == 1 ? 'copy' : 'copies'}. ${reasons.join(' ')}',
+      if (count == 0 && kept == 0) 'These editor copies were already cleared.',
+    ].join(' ');
+  }
+
   List<Map<String, Object?>> workingCopies(String path) {
+    final entry = manifest.entries[path];
+    final recoverable = entry != null && missingEditors.applies(path);
     return [
       for (final op
           in manifest
               .operationsAt(path)
-              .where((o) => o.kind == 'working' && o.staged != null))
+              .where(
+                (o) => o.kind == 'working' && (o.staged != null || recoverable),
+              ))
         () {
           final result = <String, Object?>{
             'id': op.id,
@@ -7347,25 +7392,48 @@ class SyncEngine {
             'edited': artifacts.workingEdited(op),
           };
           try {
-            final file = artifacts.resolve(op.staged!);
-            final owned = artifacts.record(file);
-            if (owned?.data['directoryIdentity'] ==
-                tree.native.identity(tree.stageFd)) {
-              final preview = artifacts.native.preview(
-                tree.stageFd,
-                p.basename(file.path),
-              );
-              result['size'] = preview.size;
-              result['modified'] = DateTime.fromMillisecondsSinceEpoch(
-                preview.modifiedMs,
-              ).toLocal().toString();
-              result['preview'] = {
-                ...preview.toJson(),
-                'directoryIdentity': tree.native.identity(tree.stageFd),
-              };
+            final staged = op.staged;
+            if (staged != null) {
+              final file = artifacts.resolve(staged);
+              final owned = artifacts.record(file);
+              if (owned?.data['directoryIdentity'] ==
+                  tree.native.identity(tree.stageFd)) {
+                final preview = artifacts.native.preview(
+                  tree.stageFd,
+                  p.basename(file.path),
+                );
+                result['size'] = preview.size;
+                result['modified'] = DateTime.fromMillisecondsSinceEpoch(
+                  preview.modifiedMs,
+                ).toLocal().toString();
+                result['preview'] = {
+                  ...preview.toJson(),
+                  'directoryIdentity': tree.native.identity(tree.stageFd),
+                };
+              }
             }
           } on FileSystemException {
             // Keep the location visible even if the owned file is unavailable.
+          }
+          if (recoverable) {
+            result['finishEligible'] = result['preview'] != null;
+            if (result['edited'] == true && result['preview'] == null) {
+              final proof = missingEditors.inspect(entry, op);
+              if (proof.reason case final reason?) {
+                result['missingEditorProblem'] = reason;
+              } else {
+                result['missingEditorClaim'] = {
+                  'id': op.id,
+                  'path': op.staged,
+                  'handedAt': op.data['handedAt'],
+                  'directory': proof.directory,
+                  'owner': proof.owner?.id,
+                  'ownerIdentity': proof.owner?.data['identity'],
+                  'binding': editing.binding,
+                  'fileId': entry.fileId,
+                };
+              }
+            }
           }
           return result;
         }(),

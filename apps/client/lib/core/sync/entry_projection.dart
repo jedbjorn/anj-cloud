@@ -5,6 +5,7 @@ import '../gateway/sharing.dart';
 import 'file_adder.dart';
 import 'name_policy.dart';
 import 'name_rule.dart';
+import 'missing_editor_copies.dart';
 import 'top_folders.dart';
 import 'sync_engine.dart';
 
@@ -51,7 +52,8 @@ Future<Map<String, Object?>> projectEntry(
   Entry entry,
 ) async {
   final operations = engine.manifest.operationsAt(entry.path).toList();
-  final errors = [
+  final copies = engine.workingCopies(entry.path);
+  final errors = {
     // Too large for the server: shown, and amber, until the file changes.
     if (isSizeRefusal(entry.status)) entry.status,
     // A name no rule resolves (spec #49 residual row): amber, with Rename.
@@ -61,9 +63,16 @@ Future<Map<String, Object?>> projectEntry(
     if (isBusyStatus(entry.status)) entry.status,
     for (final operation in operations)
       if (operation.kind == 'working' &&
-          operation.data['presentationError'] is String)
+          operation.data['presentationError'] is String &&
+          !(engine.missingEditors.applies(entry.path) &&
+              operation.data['presentationError'] ==
+                  MissingEditorCopies.missingWarning))
         operation.data['presentationError'] as String,
-  ];
+    if (copies.any((copy) => copy['missingEditorClaim'] != null))
+      'Some editor copies are missing.',
+    for (final copy in copies)
+      if (copy['missingEditorProblem'] case final String reason) reason,
+  }.toList();
   final release = releaseNote(engine, entry, operations);
   return (entry.toJson()
       ..removeWhere((key, _) => Entry.indexKeys.contains(key)))
@@ -87,7 +96,7 @@ Future<Map<String, Object?>> projectEntry(
     ..['contentsRetention'] = isTopFolder(entry.path)
         ? (entry.override ?? engine.defaultRetention).name
         : null
-    ..['workingCopies'] = engine.workingCopies(entry.path)
+    ..['workingCopies'] = copies
     ..['finishPending'] = operations.any(
       (operation) => operation.kind == 'finish-editing',
     )

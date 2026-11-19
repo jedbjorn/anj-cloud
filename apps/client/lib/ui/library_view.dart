@@ -101,6 +101,17 @@ List<Map> editedCopies(Map<String, dynamic> entry) => [
     if (copy['edited'] != false) copy,
 ];
 
+List<Map> finishableCopies(Map<String, dynamic> entry) => [
+  for (final copy in editedCopies(entry))
+    if (copy['id'] is String && copy['finishEligible'] != false) copy,
+];
+
+List<Map<String, dynamic>> missingEditorClaims(Map<String, dynamic> entry) => [
+  for (final copy in editedCopies(entry))
+    if (copy['missingEditorClaim'] case final Map claim)
+      Map<String, dynamic>.from(claim),
+];
+
 /// Unchanged working copies: opened, never written. Details offers Remove
 /// opened copy for them (decision #184).
 List<Map> openedCopies(Map<String, dynamic> entry) => [
