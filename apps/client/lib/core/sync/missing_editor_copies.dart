@@ -190,6 +190,37 @@ class MissingEditorCopies {
 
   Object? _fileIdentity(Entry entry) => entry.fileId ?? entry.localIdentity;
 
+  /// Describes the notice actions without creating, returning or saving a
+  /// notice. A legacy condition would get a claim on ordinary projection.
+  ({Object dismiss, Object undo}) diagnosticNotice(
+    Entry entry,
+    Operation work,
+    String? binding,
+    MissingEditorInspection? proof, {
+    required bool recoveryAssessed,
+    required bool observedPresent,
+  }) {
+    if (binding == null) return (dismiss: 'unknown', undo: 'unknown');
+    final raw = work.data[_noticeKey];
+    final notice =
+        raw is Map &&
+            raw['binding'] == binding &&
+            raw['file'] == _fileIdentity(entry)
+        ? raw
+        : null;
+    final legacy = proof?.legacy == true;
+    final unchanged =
+        legacy && notice?['condition'] == _condition(work, proof!);
+    final dismissed =
+        notice?['dismissed'] == true && notice?['revision'] != null;
+    return (
+      dismiss: recoveryAssessed
+          ? legacy && !(unchanged && dismissed)
+          : 'unknown',
+      undo: !observedPresent && dismissed && (!legacy || unchanged),
+    );
+  }
+
   void observePresent(Operation work) {
     final notice = _notice(work);
     if (notice == null || notice['returned'] == true) return;

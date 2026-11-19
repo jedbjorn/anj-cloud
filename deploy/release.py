@@ -597,7 +597,10 @@ def android_facts(path, runner=subprocess.run, tools=None):
             "sha256": checksum.hexdigest()}
 
 
-def check_android(facts, pin):
+EDITOR_DIAGNOSTIC_SUFFIX = "-editor-diagnostic"
+
+
+def check_android(facts, pin, *, allow_editor_diagnostic=False):
     """The release-APK rules that need no git or server: identity, one signer, the pin."""
     if facts["package"] != ANDROID_PACKAGE:
         raise Refused(f"The APK is {facts['package']!r}, not the release app {ANDROID_PACKAGE}")
@@ -605,6 +608,8 @@ def check_android(facts, pin):
     if not source or len(source) != 40 or not isinstance(code, int) or code < 1 or not facts["version"]:
         raise Refused("The APK has no source commit stamp, version or versionCode "
                       "(build it with apps/client/tool/android/release_android.py build)")
+    if facts["version"].endswith(EDITOR_DIAGNOSTIC_SUFFIX) and not allow_editor_diagnostic:
+        raise Refused("Private Android editor diagnostic builds cannot be published")
     if len(facts["signers"]) != 1:
         raise Refused(f"The APK must have exactly one signing certificate (it has {len(facts['signers'])})")
     if facts["signers"][0] != pin:

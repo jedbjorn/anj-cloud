@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
@@ -10,6 +11,8 @@ import '../core/app/add_files.dart';
 import '../core/app/controller.dart';
 import '../core/app/fetch_jobs.dart';
 import '../core/sync/bulk_targets.dart';
+import '../core/sync/editor_diagnostic.dart';
+import '../core/ports/phone_folders.dart';
 import 'recovery_actions.dart';
 import 'create_folder_dialog.dart';
 import 'downloader_tab.dart';
@@ -669,6 +672,37 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
         sessions: sessions,
       );
     }
+  }
+
+  void _showEditorDiagnostic(BuildContext context, Map<String, dynamic> entry) {
+    final report = controller.editorDiagnostic(entry);
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Editor copy diagnostic'),
+        scrollable: true,
+        content: FutureBuilder<Map?>(
+          future: report,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const LinearProgressIndicator();
+            }
+            final data = snapshot.data;
+            return SelectableText(
+              data == null
+                  ? 'Editor copy diagnostic unavailable. Reopen Details and try again.'
+                  : const JsonEncoder.withIndent('  ').convert(data),
+            );
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Remove opened copy (decision #184), after the user confirms every app
@@ -1591,6 +1625,21 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                                 'Status: ${entry['status']}\n${entry['conflict'] ?? ''}\nPreserved local copies:\n${(entry['preservedCopies'] as List? ?? []).join('\n')}\nEditor working copies:\n${workingCopyDetails(entry)}\n${artifactSummary(entry) ?? 'Local staging files: ${(entry['localArtifacts'] as Map?) == null ? 'unknown' : 'none'}'}\nLocal temporary/recovery locations:\n${localRecoveryDetails(entry)}\nRemote conflict copy: ${entry['remoteCopy'] ?? 'none'}',
                                               ),
                                               actions: [
+                                                if (editorDiagnosticsEnabled &&
+                                                    controller.phoneFolders !=
+                                                        null &&
+                                                    file &&
+                                                    inPhoneFolder(path))
+                                                  TextButton(
+                                                    onPressed: () =>
+                                                        _showEditorDiagnostic(
+                                                          context,
+                                                          entry,
+                                                        ),
+                                                    child: const Text(
+                                                      'Editor copy diagnostic',
+                                                    ),
+                                                  ),
                                                 if (undoWarnings.isNotEmpty)
                                                   TextButton(
                                                     onPressed: () {

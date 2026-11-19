@@ -13,6 +13,7 @@ import '../gateway/fetch_api.dart';
 import '../gateway/admin_api.dart';
 import '../gateway/releases_api.dart';
 import 'documents_ops.dart';
+import 'editor_diagnostic.dart';
 import 'entry_projection.dart';
 import '../ports/documents_filesystem.dart';
 import '../state/manifest.dart';
@@ -574,8 +575,7 @@ class WorkerLoop {
     try {
       while (!_stopping) {
         if (_queue.isNotEmpty) {
-          await _handle(_queue.removeFirst());
-          await emit(force: true);
+          await _handleQueued(_queue.removeFirst());
         } else if (_passWanted) {
           _passWanted = false;
           await (_paused ? _observePaused() : _pass());
@@ -788,9 +788,7 @@ class WorkerLoop {
     }
     var handled = false;
     while (_queue.isNotEmpty && !_stopping) {
-      await _handle(_queue.removeFirst());
-      await emit(force: true);
-      handled = true;
+      if (await _handleQueued(_queue.removeFirst())) handled = true;
     }
     if (_stopping || _paused) engine.stopRequested = true;
     return handled;
@@ -1131,6 +1129,34 @@ class WorkerLoop {
         _releaseCancels.remove(request);
       }
     }
+  }
+
+  Future<bool> _handleQueued(Map command) async {
+    if (editorDiagnosticsEnabled &&
+        command['action'] == editorDiagnosticRequest) {
+      Map<String, Object?>? report;
+      try {
+        report = readEditorDiagnostic(
+          engine,
+          command['path'],
+          command['selectionVersion'],
+          phoneStoragePaused: _phonePaused == true,
+        );
+      } on FileSystemException {
+        // The response must never expose paths from an exception.
+      }
+      send({
+        'event': editorDiagnosticResult,
+        'request': command['request'],
+        'report': report,
+      });
+      // Ordinary state projection can persist warning notices. This request
+      // also leaves the running pass's mutation/interruption signal alone.
+      return false;
+    }
+    await _handle(command);
+    await emit(force: true);
+    return true;
   }
 
   Future<void> _handle(Map command) async {
