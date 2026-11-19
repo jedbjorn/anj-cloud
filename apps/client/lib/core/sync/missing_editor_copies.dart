@@ -134,7 +134,7 @@ class MissingEditorCopies {
     }
     final reason = recorded == null
         ? 'The original editor staging folder could not be verified.'
-        : tokens is! List
+        : tokens is! List || work.data[providerClosureUnknownKey] == true
         ? 'Could not verify that all apps closed this editor copy.'
         : null;
     return (

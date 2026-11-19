@@ -260,16 +260,27 @@ class DocumentsOps {
   }
 
   void _recordWorkingHandout(Operation work, String token) {
+    if (!engine.missingEditors.applies(work.path)) {
+      engine.workingCopyOpened(work, providerTracked: true);
+      return;
+    }
     final tokens = work.data[providerOpenTokensKey];
     try {
-      if (tokens is List) {
-        work.data[providerOpenTokensKey] = [...tokens, token];
+      if (tokens is! List) {
+        work.data[providerClosureUnknownKey] = true;
       }
+      work.data[providerOpenTokensKey] = [if (tokens is List) ...tokens, token];
       engine.workingCopyOpened(work, providerTracked: true);
-      if (tokens is List) engine.manifest.commitPoint();
+      engine.manifest.commitPoint();
     } catch (_) {
       // The caller still owns the descriptor and will close it on failure.
-      if (tokens is List) work.data[providerOpenTokensKey] = tokens;
+      if (tokens is List) {
+        work.data[providerOpenTokensKey] = tokens;
+      } else {
+        work.data.remove(providerOpenTokensKey);
+        // With no token list, earlier closure is unknown regardless.
+        work.data.remove(providerClosureUnknownKey);
+      }
       rethrow;
     }
   }

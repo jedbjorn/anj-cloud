@@ -6,6 +6,9 @@ import '../ports/release_guard.dart';
 /// Legacy sessions have no field, so closure of their copies is unknown.
 const providerOpenTokensKey = 'providerOpenTokens';
 
+/// A legacy session may record new hand-outs while its earlier ones are unknown.
+const providerClosureUnknownKey = 'providerClosureUnknown';
+
 /// One descriptor the documents provider handed to another app.
 class OpenDocument {
   OpenDocument(this.path, this.identity, {required this.write, this.working});

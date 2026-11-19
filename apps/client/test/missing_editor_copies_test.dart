@@ -941,4 +941,67 @@ void main() {
       expect(store.operations[owner], isNull);
     });
   });
+
+  testWidgets('a new hand-out on a legacy session keeps its own warning', (
+    tester,
+  ) async {
+    await tester.runAsync(
+      () => fixture.seed(legacy: true, paused: true, parkFirstCopy: true),
+    );
+    await _mount(tester, fixture);
+    final (id, owner, file) = fixture.absent.first;
+    fixture.parkedCopy.renameSync(file.path);
+    const token = 'legacy-held-open';
+    final opened = await tester.runAsync(
+      () => fixture.controller.documentsCommand('open', {
+        'working': p.basename(file.path),
+        'token': token,
+      }),
+    );
+    final fd = opened!['fd'] as int;
+    try {
+      file.deleteSync();
+      await tester.runAsync(() async {
+        await fixture.controller.stop();
+        await fixture.controller.start();
+        await _Fixture.until(
+          () => (fixture.row['presentationErrors'] as List).contains(
+            'An app may still have the editor copy open.',
+          ),
+        );
+      });
+      await tester.pumpAndSettle();
+      expect(editorWarningClaims(fixture.row).map((claim) => claim['id']), [
+        fixture.absent.last.$1,
+      ]);
+      await _openDismiss(tester);
+      await _confirmDismiss(tester);
+      await tester.runAsync(
+        () => _Fixture.until(
+          () => fixture.editorResult == 'Dismissed 1 editor warning.',
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(_attention(tester, 'Music'), isTrue);
+      expect(File('/proc/self/fd/$fd').readAsStringSync(), _original);
+      fixture.read((store) {
+        expect(store.operations[id]!.data[providerOpenTokensKey], [token]);
+        expect(store.operations[owner], isNotNull);
+      });
+    } finally {
+      NativeRootFs(testNativeLibrary).closeFd(fd);
+    }
+    await tester.runAsync(() async {
+      await fixture.controller.documentsCommand('closed', {'token': token});
+      await _Fixture.until(
+        () =>
+            editorWarningClaims(fixture.row).any((claim) => claim['id'] == id),
+      );
+    });
+    expect(missingEditorClaims(fixture.row), isEmpty);
+    fixture.read((store) {
+      expect(store.operations[id]!.data[providerClosureUnknownKey], isTrue);
+      expect(store.operations[owner], isNotNull);
+    });
+  });
 }
