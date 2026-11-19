@@ -192,7 +192,8 @@ class MissingEditorCopies {
 
   /// Describes the notice actions without creating, returning or saving a
   /// notice. A legacy condition would get a claim on ordinary projection.
-  ({Object dismiss, Object undo}) diagnosticNotice(
+  ({Object dismiss, Object undo, String? dismissedMissingArtifact})
+  diagnosticNotice(
     Entry entry,
     Operation work,
     String? binding,
@@ -200,7 +201,13 @@ class MissingEditorCopies {
     required bool recoveryAssessed,
     required bool observedPresent,
   }) {
-    if (binding == null) return (dismiss: 'unknown', undo: 'unknown');
+    if (binding == null) {
+      return (
+        dismiss: 'unknown',
+        undo: 'unknown',
+        dismissedMissingArtifact: null,
+      );
+    }
     final raw = work.data[_noticeKey];
     final notice =
         raw is Map &&
@@ -218,6 +225,7 @@ class MissingEditorCopies {
           ? legacy && !(unchanged && dismissed)
           : 'unknown',
       undo: !observedPresent && dismissed && (!legacy || unchanged),
+      dismissedMissingArtifact: unchanged && dismissed ? proof.owner?.id : null,
     );
   }
 

@@ -46,6 +46,7 @@ class _EditorDiagnostic {
   final bool phoneStoragePaused;
   final List<Operation> operations;
   final _aliases = <String, String>{};
+  final _dismissedMissingArtifacts = <String>{};
   late final _entryOperations = operations.where((op) => op.path == entry.path);
   late final _sessions = _entryOperations.where((op) => op.kind == 'working');
   late final _byId = {for (final op in operations) op.id: op};
@@ -109,12 +110,27 @@ class _EditorDiagnostic {
     for (final (i, session) in _sessions.indexed) {
       _aliases[session.id] = 'session ${i + 1}';
     }
+    final sessions = [for (final work in _sessions) _session(work)];
     final recovery = _recovery();
     return {
-      'sessionSlots': [for (final work in _sessions) _session(work)],
+      'sessionSlots': sessions,
       'entryRecovery': recovery,
+      'entryConflictRecovery': {
+        'action': entry.conflict == null
+            ? null
+            : entry.expectedPresent
+            ? 'Keep both versions'
+            : 'Recover local edits as new files',
+        'offered': _localVariantAvailable() ?? _unknown,
+      },
       'entryWarnings': [
         if (entry.conflict != null) 'conflict',
+        if (engine.hasUncertainLocalArtifacts(
+          entry.path,
+          dismissedMissingArtifacts: _dismissedMissingArtifacts,
+          probeStaging: _artifactInfo,
+        ))
+          'staging artifacts uncertain',
         if (isSizeRefusal(entry.status)) 'size refusal',
         if (isCantSyncName(entry.status)) 'name refusal',
         if (isBusyStatus(entry.status)) 'busy file',
@@ -136,6 +152,66 @@ class _EditorDiagnostic {
           'recovery copy evidence unknown',
       ],
     };
+  }
+
+  bool? _localVariantAvailable() {
+    if (entry.conflict == null) return false;
+    if (engine.hasRecordedLocalVariant(entry)) return true;
+    var unknown = entry.expectedPresent && entry.localHash == null;
+    for (final copy in engine.stagedLocalVariantCandidates(entry.path)) {
+      final changed = _stagedVariantChanged(copy);
+      if (changed == true) return true;
+      if (changed == null) unknown = true;
+    }
+    return unknown ? null : false;
+  }
+
+  bool? _stagedVariantChanged(Operation copy) {
+    final tree = engine.tree;
+    final staged = copy.staged!;
+    final name = p.basename(staged);
+    final NativeFileInfo before;
+    try {
+      engine.artifacts.resolve(staged);
+      before = _stagingInfo(name);
+    } on FileSystemException catch (error) {
+      return error.osError?.errorCode == 2 ? false : null;
+    }
+    try {
+      final hash = tree.native.copyAndHash(
+        tree.stageFd,
+        name,
+        null,
+        purpose: 'conflict-presentation',
+      );
+      if (before.stamp != _stagingInfo(name).stamp) return null;
+      return hash != copy.hash;
+    } on FileSystemException {
+      return null;
+    }
+  }
+
+  NativeFileInfo _artifactInfo(Operation record) {
+    final name = record.data['name'];
+    if (name is! String || name != p.basename(name)) {
+      throw const FileSystemException('Staging name unavailable.');
+    }
+    return _stagingInfo(name);
+  }
+
+  NativeFileInfo _stagingInfo(String name) {
+    final shared = name.startsWith(sharedStagingTag);
+    final directory = shared ? _shared : _private;
+    if (directory != null) {
+      NativeFileInfo? info;
+      try {
+        info = engine.artifacts.native.info(engine.tree.stageFd, name);
+      } on FileSystemException {
+        if (_directory(shared: shared) == directory) rethrow;
+      }
+      if (info != null && _directory(shared: shared) == directory) return info;
+    }
+    throw const FileSystemException('Staging directory unavailable.');
   }
 
   Map<String, Object?> _recovery() {
@@ -334,6 +410,9 @@ class _EditorDiagnostic {
       recoveryAssessed: !edited || preview || proof != null,
       observedPresent: preview || warning == MissingEditorCopies.copyPresent,
     );
+    if (notice.dismissedMissingArtifact case final artifact?) {
+      _dismissedMissingArtifacts.add(artifact);
+    }
     return {
       'slot': _alias(work),
       'guardPredicates': {

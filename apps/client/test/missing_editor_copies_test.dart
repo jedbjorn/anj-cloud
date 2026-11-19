@@ -674,6 +674,151 @@ void main() {
     },
   );
 
+  test('diagnostic tracks staging attention and conflict recovery', () async {
+    await fixture.seed(legacy: true);
+    final manifest = Manifest(fixture.profile);
+    final native = MappedRootFs(fixture.access.layout, testNativeLibrary);
+    final tree = RootTree(
+      Directory(manifest.setting('root')!),
+      Directory(manifest.setting('staging')!),
+      native,
+    );
+    final cloud = _DiagnosticCloud();
+    final engine = SyncEngine(manifest, tree, cloud);
+    final entry = manifest.entries[_path]!;
+    const stagingWarning = 'staging artifacts uncertain';
+    const conflictReason = 'private conflict details';
+    try {
+      int writes() =>
+          manifest.db.select('SELECT total_changes() AS n').single['n'] as int;
+      Map<String, Object?> diagnostic({bool paused = false}) {
+        final snapshots = jsonEncode([
+          entry.toJson(),
+          manifest.operations.values.map((op) => op.toJson()).toList(),
+        ]);
+        final before = writes();
+        final report = readEditorDiagnostic(
+          engine,
+          _path,
+          engine.selectionVersion(entry),
+          phoneStoragePaused: paused,
+        )!;
+        expect(writes(), before);
+        expect(
+          jsonEncode([
+            entry.toJson(),
+            manifest.operations.values.map((op) => op.toJson()).toList(),
+          ]),
+          snapshots,
+        );
+        expect(cloud.calls, 0);
+        final json = jsonEncode(report);
+        for (final secret in [
+          _path,
+          fixture.dir.path,
+          _original,
+          _edit,
+          'private ',
+        ]) {
+          expect(json, isNot(contains(secret)));
+        }
+        return report;
+      }
+
+      final row = await projectEntry(engine, entry);
+      final claims = editorWarningClaims(row);
+      expect(claims, hasLength(2));
+      engine.missingEditors.changeWarnings(
+        entry,
+        engine.editing.binding,
+        claims,
+        undo: false,
+      );
+
+      final download = engine.artifacts.reserve(_path, 'download')
+        ..writeAsStringSync('private download bytes');
+      engine.artifacts.complete(download, hash: _digest(download));
+      final presentRow = await projectEntry(engine, entry);
+      expect(editorWarningClaims(presentRow, undo: true), hasLength(2));
+      expect(presentRow['localArtifacts'], containsPair('uncertain', false));
+      expect(hasProblem(presentRow), isFalse);
+      final withDownload = diagnostic();
+      expect(withDownload['entryWarnings'], isNot(contains(stagingWarning)));
+      expect(download.readAsStringSync(), 'private download bytes');
+
+      download.deleteSync();
+      final missingRow = await projectEntry(engine, entry);
+      expect(missingRow['localArtifacts'], containsPair('uncertain', true));
+      expect(hasProblem(missingRow), isTrue);
+      final withoutDownload = diagnostic();
+      expect(withoutDownload['entryWarnings'], contains(stagingWarning));
+      expect(withoutDownload['sessionSlots'], withDownload['sessionSlots']);
+      expect(
+        jsonEncode(withoutDownload),
+        isNot(contains(p.basename(download.path))),
+      );
+      expect(download.existsSync(), isFalse);
+      expect(
+        diagnostic(paused: true)['entryWarnings'],
+        contains(stagingWarning),
+      );
+
+      entry.conflict = conflictReason;
+      expect(entry.localHash, entry.baselineHash);
+      expect(
+        (await projectEntry(engine, entry))['canRecoverLocalVariants'],
+        false,
+      );
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Keep both versions',
+        'offered': false,
+      });
+      expect(diagnostic(paused: true)['entryConflictRecovery'], {
+        'action': 'Keep both versions',
+        'offered': 'unknown',
+      });
+
+      fixture.original.writeAsStringSync(_edit);
+      entry.localHash = _digest(fixture.original);
+      expect(
+        (await projectEntry(engine, entry))['canRecoverLocalVariants'],
+        true,
+      );
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Keep both versions',
+        'offered': true,
+      });
+      expect(fixture.original.readAsStringSync(), _edit);
+
+      entry.expectedPresent = false;
+      final editor = fixture.absent.first.$3..writeAsStringSync(_original);
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Recover local edits as new files',
+        'offered': false,
+      });
+      editor.writeAsStringSync(_edit);
+      expect(
+        (await projectEntry(engine, entry))['canRecoverLocalVariants'],
+        true,
+      );
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Recover local edits as new files',
+        'offered': true,
+      });
+      expect(editor.readAsStringSync(), _edit);
+      editor.deleteSync();
+      final unreadable = Link(editor.path)..createSync(fixture.original.path);
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Recover local edits as new files',
+        'offered': 'unknown',
+      });
+      expect(unreadable.targetSync(), fixture.original.path);
+    } finally {
+      engine.close();
+      native.setPaused(true);
+    }
+  });
+
   testWidgets('Details diagnostic is available only with its build flag', (
     tester,
   ) async {
