@@ -91,6 +91,7 @@ class _Fixture {
   late final access = _Access('${dir.path}/shared');
   late final profile = Directory('${dir.path}/profile');
   late final original = File('${access.base}/$_path');
+  late final parkedCopy = File('${dir.path}/parked-editor-copy');
   late final controller = ClientController(
     profile,
     secrets: MemorySecrets(),
@@ -102,7 +103,11 @@ class _Fixture {
   (String id, String owner, File file)? present;
   String editorResult = '';
 
-  Future<void> seed({bool mixed = false, bool paused = false}) async {
+  Future<void> seed({
+    bool mixed = false,
+    bool paused = false,
+    bool parkFirstCopy = false,
+  }) async {
     final root = Directory('${dir.path}/root')..createSync();
     final staging = Directory('${dir.path}/private-stage');
     for (final folder in phoneFolderNames.values) {
@@ -138,11 +143,13 @@ class _Fixture {
         return (work.id, artifact.id, File('${access.staging}/$name'));
       }
 
-      for (var i = 0; i < 2; i++) {
-        final copy = await handOut();
-        absent.add(copy);
-        copy.$3.deleteSync();
-      }
+      absent.add(await handOut());
+      // Move the first copy out of staging so Open makes a second copy.
+      // Keeping the first inode alive ensures their identities differ.
+      absent.first.$3.renameSync(parkedCopy.path);
+      absent.add(await handOut());
+      absent.last.$3.deleteSync();
+      if (!parkFirstCopy) parkedCopy.deleteSync();
       await engine.tick();
       expect(
         store.operationsAt(_path).where((op) => op.kind == 'working'),
@@ -496,11 +503,13 @@ void main() {
   testWidgets('a provider handle keeps an unlinked editor copy registered', (
     tester,
   ) async {
-    await tester.runAsync(() => fixture.seed(paused: true));
+    await tester.runAsync(
+      () => fixture.seed(paused: true, parkFirstCopy: true),
+    );
     await _mount(tester, fixture);
     await _openClear(tester);
     final (id, owner, file) = fixture.absent.first;
-    file.writeAsStringSync('editor contents held through an open descriptor');
+    fixture.parkedCopy.renameSync(file.path);
     final opened = await tester.runAsync(
       () => fixture.controller.documentsCommand('open', {
         'working': p.basename(file.path),
@@ -515,10 +524,12 @@ void main() {
           () => fixture.editorResult.contains('still has the editor copy open'),
         ),
       );
+      expect(fixture.editorResult, contains('Cleared 1 missing editor copy.'));
       fixture.read((store) {
         expect(store.operations[id], isNotNull);
         expect(store.operations[owner], isNotNull);
         expect(store.operations[fixture.absent.last.$1], isNull);
+        expect(store.operations[fixture.absent.last.$2], isNull);
       });
     } finally {
       NativeRootFs(testNativeLibrary).closeFd(opened!['fd'] as int);
