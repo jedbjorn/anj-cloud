@@ -9,7 +9,7 @@
         password. The operator copies both files offline before the first install on a phone: a lost
         key means every phone must uninstall and pair again.
 
-    release_android.py build OUT [--commit REF]
+    release_android.py build OUT [--commit REF] [--editor-diagnostic]
         A reproducible signed release APK (cloud.anj.anj_cloud, R8) of a committed source: `git
         archive` of the commit (default HEAD; nothing uncommitted or ignored can enter) extracted
         to a fixed path, built with the pinned Flutter and Android toolchains for arm64 phones and
@@ -17,6 +17,8 @@
         its UTC date and that code, as for Linux; the commit is stamped into the manifest
         (cloud.anj.source_head). OUT (absolute, absent) receives anj-cloud-<version>.apk, its
         .sha256 and build-receipt.json. The signer must be the pinned certificate.
+        --editor-diagnostic enables the private editor-copy Details diagnostic, with
+        the same app ID and signer. This APK is refused by the release publish tools.
 
     release_android.py github-release --apk APK [--create | --source-ref REF]
         The first-install path (#131): a GitHub release tagged android-<version_code> on the APK's
@@ -124,7 +126,8 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def build(out, commit="HEAD", signing=SIGNING_DIR / PROPERTIES, scope="anj-release-android"):
+def build(out, commit="HEAD", signing=SIGNING_DIR / PROPERTIES, scope="anj-release-android", *,
+          editor_diagnostic=False):
     out = Path(out)
     if not out.is_absolute() or out.exists() or out.is_symlink():
         raise Refused("OUT must be an absolute directory that does not exist yet")
@@ -132,7 +135,7 @@ def build(out, commit="HEAD", signing=SIGNING_DIR / PROPERTIES, scope="anj-relea
         raise Refused(f"No signing properties at {signing} (run `release_android.py keygen` once)")
     head = git("rev-parse", "--verify", f"{commit}^{{commit}}")
     code, version = release_version(head)
-    source = BUILD_ROOT / "src"
+    source = BUILD_ROOT / ("editor-diagnostic" if editor_diagnostic else "src")
     if source.exists():
         shutil.rmtree(source)
     source.mkdir(parents=True)
@@ -148,6 +151,9 @@ def build(out, commit="HEAD", signing=SIGNING_DIR / PROPERTIES, scope="anj-relea
     import apply_profile
     apply_profile.apply(source)
     defines = " --dart-define-from-file=anj-defines.env" if (client / "anj-defines.env").is_file() else ""
+    if editor_diagnostic:
+        version += release.EDITOR_DIAGNOSTIC_SUFFIX
+        defines += " --dart-define=ANJ_EDITOR_DIAGNOSTIC=true"
     env = {**os.environ, "ANJ_SOURCE_HEAD": head, "ANJ_ANDROID_SIGNING": str(signing),
            "FLUTTER_SUPPRESS_ANALYTICS": "true", "DART_SUPPRESS_ANALYTICS": "true"}
     command = [str(TOOLCHAIN / "bin/anj-android"), "bash", "-c",
@@ -155,13 +161,15 @@ def build(out, commit="HEAD", signing=SIGNING_DIR / PROPERTIES, scope="anj-relea
                f"{FLUTTER}/bin/flutter --suppress-analytics build apk --release "
                f"--target-platform {TARGET_PLATFORMS} --build-number={code} --build-name={version}{defines}"]
     done = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", f"--unit={scope}-{head[:12]}",
-                           "-p", "MemoryMax=8G", "-p", "TasksMax=2048", "timeout", "2400", *command],
+                           "-p", "MemoryMax=4G" if editor_diagnostic else "MemoryMax=8G",
+                           "-p", "TasksMax=512" if editor_diagnostic else "TasksMax=2048",
+                           "timeout", "2400", *command],
                           cwd=client, env=env)
     if done.returncode:
         raise Refused(f"flutter build apk --release failed ({done.returncode})")
     built = client / "build/app/outputs/flutter-apk/app-release.apk"
     facts = release.android_facts(built)
-    release.check_android(facts, release.android_pin())
+    release.check_android(facts, release.android_pin(), allow_editor_diagnostic=editor_diagnostic)
     if (facts["source_head"], facts["version_code"], facts["version"]) != (head, code, version):
         raise Refused("The built APK does not carry the commit, versionCode and versionName it was built with")
     out.mkdir(mode=0o700, parents=True)
@@ -220,6 +228,7 @@ def main(argv=None):
     made = sub.add_parser("build", help="Build a signed release APK of a committed source")
     made.add_argument("out", type=Path)
     made.add_argument("--commit", default="HEAD")
+    made.add_argument("--editor-diagnostic", action="store_true", help="Build the private Details diagnostic")
     gh = sub.add_parser("github-release", help="Create the GitHub release for first installs (operator go-ahead)")
     gh.add_argument("--apk", type=Path, required=True)
     gh.add_argument("--create", action="store_true", help="Really create it (default: show what would run)")
@@ -229,7 +238,7 @@ def main(argv=None):
         if args.command == "keygen":
             result = keygen()
         elif args.command == "build":
-            result = build(args.out, args.commit)
+            result = build(args.out, args.commit, editor_diagnostic=args.editor_diagnostic)
         else:
             result = github_release(args.apk, create=args.create, source_ref=args.source_ref)
     except (Refused, OSError, ValueError, subprocess.CalledProcessError) as error:

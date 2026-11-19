@@ -26,6 +26,7 @@ import '../ports/documents.dart';
 import '../ports/root_placement.dart';
 import '../ports/root_location.dart';
 import '../ports/secret_store.dart';
+import '../sync/editor_diagnostic.dart';
 import '../sync/first_sync.dart';
 import '../sync/sync_schedule.dart';
 import '../sync/worker.dart';
@@ -567,6 +568,10 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
           _bulkRequests
               .remove(event['request'])
               ?.complete(Map<String, dynamic>.from(event));
+        case editorDiagnosticResult when editorDiagnosticsEnabled:
+          _editorDiagnostics
+              .remove(event['request'])
+              ?.complete(event['report'] as Map?);
         case 'folderCreated':
           _folderRequests
               .remove(event['request'])
@@ -795,6 +800,12 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     if (!(_ready?.isCompleted ?? true)) _ready!.complete();
     _storageReady = false;
     _failFolderRequests();
+    if (editorDiagnosticsEnabled) {
+      for (final result in _editorDiagnostics.values) {
+        result.complete(null);
+      }
+      _editorDiagnostics.clear();
+    }
     // No notification: stop() also runs from dispose().
     _syncing = const {};
     _output?.close();
@@ -1394,6 +1405,30 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         throw const FileSystemException(
           'Batch confirmation timed out. Check the library before retrying.',
         );
+      },
+    );
+  }
+
+  final _editorDiagnostics = <String, Completer<Map?>>{};
+
+  Future<Map?> editorDiagnostic(Map<String, dynamic> entry) async {
+    final input = _input;
+    if (!editorDiagnosticsEnabled || phoneFolders == null || input == null) {
+      return null;
+    }
+    final request = uniqueId();
+    final result = _editorDiagnostics[request] = Completer<Map?>();
+    input.send({
+      'action': editorDiagnosticRequest,
+      'request': request,
+      'path': entry['path'],
+      'selectionVersion': entry['selectionVersion'],
+    });
+    return result.future.timeout(
+      const Duration(seconds: 30),
+      onTimeout: () {
+        _editorDiagnostics.remove(request);
+        return null;
       },
     );
   }

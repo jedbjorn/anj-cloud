@@ -138,6 +138,16 @@ class AndroidPublishTests(unittest.TestCase):
         self.assertEqual([], destination.published)
         self.assertIn("dry-run", result["state"])
 
+    def test_editor_diagnostic_is_same_signer_but_private(self):
+        self.describe(name="2026.11.06.2-editor-diagnostic")
+        release.check_android(self.android_facts(self.apk), PIN, allow_editor_diagnostic=True)
+        destination = FakeDestination()
+        with self.assertRaisesRegex(release.Refused, "diagnostic builds cannot be published"):
+            self.publish(destination)
+        self.assertEqual([], destination.published)
+        with self.assertRaisesRegex(release.Refused, "diagnostic builds cannot be published"):
+            self.github()
+
     def test_refusals_publish_nothing(self):
         cases = {
             "not the release app": dict(package="cloud.anj.anj_cloud.qa"),

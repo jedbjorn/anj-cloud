@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
 
@@ -8,6 +9,7 @@ import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/ports/phone_folders.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
+import 'package:anj_cloud/core/sync/editor_diagnostic.dart';
 import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/open_documents.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
@@ -305,10 +307,548 @@ bool _attention(WidgetTester tester, String path) => tester
     .row
     .attention;
 
+class _DiagnosticCloud extends FakeCloud {
+  int calls = 0;
+
+  @override
+  void check() {
+    calls++;
+    super.check();
+  }
+}
+
 void main() {
   late _Fixture fixture;
   setUp(() => fixture = _Fixture());
   tearDown(() => fixture.close());
+
+  test(
+    'diagnostic reports independent relationships without side effects',
+    () async {
+      await fixture.seed(legacy: true, keepNamedCopy: true);
+      final manifest = Manifest(fixture.profile);
+      final native = MappedRootFs(fixture.access.layout, testNativeLibrary);
+      final tree = RootTree(
+        Directory(manifest.setting('root')!),
+        Directory(manifest.setting('staging')!),
+        native,
+      );
+      final cloud = _DiagnosticCloud();
+      final engine = SyncEngine(manifest, tree, cloud);
+      final entry = manifest.entries[_path]!;
+      final historical = manifest.operations[fixture.absent.first.$1]!;
+      final mixed = manifest.operations[fixture.absent.last.$1]!;
+      final present = manifest.operations[fixture.present!.$1]!;
+      final owner = manifest.operations[fixture.absent.last.$2]!;
+      final token = 'private-provider-token';
+      try {
+        Operation accept(
+          Operation session,
+          String id, {
+          String? hash,
+          String? version,
+        }) {
+          final upload =
+              Operation(
+                  id,
+                  'artifact',
+                  _path,
+                  hash: hash ?? session.hash,
+                  expectedEtag: version ?? session.expectedEtag,
+                  phase: 'complete',
+                )
+                ..data = {
+                  'role': 'working-upload',
+                  'workingId': session.id,
+                  'sessionBinding': engine.editing.binding,
+                  'lineageVersion': 1,
+                  'accepted': true,
+                  'snapshotHash': hash ?? session.hash,
+                  'identity': 'private-snapshot-identity',
+                  'snapshotIdentity': 'private-snapshot-identity',
+                };
+          manifest.operations[id] = upload;
+          session.data['uploadTip'] = id;
+          return upload;
+        }
+
+        final firstUpload = accept(historical, 'private-accepted-first');
+        final secondUpload = accept(mixed, 'private-accepted-second');
+        manifest.operations['private-recovery'] =
+            Operation('private-recovery', 'preserve', _path)
+              ..data = {
+                'workingId': mixed.id,
+                'source': mixed.staged,
+                'names': [mixed.staged],
+                'artifacts': [owner.id, secondUpload.id],
+              };
+        manifest.operations['private-finish'] = Operation(
+          'private-finish',
+          'finish-editing',
+          _path,
+        )..data['sessions'] = [mixed.id];
+        manifest.operations['private-ownership'] = Operation(
+          'private-ownership',
+          'edit-ownership',
+          _path,
+          phase: 'authorized',
+        )..data = {'session': mixed.id, 'artifact': owner.id};
+        mixed.data
+          ..['reclaiming'] = true
+          ..['presentationError'] = 'private arbitrary exception';
+        owner
+          ..phase = 'owned'
+          ..data['installing'] = _path
+          ..data['releasing'] = mixed.hash;
+        present.data
+          ..['uploadTip'] = 'private-missing-upload'
+          ..[providerOpenTokensKey] = [token]
+          ..[providerClosureUnknownKey] = true;
+        openDocuments.add(
+          token,
+          OpenDocument(
+            _path,
+            owner.data['identity'] as String,
+            write: true,
+            working: p.basename(mixed.staged!),
+          ),
+        );
+        manifest.save();
+        String state() => jsonEncode({
+          'entries': manifest.entries.values
+              .map((row) => row.toJson())
+              .toList(),
+          'operations': manifest.operations.values
+              .map((op) => op.toJson())
+              .toList(),
+        });
+        Object? changes() =>
+            manifest.db.select('SELECT total_changes() AS n').single['n'];
+        Map<String, Object?> diagnostic({bool paused = false}) {
+          final before = state();
+          final written = changes();
+          final report = readEditorDiagnostic(
+            engine,
+            _path,
+            engine.selectionVersion(entry),
+            phoneStoragePaused: paused,
+          )!;
+          expect(state(), before);
+          expect(changes(), written);
+          expect(cloud.calls, 0);
+          return report;
+        }
+
+        final report = diagnostic();
+        final slots = (report['sessionSlots'] as List).cast<Map>();
+        expect(slots, hasLength(3));
+        expect(slots[0]['relationships'], ['historical']);
+        expect(
+          (slots[0]['acceptedUploads'] as List).single['obligation'],
+          'terminal',
+        );
+        expect(slots[1]['relationships'], ['historical', 'active']);
+        expect(
+          (slots[1]['acceptedUploads'] as List).single['obligation'],
+          'active',
+        );
+        expect(slots[2]['relationships'], ['unknown']);
+        expect(
+          slots[0]['staging'],
+          containsPair('historicalTargetDirectory', 'unknown'),
+        );
+        expect(slots[0]['staging'], containsPair('target', 'absent'));
+        expect(
+          slots[1]['guardPredicates'],
+          containsPair('ownerIncomplete', true),
+        );
+        expect(
+          slots[1]['guardPredicates'],
+          containsPair('ownerInstalling', true),
+        );
+        expect(
+          slots[1]['guardPredicates'],
+          containsPair('ownerReleasing', true),
+        );
+        expect(slots[1]['guardPredicates'], containsPair('reclaiming', true));
+        expect(
+          slots[1]['providerClosure'],
+          containsPair('inMemoryByName', true),
+        );
+        expect(
+          slots[1]['providerClosure'],
+          containsPair('inMemoryByOwnerIdentity', true),
+        );
+        expect(slots[1]['providerClosure'], containsPair('durable', 'unknown'));
+        expect(slots[2]['staging'], containsPair('target', 'present'));
+        expect(
+          slots[2]['providerClosure'],
+          containsPair('durable', 'outstanding'),
+        );
+        expect(
+          (slots[1]['references'] as List).expand(
+            (row) => row['relationships'] as List,
+          ),
+          containsAll([
+            'workingId',
+            'source',
+            'names',
+            'artifacts',
+            'upload artifact reference',
+            'authorized edit ownership',
+            'Finish membership',
+          ]),
+        );
+        final dumped = jsonEncode(report);
+        for (final private in [
+          _path,
+          fixture.dir.path,
+          historical.id,
+          firstUpload.id,
+          secondUpload.id,
+          historical.hash!,
+          historical.expectedEtag!,
+          'private-',
+          _original,
+        ]) {
+          expect(dumped, isNot(contains(private)));
+        }
+        final inaccessible = diagnostic(paused: true);
+        final blocked = (inaccessible['sessionSlots'] as List).first as Map;
+        expect(blocked['staging'], containsPair('access', 'unavailable'));
+        expect(blocked['staging'], containsPair('target', 'unknown'));
+        expect(blocked['guardPredicates'], containsPair('uploadTip', true));
+        expect(
+          readEditorDiagnostic(
+            engine,
+            _path,
+            'old selection',
+            phoneStoragePaused: false,
+          ),
+          isNull,
+        );
+        expect(cloud.calls, 0);
+        expect(fixture.original.readAsStringSync(), _original);
+        expect(fixture.present!.$3.existsSync(), isTrue);
+
+        secondUpload.data['snapshotHash'] = 'private-different-snapshot';
+        final unreadable = Link(fixture.absent.first.$3.path)
+          ..createSync(fixture.original.path);
+        manifest.save();
+        final changed = diagnostic();
+        final changedSlots = (changed['sessionSlots'] as List).cast<Map>();
+        expect(
+          changedSlots[0]['staging'],
+          containsPair('target', 'read error'),
+        );
+        expect(changedSlots[1]['relationships'], ['active']);
+        expect(
+          (changedSlots[1]['acceptedUploads'] as List).single,
+          containsPair('snapshotHash', 'mismatch'),
+        );
+        unreadable.deleteSync();
+
+        final beforeRecovery = diagnostic();
+        expect(beforeRecovery['entryRecovery'], {
+          'presentCount': 0,
+          'recoverOffered': false,
+          'dismissOffered': false,
+        });
+        expect(
+          beforeRecovery['entryWarnings'],
+          isNot(contains('independent recovery copies')),
+        );
+        final retained = engine.artifacts.reserve(_path, 'preserved')
+          ..writeAsStringSync('private-recovery-bytes');
+        engine.artifacts.complete(retained, hash: _digest(retained));
+        final staged = tree.durablePath(retained);
+        entry.preservedCopies.add(staged);
+        manifest.operations['private-retained'] = Operation(
+          'private-retained',
+          'retained',
+          _path,
+          staged: staged,
+        );
+        manifest.save();
+        final withRecovery = diagnostic();
+        expect(
+          engine.recovery.describe(_path),
+          containsPair('recoverable', true),
+        );
+        expect(withRecovery['entryRecovery'], {
+          'presentCount': 1,
+          'recoverOffered': true,
+          'dismissOffered': true,
+        });
+        expect(
+          withRecovery['entryWarnings'],
+          contains('independent recovery copies'),
+        );
+        expect(withRecovery['sessionSlots'], beforeRecovery['sessionSlots']);
+        expect(jsonEncode(withRecovery), isNot(contains('private-')));
+        expect(
+          jsonEncode(withRecovery),
+          isNot(contains(p.basename(retained.path))),
+        );
+        expect(retained.readAsStringSync(), 'private-recovery-bytes');
+        final pausedRecovery = diagnostic(paused: true);
+        expect(
+          pausedRecovery['entryWarnings'],
+          contains('recovery copy evidence unknown'),
+        );
+        expect(pausedRecovery['entryRecovery'], {
+          'presentCount': 'unknown',
+          'recoverOffered': 'unknown',
+          'dismissOffered': true,
+        });
+        retained.deleteSync();
+        expect(diagnostic()['entryRecovery'], {
+          'presentCount': 0,
+          'recoverOffered': false,
+          'dismissOffered': true,
+        });
+        final unreadableRecovery = Link(retained.path)
+          ..createSync(fixture.original.path);
+        expect(diagnostic()['entryRecovery'], pausedRecovery['entryRecovery']);
+        unreadableRecovery.deleteSync();
+
+        void link(Operation earlier, Operation later) {
+          earlier.data['supersededBy'] = later.id;
+          later.data['supersedes'] = earlier.id;
+          later.data['baseEtag'] = earlier.expectedEtag;
+        }
+
+        final middle = accept(
+          historical,
+          'private-middle',
+          hash: 'private-middle-hash',
+          version: 'private-middle-version',
+        );
+        final tip = accept(historical, 'private-tip');
+        link(firstUpload, middle);
+        link(middle, tip);
+
+        void checkLineage({required bool verified, required bool closedCycle}) {
+          manifest.save();
+          final slot = (diagnostic()['sessionSlots'] as List).first as Map;
+          final uploads = (slot['acceptedUploads'] as List).cast<Map>();
+          expect(
+            uploads.map((row) => row['receipt']),
+            everyElement('accepted'),
+          );
+          expect(uploads.map((row) => row['supersession']), [
+            'match',
+            'match',
+            closedCycle ? 'match' : 'unknown',
+          ]);
+          expect(
+            uploads.map((row) => row['lineage']),
+            everyElement(verified ? 'verified local tip' : 'unknown'),
+          );
+          expect(
+            uploads.map((row) => row['obligation']),
+            everyElement(verified ? 'terminal' : 'unknown'),
+          );
+          expect(slot['relationships'], [
+            'historical',
+            if (!verified) 'unknown',
+          ]);
+        }
+
+        checkLineage(verified: true, closedCycle: false);
+        final sessionHash = historical.hash;
+        historical.hash = 'private-different-session-hash';
+        checkLineage(verified: false, closedCycle: false);
+        historical.hash = sessionHash;
+        tip.data['supersededBy'] = 'private-missing-tip';
+        historical.data['uploadTip'] = 'private-missing-tip';
+        checkLineage(verified: false, closedCycle: false);
+        historical.data['uploadTip'] = tip.id;
+        link(tip, firstUpload);
+        checkLineage(verified: false, closedCycle: true);
+      } finally {
+        openDocuments.remove(token);
+        engine.close();
+        native.setPaused(true);
+      }
+    },
+  );
+
+  test('diagnostic tracks staging attention and conflict recovery', () async {
+    await fixture.seed(legacy: true);
+    final manifest = Manifest(fixture.profile);
+    final native = MappedRootFs(fixture.access.layout, testNativeLibrary);
+    final tree = RootTree(
+      Directory(manifest.setting('root')!),
+      Directory(manifest.setting('staging')!),
+      native,
+    );
+    final cloud = _DiagnosticCloud();
+    final engine = SyncEngine(manifest, tree, cloud);
+    final entry = manifest.entries[_path]!;
+    const stagingWarning = 'staging artifacts uncertain';
+    const conflictReason = 'private conflict details';
+    try {
+      int writes() =>
+          manifest.db.select('SELECT total_changes() AS n').single['n'] as int;
+      Map<String, Object?> diagnostic({bool paused = false}) {
+        final snapshots = jsonEncode([
+          entry.toJson(),
+          manifest.operations.values.map((op) => op.toJson()).toList(),
+        ]);
+        final before = writes();
+        final report = readEditorDiagnostic(
+          engine,
+          _path,
+          engine.selectionVersion(entry),
+          phoneStoragePaused: paused,
+        )!;
+        expect(writes(), before);
+        expect(
+          jsonEncode([
+            entry.toJson(),
+            manifest.operations.values.map((op) => op.toJson()).toList(),
+          ]),
+          snapshots,
+        );
+        expect(cloud.calls, 0);
+        final json = jsonEncode(report);
+        for (final secret in [
+          _path,
+          fixture.dir.path,
+          _original,
+          _edit,
+          'private ',
+        ]) {
+          expect(json, isNot(contains(secret)));
+        }
+        return report;
+      }
+
+      final row = await projectEntry(engine, entry);
+      final claims = editorWarningClaims(row);
+      expect(claims, hasLength(2));
+      engine.missingEditors.changeWarnings(
+        entry,
+        engine.editing.binding,
+        claims,
+        undo: false,
+      );
+
+      final download = engine.artifacts.reserve(_path, 'download')
+        ..writeAsStringSync('private download bytes');
+      engine.artifacts.complete(download, hash: _digest(download));
+      final presentRow = await projectEntry(engine, entry);
+      expect(editorWarningClaims(presentRow, undo: true), hasLength(2));
+      expect(presentRow['localArtifacts'], containsPair('uncertain', false));
+      expect(hasProblem(presentRow), isFalse);
+      final withDownload = diagnostic();
+      expect(withDownload['entryWarnings'], isNot(contains(stagingWarning)));
+      expect(download.readAsStringSync(), 'private download bytes');
+
+      download.deleteSync();
+      final missingRow = await projectEntry(engine, entry);
+      expect(missingRow['localArtifacts'], containsPair('uncertain', true));
+      expect(hasProblem(missingRow), isTrue);
+      final withoutDownload = diagnostic();
+      expect(withoutDownload['entryWarnings'], contains(stagingWarning));
+      expect(withoutDownload['sessionSlots'], withDownload['sessionSlots']);
+      expect(
+        jsonEncode(withoutDownload),
+        isNot(contains(p.basename(download.path))),
+      );
+      expect(download.existsSync(), isFalse);
+      expect(
+        diagnostic(paused: true)['entryWarnings'],
+        contains(stagingWarning),
+      );
+
+      entry.conflict = conflictReason;
+      expect(entry.localHash, entry.baselineHash);
+      expect(
+        (await projectEntry(engine, entry))['canRecoverLocalVariants'],
+        false,
+      );
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Keep both versions',
+        'offered': false,
+      });
+      expect(diagnostic(paused: true)['entryConflictRecovery'], {
+        'action': 'Keep both versions',
+        'offered': 'unknown',
+      });
+
+      fixture.original.writeAsStringSync(_edit);
+      entry.localHash = _digest(fixture.original);
+      expect(
+        (await projectEntry(engine, entry))['canRecoverLocalVariants'],
+        true,
+      );
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Keep both versions',
+        'offered': true,
+      });
+      expect(fixture.original.readAsStringSync(), _edit);
+
+      entry.expectedPresent = false;
+      final editor = fixture.absent.first.$3..writeAsStringSync(_original);
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Recover local edits as new files',
+        'offered': false,
+      });
+      editor.writeAsStringSync(_edit);
+      expect(
+        (await projectEntry(engine, entry))['canRecoverLocalVariants'],
+        true,
+      );
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Recover local edits as new files',
+        'offered': true,
+      });
+      expect(editor.readAsStringSync(), _edit);
+      editor.deleteSync();
+      final unreadable = Link(editor.path)..createSync(fixture.original.path);
+      expect(diagnostic()['entryConflictRecovery'], {
+        'action': 'Recover local edits as new files',
+        'offered': 'unknown',
+      });
+      expect(unreadable.targetSync(), fixture.original.path);
+    } finally {
+      engine.close();
+      native.setPaused(true);
+    }
+  });
+
+  testWidgets('Details diagnostic is available only with its build flag', (
+    tester,
+  ) async {
+    await tester.runAsync(() => fixture.seed(legacy: true, paused: true));
+    await _mount(tester, fixture);
+    await _openDetails(tester);
+    final button = find.widgetWithText(TextButton, 'Editor copy diagnostic');
+    if (!editorDiagnosticsEnabled) {
+      expect(button, findsNothing);
+      expect(await fixture.controller.editorDiagnostic(fixture.row), isNull);
+      return;
+    }
+    expect(button, findsOneWidget);
+    await tester.runAsync(() async {
+      await tester.tap(button);
+      for (var i = 0; i < 50; i++) {
+        await tester.pump();
+        if (find.textContaining('"sessionSlots"').evaluate().isNotEmpty) break;
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+    });
+    await tester.pumpAndSettle();
+    expect(find.textContaining('"sessionSlots"'), findsOneWidget);
+    expect(find.textContaining('"dismissWarning": true'), findsOneWidget);
+    await tester.runAsync(fixture.controller.stop);
+    expect(
+      File('${fixture.profile.path}/cloud-mutations').readAsStringSync(),
+      '0,0,0',
+    );
+  });
 
   testWidgets('verified sessions: cancel, clear, restart and replay', (
     tester,

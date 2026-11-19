@@ -23,6 +23,7 @@ import 'phone_folder_move.dart';
 import '../../platform/watchers.dart';
 import '../ports/change_watcher.dart';
 import '../ports/phone_folders.dart';
+import '../ports/release_guard.dart';
 import '../ports/root_filesystem.dart';
 import 'pass_metrics.dart';
 import 'recovery_copies.dart';
@@ -7529,6 +7530,38 @@ class SyncEngine {
     return _artifactIndex[path] ?? const [];
   }
 
+  ({NativeFileInfo? info, bool uncertain}) _readLocalArtifact(
+    Operation record,
+    Set<String> dismissedMissingArtifacts, {
+    NativeFileInfo Function(Operation)? probeStaging,
+  }) {
+    try {
+      final info = probeStaging == null
+          ? artifacts.native.info(tree.stageFd, record.data['name'] as String)
+          : probeStaging(record);
+      return (info: info, uncertain: info.identity != record.data['identity']);
+    } on FileSystemException catch (error) {
+      return (
+        info: null,
+        uncertain:
+            error.osError?.errorCode != 2 ||
+            !dismissedMissingArtifacts.contains(record.id),
+      );
+    }
+  }
+
+  bool hasUncertainLocalArtifacts(
+    String path, {
+    required Set<String> dismissedMissingArtifacts,
+    required NativeFileInfo Function(Operation) probeStaging,
+  }) => _artifactsFor(path).any(
+    (record) => _readLocalArtifact(
+      record,
+      dismissedMissingArtifacts,
+      probeStaging: probeStaging,
+    ).uncertain,
+  );
+
   Map<String, Object?> localArtifacts(
     String path, {
     Set<String> dismissedMissingArtifacts = const {},
@@ -7552,37 +7585,28 @@ class SyncEngine {
       }
     }
     for (final record in records) {
-      try {
-        final info = artifacts.native.info(
-          tree.stageFd,
-          record.data['name'] as String,
-        );
-        if (info.identity == live && info.identity == record.data['identity']) {
-          continue;
-        }
-        var kind = artifactKind(record.data['role'] as String?);
-        if (record.data['role'] == 'working') {
-          // An unchanged working copy is a downloaded copy (decision #183).
-          final session = manifest
-              .operationsAt(path)
-              .where((o) => o.kind == 'working' && o.staged == record.staged)
-              .firstOrNull;
-          if (session != null && !artifacts.workingEdited(session)) {
-            kind = 'download';
-          }
-        }
-        count++;
-        kinds[kind] = (kinds[kind] ?? 0) + 1;
-        // Hard-linked names (download-* installs) share one inode's bytes.
-        if (inodes.add(info.identity)) bytes += info.size;
-        files.add({'path': record.staged, 'size': info.size, 'kind': kind});
-        if (info.identity != record.data['identity']) uncertain = true;
-      } on FileSystemException catch (error) {
-        if (error.osError?.errorCode != 2 ||
-            !dismissedMissingArtifacts.contains(record.id)) {
-          uncertain = true;
+      final evidence = _readLocalArtifact(record, dismissedMissingArtifacts);
+      if (evidence.uncertain) uncertain = true;
+      final info = evidence.info;
+      if (info == null || info.identity == live && !evidence.uncertain) {
+        continue;
+      }
+      var kind = artifactKind(record.data['role'] as String?);
+      if (record.data['role'] == 'working') {
+        // An unchanged working copy is a downloaded copy (decision #183).
+        final session = manifest
+            .operationsAt(path)
+            .where((o) => o.kind == 'working' && o.staged == record.staged)
+            .firstOrNull;
+        if (session != null && !artifacts.workingEdited(session)) {
+          kind = 'download';
         }
       }
+      count++;
+      kinds[kind] = (kinds[kind] ?? 0) + 1;
+      // Hard-linked names (download-* installs) share one inode's bytes.
+      if (inodes.add(info.identity)) bytes += info.size;
+      files.add({'path': record.staged, 'size': info.size, 'kind': kind});
     }
     return {
       'count': count,
@@ -7593,6 +7617,20 @@ class SyncEngine {
     };
   }
 
+  bool hasRecordedLocalVariant(Entry entry) =>
+      entry.expectedPresent &&
+      entry.localHash != null &&
+      entry.localHash != entry.baselineHash;
+
+  Iterable<Operation> stagedLocalVariantCandidates(String path) => manifest
+      .operationsAt(path)
+      .where(
+        (op) =>
+            (op.kind == 'working' || op.kind == 'retained') &&
+            op.staged != null &&
+            op.hash != null,
+      );
+
   Future<bool> canRecoverLocalVariants(String path) async {
     final entry = manifest.entries[path];
     if (entry == null ||
@@ -7600,18 +7638,8 @@ class SyncEngine {
         entry.kind != ItemKind.file) {
       return false;
     }
-    if (entry.expectedPresent &&
-        entry.localHash != null &&
-        entry.localHash != entry.baselineHash) {
-      return true;
-    }
-    for (final op
-        in manifest
-            .operationsAt(path)
-            .where((o) => o.kind == 'working' || o.kind == 'retained')) {
-      if (op.staged == null || op.hash == null) {
-        continue;
-      }
+    if (hasRecordedLocalVariant(entry)) return true;
+    for (final op in stagedLocalVariantCandidates(path)) {
       try {
         final file = artifacts.resolve(op.staged!);
         if (file.existsSync() &&
