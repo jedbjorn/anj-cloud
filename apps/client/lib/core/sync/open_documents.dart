@@ -2,6 +2,10 @@ import 'dart:io';
 
 import '../ports/release_guard.dart';
 
+/// Outstanding Android provider hand-outs recorded on a working session.
+/// Legacy sessions have no field, so closure of their copies is unknown.
+const providerOpenTokensKey = 'providerOpenTokens';
+
 /// One descriptor the documents provider handed to another app.
 class OpenDocument {
   OpenDocument(this.path, this.identity, {required this.write, this.working});

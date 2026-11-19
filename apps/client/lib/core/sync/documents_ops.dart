@@ -215,7 +215,8 @@ class DocumentsOps {
         'This working copy was finished or removed.',
       );
     }
-    final path = owner.first.path;
+    final work = owner.first;
+    final path = work.path;
     if (write && engine.viewOnly(path)) {
       throw const DocumentsFailure(
         'readOnly',
@@ -223,9 +224,7 @@ class DocumentsOps {
       );
     }
     tree.native.checkRoot(tree.stageFd, tree.staging.path);
-    final handed = _hand(tree.stageFd, name, path, write, token, working: name);
-    engine.workingCopyOpened(owner.first, providerTracked: true);
-    return handed;
+    return _hand(tree.stageFd, name, path, write, token, work: work);
   }
 
   /// A read-only descriptor of [relative] beneath [directory], recorded in
@@ -237,19 +236,40 @@ class DocumentsOps {
     String path,
     bool write,
     String token, {
-    String? working,
+    Operation? work,
   }) {
     if (directory == tree.fd) tree.native.checkRoot(tree.fd, tree.root.path);
     final fd = _fs.openRead(directory, relative);
     try {
       final info = engine.artifacts.native.infoFd(fd);
+      if (work != null) _recordWorkingHandout(work, token);
       registry.add(
         token,
-        OpenDocument(path, info.identity, write: write, working: working),
+        OpenDocument(
+          path,
+          info.identity,
+          write: write,
+          working: work == null ? null : relative,
+        ),
       );
       return {'fd': fd, 'size': info.size, 'token': token};
     } catch (_) {
       tree.native.closeFd(fd);
+      rethrow;
+    }
+  }
+
+  void _recordWorkingHandout(Operation work, String token) {
+    final tokens = work.data[providerOpenTokensKey];
+    try {
+      if (tokens is List) {
+        work.data[providerOpenTokensKey] = [...tokens, token];
+      }
+      engine.workingCopyOpened(work, providerTracked: true);
+      if (tokens is List) engine.manifest.commitPoint();
+    } catch (_) {
+      // The caller still owns the descriptor and will close it on failure.
+      if (tokens is List) work.data[providerOpenTokensKey] = tokens;
       rethrow;
     }
   }
@@ -261,10 +281,26 @@ class DocumentsOps {
   /// no app holds open any more is reclaimed by that pass.
   void closed(String token) {
     final document = registry.remove(token);
-    if (document == null) return;
-    if (document.write || document.working != null) {
+    if (document != null && (document.write || document.working != null)) {
       engine.markDirty(document.path);
     }
+    if (document != null && document.working == null) return;
+    final work = engine.manifest.operations.values.where((op) {
+      final tokens = op.data[providerOpenTokensKey];
+      return op.kind == 'working' && tokens is List && tokens.contains(token);
+    }).firstOrNull;
+    if (work == null) return;
+    final tokens = work.data[providerOpenTokensKey] as List;
+    work.data[providerOpenTokensKey] = tokens
+        .where((id) => id != token)
+        .toList();
+    try {
+      engine.manifest.save();
+    } catch (_) {
+      work.data[providerOpenTokensKey] = tokens;
+      rethrow;
+    }
+    if (document == null) engine.markDirty(work.path);
   }
 
   // ---- names ---------------------------------------------------------------

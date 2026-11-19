@@ -7284,14 +7284,20 @@ class SyncEngine {
       await cloud.download(path, copy, etag: entry.etag!);
       hash = await fileHash(copy, 'open');
     }
-    final op = Operation(
-      uniqueId(),
-      'working',
-      path,
-      expectedEtag: entry.etag,
-      staged: tree.durablePath(copy),
-      hash: hash,
-    )..data['handout'] = providerTracked ? 'provider' : 'untracked';
+    final op =
+        Operation(
+            uniqueId(),
+            'working',
+            path,
+            expectedEtag: entry.etag,
+            staged: tree.durablePath(copy),
+            hash: hash,
+          )
+          ..data = {
+            'handout': providerTracked ? 'provider' : 'untracked',
+            if (providerTracked && missingEditors.applies(path))
+              providerOpenTokensKey: <String>[],
+          };
     manifest.operations[op.id] = op;
     markDirty(path);
     artifacts.complete(copy, hash: hash, etag: entry.etag);

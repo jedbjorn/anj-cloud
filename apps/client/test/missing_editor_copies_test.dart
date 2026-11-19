@@ -6,6 +6,7 @@ import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/ports/phone_folders.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
+import 'package:anj_cloud/core/sync/open_documents.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/core/sync/worker.dart';
 import 'package:anj_cloud/platform/native/mapped_root_fs.dart';
@@ -107,6 +108,7 @@ class _Fixture {
     bool mixed = false,
     bool paused = false,
     bool parkFirstCopy = false,
+    bool legacy = false,
   }) async {
     final root = Directory('${dir.path}/root')..createSync();
     final staging = Directory('${dir.path}/private-stage');
@@ -128,10 +130,8 @@ class _Fixture {
     try {
       await engine.tick();
       store.entries[_path]!.override = Retention.local;
-      // Build 177 persisted the tagged private path and private directory
-      // identity even though the bytes are in the shared staging directory.
       Future<(String, String, File)> handOut() async {
-        final staged = await engine.openFile(_path);
+        final staged = await engine.openFile(_path, providerTracked: true);
         final name = p.basename(staged);
         final work = store
             .operationsAt(_path)
@@ -139,7 +139,12 @@ class _Fixture {
         final artifact = store
             .operationsAt(_path)
             .singleWhere((op) => op.kind == 'artifact' && op.staged == staged);
-        artifact.data.remove('sharedDirectoryIdentity');
+        if (legacy) {
+          // Build 177 recorded the private directory for shared copies and
+          // kept provider hand-outs in memory.
+          artifact.data.remove('sharedDirectoryIdentity');
+          work.data.remove(providerOpenTokensKey);
+        }
         return (work.id, artifact.id, File('${access.staging}/$name'));
       }
 
@@ -253,7 +258,7 @@ void main() {
   setUp(() => fixture = _Fixture());
   tearDown(() => fixture.close());
 
-  testWidgets('legacy sessions: cancel, clear, restart and replay', (
+  testWidgets('verified sessions: cancel, clear, restart and replay', (
     tester,
   ) async {
     await tester.runAsync(fixture.seed);
@@ -414,6 +419,12 @@ void main() {
     await tester.runAsync(() => fixture.seed(paused: true));
     await _mount(tester, fixture);
     final (id, owner, file) = fixture.absent.first;
+    late Operation sibling;
+    late Operation siblingArtifact;
+    fixture.read((store) {
+      sibling = store.operations[fixture.absent.last.$1]!;
+      siblingArtifact = store.operations[fixture.absent.last.$2]!;
+    });
     final claims = missingEditorClaims(fixture.row);
     await _openClear(tester);
     file.writeAsStringSync('returned editor changes');
@@ -438,14 +449,13 @@ void main() {
     await tester.runAsync(() async {
       await fixture.controller.stop();
       fixture.read((store) {
-        final stage = store.setting('staging')!;
-        final oldName = p.basename(fixture.absent.last.$3.path);
+        store.operations[siblingArtifact.id] = siblingArtifact;
         store.operations['new-session'] = Operation(
           'new-session',
           'working',
           _path,
-          staged: p.join(stage, oldName),
-        );
+          staged: sibling.staged,
+        )..data = sibling.data;
         store.save();
       });
       await fixture.controller.start();
@@ -487,7 +497,7 @@ void main() {
       await fixture.controller.start();
       await _Fixture.until(
         () => (fixture.row['presentationErrors'] as List).contains(
-          'The original editor staging folder could not be verified.',
+          'The editor staging folder has changed.',
         ),
       );
     });
@@ -498,6 +508,65 @@ void main() {
         expect(store.operations[owner], isNotNull);
       }
     });
+  });
+
+  testWidgets('build 177 sessions survive a marked replacement on upgrade', (
+    tester,
+  ) async {
+    await tester.runAsync(() => fixture.seed(legacy: true, mixed: true));
+    final (id, owner, edit) = fixture.present!;
+    final stage = fixture.access.staging;
+    final originalStage = Directory(stage).renameSync('$stage-original');
+    Directory(stage).createSync();
+    File('$stage/.nomedia').createSync();
+    await _mount(tester, fixture);
+    expect(missingEditorClaims(fixture.row), isEmpty);
+    expect(find.text('Clear missing editor copies'), findsNothing);
+    expect(
+      fixture.row['presentationErrors'],
+      contains('The original editor staging folder could not be verified.'),
+    );
+    expect(
+      File(p.join(originalStage.path, p.basename(edit.path)))
+          .readAsStringSync(),
+      'unsynced editor changes',
+    );
+    fixture.read((store) {
+      for (final (workId, artifactId) in [
+        (id, owner),
+        for (final (workId, artifactId, _) in fixture.absent)
+          (workId, artifactId),
+      ]) {
+        expect(store.operations[workId], isNotNull);
+        expect(store.operations[artifactId], isNotNull);
+      }
+    });
+  });
+
+  testWidgets('a legacy directory alone does not prove editor closure', (
+    tester,
+  ) async {
+    await tester.runAsync(() => fixture.seed(legacy: true));
+    final native = NativeRootFs(testNativeLibrary);
+    final stage = native.openRoot(fixture.access.staging);
+    try {
+      // Isolate closure from the separate lack of directory evidence.
+      fixture.read((store) {
+        for (final (_, owner, _) in fixture.absent) {
+          store.operations[owner]!.data['sharedDirectoryIdentity'] = native
+              .identity(stage);
+        }
+        store.save();
+      });
+    } finally {
+      native.closeFd(stage);
+    }
+    await _mount(tester, fixture);
+    expect(missingEditorClaims(fixture.row), isEmpty);
+    expect(
+      fixture.row['presentationErrors'],
+      contains('Could not verify that all apps closed this editor copy.'),
+    );
   });
 
   testWidgets('a provider handle keeps an unlinked editor copy registered', (
@@ -539,5 +608,74 @@ void main() {
         }),
       );
     }
+  });
+
+  testWidgets('a provider-held editor copy survives a worker restart', (
+    tester,
+  ) async {
+    await tester.runAsync(
+      () => fixture.seed(paused: true, parkFirstCopy: true),
+    );
+    await _mount(tester, fixture);
+    final (id, owner, file) = fixture.absent.first;
+    fixture.parkedCopy.renameSync(file.path);
+    const token = 'restart-held-open';
+    final opened = await tester.runAsync(
+      () => fixture.controller.documentsCommand('open', {
+        'working': p.basename(file.path),
+        'token': token,
+      }),
+    );
+    final fd = opened!['fd'] as int;
+    try {
+      file.deleteSync();
+      await tester.runAsync(() async {
+        await fixture.controller.stop();
+        await fixture.controller.start();
+        await _Fixture.until(
+          () => (fixture.row['presentationErrors'] as List).contains(
+            'An app may still have the editor copy open.',
+          ),
+        );
+      });
+      await tester.pumpAndSettle();
+      expect(missingEditorClaims(fixture.row).map((claim) => claim['id']), [
+        fixture.absent.last.$1,
+      ]);
+      await _openClear(tester);
+      await _confirmClear(tester);
+      await tester.runAsync(
+        () => _Fixture.until(
+          () => fixture.editorResult == 'Cleared 1 missing editor copy.',
+        ),
+      );
+      expect(File('/proc/self/fd/$fd').readAsStringSync(), _original);
+      fixture.read((store) {
+        expect(store.operations[id]!.data[providerOpenTokensKey], [token]);
+        expect(store.operations[owner], isNotNull);
+        expect(store.operations[fixture.absent.last.$1], isNull);
+        expect(store.operations[fixture.absent.last.$2], isNull);
+      });
+    } finally {
+      NativeRootFs(testNativeLibrary).closeFd(fd);
+    }
+    await tester.runAsync(() async {
+      await fixture.controller.documentsCommand('closed', {'token': token});
+      await _Fixture.until(
+        () =>
+            missingEditorClaims(fixture.row).any((claim) => claim['id'] == id),
+      );
+    });
+    await tester.pumpAndSettle();
+    await _openClear(tester);
+    await _confirmClear(tester);
+    await tester.runAsync(
+      () =>
+          _Fixture.until(() => (fixture.row['workingCopies'] as List).isEmpty),
+    );
+    fixture.read((store) {
+      expect(store.operations[id], isNull);
+      expect(store.operations[owner], isNull);
+    });
   });
 }

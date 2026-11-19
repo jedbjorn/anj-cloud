@@ -38,10 +38,6 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
 
   bool _paused;
   int? _root, _stage, _base, _shared;
-  String? _sharedIdentity;
-  @override
-  bool get sharedStagingWasPresent => _sharedStagingWasPresent;
-  bool _sharedStagingWasPresent = false;
   final Set<String> _media = {};
 
   @override
@@ -72,14 +68,8 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
       privateDir(layout.staging);
       // The media library never indexes staged bytes (spec #52 Sync Rules).
       final marker = File('${staging.path}/.nomedia');
-      final marked = marker.existsSync();
-      if (!marked) marker.writeAsStringSync('');
+      if (!marker.existsSync()) marker.writeAsStringSync('');
       _shared = openRoot(layout.staging);
-      final identity = this.identity(_shared!);
-      if (identity != _sharedIdentity) {
-        _sharedStagingWasPresent = _sharedIdentity == null && marked;
-        _sharedIdentity = identity;
-      }
       // Copies an interrupted install left (decision #130 (4)); no install
       // runs before the engine starts.
       _touch('list', _stagingBeneathBase ?? layout.staging);

@@ -19,7 +19,6 @@ class MissingEditorCopies {
   final Artifacts artifacts;
 
   static const missingWarning = 'Working copy missing; root/cloud retained';
-  static const _legacyStage = 'missingEditorCopiesLegacySharedStage';
 
   bool applies(String path) => tree.phoneFolders != null && inPhoneFolder(path);
 
@@ -115,24 +114,21 @@ class MissingEditorCopies {
     }
     if (shared) {
       final recorded = owner?.data['sharedDirectoryIdentity'];
-      if (recorded != null && recorded != directory) {
+      if (recorded == null) {
+        return _keep(
+          'The original editor staging folder could not be verified.',
+        );
+      }
+      if (recorded != directory) {
         return _keep('The editor staging folder has changed.');
       }
-      if (recorded == null) {
-        // Build 177 records the private staging directory even for tagged
-        // shared copies. Bind legacy copies only to a pre-existing app
-        // staging folder, never to an empty replacement we just created.
-        final stored = manifest.setting(_legacyStage);
-        final legacy =
-            stored ??
-            (routing.sharedStagingWasPresent ? directory : 'unverified');
-        if (stored == null) manifest.setSetting(_legacyStage, legacy);
-        if (legacy != directory) {
-          return _keep(
-            'The original editor staging folder could not be verified.',
-          );
-        }
-      }
+    }
+    final tokens = work.data[providerOpenTokensKey];
+    if (tokens is! List) {
+      return _keep('Could not verify that all apps closed this editor copy.');
+    }
+    if (tokens.isNotEmpty) {
+      return _keep('An app may still have the editor copy open.');
     }
     if (_checkAbsence(name, directory) case final problem?) {
       return _keep(problem);
