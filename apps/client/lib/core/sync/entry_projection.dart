@@ -69,6 +69,9 @@ Future<Map<String, Object?>> projectEntry(
     // Open in another app without read sharing (SC-048 F5): amber until
     // a pass can read it.
     if (isBusyStatus(entry.status)) entry.status,
+    if (engine.missingEditors.applies(entry.path) &&
+        entry.status.startsWith('Finish pending:'))
+      entry.status,
     for (final operation in operations)
       if (operation.kind == 'working' &&
           operation.data['presentationError'] is String &&

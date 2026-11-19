@@ -6,9 +6,11 @@ import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/ports/phone_folders.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
+import 'package:anj_cloud/core/sync/entry_projection.dart';
 import 'package:anj_cloud/core/sync/open_documents.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
 import 'package:anj_cloud/core/sync/worker.dart';
+import 'package:anj_cloud/platform/android/android_root_fs.dart';
 import 'package:anj_cloud/platform/native/mapped_root_fs.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:anj_cloud/ui/app.dart';
@@ -24,6 +26,7 @@ import 'test_platform.dart';
 
 const _path = 'Music/example.mp3';
 const _original = 'anonymous synchronized original';
+const _edit = 'unsynced editor changes';
 
 String _digest(File file) => sha256.convert(file.readAsBytesSync()).toString();
 
@@ -43,7 +46,7 @@ Future<void> _worker(Map<String, Object?> initial) async {
   final input = ReceivePort();
   final profile = Directory(initial['profile'] as String);
   final store = Manifest(profile);
-  final routing = MappedRootFs(
+  final routing = AndroidPhoneRootFs(
     PhoneFolderLayout.fromJson(initial['phoneFolders'])!,
     initial['nativeLibrary'] as String?,
   );
@@ -163,7 +166,7 @@ class _Fixture {
       );
       if (mixed || keepNamedCopy) present = await handOut();
       if (mixed) {
-        present!.$3.writeAsStringSync('unsynced editor changes');
+        present!.$3.writeAsStringSync(_edit);
         final unrelated = File('${access.base}/Documents/pending.txt')
           ..writeAsStringSync('unrelated pending content');
         store.entries['Documents/pending.txt'] = Entry(
@@ -256,6 +259,16 @@ Future<void> _openClear(WidgetTester tester) async {
     find.widgetWithText(TextButton, 'Clear missing editor copies'),
   );
   await tester.pumpAndSettle();
+}
+
+Future<void> _confirmFinish(WidgetTester tester, _Fixture fixture) async {
+  await tester.tap(find.text('Finish editing'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('Editors closed — finish'));
+  await tester.pumpAndSettle();
+  await tester.runAsync(
+    () => _Fixture.until(() => fixture.controller.finishingEdits),
+  );
 }
 
 Future<void> _confirmClear(WidgetTester tester) async {
@@ -631,6 +644,178 @@ void main() {
       'unrelated pending content',
     );
   });
+
+  testWidgets('Finish waits for a reopened editor across worker restart', (
+    tester,
+  ) async {
+    await tester.runAsync(() => fixture.seed(mixed: true, legacy: true));
+    await _mount(tester, fixture);
+    await _confirmFinish(tester, fixture);
+    final (id, owner, file) = fixture.present!;
+    const token = 'reopened-after-finish';
+    final native = NativeRootFs(testNativeLibrary);
+    await tester.runAsync(() async {
+      final opened = await fixture.controller.documentsCommand('open', {
+        'working': p.basename(file.path),
+        'token': token,
+      });
+      final fd = opened['fd'] as int;
+      Future<void> checkPending() async {
+        final pass = await fixture.controller.backgroundRun(
+          timeout: const Duration(seconds: 5),
+        );
+        expect(pass['listed'], isTrue);
+        expect(
+          libraryStatus(fixture.row),
+          contains('still has the editor copy open'),
+        );
+        expect(fixture.row['finishPending'], isTrue);
+        expect(file.readAsStringSync(), _edit);
+        fixture.read((store) {
+          expect(store.operations[id]!.data[providerOpenTokensKey], [token]);
+          expect(store.operations[owner], isNotNull);
+        });
+      }
+
+      try {
+        await fixture.controller.stop();
+        await fixture.controller.start();
+        fixture.controller.setPaused(false);
+        await checkPending();
+        expect(File('/proc/self/fd/$fd').readAsStringSync(), _edit);
+      } finally {
+        native.closeFd(fd);
+      }
+      // The OS descriptor closing and the provider's close event are separate.
+      // The durable token still gates completion even where a lease succeeds.
+      await checkPending();
+      await fixture.controller.documentsCommand('closed', {'token': token});
+      await _Fixture.until(() => fixture.row['finishPending'] == false);
+    });
+    expect(file.existsSync(), isFalse);
+    expect(fixture.original.readAsStringSync(), _edit);
+    fixture.read((store) {
+      expect(store.operations[id], isNull);
+      expect(store.operations[owner], isNull);
+      for (final (missingId, missingOwner, _) in fixture.absent) {
+        expect(store.operations[missingId], isNotNull);
+        expect(store.operations[missingOwner], isNotNull);
+      }
+    });
+  });
+
+  for (final replaceStaging in [false, true]) {
+    testWidgets(
+      replaceStaging
+          ? 'Interrupted Finish retains recovery records in replacement staging'
+          : 'Interrupted Finish resumes in the original shared staging folder',
+      (tester) async {
+        await tester.runAsync(() => fixture.seed(mixed: true, legacy: true));
+        await _mount(tester, fixture);
+        await _confirmFinish(tester, fixture);
+        await tester.runAsync(() async {
+          await fixture.controller.stop();
+          final cloud = await _cloud();
+          final (id, owner, copy) = fixture.present!;
+          Future<Map<String, Object?>> tick(
+            void Function(SyncEngine)? configure,
+          ) async {
+            final store = Manifest(fixture.profile);
+            final routing = AndroidPhoneRootFs(
+              fixture.access.layout,
+              testNativeLibrary,
+            );
+            final engine = SyncEngine(
+              store,
+              RootTree(
+                Directory(store.setting('root')!),
+                Directory(store.setting('staging')!),
+                routing,
+              ),
+              cloud,
+            );
+            try {
+              configure?.call(engine);
+              await engine.tick();
+              return await projectEntry(engine, store.entries[_path]!);
+            } finally {
+              engine.close();
+              routing.setPaused(true);
+            }
+          }
+
+          String? quarantineName;
+          await tick((engine) {
+            engine.editing.barrier = (phase, request, _) {
+              if (phase != 'before-final-unlink') return;
+              final plan = engine.editing
+                  .plans(request)
+                  .singleWhere((plan) => plan['artifact'] == owner);
+              quarantineName = plan['to'] as String;
+              throw StateError('Interrupt before final unlink');
+            };
+          });
+          expect(copy.existsSync(), isFalse);
+          final quarantine = File(
+            '${fixture.access.staging}/${quarantineName!}',
+          );
+          expect(quarantine.readAsStringSync(), _edit);
+          fixture.read((store) {
+            final request = store
+                .operationsAt(_path)
+                .singleWhere((op) => op.kind == 'finish-editing');
+            expect(request.phase, 'reclaiming');
+            expect(store.operations[id], isNotNull);
+            expect(store.operations[owner], isNotNull);
+          });
+
+          final staging = Directory(fixture.access.staging);
+          final displaced = '${staging.path}-displaced';
+          if (replaceStaging) {
+            staging.renameSync(displaced);
+            staging.createSync();
+            File('${staging.path}/.nomedia').createSync();
+          }
+          final row = await tick(null);
+          expect(fixture.original.readAsStringSync(), _edit);
+          expect(quarantine.existsSync(), isFalse);
+          if (replaceStaging) {
+            expect(
+              File('$displaced/$quarantineName').readAsStringSync(),
+              _edit,
+            );
+            expect(
+              libraryStatus(row),
+              contains('The editor staging folder has changed.'),
+            );
+          }
+          fixture.read((store) {
+            expect(store.operations[id], replaceStaging ? isNotNull : isNull);
+            expect(
+              store.operations[owner],
+              replaceStaging ? isNotNull : isNull,
+            );
+            final requests = store
+                .operationsAt(_path)
+                .where((op) => op.kind == 'finish-editing');
+            expect(requests, replaceStaging ? hasLength(1) : isEmpty);
+            expect(
+              store.entries[_path]!.status,
+              contains(
+                replaceStaging
+                    ? 'The editor staging folder has changed.'
+                    : 'Editing finished',
+              ),
+            );
+            for (final (missingId, missingOwner, _) in fixture.absent) {
+              expect(store.operations[missingId], isNotNull);
+              expect(store.operations[missingOwner], isNotNull);
+            }
+          });
+        });
+      },
+    );
+  }
 
   testWidgets('lost All files access after preview keeps both sessions', (
     tester,

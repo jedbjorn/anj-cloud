@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 import 'artifacts.dart';
+import 'open_documents.dart';
 import '../gateway/cloud_api.dart';
 import '../ports/phone_folders.dart';
 import '../ports/release_guard.dart';
@@ -306,15 +307,100 @@ class EditCompletion {
     if (paths.contains(entry.workingCopy)) entry.workingCopy = null;
   }
 
+  Iterable<Operation> _sessions(Operation request) {
+    final confirmed = ids(request, 'sessions');
+    return manifest
+        .operationsAt(request.path)
+        .where((op) => op.kind == 'working' && confirmed.contains(op.id));
+  }
+
+  void _checkEditorsClosed(Iterable<Operation> sessions) {
+    for (final session in sessions) {
+      final tokens = session.data[providerOpenTokensKey];
+      if (tokens is List && tokens.isNotEmpty) {
+        throw const FileSystemException(
+          'An app still has the editor copy open.',
+        );
+      }
+    }
+  }
+
+  String _stagingIdentity(String name) {
+    try {
+      if (name.startsWith(sharedStagingTag)) {
+        final shared = tree.phoneFolders?.checkedSharedStagingIdentity();
+        if (shared != null) return shared;
+      } else {
+        tree.native.checkRoot(tree.stageFd, tree.staging.path);
+        return tree.native.identity(tree.stageFd);
+      }
+    } on FileSystemException {
+      // Without the original directory, a missing name proves nothing.
+    }
+    throw const FileSystemException(
+      'The editor staging folder is unavailable or has changed.',
+    );
+  }
+
+  Object? _recordedDirectory(String name, Operation? record) =>
+      record?.data[name.startsWith(sharedStagingTag)
+          ? 'sharedDirectoryIdentity'
+          : 'directoryIdentity'];
+
+  String _reclaimDirectory(Operation record) {
+    final name = record.data['name'] as String;
+    final directory = _stagingIdentity(name);
+    final recorded = _recordedDirectory(name, record);
+    if (recorded != null && recorded != directory) {
+      throw const FileSystemException('The editor staging folder has changed.');
+    }
+    return directory;
+  }
+
+  void _checkPlanDirectory(Map<String, dynamic> plan) {
+    final name = plan['from'] as String;
+    // Older plans can use the artifact's original directory evidence when
+    // available. A private staging identity cannot prove a shared location.
+    final expected =
+        plan['directoryIdentity'] ??
+        _recordedDirectory(name, manifest.operations[plan['artifact']]);
+    if (expected == null) {
+      throw const FileSystemException(
+        'The original editor staging folder could not be verified.',
+      );
+    }
+    if (_stagingIdentity(name) != expected) {
+      throw const FileSystemException('The editor staging folder has changed.');
+    }
+  }
+
   /// Only durable, proven reclaim intent permits acknowledging absent bytes.
   void recover() {
     for (final request in requests.toList()) {
       final entry = manifest.entries[request.path];
       if (entry == null || request.data['binding'] != binding) continue;
       if (tree.phonePaused(path: request.path)) continue;
+      try {
+        _checkEditorsClosed(_sessions(request));
+      } on FileSystemException catch (error) {
+        entry.status = 'Finish pending: ${error.message}';
+        manifest.save();
+        continue;
+      }
       for (final plan in plans(request)) {
-        final to = info(plan['to'] as String);
-        final from = info(plan['from'] as String);
+        // A retired plan can remain in the request until its siblings finish.
+        if (!manifest.operations.containsKey(plan['artifact'])) continue;
+        final NativeFileInfo? to;
+        final NativeFileInfo? from;
+        try {
+          _checkPlanDirectory(plan);
+          to = info(plan['to'] as String);
+          from = info(plan['from'] as String);
+          _checkPlanDirectory(plan);
+        } on FileSystemException catch (error) {
+          entry.status = 'Finish pending: ${error.message}';
+          continue;
+        }
         if ((from != null && from.identity != plan['identity']) ||
             (to != null && to.identity != plan['identity'])) {
           request.data['recoveryIssue'] = 'A completion slot was replaced; both paths are retained for recovery.';
@@ -385,12 +471,13 @@ class EditCompletion {
       if (entry.conflict != null) {
         throw const FileSystemException('resolve conflicting versions first');
       }
-      final sessions = manifest.operations.values
-          .where(
-            (o) =>
-                o.kind == 'working' && ids(request, 'sessions').contains(o.id),
-          )
-          .toList();
+      final sessions = _sessions(request).toList();
+      _checkEditorsClosed(sessions);
+      for (final plan in plans(request)) {
+        if (manifest.operations.containsKey(plan['artifact'])) {
+          _checkPlanDirectory(plan);
+        }
+      }
       final scopedArtifactsRemain = artifacts.records.any(
         (o) =>
             ids(request, 'artifacts').contains(o.id) ||
@@ -556,6 +643,8 @@ class EditCompletion {
           }
         }
       }
+      // The proof download can yield before the synchronous reclamation.
+      _checkEditorsClosed(sessions);
       // Guard every inode and account for all owned names, including a retained
       // Local root alias. Unknown hardlinks make the native guard refuse.
       final groups = <String, List<Operation>>{};
@@ -656,6 +745,7 @@ class EditCompletion {
                     '${(o.data['name'] as String).startsWith(sharedStagingTag) ? sharedStagingTag : ''}'
                     'finished-${uniqueId()}',
                 'identity': o.data['identity'],
+                'directoryIdentity': _reclaimDirectory(o),
                 'hash': hashes[o.id],
                 'proofKind': chains.containsKey(o.id)
                     ? 'superseded-upload'
@@ -670,6 +760,7 @@ class EditCompletion {
           final fd = guards[plan['identity']]!;
           current();
           barrier?.call('before-quarantine', request, fd);
+          _checkPlanDirectory(plan);
           artifacts.native.valid(fd);
           artifacts.native.quarantine(
             fd,
@@ -711,6 +802,7 @@ class EditCompletion {
           final fd = guards[plan['identity']]!;
           current();
           barrier?.call('before-final-unlink', request, fd);
+          _checkPlanDirectory(plan);
           artifacts.native.valid(fd);
           artifacts.native.unlink(fd, tree.stageFd, plan['to'] as String);
           barrier?.call('after-unlink-before-db', request, fd);
@@ -737,7 +829,10 @@ class EditCompletion {
       manifest.save();
     } catch (error) {
       recover();
-      entry.status = 'Finish pending: $error';
+      final reason = error is FileSystemException && error.osError == null
+          ? error.message
+          : error;
+      entry.status = 'Finish pending: $reason';
       manifest.save();
     }
   }
