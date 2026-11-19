@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:isolate';
 
+import 'package:anj_cloud/core/access/access_store.dart';
+import 'package:anj_cloud/core/access/documents_service.dart';
 import 'package:anj_cloud/core/app/controller.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/ports/phone_folders.dart';
@@ -645,64 +647,90 @@ void main() {
     );
   });
 
-  testWidgets('Finish waits for a reopened editor across worker restart', (
-    tester,
-  ) async {
-    await tester.runAsync(() => fixture.seed(mixed: true, legacy: true));
-    await _mount(tester, fixture);
-    await _confirmFinish(tester, fixture);
-    final (id, owner, file) = fixture.present!;
-    const token = 'reopened-after-finish';
-    final native = NativeRootFs(testNativeLibrary);
-    await tester.runAsync(() async {
-      final opened = await fixture.controller.documentsCommand('open', {
-        'working': p.basename(file.path),
-        'token': token,
-      });
-      final fd = opened['fd'] as int;
-      Future<void> checkPending() async {
-        final pass = await fixture.controller.backgroundRun(
-          timeout: const Duration(seconds: 5),
+  for (final closeDuringRestart in [false, true]) {
+    testWidgets(
+      closeDuringRestart
+          ? 'Finish receives a provider close reported during worker restart'
+          : 'Finish waits for a reopened editor across worker restart',
+      (tester) async {
+        await tester.runAsync(() => fixture.seed(mixed: true, legacy: true));
+        await _mount(tester, fixture);
+        await _confirmFinish(tester, fixture);
+        final (id, owner, file) = fixture.present!;
+        final service = DocumentsService(
+          fixture.controller,
+          AccessStore(fixture.profile),
+          hidden: inPhoneFolder,
         );
-        expect(pass['listed'], isTrue);
-        expect(
-          libraryStatus(fixture.row),
-          contains('still has the editor copy open'),
-        );
-        expect(fixture.row['finishPending'], isTrue);
-        expect(file.readAsStringSync(), _edit);
-        fixture.read((store) {
-          expect(store.operations[id]!.data[providerOpenTokensKey], [token]);
-          expect(store.operations[owner], isNotNull);
-        });
-      }
+        addTearDown(service.dispose);
+        await tester.runAsync(() async {
+          final opened = await service.open(
+            'w:${p.basename(file.path)}',
+            'r',
+            const DocumentsCaller(CallerKind.own),
+          );
+          final token = opened['token'] as String;
+          final fd = opened['fd'] as int;
+          void checkToken() {
+            expect(file.readAsStringSync(), _edit);
+            fixture.read((store) {
+              expect(store.operations[id]!.data[providerOpenTokensKey], [
+                token,
+              ]);
+              expect(store.operations[owner], isNotNull);
+            });
+          }
 
-      try {
-        await fixture.controller.stop();
-        await fixture.controller.start();
-        fixture.controller.setPaused(false);
-        await checkPending();
-        expect(File('/proc/self/fd/$fd').readAsStringSync(), _edit);
-      } finally {
-        native.closeFd(fd);
-      }
-      // The OS descriptor closing and the provider's close event are separate.
-      // The durable token still gates completion even where a lease succeeds.
-      await checkPending();
-      await fixture.controller.documentsCommand('closed', {'token': token});
-      await _Fixture.until(() => fixture.row['finishPending'] == false);
-    });
-    expect(file.existsSync(), isFalse);
-    expect(fixture.original.readAsStringSync(), _edit);
-    fixture.read((store) {
-      expect(store.operations[id], isNull);
-      expect(store.operations[owner], isNull);
-      for (final (missingId, missingOwner, _) in fixture.absent) {
-        expect(store.operations[missingId], isNotNull);
-        expect(store.operations[missingOwner], isNotNull);
-      }
-    });
-  });
+          Future<void> checkPending() async {
+            final pass = await fixture.controller.backgroundRun(
+              timeout: const Duration(seconds: 5),
+            );
+            expect(pass['listed'], isTrue);
+            expect(
+              libraryStatus(fixture.row),
+              contains('still has the editor copy open'),
+            );
+            expect(fixture.row['finishPending'], isTrue);
+            checkToken();
+          }
+
+          try {
+            expect(await fixture.controller.stop(), isTrue);
+            if (!closeDuringRestart) {
+              await fixture.controller.start();
+              fixture.controller.setPaused(false);
+              await checkPending();
+            }
+            expect(File('/proc/self/fd/$fd').readAsStringSync(), _edit);
+          } finally {
+            NativeRootFs(testNativeLibrary).closeFd(fd);
+          }
+
+          // The OS close and the provider callback are separate. Until the
+          // callback arrives, the token still gates completion.
+          if (!closeDuringRestart) await checkPending();
+          final acknowledged = expectLater(service.closed(token), completes);
+          if (closeDuringRestart) {
+            checkToken();
+            await fixture.controller.start();
+            fixture.controller.setPaused(false);
+          }
+          await acknowledged.timeout(const Duration(seconds: 5));
+          await _Fixture.until(() => fixture.row['finishPending'] == false);
+        });
+        expect(file.existsSync(), isFalse);
+        expect(fixture.original.readAsStringSync(), _edit);
+        fixture.read((store) {
+          expect(store.operations[id], isNull);
+          expect(store.operations[owner], isNull);
+          for (final (missingId, missingOwner, _) in fixture.absent) {
+            expect(store.operations[missingId], isNotNull);
+            expect(store.operations[missingOwner], isNotNull);
+          }
+        });
+      },
+    );
+  }
 
   for (final replaceStaging in [false, true]) {
     testWidgets(

@@ -656,6 +656,8 @@ class DocumentsService extends ChangeNotifier implements AppAccess {
     final open = _open.remove(token);
     if (open == null) return;
     notifyListeners();
+    // The descriptor is gone from the UI count. The host retains the close
+    // until the worker acknowledges it, including across worker restarts.
     await host.documentsCommand('closed', {'token': token});
     // A descriptor opened for writing may have changed the file.
     if (open.write) _localChange();

@@ -72,6 +72,13 @@ class DocumentsOps {
   }
 
   Future<Map<String, Object?>> handle(String op, Map command) async {
+    // A close retires an exact hand-out in the manifest. It needs no access
+    // to file bytes and can be acknowledged while storage is unavailable.
+    if (op == 'closed') {
+      closed(command['token'] as String);
+      engine.manifest.commitPoint();
+      return const {};
+    }
     try {
       engine.requireStorageReady();
     } on CloudFailure catch (error) {
@@ -85,9 +92,6 @@ class DocumentsOps {
           write: command['write'] == true,
           token: command['token'] as String,
         );
-      case 'closed':
-        closed(command['token'] as String);
-        return const {};
       case 'create':
         final parent = command['parent'] as String;
         final name = command['name'] as String;

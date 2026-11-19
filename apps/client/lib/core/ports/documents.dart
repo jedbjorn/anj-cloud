@@ -26,7 +26,8 @@ abstract interface class DocumentsHost implements Listenable {
 
   /// One documents command to the worker (`open`, `create`, `rename`,
   /// `move`, `delete`, `closed`); completes with the worker's answer or
-  /// fails with a [DocumentsFailure].
+  /// fails with a [DocumentsFailure]. A reported close waits across worker
+  /// restarts for acknowledgement.
   Future<Map<String, Object?>> documentsCommand(
     String op,
     Map<String, Object?> args,

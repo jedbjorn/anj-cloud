@@ -279,6 +279,10 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   /// request). An update waits for it (spec #37 rule 4).
   bool finishingEdits = false;
   final _documentsRequests = <String, Completer<Map<String, Object?>>>{};
+  // An Android close callback is delivered once. Keep its token while the
+  // worker is away or its reply is lost, and replay it on the next ready.
+  final _documentCloses = <String, Completer<Map<String, Object?>>>{};
+  Timer? _documentCloseRetry;
 
   /// Whether this device's account holds the admin role (spec #27), from
   /// `GET /v1/account` at start, after pairing and every 5 minutes. The
@@ -512,6 +516,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         case 'ready':
           _input = event['input'] as SendPort;
           _flushPendingPause();
+          _flushDocumentCloses();
           final wifi = _onWifi;
           if (wifi != null) _input!.send({'action': 'network', 'wifi': wifi});
           _ready?.complete();
@@ -604,7 +609,21 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
             pending?.completeError(CloudFailure(event['message'] as String));
           }
         case 'documentsResult':
-          final pending = _documentsRequests.remove(event['request']);
+          final request = event['request'] as String?;
+          final close = _documentCloses[request];
+          if (close != null) {
+            if (event['ok'] == true) {
+              _documentCloses.remove(request);
+              close.complete(const {});
+            } else {
+              _documentCloseRetry ??= Timer(const Duration(seconds: 5), () {
+                _documentCloseRetry = null;
+                _flushDocumentCloses();
+              });
+            }
+            break;
+          }
+          final pending = _documentsRequests.remove(request);
           final data = event['data'] is Map
               ? Map<String, Object?>.from(event['data'] as Map)
               : <String, Object?>{};
@@ -1059,6 +1078,13 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     String op,
     Map<String, Object?> args,
   ) {
+    if (op == 'closed') {
+      final token = args['token'] as String;
+      return _documentCloses.putIfAbsent(token, () {
+        _sendDocumentClose(token);
+        return Completer<Map<String, Object?>>();
+      }).future;
+    }
     final input = _input;
     if (input == null) {
       return Future.error(
@@ -1091,6 +1117,23 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         );
       },
     );
+  }
+
+  void _sendDocumentClose(String token) {
+    final input = _input;
+    if (input == null || (_stopped?.isCompleted ?? true)) return;
+    input.send({
+      'action': 'documents',
+      'request': token,
+      'op': 'closed',
+      'args': {'token': token},
+    });
+  }
+
+  void _flushDocumentCloses() {
+    for (final token in _documentCloses.keys) {
+      _sendDocumentClose(token);
+    }
   }
 
   /// Stops the add copy of [run] at its next chunk (spec #43); answered by
@@ -1891,6 +1934,13 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   void dispose() {
     _adminPoll?.cancel();
     _fetchJobs?.dispose();
+    _documentCloseRetry?.cancel();
+    for (final close in _documentCloses.values) {
+      close.completeError(
+        const DocumentsFailure('unavailable', 'AnJ Cloud closed.'),
+      );
+    }
+    _documentCloses.clear();
     unawaited(stop());
     super.dispose();
   }
