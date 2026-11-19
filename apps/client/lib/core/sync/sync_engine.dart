@@ -5840,12 +5840,11 @@ class SyncEngine {
   /// closed it and still save to it later, so such a copy is kept until the
   /// user removes it ([removeOpenedCopy]). A copy is left for
   /// [workingCopyGrace] after its last hand-out (an app may read, close and
-  /// save later). The release is the guarded staging release (the lease, and
-  /// on Android the open-descriptor registry, refuse a copy an app holds
-  /// open; the bytes must still hash to the version that was handed out), so
-  /// an open copy is retried by a later pass and a changed one is never
-  /// discarded. Busy copies are not reported as pending releases: a song
-  /// playing is not a sync problem.
+  /// save later). Release is guarded and the bytes must still hash to the
+  /// version handed out. Mapped Android copies also require durable provider
+  /// closure. A later pass retries open copies and keeps changed copies.
+  /// Busy copies are not reported as pending releases: a song playing is
+  /// not a sync problem.
   void reclaimUnchangedWorkingCopies() {
     for (final work
         in manifest.operations.values
@@ -5859,23 +5858,22 @@ class SyncEngine {
         continue;
       }
       final record = artifacts.record(artifacts.resolve(staged));
-      final name = p.basename(staged);
-      bool present() {
-        try {
-          artifacts.native.info(tree.stageFd, name);
-          return true;
-        } on FileSystemException catch (error) {
-          return error.osError?.errorCode != 2;
-        }
-      }
-
       if (work.data['reclaiming'] == true) {
-        // Interrupted after the guarded unlink: the durable release intent
-        // (or its already finalized record) proves the bytes were these.
-        if (!present() &&
-            (record == null || record.data['releasing'] == work.hash)) {
+        final intentMatches = record?.data['releasing'] == work.hash;
+        if (_mappedWorkingCopy(work)) {
+          // The intent predates unlink. A missing name after restart can
+          // also mean the directory or file moved. Keep both records for
+          // recovery and let a fresh release verify any copy still present.
+          if (record != null &&
+              record.data['role'] == 'working' &&
+              intentMatches) {
+            record.data.remove('releasing');
+          }
+        } else if ((record == null || intentMatches) &&
+            _reclaimedNameAbsent(p.basename(staged))) {
           if (record != null) manifest.operations.remove(record.id);
           _workingReclaimed(work, entry);
+          manifest.save();
           continue;
         }
         work.data.remove('reclaiming');
@@ -5883,6 +5881,20 @@ class SyncEngine {
       }
       if (!_providerOnly(work) || !_graceOver(work)) continue;
       _releaseWorking(work, record, entry);
+    }
+  }
+
+  bool _mappedWorkingCopy(Operation work) =>
+      missingEditors.applies(work.path) ||
+      (tree.phoneFolders != null &&
+          work.staged != null &&
+          p.basename(work.staged!).startsWith(sharedStagingTag));
+
+  bool _reclaimedNameAbsent(String name) {
+    try {
+      return releases.info(name) == null;
+    } on FileSystemException {
+      return false;
     }
   }
 
@@ -5912,13 +5924,22 @@ class SyncEngine {
 
   /// Releases unchanged working copy [work] through the guarded staging
   /// release; null when it is not eligible (changed, finishing, conflicted
-  /// or not exclusively owned). A durable `reclaiming` mark covers a crash
-  /// between the unlink and the session's removal.
+  /// or not exclusively owned). An interrupted release can leave durable
+  /// intent behind. A successful unlink removes both records together.
   ReleaseOutcome? _releaseWorking(
     Operation work,
     Operation? record,
     Entry? entry,
   ) {
+    final tokens = work.data[providerOpenTokensKey];
+    if (tokens is List && tokens.isNotEmpty) return ReleaseOutcome.busy;
+    final mapped = _mappedWorkingCopy(work);
+    if (mapped &&
+        (tokens is! List ||
+            work.data[providerClosureUnknownKey] == true ||
+            work.data['handout'] != 'provider')) {
+      return ReleaseOutcome.uncertain;
+    }
     if (work.hash == null ||
         artifacts.workingEdited(work) ||
         record == null ||
@@ -5935,15 +5956,19 @@ class SyncEngine {
     manifest.save();
     ReleaseOutcome outcome;
     try {
-      outcome = releases.release(record, work.hash!);
+      outcome = releases.release(
+        record,
+        work.hash!,
+        onReleased: () => _workingReclaimed(work, entry),
+      );
     } on FileSystemException {
       outcome = ReleaseOutcome.busy;
     }
-    if (outcome == ReleaseOutcome.released) {
-      _workingReclaimed(work, entry);
-      return outcome;
-    }
+    if (outcome == ReleaseOutcome.released) return outcome;
     work.data.remove('reclaiming');
+    if (mapped && record.data['releasing'] == work.hash) {
+      record.data.remove('releasing');
+    }
     // Bytes that no longer hash to the handed-out version are an edit.
     if (outcome == ReleaseOutcome.differs) work.data['edited'] = true;
     manifest.save();
@@ -5998,7 +6023,6 @@ class SyncEngine {
       }
       markDirty(entry.path);
     }
-    manifest.save();
   }
 
   /// A deletion copy made by an earlier version is recognised only when it is

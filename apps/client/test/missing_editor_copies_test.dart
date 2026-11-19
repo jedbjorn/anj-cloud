@@ -109,6 +109,7 @@ class _Fixture {
     bool paused = false,
     bool parkFirstCopy = false,
     bool legacy = false,
+    bool keepNamedCopy = false,
   }) async {
     final root = Directory('${dir.path}/root')..createSync();
     final staging = Directory('${dir.path}/private-stage');
@@ -160,8 +161,8 @@ class _Fixture {
         store.operationsAt(_path).where((op) => op.kind == 'working'),
         hasLength(2),
       );
+      if (mixed || keepNamedCopy) present = await handOut();
       if (mixed) {
-        present = await handOut();
         present!.$3.writeAsStringSync('unsynced editor changes');
         final unrelated = File('${access.base}/Documents/pending.txt')
           ..writeAsStringSync('unrelated pending content');
@@ -218,6 +219,16 @@ class _Fixture {
     } finally {
       stored.close();
     }
+  }
+
+  void markInterruptedReclaim(String id, String owner) {
+    read((store) {
+      final work = store.operations[id]!;
+      // The intent is saved before unlink and survives until finalization.
+      work.data['reclaiming'] = true;
+      store.operations[owner]!.data['releasing'] = work.hash;
+      store.save();
+    });
   }
 
   Future<void> close() async {
@@ -748,6 +759,56 @@ void main() {
     });
   });
 
+  for (final legacy in [true, false]) {
+    final profile = legacy ? 'build-177' : 'current';
+    test('restart keeps a displaced $profile edit before unlink', () async {
+      await fixture.seed(legacy: legacy, parkFirstCopy: true);
+      final (id, owner, file) = fixture.absent.first;
+      fixture.parkedCopy.renameSync(file.path);
+      fixture.markInterruptedReclaim(id, owner);
+      final stage = fixture.access.staging;
+      final displacedDir = Directory(stage).renameSync('$stage-original');
+      Directory(stage).createSync();
+      File('$stage/.nomedia').createSync();
+      final displaced = File(p.join(displacedDir.path, p.basename(file.path)))
+        ..writeAsStringSync('displaced editor changes');
+
+      await fixture.start();
+
+      expect(displaced.readAsStringSync(), 'displaced editor changes');
+      expect(missingEditorClaims(fixture.row), isEmpty);
+      fixture.read((store) {
+        expect(store.operations[id], isNotNull);
+        expect(store.operations[owner], isNotNull);
+        expect(store.operations[id]!.data['reclaiming'], isNull);
+        expect(store.operations[owner]!.data['releasing'], isNull);
+      });
+    });
+  }
+
+  testWidgets('an interrupted release in the original staging can be cleared', (
+    tester,
+  ) async {
+    await tester.runAsync(fixture.seed);
+    final (id, owner, _) = fixture.absent.first;
+    fixture.markInterruptedReclaim(id, owner);
+    await _mount(tester, fixture);
+    expect(
+      missingEditorClaims(fixture.row).map((claim) => claim['id']),
+      contains(id),
+    );
+    await _openClear(tester);
+    await _confirmClear(tester);
+    await tester.runAsync(
+      () => _Fixture.until(() => fixture.editorResult.startsWith('Cleared 2')),
+    );
+    fixture.read((store) {
+      expect(store.operations[id], isNull);
+      expect(store.operations[owner], isNull);
+    });
+    expect(fixture.original.readAsStringSync(), _original);
+  });
+
   testWidgets('build 177 sessions survive a marked replacement on upgrade', (
     tester,
   ) async {
@@ -941,6 +1002,76 @@ void main() {
       expect(store.operations[owner], isNull);
     });
   });
+
+  test(
+    'a named copy survives restart and grace expiry until provider close',
+    () async {
+      await fixture.seed(keepNamedCopy: true);
+      await fixture.start();
+      final (id, owner, file) = fixture.present!;
+      const token = 'named-copy-held';
+      final opened = await fixture.controller.documentsCommand('open', {
+        'working': p.basename(file.path),
+        'token': token,
+      });
+      final native = NativeRootFs(testNativeLibrary);
+      final fd = opened['fd'] as int;
+      Future<void> pass() async {
+        final result = await fixture.controller.backgroundRun(
+          timeout: const Duration(seconds: 5),
+        );
+        expect(result['listed'], isTrue);
+        expect(result['timedOut'], isNot(true));
+      }
+
+      void expectKept() {
+        expect(file.readAsStringSync(), _original);
+        fixture.read((store) {
+          expect(store.operations[id]!.data[providerOpenTokensKey], [token]);
+          expect(store.operations[owner], isNotNull);
+        });
+      }
+
+      try {
+        await fixture.controller.stop();
+        fixture.read((store) {
+          final work = store.operations[id]!;
+          expect(work.data[providerOpenTokensKey], [token]);
+          work.data['handedAt'] = DateTime.now()
+              .subtract(const Duration(hours: 13))
+              .millisecondsSinceEpoch;
+          store.save();
+        });
+        await fixture.controller.start();
+        await pass();
+        expect(File('/proc/self/fd/$fd').readAsStringSync(), _original);
+        expectKept();
+      } finally {
+        native.closeFd(fd);
+      }
+
+      // Closing the OS descriptor alone has not delivered the provider event.
+      // This also exercises the durable token where Linux would grant a lease.
+      fixture.controller.command(
+        'removeOpenedCopy',
+        _path,
+        sessions: [
+          {'id': id},
+        ],
+      );
+      await pass();
+      expectKept();
+
+      await fixture.controller.documentsCommand('closed', {'token': token});
+      await pass();
+      expect(file.existsSync(), isFalse);
+      fixture.read((store) {
+        expect(store.operations[id], isNull);
+        expect(store.operations[owner], isNull);
+      });
+      expect(fixture.original.readAsStringSync(), _original);
+    },
+  );
 
   testWidgets('a new hand-out on a legacy session keeps its own warning', (
     tester,

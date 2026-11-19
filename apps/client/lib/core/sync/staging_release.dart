@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 
 import 'artifacts.dart';
+import '../ports/phone_folders.dart';
 import '../ports/release_guard.dart';
 import '../state/manifest.dart';
 import '../state/model.dart';
@@ -153,10 +154,13 @@ class StagingRelease {
 
   /// [aliases] are other owned names for the same inode (hard links made by
   /// `installOwned`); they are released together or not at all.
+  /// [onReleased] updates related manifest rows after unlink, before the
+  /// same save that removes the staging records.
   ReleaseOutcome release(
     Operation record,
     String expectedHash, {
     List<Operation> aliases = const [],
+    void Function()? onReleased,
   }) {
     final native = artifacts.native;
     tree.native.checkRoot(tree.stageFd, tree.staging.path);
@@ -173,6 +177,14 @@ class StagingRelease {
       return ReleaseOutcome.uncertain;
     }
     final name = record.data['name'] as String;
+    final routing = tree.phoneFolders;
+    if (routing != null &&
+        record.data['role'] == 'working' &&
+        name.startsWith(sharedStagingTag) &&
+        record.data['sharedDirectoryIdentity'] !=
+            routing.checkedSharedStagingIdentity()) {
+      return ReleaseOutcome.uncertain;
+    }
     final current = info(name);
     if (current == null || current.identity != record.data['identity']) {
       return ReleaseOutcome.uncertain;
@@ -217,6 +229,7 @@ class StagingRelease {
     } finally {
       native.close(fd);
     }
+    onReleased?.call();
     _finalize(all);
     return ReleaseOutcome.released;
   }
