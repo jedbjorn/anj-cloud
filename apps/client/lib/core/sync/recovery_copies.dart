@@ -192,7 +192,11 @@ class RecoveryCopies {
   /// - for a completed deletion, every other owned staging file of the row
   ///   (it is gone from the root and the cloud; they are leftovers);
   /// - owned hard-link aliases of any of the above (same bytes).
-  List<RecoveryCopy> copiesOf(String path) {
+  /// A diagnostic can supply [probeStaging] to track unavailable reads.
+  List<RecoveryCopy> copiesOf(
+    String path, {
+    NativeFileInfo? Function(String name)? probeStaging,
+  }) {
     final entry = manifest.entries[path];
     if (entry == null) return const [];
     final explicit = <String>{
@@ -226,12 +230,7 @@ class RecoveryCopies {
       // offered until that work ends.
       if (_inUse(path)) continue;
       final record = byStaged[path];
-      NativeFileInfo? info;
-      try {
-        info = _info(p.basename(path));
-      } on FileSystemException {
-        info = null;
-      }
+      final info = (probeStaging ?? _present)(p.basename(path));
       if (info != null && _live(info, record, entry.path)) continue;
       if (!explicit.contains(path) && _redundant(record, entry)) continue;
       copies.add(
@@ -249,7 +248,7 @@ class RecoveryCopies {
           _inUse(record.staged!)) {
         continue;
       }
-      final info = _info(p.basename(record.staged!));
+      final info = (probeStaging ?? _info)(p.basename(record.staged!));
       if (info != null &&
           identities.contains(info.identity) &&
           !_live(info, record, entry.path)) {

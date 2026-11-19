@@ -109,8 +109,10 @@ class _EditorDiagnostic {
     for (final (i, session) in _sessions.indexed) {
       _aliases[session.id] = 'session ${i + 1}';
     }
+    final recovery = _recovery();
     return {
       'sessionSlots': [for (final work in _sessions) _session(work)],
+      'entryRecovery': recovery,
       'entryWarnings': [
         if (entry.conflict != null) 'conflict',
         if (isSizeRefusal(entry.status)) 'size refusal',
@@ -125,7 +127,59 @@ class _EditorDiagnostic {
           'sync work pending',
         if (_entryOperations.any((op) => op.kind == 'finish-editing'))
           'Finish request exists',
+        if (recovery['dismissOffered'] == true)
+          'independent recovery copies'
+        else if (_entryOperations.any((op) => op.kind == 'retained') ||
+            entry.preservedCopies.isNotEmpty)
+          'retained recovery reference',
+        if (recovery['recoverOffered'] == _unknown)
+          'recovery copy evidence unknown',
       ],
+    };
+  }
+
+  Map<String, Object?> _recovery() {
+    var unavailable = false;
+    final tree = engine.tree;
+    final copies = engine.recovery.copiesOf(
+      entry.path,
+      probeStaging: (name) {
+        final shared = name.startsWith(sharedStagingTag);
+        final directory = shared ? _shared : _private;
+        NativeFileInfo? info;
+        if (directory != null) {
+          try {
+            info = engine.artifacts.native.info(tree.stageFd, name);
+          } on FileSystemException catch (error) {
+            if (error.osError?.errorCode != 2) unavailable = true;
+          }
+          if (_directory(shared: shared) == directory) return info;
+        }
+        unavailable = true;
+        return null;
+      },
+    );
+    var ownershipUnavailable = false;
+    final recoverable = copies.any((copy) {
+      try {
+        return engine.recovery.owned(copy);
+      } on FileSystemException {
+        ownershipUnavailable = true;
+        return false;
+      }
+    });
+    return {
+      'presentCount': unavailable
+          ? _unknown
+          : copies.map((copy) => copy.info?.identity).nonNulls.toSet().length,
+      'recoverOffered': recoverable
+          ? true
+          : unavailable || ownershipUnavailable
+          ? _unknown
+          : false,
+      // The row offers Dismiss for listed copies even if their bytes could
+      // not be read. Its confirmation still rechecks the copy guards.
+      'dismissOffered': copies.isNotEmpty,
     };
   }
 
@@ -235,7 +289,9 @@ class _EditorDiagnostic {
       }
       final obligation = uploadFacts?['obligation'];
       if (obligation == 'active') live.add('upload obligation ${_alias(op)}');
-      if (obligation == _unknown) {
+      if (obligation == _unknown ||
+          uploadFacts?['receipt'] == 'accepted' &&
+              uploadFacts?['lineage'] == _unknown) {
         uncertain.add('upload evidence ${_alias(op)}');
       }
       references.add({
@@ -368,26 +424,7 @@ class _EditorDiagnostic {
     final successor = _byId[data['supersededBy']];
     final successorAgrees = successor == null
         ? _unknown
-        : successor.kind == 'artifact' &&
-              successor.data['role'] == 'working-upload' &&
-              successor.data['workingId'] == work.id &&
-              _binding != null &&
-              successor.data['sessionBinding'] == _binding &&
-              successor.path == entry.path &&
-              (successor.data['entryPath'] ?? successor.path) == entry.path &&
-              successor.data['lineageVersion'] == 1 &&
-              successor.data['accepted'] == true &&
-              successor.phase == 'complete' &&
-              successor.data['supersedes'] == op.id &&
-              _agreement(successor.data['baseEtag'], op.expectedEtag) ==
-                  'match' &&
-              _agreement(successor.hash, successor.data['snapshotHash']) ==
-                  'match' &&
-              _agreement(
-                    successor.data['identity'],
-                    successor.data['snapshotIdentity'],
-                  ) ==
-                  'match'
+        : _agreesWithPredecessor(op, successor, work)
         ? 'match'
         : 'mismatch';
     final accepted = data['accepted'] == true;
@@ -406,21 +443,10 @@ class _EditorDiagnostic {
                     _contains(other.data['sessions'], work.id)))
           _alias(other),
     ];
-    final matching = sameEntry && session == 'match' && binding == 'match';
+    final matching = _matchesUpload(op, work);
     final validReceipt =
-        matching &&
-        accepted &&
-        data['lineageVersion'] == 1 &&
-        hash == 'match' &&
-        identity == 'match' &&
-        op.expectedEtag != null;
-    final terminal =
-        validReceipt &&
-        (successorAgrees == 'match' ||
-            data['supersededBy'] == null &&
-                work.data['uploadTip'] == op.id &&
-                currentVersion == 'match' &&
-                currentHash == 'match');
+        matching && _acceptedSnapshot(op) && op.expectedEtag != null;
+    final terminal = validReceipt && _reachesUploadTip(op, work);
     return {
       'record': _alias(op),
       'sameEntry': sameEntry,
@@ -446,6 +472,7 @@ class _EditorDiagnostic {
       'supersession': successorAgrees,
       if (successor != null && successorAgrees == 'match')
         'successor': _alias(successor),
+      'lineage': terminal ? 'verified local tip' : _unknown,
       'installing': data['installing'] != null,
       'releasing': data['releasing'] != null,
       'recordedObligations': obligations,
@@ -456,6 +483,56 @@ class _EditorDiagnostic {
           ? 'terminal'
           : _unknown,
     };
+  }
+
+  bool _matchesUpload(Operation op, Operation work) =>
+      op.kind == 'artifact' &&
+      op.data['role'] == 'working-upload' &&
+      op.data['workingId'] == work.id &&
+      _binding != null &&
+      op.data['sessionBinding'] == _binding &&
+      op.path == entry.path &&
+      (op.data['entryPath'] ?? op.path) == entry.path;
+
+  static bool _acceptedSnapshot(Operation op) =>
+      op.data['lineageVersion'] == 1 &&
+      op.data['accepted'] == true &&
+      _agreement(op.hash, op.data['snapshotHash']) == 'match' &&
+      _agreement(op.data['identity'], op.data['snapshotIdentity']) == 'match';
+
+  bool _agreesWithPredecessor(
+    Operation prior,
+    Operation next,
+    Operation work,
+  ) =>
+      _matchesUpload(next, work) &&
+      next.phase == 'complete' &&
+      _acceptedSnapshot(next) &&
+      next.data['supersedes'] == prior.id &&
+      _agreement(next.data['baseEtag'], prior.expectedEtag) == 'match';
+
+  /// Follow only locally accepted links to the recorded session tip. This
+  /// checks local lineage without consulting the remote file or its version.
+  bool _reachesUploadTip(Operation first, Operation work) {
+    final visited = <String>{};
+    var record = first;
+    while (visited.add(record.id)) {
+      if (record.phase != 'complete' || record.expectedEtag == null) {
+        return false;
+      }
+      final nextId = record.data['supersededBy'];
+      if (nextId == null) {
+        return work.data['uploadTip'] == record.id &&
+            _agreement(record.hash, work.hash) == 'match' &&
+            _agreement(record.expectedEtag, work.expectedEtag) == 'match';
+      }
+      final next = _byId[nextId];
+      if (next == null || !_agreesWithPredecessor(record, next, work)) {
+        return false;
+      }
+      record = next;
+    }
+    return false;
   }
 
   String? _readBinding() {

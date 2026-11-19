@@ -342,14 +342,19 @@ void main() {
       final owner = manifest.operations[fixture.absent.last.$2]!;
       final token = 'private-provider-token';
       try {
-        Operation accept(Operation session, String id) {
+        Operation accept(
+          Operation session,
+          String id, {
+          String? hash,
+          String? version,
+        }) {
           final upload =
               Operation(
                   id,
                   'artifact',
                   _path,
-                  hash: session.hash,
-                  expectedEtag: session.expectedEtag,
+                  hash: hash ?? session.hash,
+                  expectedEtag: version ?? session.expectedEtag,
                   phase: 'complete',
                 )
                 ..data = {
@@ -358,7 +363,7 @@ void main() {
                   'sessionBinding': engine.editing.binding,
                   'lineageVersion': 1,
                   'accepted': true,
-                  'snapshotHash': session.hash,
+                  'snapshotHash': hash ?? session.hash,
                   'identity': 'private-snapshot-identity',
                   'snapshotIdentity': 'private-snapshot-identity',
                 };
@@ -419,14 +424,22 @@ void main() {
         });
         Object? changes() =>
             manifest.db.select('SELECT total_changes() AS n').single['n'];
-        final before = state();
-        final written = changes();
-        final report = readEditorDiagnostic(
-          engine,
-          _path,
-          engine.selectionVersion(entry),
-          phoneStoragePaused: false,
-        )!;
+        Map<String, Object?> diagnostic({bool paused = false}) {
+          final before = state();
+          final written = changes();
+          final report = readEditorDiagnostic(
+            engine,
+            _path,
+            engine.selectionVersion(entry),
+            phoneStoragePaused: paused,
+          )!;
+          expect(state(), before);
+          expect(changes(), written);
+          expect(cloud.calls, 0);
+          return report;
+        }
+
+        final report = diagnostic();
         final slots = (report['sessionSlots'] as List).cast<Map>();
         expect(slots, hasLength(3));
         expect(slots[0]['relationships'], ['historical']);
@@ -500,12 +513,7 @@ void main() {
         ]) {
           expect(dumped, isNot(contains(private)));
         }
-        final inaccessible = readEditorDiagnostic(
-          engine,
-          _path,
-          engine.selectionVersion(entry),
-          phoneStoragePaused: true,
-        )!;
+        final inaccessible = diagnostic(paused: true);
         final blocked = (inaccessible['sessionSlots'] as List).first as Map;
         expect(blocked['staging'], containsPair('access', 'unavailable'));
         expect(blocked['staging'], containsPair('target', 'unknown'));
@@ -519,8 +527,6 @@ void main() {
           ),
           isNull,
         );
-        expect(state(), before);
-        expect(changes(), written);
         expect(cloud.calls, 0);
         expect(fixture.original.readAsStringSync(), _original);
         expect(fixture.present!.$3.existsSync(), isTrue);
@@ -529,14 +535,7 @@ void main() {
         final unreadable = Link(fixture.absent.first.$3.path)
           ..createSync(fixture.original.path);
         manifest.save();
-        final beforeUnreadable = state();
-        final beforeUnreadableWrites = changes();
-        final changed = readEditorDiagnostic(
-          engine,
-          _path,
-          engine.selectionVersion(entry),
-          phoneStoragePaused: false,
-        )!;
+        final changed = diagnostic();
         final changedSlots = (changed['sessionSlots'] as List).cast<Map>();
         expect(
           changedSlots[0]['staging'],
@@ -547,10 +546,126 @@ void main() {
           (changedSlots[1]['acceptedUploads'] as List).single,
           containsPair('snapshotHash', 'mismatch'),
         );
-        expect(state(), beforeUnreadable);
-        expect(changes(), beforeUnreadableWrites);
-        expect(cloud.calls, 0);
         unreadable.deleteSync();
+
+        final beforeRecovery = diagnostic();
+        expect(beforeRecovery['entryRecovery'], {
+          'presentCount': 0,
+          'recoverOffered': false,
+          'dismissOffered': false,
+        });
+        expect(
+          beforeRecovery['entryWarnings'],
+          isNot(contains('independent recovery copies')),
+        );
+        final retained = engine.artifacts.reserve(_path, 'preserved')
+          ..writeAsStringSync('private-recovery-bytes');
+        engine.artifacts.complete(retained, hash: _digest(retained));
+        final staged = tree.durablePath(retained);
+        entry.preservedCopies.add(staged);
+        manifest.operations['private-retained'] = Operation(
+          'private-retained',
+          'retained',
+          _path,
+          staged: staged,
+        );
+        manifest.save();
+        final withRecovery = diagnostic();
+        expect(
+          engine.recovery.describe(_path),
+          containsPair('recoverable', true),
+        );
+        expect(withRecovery['entryRecovery'], {
+          'presentCount': 1,
+          'recoverOffered': true,
+          'dismissOffered': true,
+        });
+        expect(
+          withRecovery['entryWarnings'],
+          contains('independent recovery copies'),
+        );
+        expect(withRecovery['sessionSlots'], beforeRecovery['sessionSlots']);
+        expect(jsonEncode(withRecovery), isNot(contains('private-')));
+        expect(
+          jsonEncode(withRecovery),
+          isNot(contains(p.basename(retained.path))),
+        );
+        expect(retained.readAsStringSync(), 'private-recovery-bytes');
+        final pausedRecovery = diagnostic(paused: true);
+        expect(
+          pausedRecovery['entryWarnings'],
+          contains('recovery copy evidence unknown'),
+        );
+        expect(pausedRecovery['entryRecovery'], {
+          'presentCount': 'unknown',
+          'recoverOffered': 'unknown',
+          'dismissOffered': true,
+        });
+        retained.deleteSync();
+        expect(diagnostic()['entryRecovery'], {
+          'presentCount': 0,
+          'recoverOffered': false,
+          'dismissOffered': true,
+        });
+        final unreadableRecovery = Link(retained.path)
+          ..createSync(fixture.original.path);
+        expect(diagnostic()['entryRecovery'], pausedRecovery['entryRecovery']);
+        unreadableRecovery.deleteSync();
+
+        void link(Operation earlier, Operation later) {
+          earlier.data['supersededBy'] = later.id;
+          later.data['supersedes'] = earlier.id;
+          later.data['baseEtag'] = earlier.expectedEtag;
+        }
+
+        final middle = accept(
+          historical,
+          'private-middle',
+          hash: 'private-middle-hash',
+          version: 'private-middle-version',
+        );
+        final tip = accept(historical, 'private-tip');
+        link(firstUpload, middle);
+        link(middle, tip);
+
+        void checkLineage({required bool verified, required bool closedCycle}) {
+          manifest.save();
+          final slot = (diagnostic()['sessionSlots'] as List).first as Map;
+          final uploads = (slot['acceptedUploads'] as List).cast<Map>();
+          expect(
+            uploads.map((row) => row['receipt']),
+            everyElement('accepted'),
+          );
+          expect(uploads.map((row) => row['supersession']), [
+            'match',
+            'match',
+            closedCycle ? 'match' : 'unknown',
+          ]);
+          expect(
+            uploads.map((row) => row['lineage']),
+            everyElement(verified ? 'verified local tip' : 'unknown'),
+          );
+          expect(
+            uploads.map((row) => row['obligation']),
+            everyElement(verified ? 'terminal' : 'unknown'),
+          );
+          expect(slot['relationships'], [
+            'historical',
+            if (!verified) 'unknown',
+          ]);
+        }
+
+        checkLineage(verified: true, closedCycle: false);
+        final sessionHash = historical.hash;
+        historical.hash = 'private-different-session-hash';
+        checkLineage(verified: false, closedCycle: false);
+        historical.hash = sessionHash;
+        tip.data['supersededBy'] = 'private-missing-tip';
+        historical.data['uploadTip'] = 'private-missing-tip';
+        checkLineage(verified: false, closedCycle: false);
+        historical.data['uploadTip'] = tip.id;
+        link(tip, firstUpload);
+        checkLineage(verified: false, closedCycle: true);
       } finally {
         openDocuments.remove(token);
         engine.close();
