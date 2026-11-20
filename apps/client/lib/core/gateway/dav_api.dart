@@ -63,6 +63,7 @@ const firstSyncPropfind =
 class DavCloud
     implements
         CloudApi,
+        ForegroundReads,
         SharingApi,
         AdminTransport,
         ReleaseTransport,
@@ -229,6 +230,48 @@ class DavCloud
   /// if no forget happened while it ran.
   int _generation = 0;
 
+  ({int generation, List<RemoteItem> children})? _checkedRoot;
+  bool Function()? _listingWanted;
+  Future<void>? Function()? _selectedRead;
+
+  @override
+  Future<void> checkRoot({
+    required bool Function() stillWanted,
+    required Future<void>? Function() selectedRead,
+  }) async {
+    clearCheckedRoot();
+    _listingWanted = stillWanted;
+    _selectedRead = selectedRead;
+    final generation = _generation;
+    try {
+      final children = await _listChildren('');
+      if (generation == _generation) {
+        _checkedRoot = (generation: generation, children: children);
+      }
+    } catch (_) {
+      forgetListing();
+      rethrow;
+    }
+  }
+
+  @override
+  void clearCheckedRoot() {
+    _checkedRoot = null;
+    _listingWanted = null;
+    _selectedRead = null;
+  }
+
+  @override
+  Future<RemoteItem> checkFile(String path, String etag) async {
+    final name = path.split('/').map(NamePolicy.nfc).join('/');
+    final items = await _listChildren(name, selectedItem: true);
+    final item = items.singleOrNull;
+    if (item == null || item.kind != ItemKind.file || item.etag != etag) {
+      failure(412);
+    }
+    return item;
+  }
+
   /// The last incoming-share list read; a change forces a full walk.
   String? _incomingFingerprint;
 
@@ -311,11 +354,29 @@ class DavCloud
     String directory, {
     String propfind = listingPropfind,
     Map<String, int>? sizes,
+    bool selectedItem = false,
   }) async {
+    if (!selectedItem) {
+      if (_selectedRead?.call() case final pending?) await pending;
+      if (_listingWanted?.call() == false) {
+        throw const CloudFailure('The server check was interrupted.');
+      }
+    }
+    if (!selectedItem &&
+        directory.isEmpty &&
+        propfind == listingPropfind &&
+        sizes == null) {
+      final checked = _checkedRoot;
+      _checkedRoot = null;
+      if (checked?.generation == _generation) return checked!.children;
+    }
     final response = await request(
       'PROPFIND',
       directory,
-      headers: {'Depth': '1', 'Content-Type': 'application/xml; charset=utf-8'},
+      headers: {
+        'Depth': selectedItem ? '0' : '1',
+        'Content-Type': 'application/xml; charset=utf-8',
+      },
       body: utf8.encode(propfind),
     );
     if (response.statusCode != 207) {
@@ -376,9 +437,9 @@ class DavCloud
       }
       if (path == directory) {
         sawDirectory = true;
-        continue;
-      }
-      if (p.posix.dirname(path) != (directory.isEmpty ? '.' : directory)) {
+        if (!selectedItem) continue;
+      } else if (selectedItem ||
+          p.posix.dirname(path) != (directory.isEmpty ? '.' : directory)) {
         throw const CloudFailure(
           'Cloud listing escaped its requested directory.',
         );

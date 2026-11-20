@@ -2,6 +2,17 @@ import 'dart:io';
 
 import '../state/model.dart';
 
+/// Authenticated reads for Android's foreground worker. The checked root is
+/// available to the same pass's snapshot and is discarded at its end.
+abstract interface class ForegroundReads {
+  Future<void> checkRoot({
+    required bool Function() stillWanted,
+    required Future<void>? Function() selectedRead,
+  });
+  void clearCheckedRoot();
+  Future<RemoteItem> checkFile(String path, String etag);
+}
+
 /// One authenticated account's anj-cloud namespace. Implementations must fail
 /// incomplete enumeration and preserve remote preconditions. ETags are opaque.
 abstract interface class CloudApi {

@@ -28,10 +28,13 @@ object NetworkMonitor {
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
     }
 
-    fun onWifi(context: Context): Boolean {
+    fun state(context: Context): Pair<Boolean, Boolean> {
         val manager = context.getSystemService(ConnectivityManager::class.java)
-        return wifi(manager.getNetworkCapabilities(manager.activeNetwork))
+        val caps = manager.getNetworkCapabilities(manager.activeNetwork)
+        return wifi(caps) to (caps != null && online(caps))
     }
+
+    fun onWifi(context: Context): Boolean = state(context).first
 
     /// Registered once per process (AnjApplication); callbacks arrive on the main thread.
     fun start(context: Context) {

@@ -143,6 +143,7 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
     return;
   }
   CloudApi cloud = const DisconnectedCloud();
+  RenewableCloud? renewable;
   CertificateRenewal? renewal;
   if (initial['privateKey'] != null &&
       manifest.setting('certificate') != null &&
@@ -155,8 +156,11 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
       pickup.context(certificate),
       folderDeletionQualified: true,
     );
-    final renewable = RenewableCloud(connect(manifest.setting('certificate')!));
-    cloud = renewable;
+    final connection = RenewableCloud(
+      connect(manifest.setting('certificate')!),
+    );
+    renewable = connection;
+    cloud = connection;
     // Reissued certificates arrive over this device's existing mTLS identity
     // (spec #19); the sync engine switches to the renewed one in place.
     renewal = CertificateRenewal(
@@ -164,7 +168,7 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
       expires:
           DateTime.tryParse(manifest.setting('certificateExpires') ?? '') ??
           DateTime.now(),
-      onRenewed: (result) => renewable.replace(connect(result.certificate)),
+      onRenewed: (result) => connection.replace(connect(result.certificate)),
       onStatus: (warning, expires) => output.send({
         'event': 'certificate',
         'warning': warning,
@@ -203,6 +207,9 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
     fetch: cloud is FetchTransport ? cloud as FetchTransport : null,
     defaultNetworkPolicy: initial['networkPolicy'] as String?,
     pickupIfDue: renewal?.runIfDue,
+    foregroundReads: initial['androidForeground'] == true && renewable != null
+        ? () => renewable!.current as ForegroundReads
+        : null,
   );
   output.send({'event': 'ready', 'input': input.sendPort});
   renewal?.start();
@@ -306,11 +313,16 @@ class WorkerLoop {
     this.defaultNetworkPolicy,
     this.pickupIfDue,
     this.joinedListingAge = const Duration(seconds: 60),
+    this.foregroundReads,
   }) : schedule = schedule ?? RemoteSchedule() {
     engine.onLocalChange = () {
       if (!_inPass && !_paused) _schedule(interval);
     };
     engine.activity.onChanged = _activityChanged;
+    if (_androidForeground) {
+      engine.yieldToForeground = _foregroundCheckpoint;
+      engine.duringDiscovery = _duringDiscovery;
+    }
   }
   final SyncEngine engine;
   final void Function(Object?) send;
@@ -341,12 +353,27 @@ class WorkerLoop {
   /// Opt-in JSON-lines file receiving one record per pass.
   final File? metrics;
   final Queue<Map> _queue = Queue();
+  final ForegroundReads Function()? foregroundReads;
+  bool get _androidForeground => foregroundReads != null;
+  SyncStatus _connection = SyncStatus.checkingServer;
+  String? _connectionMessage;
+  bool _checkingChanges = true;
+  int _connectionGeneration = 0;
+  int _passGeneration = 0;
+  late bool _verifyPassWanted = _androidForeground;
+  bool _passWillVerify = false;
+  bool _discovering = false;
+  bool? _online;
+  Map? _heldOpen;
+  Future<void>? _selectedRead;
 
   /// The documents provider's commands (spec #28 A5; Android only sends
   /// them).
   late final DocumentsOps documents = DocumentsOps(
     engine,
     paused: () => _paused,
+    checkRemote: _androidForeground ? _checkSelectedFile : null,
+    checkTransferPolicy: _androidForeground ? _checkOpenPolicy : null,
   );
   Completer<void>? _signal;
   Timer? _deadline;
@@ -407,7 +434,10 @@ class WorkerLoop {
 
   /// The running pass is already a full verification (it began one).
   bool get _passVerifies =>
-      _inPass && _passLists && engine.fullVerifications > _passVerifications;
+      _inPass &&
+      _passLists &&
+      _passGeneration == _connectionGeneration &&
+      (_passWillVerify || engine.fullVerifications > _passVerifications);
 
   String? get networkPolicy => _networkPolicy;
 
@@ -442,6 +472,205 @@ class WorkerLoop {
   void _setPaused(bool value) {
     _paused = value;
     gate?.paused = value;
+  }
+
+  void _restartForegroundCheck() {
+    _connectionGeneration++;
+    if (_inPass) engine.stopRequested = true;
+    _connection = SyncStatus.checkingServer;
+    _connectionMessage = null;
+    _checkingChanges = true;
+  }
+
+  void _foregroundReadFailed(Object error) {
+    final denied =
+        error is CloudFailure && (error.status == 401 || error.status == 403);
+    _connection = denied ? SyncStatus.accessDenied : SyncStatus.offline;
+    _connectionMessage = denied ? error.toString() : unreachableMessage(error);
+    _emitForegroundStatus();
+  }
+
+  SyncStatus get _status {
+    if (_androidForeground && !_paused) {
+      if (_connection == SyncStatus.accessDenied ||
+          _connection == SyncStatus.offline) {
+        return _connection;
+      }
+      if (_heldOpen != null) return SyncStatus.waiting;
+      if (_connection == SyncStatus.checkingServer) return _connection;
+    }
+    final status = deriveStatus(
+      paused: _paused,
+      offline: !_androidForeground && (schedule.offline || _connecting),
+      unpaired: unpaired,
+      message: engine.message,
+      entries: engine.manifest.entries.values,
+      operations: engine.manifest.operations.values,
+    );
+    if (_androidForeground &&
+        _checkingChanges &&
+        (status == SyncStatus.syncing || status == SyncStatus.upToDate)) {
+      return SyncStatus.checkingChanges;
+    }
+    return status;
+  }
+
+  String _statusMessage(SyncStatus status) => _androidForeground && !_paused
+      ? _connectionMessage ??
+            (status == SyncStatus.checkingServer
+                ? startingMessage
+                : status == SyncStatus.checkingChanges
+                ? 'Checking the library.'
+                : engine.message)
+      : engine.message;
+
+  void _emitForegroundStatus() {
+    final status = _status;
+    send({
+      'event': 'foregroundStatus',
+      'status': status.name,
+      'message': _statusMessage(status),
+      'paused': _paused,
+      'transfersHeld': engine.transfersHeld,
+      'networkPolicy': _networkPolicy,
+    });
+  }
+
+  void _openNotice(String? message) =>
+      send({'event': 'openNotice', 'message': message});
+
+  bool _isForegroundCommand(Map command) => switch (command['action']) {
+    'visible' ||
+    'foregroundLeft' ||
+    'pause' ||
+    'resume' ||
+    'network' ||
+    'networkPolicy' ||
+    'phoneFolders' ||
+    'open' => true,
+    'documents' => command['op'] == 'open' || command['op'] == 'closed',
+    _ => false,
+  };
+
+  /// Discovery has no in-flight reconciliation write. Service foreground
+  /// commands while waiting for its response, then give ownership back to
+  /// the pass before it interprets the snapshot.
+  Future<T> _duringDiscovery<T>(Future<T> pending) async {
+    var finished = false;
+    late T result;
+    Object? failure;
+    StackTrace? trace;
+    final completion = pending
+        .then(
+          (value) {
+            result = value;
+          },
+          onError: (Object error, StackTrace stack) {
+            failure = error;
+            trace = stack;
+          },
+        )
+        .whenComplete(() {
+          finished = true;
+          _wake();
+        });
+    while (!_stopping) {
+      await _foregroundCheckpoint();
+      if (finished || _stopping) break;
+      final wake = _signal = Completer<void>();
+      await wake.future;
+      _signal = null;
+    }
+    await completion;
+    if (failure case final error?) Error.throwWithStackTrace(error, trace!);
+    return result;
+  }
+
+  Future<void> _foregroundCheckpoint() async {
+    await Future<void>.delayed(Duration.zero);
+    while (!_stopping) {
+      final command = _queue.where(_isForegroundCommand).firstOrNull;
+      if (command == null) return;
+      _queue.remove(command);
+      await _handleQueued(command);
+    }
+  }
+
+  void _checkOpenPolicy() {
+    var wifi = _onWifi;
+    var policy = _networkPolicy;
+    var paused = _paused || _stopping;
+    for (final command in _queue) {
+      switch (command['action']) {
+        case 'pause':
+          paused = true;
+        case 'network':
+          wifi = command['wifi'] == true;
+        case 'networkPolicy':
+          policy = command['value'] as String?;
+      }
+    }
+    if (paused) {
+      throw const CloudFailure('Resume sync to download this file.');
+    }
+    if (policy == 'wifi' && wifi != true) throw const TransfersHeld();
+  }
+
+  Future<RemoteItem> _checkSelectedFile(String path, String etag) async {
+    if (engine.phoneFolderPaused(path) ||
+        (_phonePaused == true && inPhoneFolder(path))) {
+      // A new grant or loss of shared storage is applied at the pass boundary.
+      throw const CloudFailure(
+        'Phone storage is unavailable. Check All files access.',
+      );
+    }
+    final name = engine.names.cloudPath(path);
+    try {
+      return await foregroundReads!().checkFile(name, etag);
+    } on CloudFailure catch (error) {
+      switch (error.status) {
+        case 404:
+          throw const CloudFailure(
+            'This file is no longer available.',
+            status: 404,
+          );
+        case 412:
+          throw const CloudFailure(
+            'This file changed on the server. Try again after the library refreshes.',
+            status: 412,
+          );
+        default:
+          rethrow;
+      }
+    }
+  }
+
+  Future<void> _openForegroundFile(Map command) async {
+    final path = command['path'] as String;
+    final name = p.posix.basename(path);
+    _heldOpen = null;
+    _openNotice('Opening $name…');
+    try {
+      final copy = await engine.openFile(
+        path,
+        providerTracked: command['providerTracked'] == true,
+        checkRemote: _checkSelectedFile,
+        checkTransferPolicy: _checkOpenPolicy,
+      );
+      // The provider resolves the working-copy URI from the projected rows.
+      // Publish its ID before the receiver is launched.
+      await emit();
+      if (!_stopping &&
+          !_queue.any((command) => command['action'] == 'foregroundLeft')) {
+        send({'event': 'open', 'path': copy});
+      }
+      _openNotice(null);
+    } on TransfersHeld catch (error) {
+      _heldOpen = command;
+      _openNotice('$name: ${error.message}');
+    } catch (error) {
+      _openNotice('Could not open $name. $error');
+    }
   }
 
   /// Coalesced: at most one event per [activityInterval] while files keep
@@ -489,8 +718,14 @@ class WorkerLoop {
       engine.transfersHeld = true;
     } else {
       engine.releaseTransfers();
-      schedule.requestNow();
-      _passWanted = true;
+      if (!_androidForeground || !_discovering || !_passLists) {
+        schedule.requestNow();
+        _passWanted = true;
+      }
+      if (_heldOpen case final held?) {
+        _heldOpen = null;
+        _queue.addFirst(held);
+      }
     }
   }
 
@@ -507,6 +742,7 @@ class WorkerLoop {
       final listed = engine.lastListedAt;
       if (!paused &&
           !stopped &&
+          !(_androidForeground && schedule.offline) &&
           since != null &&
           (listed == null || listed < since)) {
         // The joined pass verified, but its listing is too old: one
@@ -694,13 +930,52 @@ class WorkerLoop {
     _inPass = true;
     _passSerial++;
     _passVerifications = engine.fullVerifications;
+    _passGeneration = _connectionGeneration;
+    _passWillVerify = _verifyPassWanted;
+    _verifyPassWanted = false;
     final remote = schedule.policy();
     _passLists = remote == RemotePolicy.always;
+    _discovering = _androidForeground;
     _lastPassFailed = true;
+    final reads = _passLists ? foregroundReads?.call() : null;
+    bool current() =>
+        !_paused && !_stopping && _passGeneration == _connectionGeneration;
+    Object? probeError;
     try {
-      await engine.tick(between: _between, remote: remote);
+      if (reads != null) {
+        await _foregroundCheckpoint();
+      }
+      if (reads != null && current()) {
+        try {
+          await _duringDiscovery(
+            reads.checkRoot(
+              stillWanted: current,
+              selectedRead: () => _selectedRead,
+            ),
+          );
+          if (current()) {
+            if (_connection != SyncStatus.checkingChanges) {
+              _checkingChanges = true;
+            }
+            _connection = SyncStatus.checkingChanges;
+            _connectionMessage = null;
+            _emitForegroundStatus();
+          }
+        } catch (error) {
+          probeError = error;
+          if (current()) _foregroundReadFailed(error);
+        }
+      }
+      if (!current()) {
+        engine.stopRequested = false;
+        return;
+      }
+      await engine.tick(
+        between: _between,
+        remote: probeError == null ? remote : RemotePolicy.never,
+      );
       _lastPassFailed = false;
-      if (engine.fullVerifications > _passVerifications &&
+      if ((_passWillVerify || engine.fullVerifications > _passVerifications) &&
           engine.remoteListed) {
         _verifiedSerial = _passSerial;
       }
@@ -708,15 +983,30 @@ class WorkerLoop {
       if (engine.remoteListed && pass != null && pass.rowsWritten > 0) {
         schedule.mutated();
       }
-      schedule.completed(
-        listed: engine.remoteListed,
-        failed: engine.remoteFailed,
-      );
+      if (current()) {
+        schedule.completed(
+          listed: engine.remoteListed,
+          failed: engine.remoteFailed || probeError != null,
+        );
+        if (_androidForeground) {
+          if (engine.remoteError case final error?) {
+            _foregroundReadFailed(error);
+          } else if (pass?.completed == true && engine.remoteListed) {
+            _checkingChanges = false;
+          }
+        }
+      }
     } catch (error) {
       engine.message = 'Pending: $error';
     } finally {
+      reads?.clearCheckedRoot();
       _inPass = false;
+      _discovering = false;
       _connecting = false;
+      if (_androidForeground && !_stopping && !current() && _passWillVerify) {
+        _verifyPassWanted = true;
+        engine.requestFullVerification();
+      }
     }
     await _applyPhoneFolders();
     // A pause handled during the pass leaves its message to the paused scan.
@@ -763,6 +1053,7 @@ class WorkerLoop {
   Future<void> _observePaused() async {
     _deadline?.cancel();
     try {
+      await _applyPhoneFolders();
       final changed = await engine.observePaused();
       engine.message = changed == 0
           ? 'Sync paused. Local changes are recorded and sync after you resume.'
@@ -780,9 +1071,10 @@ class WorkerLoop {
 
   /// Runs at each candidate-path boundary during a pass.
   Future<bool> _between() async {
+    _discovering = false;
     await Future<void>.delayed(Duration.zero);
     // The server answered: the rest of the first pass is ordinary sync.
-    if (_connecting && engine.remoteListed) {
+    if (!_androidForeground && _connecting && engine.remoteListed) {
       _connecting = false;
       await emit();
     }
@@ -820,9 +1112,10 @@ class WorkerLoop {
     for (final entry in engine.manifest.entries.values) {
       entries.add(await projectEntry(engine, entry));
     }
+    final status = _status;
     final state = {
       'event': 'state',
-      'message': engine.message,
+      'message': _statusMessage(status),
       'entries': entries,
       'operations': engine.manifest.operations.length,
       'storageReady':
@@ -833,14 +1126,7 @@ class WorkerLoop {
       'finishing': engine.editing.requests.isNotEmpty,
       'networkPolicy': _networkPolicy,
       'transfersHeld': engine.transfersHeld,
-      'status': deriveStatus(
-        paused: _paused,
-        offline: schedule.offline || _connecting,
-        unpaired: unpaired,
-        message: engine.message,
-        entries: engine.manifest.entries.values,
-        operations: engine.manifest.operations.values,
-      ).name,
+      'status': status.name,
     };
     String? encoded;
     try {
@@ -1154,6 +1440,19 @@ class WorkerLoop {
       // also leaves the running pass's mutation/interruption signal alone.
       return false;
     }
+    if (_androidForeground && _isForegroundCommand(command)) {
+      final opening = command['action'] == 'open' || command['op'] == 'open';
+      final done = opening ? Completer<void>() : null;
+      _selectedRead = done?.future;
+      try {
+        await _handle(command);
+      } finally {
+        _selectedRead = null;
+        done?.complete();
+      }
+      _emitForegroundStatus();
+      return command['action'] == 'open' || command['action'] == 'documents';
+    }
     await _handle(command);
     await emit(force: true);
     return true;
@@ -1162,16 +1461,17 @@ class WorkerLoop {
   Future<void> _handle(Map command) async {
     final action = command['action'];
     try {
-      if (const {
-        'bulk',
-        'retention',
-        'delete',
-        'finishEditing',
-        'keepBoth',
-        'open',
-        'createFolder',
-        'renameLocal',
-      }.contains(action)) {
+      if (!(action == 'open' && _androidForeground) &&
+          const {
+            'bulk',
+            'retention',
+            'delete',
+            'finishEditing',
+            'keepBoth',
+            'open',
+            'createFolder',
+            'renameLocal',
+          }.contains(action)) {
         engine.requireStorageReady();
         // These change the root at once; while paused only intents that
         // wait for the next pass (retention, delete, finish) are recorded.
@@ -1191,6 +1491,7 @@ class WorkerLoop {
         case 'tick':
           // An explicit retry: held uploads (backoff, size refusals) too.
           engine.uploads.retryAll();
+          if (_androidForeground) _restartForegroundCheck();
           schedule.reconnect();
           _passWanted = true;
         case 'visible':
@@ -1198,9 +1499,21 @@ class WorkerLoop {
           // Android's app opening also verifies every file (#130 (3)): its
           // entry sends 'verify'. The always-on desktop does not (#135).
           // Unreachable, the next retry is seconds away, not minutes.
+          if (_androidForeground) {
+            if (_paused || _passVerifies) break;
+            if (!_verifyPassWanted) _restartForegroundCheck();
+            _verifyPassWanted = true;
+          }
           schedule.reconnect();
-          if (command['verify'] == true) engine.requestFullVerification();
+          if (command['verify'] == true || _androidForeground) {
+            engine.requestFullVerification();
+          }
           _passWanted = true;
+        case 'foregroundLeft':
+          if (_heldOpen != null) {
+            _heldOpen = null;
+            _openNotice(null);
+          }
         case 'background':
           // A background run (Android WorkManager, spec #28 A4): one
           // complete pass that lists the cloud and, with event-driven
@@ -1217,7 +1530,13 @@ class WorkerLoop {
             _answerBackground(paused: true);
           } else if (during != null &&
               during == _passSerial &&
-              (_passVerifies || (!_inPass && _verifiedSerial == during))) {
+              (_passVerifies ||
+                  (!_inPass &&
+                      (_verifiedSerial == during ||
+                          (_androidForeground &&
+                              _passWillVerify &&
+                              _passGeneration == _connectionGeneration &&
+                              schedule.offline))))) {
             // Asked for during a pass that is itself a full verification (a
             // cold start's start-up pass): that pass is the run, so it
             // verifies once, not twice (#130 (3)). Answered when it ends,
@@ -1238,16 +1557,20 @@ class WorkerLoop {
             ));
             schedule.requestNow();
             engine.requestFullVerification();
+            if (_androidForeground) _verifyPassWanted = true;
             _passWanted = true;
           }
         case 'phoneFolders':
           // All files access granted or lost while the app runs (spec #52),
           // applied between passes only: a pass keeps the state it began
           // with (commands also run between the paths of a pass).
-          if (engine.tree.phoneFolders != null) {
-            _phonePaused = command['paused'] == true;
+          final routing = engine.tree.phoneFolders;
+          final paused = command['paused'] == true;
+          if (routing != null && paused != (_phonePaused ?? routing.paused)) {
+            _phonePaused = paused;
             if (!_inPass) await _applyPhoneFolders();
             schedule.requestNow();
+            if (_androidForeground && !paused) _verifyPassWanted = true;
             _passWanted = true;
           }
         case 'network':
@@ -1255,7 +1578,21 @@ class WorkerLoop {
           // just became usable ends an offline wait at once.
           _onWifi = command['wifi'] == true;
           _applyNetwork();
-          if (command['online'] == true && schedule.offline && !_paused) {
+          final online = command['online'];
+          final changed = online is bool && _online != online;
+          final previous = _online;
+          if (changed) _online = online;
+          if (_androidForeground &&
+              changed &&
+              !_paused &&
+              (previous != null || _connection == SyncStatus.offline)) {
+            _restartForegroundCheck();
+            schedule.reconnect();
+            _passWanted = true;
+          } else if (!_androidForeground &&
+              online == true &&
+              schedule.offline &&
+              !_paused) {
             schedule.reconnect();
             _passWanted = true;
           }
@@ -1271,11 +1608,24 @@ class WorkerLoop {
           // Durable before acknowledged; a running pass ends at its next
           // path boundary (see [_between]) and no request follows it.
           engine.manifest.setSetting('paused', '1');
+          if (_androidForeground && !_paused) {
+            _restartForegroundCheck();
+            _heldOpen = null;
+            _openNotice(null);
+            engine.message =
+                'Sync paused. Local changes sync after you resume.';
+          }
           _setPaused(true);
           _passWanted = true;
         case 'resume':
+          if (_androidForeground && !_paused) break;
           engine.manifest.setSetting('paused', '0');
           _setPaused(false);
+          if (_androidForeground) {
+            _restartForegroundCheck();
+            _verifyPassWanted = true;
+            engine.requestFullVerification();
+          }
           // Pause then Resume is the user's way to retry held uploads.
           engine.uploads.retryAll();
           schedule.reconnect();
@@ -1374,6 +1724,10 @@ class WorkerLoop {
             'rootIdentity': tree.native.identity(tree.fd),
           });
         case 'open':
+          if (_androidForeground) {
+            await _openForegroundFile(command);
+            break;
+          }
           final path = await engine.openFile(
             command['path'] as String,
             providerTracked: command['providerTracked'] == true,

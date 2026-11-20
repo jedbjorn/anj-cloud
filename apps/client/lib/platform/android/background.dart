@@ -163,7 +163,9 @@ class AndroidBackground extends ChangeNotifier implements MobileSettings {
       );
       _notifications = state['notifications'] == true;
       final wifi = state['wifi'];
-      if (wifi is bool) controller.reportNetwork(wifi: wifi);
+      if (wifi is bool) {
+        controller.reportNetwork(wifi: wifi, online: state['online'] as bool?);
+      }
       _attached = true;
       notifyListeners();
       _report();

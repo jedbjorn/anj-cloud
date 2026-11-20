@@ -8,6 +8,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:anj_cloud/core/gateway/cloud_api.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
@@ -29,8 +30,43 @@ class _ShortVerification extends AndroidRootFs {
   _ShortVerification(this.interval)
     : super(Platform.environment['ANJ_ROOTFS_LIBRARY']);
   Duration interval;
+  void Function()? beforeScanHash;
   @override
   Duration? get fullVerificationInterval => interval;
+
+  @override
+  ({String hash, String stamp}) copyAndHashStamped(
+    int root,
+    String relative,
+    File? destination, {
+    String purpose = 'content',
+  }) {
+    if (purpose == 'scan') beforeScanHash?.call();
+    return super.copyAndHashStamped(
+      root,
+      relative,
+      destination,
+      purpose: purpose,
+    );
+  }
+}
+
+class _ForegroundFixture implements ForegroundReads {
+  _ForegroundFixture(this.cloud);
+  final FakeCloud cloud;
+
+  @override
+  Future<void> checkRoot({
+    required bool Function() stillWanted,
+    required Future<void>? Function() selectedRead,
+  }) async => cloud.check();
+
+  @override
+  Future<RemoteItem> checkFile(String path, String etag) async =>
+      RemoteItem(path, ItemKind.file, cloud.versions[path]!);
+
+  @override
+  void clearCheckedRoot() {}
 }
 
 void main() {
@@ -131,6 +167,67 @@ void main() {
       }
       expect(engine.fullVerifications, 1);
       expect(cloud.uploads, 20);
+    },
+  );
+
+  test(
+    'connects before the first audit and opens between audit reads',
+    () async {
+      const selected = 'read-first.txt';
+      cloud.put(selected, 'selected file');
+      store.entries[selected] = Entry(selected, ItemKind.file)
+        ..etag = cloud.versions[selected]
+        ..override = Retention.cloud
+        ..status = 'cloud-only';
+      store.save();
+
+      final input = StreamController<Object?>();
+      final opened = Completer<String>();
+      final settled = Completer<void>();
+      var hashesAtConnect = -1;
+      var hashesAtOpen = -1;
+      var scanReads = 0;
+      final loop = WorkerLoop(engine, (event) {
+        final value = event as Map;
+        if (value['status'] == SyncStatus.checkingChanges.name &&
+            hashesAtConnect == -1) {
+          hashesAtConnect = scanReads;
+        }
+        if (value['event'] == 'open') {
+          hashesAtOpen = scanReads;
+          opened.complete(File(value['path'] as String).readAsStringSync());
+        }
+        if (value['status'] == SyncStatus.upToDate.name &&
+            !settled.isCompleted) {
+          settled.complete();
+        }
+      }, foregroundReads: () => _ForegroundFixture(cloud));
+      fs.beforeScanHash = () {
+        if (++scanReads != 1) return;
+        input
+          ..add({'action': 'visible', 'verify': true})
+          ..add({'action': 'open', 'path': selected, 'providerTracked': true});
+        // One deliberately slow descriptor-bound read, to exercise the
+        // checkpoint while the nineteen other audit reads are still pending.
+        sleep(const Duration(milliseconds: 20));
+      };
+      final done = loop.run(input.stream);
+      try {
+        expect(
+          await opened.future.timeout(const Duration(seconds: 5)),
+          'selected file',
+        );
+        await settled.future.timeout(const Duration(seconds: 5));
+        expect(hashesAtConnect, 0);
+        expect(hashesAtOpen, inInclusiveRange(1, 19));
+        expect(engine.fullVerifications, 1);
+        expect(engine.lastPass!.filesHashedBy['scan'], 20);
+      } finally {
+        input.add({'action': 'stop'});
+        await done;
+        await input.close();
+        closed = true;
+      }
     },
   );
 

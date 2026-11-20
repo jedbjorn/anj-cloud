@@ -32,10 +32,12 @@ object BackgroundChannel {
                 when (call.method) {
                     "attach" -> {
                         attached.complete(Unit)
+                        val (wifi, online) = NetworkMonitor.state(app)
                         result.success(
                             mapOf(
                                 "notifications" to Notifications.allowed(app),
-                                "wifi" to NetworkMonitor.onWifi(app),
+                                "wifi" to wifi,
+                                "online" to online,
                             ),
                         )
                     }

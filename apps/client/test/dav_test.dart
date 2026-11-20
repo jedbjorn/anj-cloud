@@ -1,16 +1,28 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:anj_cloud/core/access/documents_service.dart';
 import 'package:anj_cloud/core/sync/name_rule.dart';
 import 'package:anj_cloud/core/app/controller.dart';
 import 'package:anj_cloud/core/gateway/dav_api.dart';
+import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/name_policy.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
+import 'package:anj_cloud/platform/android/android_documents.dart';
+import 'package:anj_cloud/platform/native/native_root_fs.dart';
 
 import 'fakes.dart';
 import 'test_platform.dart';
+
+class _NetworkBinding extends AutomatedTestWidgetsFlutterBinding {
+  @override
+  bool get overrideHttpClient => false;
+}
 
 void main() {
   if (skipSuite('DAV client over a synthetic TLS gateway', opensslSkip)) return;
@@ -60,8 +72,13 @@ void main() {
     return result;
   }
 
-  String response(String href, {bool directory = false, int status = 200}) =>
-      '<d:response><d:href>$href</d:href><d:propstat><d:prop><d:resourcetype>${directory ? '<d:collection/>' : ''}</d:resourcetype><d:getetag>&quot;v1&quot;</d:getetag><d:getcontentlength>4</d:getcontentlength></d:prop><d:status>HTTP/1.1 $status Result</d:status></d:propstat></d:response>';
+  String response(
+    String href, {
+    bool directory = false,
+    int status = 200,
+    String version = 'v1',
+  }) =>
+      '<d:response><d:href>$href</d:href><d:propstat><d:prop><d:resourcetype>${directory ? '<d:collection/>' : ''}</d:resourcetype><d:getetag>&quot;$version&quot;</d:getetag><d:getcontentlength>4</d:getcontentlength></d:prop><d:status>HTTP/1.1 $status Result</d:status></d:propstat></d:response>';
   String listing(List<String> items) =>
       '<d:multistatus xmlns:d="DAV:">${items.join()}</d:multistatus>';
   setUpAll(() async {
@@ -349,7 +366,7 @@ void main() {
       }
     },
   );
-  test('mutual TLS succeeds only with a trusted client identity', () async {
+  Future<({File key, File cert})> enrolledIdentity() async {
     final clientKey = File('${fixture.path}/client.key');
     final csr = File('${fixture.path}/client.csr');
     final cert = File('${fixture.path}/client.crt');
@@ -384,6 +401,11 @@ void main() {
       '-days',
       '1',
     ]);
+    return (key: clientKey, cert: cert);
+  }
+
+  test('mutual TLS succeeds only with a trusted client identity', () async {
+    final identity = await enrolledIdentity();
     final mutual = await startServer(mutual: true);
     final address = origin.replace(port: mutual.port);
     handler = (request) async {
@@ -396,8 +418,8 @@ void main() {
     final enrolled = DavCloud(
       address,
       trust()
-        ..usePrivateKey(clientKey.path)
-        ..useCertificateChain(cert.path),
+        ..usePrivateKey(identity.key.path)
+        ..useCertificateChain(identity.cert.path),
     );
     try {
       await expectLater(missing.snapshot(), throwsA(isA<Exception>()));
@@ -408,6 +430,266 @@ void main() {
       await mutual.close(force: true);
     }
   });
+
+  test(
+    'Android foreground Open hands out bytes before a cold DAV walk completes',
+    () async {
+      final binding = _NetworkBinding();
+      final identity = await enrolledIdentity();
+      final mutual = await startServer(mutual: true);
+      final parent = Directory('${fixture.path}/foreground-root')..createSync();
+      final profile = Directory('${fixture.path}/foreground-profile');
+      final fs = NativeRootFs();
+      final tree = RootTree.setup(parent.path, 'foreground', fs);
+      final store = Manifest(profile);
+      final deviceOrigin = origin.replace(port: mutual.port).origin;
+      const path = 'chosen.txt';
+      for (final setting in {
+        'root': tree.root.path,
+        'staging': tree.staging.path,
+        'rootIdentity': fs.rootInfo(tree.fd).identity,
+        'retention': 'local',
+        'profileId': 'foreground',
+        'server': deviceOrigin,
+        'accountOrigin': deviceOrigin,
+        'accountUid': 'fixture-user',
+        'ca': ca.path,
+        'certificate': identity.cert.readAsStringSync(),
+        'certificateExpires': DateTime.now()
+            .add(const Duration(days: 365))
+            .toIso8601String(),
+      }.entries) {
+        store.setSetting(setting.key, setting.value);
+      }
+      store.entries[path] = Entry(path, ItemKind.file)
+        ..etag = '"v1"'
+        ..override = Retention.cloud
+        ..status = 'cloud-only'
+        ..size = 4;
+      store.save();
+      store.close();
+      tree.close();
+
+      final walk = Completer<void>();
+      final walking = Completer<void>();
+      final viewed = Completer<String>();
+      Completer<void>? rootReading;
+      Completer<void>? rootRelease;
+      var version = 'v1';
+      var offline = false;
+      var denied = false;
+      var rejectDownload = false;
+      handler = (request) async {
+        await request.drain<void>();
+        final reply = request.response;
+        final uri = request.uri.path;
+        if (denied && uri.startsWith('/dav/')) {
+          reply.statusCode = 403;
+          await reply.close();
+          return;
+        }
+        switch ((request.method, uri)) {
+          case ('PROPFIND', '/dav/'):
+            if (offline) {
+              (await reply.detachSocket(writeHeaders: false)).destroy();
+              return;
+            }
+            if (rootRelease case final wait?) {
+              rootReading!.complete();
+              await wait.future;
+            }
+            reply.statusCode = 207;
+            reply.write(
+              listing([
+                response('/dav/', directory: true),
+                for (final top in ['Documents', 'Music', 'Videos'])
+                  response('/dav/$top/', directory: true),
+                response('/dav/Slow/', directory: true),
+                response('/dav/$path', version: version),
+              ]),
+            );
+          case ('PROPFIND', '/dav/Slow'):
+            if (!walking.isCompleted) walking.complete();
+            await walk.future;
+            reply.statusCode = 207;
+            reply.write(listing([response('/dav/Slow/', directory: true)]));
+          case ('PROPFIND', '/dav/Documents' || '/dav/Music' || '/dav/Videos'):
+            reply.statusCode = 207;
+            reply.write(listing([response('$uri/', directory: true)]));
+          case ('PROPFIND', '/dav/chosen.txt'):
+            expect(request.headers.value('depth'), '0');
+            reply.statusCode = 207;
+            reply.write(listing([response('/dav/$path', version: version)]));
+          case ('GET', '/dav/chosen.txt'):
+            expect(request.headers.value('if-match'), '"$version"');
+            reply.statusCode = rejectDownload ? 412 : 200;
+            if (!rejectDownload) {
+              reply.headers.set('etag', '"$version"');
+              reply.write('read');
+            }
+          default:
+            reply.statusCode = 404;
+        }
+        await reply.close();
+      };
+
+      final controller = ClientController(
+        profile,
+        secrets: MemorySecrets()
+          ..values['anj-cloud:foreground:device-key'] = identity.key
+              .readAsStringSync(),
+        nativeLibrary: testNativeLibrary,
+        launcher: AndroidLauncher(),
+        androidForeground: true,
+        defaultNetworkPolicy: 'wifi',
+      );
+      final service =
+          AndroidDocuments.start(controller, profile.path) as DocumentsService;
+      final messenger = binding.defaultBinaryMessenger;
+      const apps = MethodChannel('cloud.anj/apps');
+      messenger.setMockMethodCallHandler(apps, (call) async {
+        expect(call.method, 'openDocument');
+        final id = (call.arguments as Map)['id'] as String;
+        expect(id, startsWith('w:'));
+        final descriptor = await service.open(
+          id,
+          'r',
+          const DocumentsCaller(CallerKind.document, documentRead: true),
+        );
+        final fd = descriptor['fd'] as int;
+        try {
+          viewed.complete(File('/proc/self/fd/$fd').readAsStringSync());
+        } finally {
+          fs.closeFd(fd);
+          await service.closed(descriptor['token'] as String);
+        }
+        return true;
+      });
+
+      Future<void> until(bool Function() ready) async {
+        final deadline = Stopwatch()..start();
+        while (!ready()) {
+          if (deadline.elapsed > const Duration(seconds: 5)) {
+            fail(
+              'Foreground condition not reached: ${controller.status}, '
+              '${controller.message}, ${controller.openNotice}, $requests',
+            );
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+      }
+
+      try {
+        controller.reportNetwork(wifi: false, online: true);
+        await controller.initialize();
+        await walking.future.timeout(const Duration(seconds: 5));
+        await until(() => controller.status == SyncStatus.checkingChanges);
+        expect(
+          controller.entries.any((entry) => entry['path'] == path),
+          isTrue,
+        );
+
+        controller.windowShown(verify: true);
+        controller.windowShown(verify: true);
+        final background = controller.backgroundRun();
+        controller.command('open', path);
+        await until(() => controller.status == SyncStatus.waiting);
+        expect(requests.where((r) => r['path'] == '/dav/$path'), isEmpty);
+
+        version = 'v2';
+        controller.reportNetwork(wifi: true, online: true);
+        await until(() => controller.openNotice?.contains('changed') == true);
+        expect(
+          requests.where(
+            (r) => r['method'] == 'GET' && r['path'] == '/dav/$path',
+          ),
+          isEmpty,
+        );
+
+        version = 'v1';
+        rejectDownload = true;
+        controller.command('open', path);
+        await until(
+          () =>
+              requests.any(
+                (r) => r['method'] == 'GET' && r['path'] == '/dav/$path',
+              ) &&
+              (controller.openNotice?.contains('changed') ?? false),
+        );
+        expect(viewed.isCompleted, isFalse);
+
+        rejectDownload = false;
+        controller.command('open', path);
+        expect(await viewed.future.timeout(const Duration(seconds: 5)), 'read');
+        expect(walk.isCompleted, isFalse);
+        expect(controller.status, SyncStatus.checkingChanges);
+        walk.complete();
+        expect((await background)['listed'], isTrue);
+        await until(() => controller.status == SyncStatus.upToDate);
+        expect(requests.where((r) => r['path'] == '/dav/Slow'), hasLength(1));
+
+        controller.setPaused(true);
+        await until(
+          () => controller.paused && controller.status == SyncStatus.paused,
+        );
+        final pausedRequests = requests
+            .where((r) => r['path'] == '/dav/$path')
+            .length;
+        // A second uncached file is unnecessary: foreground Open must check
+        // policy before reusing even an existing working copy.
+        controller.command('open', path);
+        await until(
+          () => controller.openNotice?.contains('Resume sync') == true,
+        );
+        expect(
+          requests.where((r) => r['path'] == '/dav/$path'),
+          hasLength(pausedRequests),
+        );
+
+        offline = true;
+        controller.setPaused(false);
+        await until(() => controller.status == SyncStatus.offline);
+        controller.reportNetwork(wifi: false, online: false);
+        await until(() => controller.status == SyncStatus.offline);
+        offline = false;
+        denied = true;
+        controller.reportNetwork(wifi: true, online: true);
+        await until(() => controller.status == SyncStatus.accessDenied);
+        final downloads = requests
+            .where((r) => r['method'] == 'GET' && r['path'] == '/dav/$path')
+            .length;
+        controller.command('open', path);
+        await until(() => controller.openNotice?.contains('revoked') == true);
+        expect(
+          requests.where(
+            (r) => r['method'] == 'GET' && r['path'] == '/dav/$path',
+          ),
+          hasLength(downloads),
+        );
+
+        denied = false;
+        rootReading = Completer<void>();
+        rootRelease = Completer<void>();
+        controller.windowShown(verify: true);
+        await rootReading.future.timeout(const Duration(seconds: 5));
+        expect(controller.status, SyncStatus.checkingServer);
+        rootRelease.complete();
+        rootRelease = null;
+        await until(() => controller.status == SyncStatus.upToDate);
+      } finally {
+        if (!walk.isCompleted) walk.complete();
+        if (rootRelease case final wait? when !wait.isCompleted) {
+          wait.complete();
+        }
+        await controller.stop();
+        service.dispose();
+        controller.dispose();
+        messenger.setMockMethodCallHandler(apps, null);
+        await mutual.close(force: true);
+      }
+    },
+    skip: linuxOnly('checks the Android provider descriptor through /proc'),
+  );
   test('existing account profile refuses another UID before certificate activation', () async {
     final profile = Directory('${fixture.path}/bound-profile');
     final store = Manifest(profile);
