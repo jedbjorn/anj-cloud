@@ -54,6 +54,7 @@ Future<void> main(List<String> args) async {
           'elapsed_ms': watch.elapsedMilliseconds,
           'full_walks': cloud.fullWalks,
           'folders_reused': cloud.foldersReused,
+          'deep_shared': items.singleWhere((item) => item.path == deep).shared,
           'deep': {
             for (final item in items)
               if (item.path.startsWith('$deep/')) item.path: item.etag,

@@ -127,9 +127,35 @@ class DavCloud
     File? source,
     List<int>? body,
   }) async {
+    final response = await _request(
+      method,
+      uri(path),
+      headers: headers,
+      source: source,
+      body: body,
+      timeoutFailure: const TransferInterrupted(
+        'Server did not respond. Work remains pending.',
+        TransferFailure.timeout,
+      ),
+    );
+    final limit = int.tryParse(
+      response.headers.value(uploadLimitHeader)?.trim() ?? '',
+    );
+    if (limit != null && limit > 0) uploadLimit = limit;
+    return response;
+  }
+
+  Future<HttpClientResponse> _request(
+    String method,
+    Uri url, {
+    Map<String, String> headers = const {},
+    File? source,
+    List<int>? body,
+    CloudFailure timeoutFailure = const CloudFailure('Server did not respond.'),
+  }) async {
     final HttpClientResponse response;
     try {
-      final req = await client.openUrl(method, uri(path));
+      final req = await client.openUrl(method, url);
       req.followRedirects = false;
       headers.forEach(req.headers.set);
       if (source != null) {
@@ -143,10 +169,7 @@ class DavCloud
         response = await req.close().timeout(const Duration(seconds: 30));
       } on TimeoutException {
         req.abort();
-        throw const TransferInterrupted(
-          'Server did not respond. Work remains pending.',
-          TransferFailure.timeout,
-        );
+        throw timeoutFailure;
       }
     } catch (_) {
       // The connection failed: whatever changed meanwhile is unknown, so
@@ -158,10 +181,6 @@ class DavCloud
         (response.statusCode == 401 || response.statusCode == 403)) {
       forgetListing();
     }
-    final limit = int.tryParse(
-      response.headers.value(uploadLimitHeader)?.trim() ?? '',
-    );
-    if (limit != null && limit > 0) uploadLimit = limit;
     return response;
   }
 
@@ -534,7 +553,7 @@ class DavCloud
         wallElapsed < _foregroundReadLifetime;
   }
 
-  Future<_ListingRoot> _takeListingRoot() async {
+  Future<_ListingRoot> _takeListingRoot(Set<String>? outgoingPaths) async {
     final prepared = _preparedRoot;
     _preparedRoot = null;
     if (prepared != null) {
@@ -543,11 +562,27 @@ class DavCloud
       // the freshness window and the profile must still trust its revision.
       if (result.generation == _generation &&
           result.revision == listingCache?.revision &&
-          _fresh(result.started, result.startedWall)) {
+          _fresh(result.started, result.startedWall) &&
+          // A prepared root may predate an outgoing share change.
+          (outgoingPaths == null ||
+              _matchesOutgoingRoot(result.children, outgoingPaths))) {
         return result;
       }
     }
     return _readListingRoot();
+  }
+
+  static bool _matchesOutgoingRoot(
+    List<RemoteItem> children,
+    Set<String> outgoingPaths,
+  ) {
+    final rootPaths = {for (final child in children) child.path};
+    return outgoingPaths.every(
+          (path) => rootPaths.contains(path.split('/').first),
+        ) &&
+        children.every(
+          (item) => item.shared == outgoingPaths.contains(item.path),
+        );
   }
 
   /// The whole tree (flag SC-057). The root is always listed. A folder whose
@@ -602,6 +637,23 @@ class DavCloud
       }
       _incomingObserved = null;
     }
+    final checkOutgoing = persistent && _incomingAvailable;
+    Set<String>? outgoingPaths;
+    final outgoingStarted = monotonic();
+    final outgoingStartedWall = wallClock();
+    if (checkOutgoing) {
+      try {
+        final paths = <String>{};
+        for (final share in await outgoingShares()) {
+          validateRelative(share.path);
+          paths.add(share.path);
+        }
+        outgoingPaths = paths;
+      } on Exception {
+        discardPreparedListingRoot();
+        // A live full walk can still read the DAV share properties.
+      }
+    }
     final generation = _generation;
     final revision = cache?.revision;
     if (cache != null && _cacheRevision != revision) {
@@ -609,7 +661,7 @@ class DavCloud
       _savedAge = null;
       discardPreparedListingRoot();
     }
-    final root = await _takeListingRoot();
+    final root = await _takeListingRoot(outgoingPaths);
     if (cache != null &&
         (generation != _generation || revision != cache.revision)) {
       throw const CloudFailure('Cloud listing changed during validation.');
@@ -622,9 +674,12 @@ class DavCloud
         _incomingAvailable &&
         observed != null &&
         _fresh(observed.started, observed.startedWall);
+    final outgoingFresh =
+        outgoingPaths != null && _fresh(outgoingStarted, outgoingStartedWall);
     final reusable =
         !persistent ||
         (sharesFresh &&
+            outgoingFresh &&
             saved != null &&
             server != null &&
             wall >= saved.wall &&
@@ -639,7 +694,27 @@ class DavCloud
       _savedAge = null;
     }
     final traversalRevision = cache?.revision;
-    if (persistent && previous != null) _markShareFolders(previous);
+    final refreshParents = <String>{};
+    if (persistent && previous != null) {
+      _markShareFolders(previous);
+      // Sharing changes no folder ETag. Re-read the parents of newly
+      // shared or unshared items, following their ancestors through any
+      // otherwise reusable branches. DAV supplies the item's share bit.
+      final changedShares = outgoingPaths!.toSet();
+      for (final folder in previous.values) {
+        for (final child in folder.children) {
+          if (child.shared && !changedShares.remove(child.path)) {
+            changedShares.add(child.path);
+          }
+        }
+      }
+      for (final path in changedShares) {
+        var parent = p.posix.dirname(path);
+        while (parent != '.' && refreshParents.add(parent)) {
+          parent = p.posix.dirname(parent);
+        }
+      }
+    }
     _listing = null;
     final folders = <String, ListedFolder>{};
     final entries = <String, RemoteItem>{};
@@ -665,6 +740,7 @@ class DavCloud
       final stored = previous?[directory];
       if (self != null &&
           stored != null &&
+          !refreshParents.contains(directory) &&
           stored.matches(self, persistent: persistent) &&
           ((!persistent && pruneShares) ||
               (!insideShare && !stored.holdsShare))) {
@@ -717,7 +793,7 @@ class DavCloud
         _lastFullWalkWall = wallClock();
         fullWalks++;
       }
-      if (cache != null && sharesFresh && server != null) {
+      if (cache != null && sharesFresh && outgoingFresh && server != null) {
         final finished = wallClock().millisecondsSinceEpoch;
         if (finished >= wall) {
           final age = (
@@ -977,26 +1053,19 @@ class DavCloud
   /// dates, no error.
   @override
   Future<AddedPage?> addedSince(int after) async {
-    final req = await client.getUrl(
+    final response = await _request(
+      'GET',
       origin.replace(
         path: '/v1/files/added',
         queryParameters: {'after': '$after'},
       ),
     );
-    req.followRedirects = false;
-    final HttpClientResponse response;
-    try {
-      response = await req.close().timeout(const Duration(seconds: 30));
-    } on TimeoutException {
-      req.abort();
-      throw const CloudFailure('Server did not respond.');
-    }
     if (response.statusCode == 404) {
-      await response.drain<void>();
+      await _watchResponseBody(response).drain<void>();
       return null;
     }
     if (response.statusCode != 200) {
-      await response.drain<void>();
+      await _watchResponseBody(response).drain<void>();
       failure(response.statusCode);
     }
     return parseAddedPage(await boundedBody(response));
@@ -1035,23 +1104,14 @@ class DavCloud
     Map<String, Object?>? body,
     required bool missingIsNull,
   }) async {
-    final req = await client.openUrl(method, origin.replace(path: path));
-    req.followRedirects = false;
-    if (body != null) {
-      final bytes = utf8.encode(jsonEncode(body));
-      req.headers.contentType = ContentType.json;
-      req.contentLength = bytes.length;
-      req.add(bytes);
-    }
-    final HttpClientResponse response;
-    try {
-      response = await req.close().timeout(const Duration(seconds: 30));
-    } on TimeoutException {
-      req.abort();
-      throw const CloudFailure('Server did not respond.');
-    }
+    final response = await _request(
+      method,
+      origin.replace(path: path),
+      headers: {if (body != null) 'Content-Type': ContentType.json.toString()},
+      body: body == null ? null : utf8.encode(jsonEncode(body)),
+    );
     if (missingIsNull && response.statusCode == 404) {
-      await response.drain<void>();
+      await _watchResponseBody(response).drain<void>();
       return null;
     }
     final text = await boundedBody(response);

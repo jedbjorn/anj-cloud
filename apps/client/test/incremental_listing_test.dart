@@ -122,6 +122,9 @@ void main() {
   late DateTime serverClock;
   late int incomingStatus;
   late int incomingReads;
+  late int outgoingStatus;
+  late int outgoingReads;
+  bool interruptedAddedPage = false;
   late int fileReads;
   String? interruptedDownload;
 
@@ -202,10 +205,9 @@ void main() {
         response.headers.contentType = ContentType.json;
         response.write(jsonEncode(tree.incoming));
       } else if (route.startsWith('/v1/shares')) {
-        // Outgoing shares by id: '7' is the one share, of [sharePath].
-        final outgoing = {
+        Map<String, String> outgoing(String path) => {
           'share_id': '7',
-          'path': sharePath,
+          'path': path,
           'recipient_id': 'bob',
           'recipient_display_name': 'Bob',
           'permission': 'edit',
@@ -213,13 +215,17 @@ void main() {
         response.headers.contentType = ContentType.json;
         if (request.method == 'POST') tree.sharedOut.add(sharePath);
         if (request.method == 'DELETE') tree.sharedOut.remove(sharePath);
+        if (route == '/v1/shares/outgoing') {
+          outgoingReads++;
+          response.statusCode = outgoingStatus;
+        }
         response.write(
           jsonEncode(
             route == '/v1/shares/outgoing'
-                ? [outgoing]
+                ? tree.sharedOut.map(outgoing).toList()
                 : request.method == 'DELETE'
                 ? {}
-                : outgoing,
+                : outgoing(sharePath),
           ),
         );
       } else if (request.method == 'PROPFIND' && route.startsWith('/dav/')) {
@@ -234,6 +240,16 @@ void main() {
         } else {
           response.statusCode = 207;
           response.write(tree.listing(path));
+        }
+      } else if (route == '/v1/files/added') {
+        response.statusCode = 404;
+        if (interruptedAddedPage) {
+          response.contentLength = 100;
+          final socket = await response.detachSocket();
+          socket.add([97]);
+          await socket.flush();
+          await socket.close();
+          return;
         }
       } else if (request.method == 'GET' && route.startsWith('/dav/')) {
         final path = Uri.decodeFull(route.substring(5));
@@ -272,6 +288,9 @@ void main() {
     serverClock = wall;
     incomingStatus = 200;
     incomingReads = 0;
+    outgoingStatus = 200;
+    outgoingReads = 0;
+    interruptedAddedPage = false;
     fileReads = 0;
     interruptedDownload = null;
     onPropfind = null;
@@ -699,9 +718,11 @@ void main() {
           restart();
           final writes = profile.rowsPersisted;
           final reads = incomingReads;
+          final outgoing = outgoingReads;
           await api.incomingShares();
           await listsLikeAFullWalk();
           expect(incomingReads - reads, 1);
+          expect(outgoingReads - outgoing, 1);
           expect(propfinds, ['']);
           expect(profile.rowsPersisted - writes, 1);
           expect(profile.setting(payload), data);
@@ -754,18 +775,109 @@ void main() {
       expect(propfinds, hasLength(folderCount()));
     });
 
-    test(
-      'a connection failure outside listing persists invalidation',
-      () async {
+    for (final (route, read) in <(String, Future<Object?> Function(DavCloud))>[
+      ('DAV', (cloud) => cloud.request('HEAD', '')),
+      ('outgoing shares', (cloud) => cloud.outgoingShares()),
+      ('file dates', (cloud) => cloud.addedSince(0)),
+    ]) {
+      test('a $route connection failure persists invalidation', () async {
         await list();
+        expect(profile.setting(anchor), isNotNull);
         final port = server.port;
         await server.close(force: true);
-        await expectLater(api.request('HEAD', ''), throwsA(isA<Exception>()));
+        await expectLater(read(api), throwsA(isA<IOException>()));
         expect(profile.setting(anchor), isNull);
         server = await serve(port);
         restart();
         await listsLikeAFullWalk();
         expect(propfinds, hasLength(folderCount()));
+      });
+    }
+
+    test(
+      'a missing file-date route keeps trust unless its body fails',
+      () async {
+        await list();
+        final trusted = profile.setting(anchor);
+        expect(trusted, isNotNull);
+        expect(await api.addedSince(0), isNull);
+        expect(profile.setting(anchor), trusted);
+
+        interruptedAddedPage = true;
+        await expectLater(api.addedSince(0), throwsA(isA<HttpException>()));
+        expect(profile.setting(anchor), isNull);
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    for (final wasShared in [false, true]) {
+      test(
+        'a cold check discovers an outgoing share ${wasShared ? 'removal' : 'creation'}',
+        () async {
+          tree.folder('T2');
+          tree.folder('T2/L0');
+          tree.folder(sharePath);
+          if (wasShared) tree.sharedOut.add(sharePath);
+          expect((await list())[sharePath]!.shared, wasShared);
+          api.close();
+          final other = connect();
+          addTearDown(other.close);
+          final etags = Map.of(tree.etags);
+          if (wasShared) {
+            await other.removeShare('7');
+          } else {
+            await other.createShare(sharePath, 'bob', SharePermission.edit);
+          }
+          expect(tree.etags, etags);
+
+          restart();
+          final reused = await listsLikeAFullWalkWith();
+          expect(reused[sharePath]!.shared, !wasShared);
+          expect(propfinds, unorderedEquals(['', 'T2', 'T2/L0', sharePath]));
+          final reference = connect();
+          addTearDown(reference.close);
+          expect(reused.map((path, item) => MapEntry(path, item.shared)), {
+            for (final item in await reference.snapshot())
+              item.path: item.shared,
+          });
+          restart();
+          expect((await list())[sharePath]!.shared, !wasShared);
+          expect(propfinds, ['']);
+        },
+      );
+    }
+
+    test('a prepared root predating a share change is read again', () async {
+      await list();
+      restart();
+      await api.prepareListingRoot();
+      tree.sharedOut.add('T0');
+      expect((await list())['T0']!.shared, isTrue);
+      expect(propfinds.where((path) => path.isEmpty), hasLength(2));
+    });
+
+    test(
+      'an unavailable outgoing list uses live DAV without persisting trust',
+      () async {
+        tree.folder('T2');
+        tree.folder('T2/L0');
+        tree.folder(sharePath);
+        await list();
+        tree.sharedOut.add(sharePath);
+        for (final status in [404, 503]) {
+          restart();
+          outgoingStatus = status;
+          expect((await list())[sharePath]!.shared, isTrue);
+          expect(propfinds, hasLength(folderCount()));
+          expect(profile.setting(anchor), isNull);
+        }
+        outgoingStatus = 200;
+        restart();
+        expect((await list())[sharePath]!.shared, isTrue);
+        expect(propfinds, hasLength(folderCount()));
+        expect(profile.setting(anchor), isNotNull);
       },
     );
 

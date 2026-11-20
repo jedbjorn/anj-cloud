@@ -64,11 +64,11 @@ async def client_check(stack, run, config, device, phase, name):
         "dav_methods": dict(methods),
         "file_body_bytes": sum(e["bytes"] for e in requests if e["method"] == "GET"
                                and e["route"] == "dav-read" and e["status"] in (200, 206)),
-        "incoming_statuses": share_statuses,
+        "share_statuses": share_statuses,
     }
     (run / f"{name}.json").write_text(json.dumps(report, indent=2) + "\n")
-    if phase not in ("fresh", "interrupt") and share_statuses != [200]:
-        raise RuntimeError(f"{name} did not validate current incoming-share state")
+    if phase not in ("fresh", "interrupt") and share_statuses != [200, 200]:
+        raise RuntimeError(f"{name} did not validate current incoming and outgoing shares")
     if methods - Counter({"PROPFIND": methods["PROPFIND"]}):
         raise RuntimeError(f"{name} issued unexpected DAV requests")
     print(f"{name}: {methods['PROPFIND']} gateway PROPFINDs, {report['file_body_bytes']} file bytes", flush=True)
@@ -145,6 +145,24 @@ async def run_fixture(stack, run):
             raise RuntimeError("The first restart missed a deep change or reused no unaffected folders")
         print("PASS three quiet restarts, interrupted publish, and four deep changes agree with fresh walks",
               flush=True)
+
+        body, _ = await writer.request(
+            "POST", "/v1/shares", headers={"Content-Type": "application/json"}, expected=(201,),
+            data=json.dumps({"path": deep, "recipient_id": FIXTURE_USERS[1], "permission": "view"}),
+        )
+        share_id = json.loads(body)["share_id"]
+        try:
+            shared = await check("cached", "outgoing-created")
+            shared_fresh = await check("fresh", "fresh-outgoing-created")
+        finally:
+            await writer.request("DELETE", f"/v1/shares/{share_id}")
+        unshared = await check("cached", "outgoing-removed")
+        unshared_fresh = await check("fresh", "fresh-outgoing-removed")
+        for expected, cached, walked in [(True, shared, shared_fresh), (False, unshared, unshared_fresh)]:
+            if (cached["deep_shared"] != expected or cached["sha256"] != walked["sha256"]
+                    or cached["full_walks"] or not cached["folders_reused"] or cached["file_body_bytes"]):
+                raise RuntimeError("An outgoing share change did not match the fresh walk with subtree reuse")
+        print("PASS cold restarts after outgoing share creation and removal agree with fresh walks", flush=True)
     finally:
         if writer is not None:
             try:
