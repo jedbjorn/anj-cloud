@@ -15,6 +15,7 @@ typedef MissingEditorInspection = ({
   Operation? owner,
   String? reason,
   bool legacy,
+  bool cleanupUnconfirmed,
 });
 
 /// Explicit repair of missing working-copy records in Android phone folders.
@@ -28,6 +29,8 @@ class MissingEditorCopies {
 
   static const missingWarning = 'Working copy missing; root/cloud retained';
   static const copyPresent = 'The editor copy is present.';
+  static const _relatedWork =
+      'Finishing, upload or recovery work still refers to this copy.';
   static const _noticeKey = 'missingEditorNotice';
 
   bool applies(String path) => tree.phoneFolders != null && inPhoneFolder(path);
@@ -98,9 +101,7 @@ class MissingEditorCopies {
     if (work.data['reclaiming'] == true ||
         work.data['uploadTip'] != null ||
         owner != null &&
-            (owner.phase != 'complete' ||
-                owner.data['releasing'] != null ||
-                owner.data['installing'] != null) ||
+            (owner.phase != 'complete' || owner.data['installing'] != null) ||
         manifest.operations.values.any(
           (op) =>
               op.data['workingId'] == work.id ||
@@ -115,9 +116,7 @@ class MissingEditorCopies {
               op.kind == 'finish-editing' &&
                   (op.data['sessions'] as List?)?.contains(work.id) == true,
         )) {
-      return _keep(
-        'Finishing, upload or recovery work still refers to this copy.',
-      );
+      return _keep(_relatedWork);
     }
     final recorded = shared
         ? owner?.data['sharedDirectoryIdentity']
@@ -132,9 +131,32 @@ class MissingEditorCopies {
     if (_checkAbsence(name, directory) case final problem?) {
       return _keep(problem);
     }
+    final closureUnknown =
+        tokens is! List || work.data[providerClosureUnknownKey] == true;
+    final releaseIntent = owner?.data['releasing'];
+    if (releaseIntent != null) {
+      // The build-177 intent was saved before unlink. With neither historic
+      // shared directory nor closure proof, the current absence only explains
+      // the notice. The same release guard still refuses Clear and Dismiss.
+      if (shared &&
+          recorded == null &&
+          closureUnknown &&
+          (tokens == null || tokens is List) &&
+          releaseIntent is String &&
+          releaseIntent.isNotEmpty) {
+        return (
+          directory: directory,
+          owner: owner,
+          reason: _relatedWork,
+          legacy: false,
+          cleanupUnconfirmed: true,
+        );
+      }
+      return _keep(_relatedWork);
+    }
     final reason = recorded == null
         ? 'The original editor staging folder could not be verified.'
-        : tokens is! List || work.data[providerClosureUnknownKey] == true
+        : closureUnknown
         ? 'Could not verify that all apps closed this editor copy.'
         : null;
     return (
@@ -142,6 +164,7 @@ class MissingEditorCopies {
       owner: owner,
       reason: reason,
       legacy: reason != null,
+      cleanupUnconfirmed: false,
     );
   }
 
@@ -173,8 +196,13 @@ class MissingEditorCopies {
   static bool _names(String? staged, String name) =>
       staged != null && p.basename(staged) == name;
 
-  static MissingEditorInspection _keep(String reason) =>
-      (directory: null, owner: null, reason: reason, legacy: false);
+  static MissingEditorInspection _keep(String reason) => (
+    directory: null,
+    owner: null,
+    reason: reason,
+    legacy: false,
+    cleanupUnconfirmed: false,
+  );
 
   String _condition(Operation work, MissingEditorInspection proof) =>
       jsonEncode([
@@ -192,7 +220,7 @@ class MissingEditorCopies {
 
   /// Describes the notice actions without creating, returning or saving a
   /// notice. A legacy condition would get a claim on ordinary projection.
-  ({Object dismiss, Object undo, String? dismissedMissingArtifact})
+  ({Object dismiss, Object undo, String? detailsOnlyMissingArtifact})
   diagnosticNotice(
     Entry entry,
     Operation work,
@@ -205,7 +233,7 @@ class MissingEditorCopies {
       return (
         dismiss: 'unknown',
         undo: 'unknown',
-        dismissedMissingArtifact: null,
+        detailsOnlyMissingArtifact: null,
       );
     }
     final raw = work.data[_noticeKey];
@@ -225,7 +253,10 @@ class MissingEditorCopies {
           ? legacy && !(unchanged && dismissed)
           : 'unknown',
       undo: !observedPresent && dismissed && (!legacy || unchanged),
-      dismissedMissingArtifact: unchanged && dismissed ? proof.owner?.id : null,
+      detailsOnlyMissingArtifact:
+          proof?.cleanupUnconfirmed == true || unchanged && dismissed
+          ? proof?.owner?.id
+          : null,
     );
   }
 
@@ -281,7 +312,7 @@ class MissingEditorCopies {
         'dismissEditorWarningClaim': claim,
       if (legacy && dismissed) 'editorWarningDismissed': true,
       if (legacy && dismissed && proof!.owner != null)
-        'dismissedMissingArtifact': proof.owner!.id,
+        'detailsOnlyMissingArtifact': proof.owner!.id,
     };
   }
 

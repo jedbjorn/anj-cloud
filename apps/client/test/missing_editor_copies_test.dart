@@ -111,25 +111,39 @@ class _Fixture {
   (String id, String owner, File file)? present;
   String editorResult = '';
 
+  void markLegacyReleaseIntents({Iterable<int> slots = const [0, 1]}) {
+    read((store) {
+      for (final slot in slots) {
+        final (id, owner, _) = absent[slot];
+        store.operations[owner]!.data['releasing'] = store.operations[id]!.hash;
+      }
+      store.save();
+    });
+  }
+
   Future<void> seed({
     bool mixed = false,
     bool paused = false,
     bool parkFirstCopy = false,
     bool legacy = false,
     bool keepNamedCopy = false,
+    bool fromCloud = false,
   }) async {
     final root = Directory('${dir.path}/root')..createSync();
     final staging = Directory('${dir.path}/private-stage');
     for (final folder in phoneFolderNames.values) {
       Directory('${access.base}/$folder').createSync(recursive: true);
     }
-    original.writeAsStringSync(_original);
+    if (!fromCloud) original.writeAsStringSync(_original);
     final store = Manifest(profile)
       ..setSetting('root', root.path)
       ..setSetting('staging', staging.path)
       ..setSetting('accountUid', 'anonymous-fixture')
       ..setSetting('accountOrigin', 'https://fixture.invalid');
-    final routing = MappedRootFs(access.layout, testNativeLibrary);
+    if (fromCloud) store.setSetting('retention', 'local');
+    final routing = fromCloud
+        ? AndroidPhoneRootFs(access.layout, testNativeLibrary)
+        : MappedRootFs(access.layout, testNativeLibrary);
     final engine = SyncEngine(
       store,
       RootTree(root, staging, routing),
@@ -321,6 +335,637 @@ void main() {
   late _Fixture fixture;
   setUp(() => fixture = _Fixture());
   tearDown(() => fixture.close());
+
+  testWidgets('legacy release intents are Details-only on first projection', (
+    tester,
+  ) async {
+    String retainedState() {
+      late String snapshot;
+      fixture.read((store) {
+        final entry = store.entries[_path]!;
+        expect(
+          entry.workingCopy,
+          store.operations[fixture.absent.last.$1]!.staged,
+        );
+        expect(entry.override, Retention.local);
+        snapshot = jsonEncode([
+          entry.workingCopy,
+          entry.fileId,
+          entry.etag,
+          for (final (id, owner, file) in fixture.absent) ...[
+            store.operations[id]!.toJson(),
+            store.operations[owner]!.toJson(),
+            file.existsSync(),
+          ],
+        ]);
+      });
+      return snapshot;
+    }
+
+    await tester.runAsync(() async {
+      await fixture.seed(legacy: true, fromCloud: true);
+      fixture.markLegacyReleaseIntents();
+    });
+    final before = retainedState();
+    Map<String, dynamic>? first;
+    Map<String, dynamic>? beforeRestart;
+    fixture.controller.addListener(() {
+      for (final row in fixture.controller.entries) {
+        if (row['path'] == _path && !identical(row, beforeRestart)) {
+          first ??= row;
+        }
+      }
+    });
+    await _mount(tester, fixture);
+
+    void expectQuiet(Map<String, dynamic> row) {
+      expect(hasProblem(row), isFalse, reason: 'The first row has no warning');
+      expect(hasEditing(row), isFalse);
+      expect(hasQueuedWork(row), isFalse);
+      expect(rowBadge(row), RowBadge.local);
+      expect(missingEditorClaims(row), isEmpty);
+      expect(editorWarningClaims(row), isEmpty);
+      expect(editorWarningClaims(row, undo: true), isEmpty);
+      expect(row['localArtifacts'], containsPair('uncertain', false));
+      expect(row['localArtifacts'], containsPair('count', 0));
+      expect(
+        RegExp('Cleanup could not be confirmed')
+            .allMatches(workingCopyDetails(row)),
+        hasLength(2),
+      );
+    }
+
+    expectQuiet(first!);
+    expectQuiet(fixture.row);
+    expect(_attention(tester, _path), isFalse);
+    expect(_attention(tester, 'Music'), isFalse);
+    expect(find.text('Dismiss warning'), findsNothing);
+    expect(find.text('Finish editing'), findsNothing);
+    await _openDetails(tester);
+    expect(
+      find.textContaining('Cleanup could not be confirmed', findRichText: true),
+      findsWidgets,
+    );
+    expect(find.widgetWithText(TextButton, 'Undo'), findsNothing);
+    await tester.tap(find.widgetWithText(TextButton, 'Close'));
+    await tester.pumpAndSettle();
+
+    await tester.runAsync(() async {
+      await fixture.controller.stop();
+      expect(
+        File('${fixture.profile.path}/cloud-mutations').readAsStringSync(),
+        '0,0,0',
+      );
+      expect(retainedState(), before);
+      beforeRestart = fixture.row;
+      first = null;
+      await fixture.controller.start();
+      final pass = await fixture.controller.backgroundRun(
+        timeout: const Duration(seconds: 5),
+      );
+      expect(pass['timedOut'], isNot(true));
+    });
+    await tester.pumpAndSettle();
+    expectQuiet(first!);
+    expectQuiet(fixture.row);
+    expect(_attention(tester, _path), isFalse);
+    expect(_attention(tester, 'Music'), isFalse);
+    expect(fixture.original.readAsStringSync(), _original);
+    await tester.runAsync(fixture.controller.stop);
+    expect(
+      File('${fixture.profile.path}/cloud-mutations').readAsStringSync(),
+      '0,0,0',
+    );
+    expect(retainedState(), before);
+  });
+
+  testWidgets('an existing acknowledgement survives Details-only projection', (
+    tester,
+  ) async {
+    await tester.runAsync(
+      () => fixture.seed(legacy: true, paused: true, parkFirstCopy: true),
+    );
+    await _mount(tester, fixture);
+    final [first, second] = editorWarningClaims(fixture.row);
+    late Map<String, dynamic> undo;
+    await tester.runAsync(() async {
+      fixture.controller.command(
+        'dismissEditorWarnings',
+        _path,
+        sessions: [first],
+      );
+      await _Fixture.until(
+        () => editorWarningClaims(fixture.row, undo: true).isNotEmpty,
+      );
+      undo = editorWarningClaims(fixture.row, undo: true).single;
+      await fixture.controller.stop();
+      fixture.markLegacyReleaseIntents();
+      await fixture.controller.start();
+      await _Fixture.until(() => !hasProblem(fixture.row));
+      expect(editorWarningClaims(fixture.row, undo: true), [undo]);
+      expect(editorWarningClaims(fixture.row), isEmpty);
+      fixture.controller.command(
+        'dismissEditorWarnings',
+        _path,
+        sessions: [second],
+      );
+      await _Fixture.until(
+        () => fixture.editorResult.contains('still refers to this copy'),
+      );
+      expect(editorWarningClaims(fixture.row, undo: true), [undo]);
+    });
+
+    await tester.pumpAndSettle();
+    await _openDetails(tester);
+    expect(
+      find.textContaining('Warning dismissed', findRichText: true),
+      findsOneWidget,
+    );
+    await tester.tap(find.widgetWithText(TextButton, 'Undo'));
+    await tester.pumpAndSettle();
+    await tester.runAsync(() async {
+      await _Fixture.until(
+        () => editorWarningClaims(fixture.row, undo: true).isEmpty,
+      );
+      fixture.controller.command('undoEditorWarnings', _path, sessions: [undo]);
+      await _Fixture.until(
+        () => fixture.editorResult.contains('editor warning changed'),
+      );
+      await fixture.controller.stop();
+      final (_, _, file) = fixture.absent.first;
+      fixture.parkedCopy.renameSync(file.path);
+      file.writeAsStringSync(_edit);
+      await fixture.controller.start();
+      await _Fixture.until(() => finishableCopies(fixture.row).isNotEmpty);
+      expect(libraryStatus(fixture.row), contains('available with changes'));
+      expect(finishableCopies(fixture.row).single['id'], first['id']);
+      expect(
+        workingCopyDetails(fixture.row),
+        contains('Cleanup could not be confirmed'),
+      );
+      expect(fixture.original.readAsStringSync(), _original);
+    });
+    await tester.pumpAndSettle();
+    expect(find.text('Finish editing'), findsOneWidget);
+    expect(_attention(tester, _path), isTrue);
+    expect(_attention(tester, 'Music'), isTrue);
+  });
+
+  testWidgets('Details-only notices leave another artifact and Clear visible', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      await fixture.seed(legacy: true, paused: true);
+      fixture.markLegacyReleaseIntents(slots: [0]);
+      final native = NativeRootFs(testNativeLibrary);
+      final stageFd = native.openRoot(fixture.access.staging);
+      try {
+        fixture.read((store) {
+          final (session, owner, _) = fixture.absent.last;
+          store.operations[session]!.data[providerOpenTokensKey] = <String>[];
+          store.operations[owner]!.data['sharedDirectoryIdentity'] = native
+              .identity(stageFd);
+          final name = '${sharedStagingTag}download-independent';
+          store.operations['independent-download'] = Operation(
+            'independent-download',
+            'artifact',
+            _path,
+            phase: 'complete',
+            staged: p.join(store.setting('staging')!, name),
+          )..data = {'role': 'download', 'name': name};
+          store.save();
+        });
+      } finally {
+        native.closeFd(stageFd);
+      }
+    });
+    await _mount(tester, fixture);
+    expect(
+      missingEditorClaims(fixture.row).single['id'],
+      fixture.absent.last.$1,
+    );
+    await _openClear(tester);
+    await _confirmClear(tester);
+    await tester.runAsync(
+      () => _Fixture.until(() => missingEditorClaims(fixture.row).isEmpty),
+    );
+    await tester.pumpAndSettle();
+    expect(hasEditing(fixture.row), isFalse);
+    expect(fixture.row['localArtifacts'], containsPair('uncertain', true));
+    expect(_attention(tester, _path), isTrue);
+    expect(_attention(tester, 'Music'), isTrue);
+    expect(
+      workingCopyDetails(fixture.row),
+      contains('Cleanup could not be confirmed'),
+    );
+    fixture.access.granted = false;
+    await tester.runAsync(() async {
+      await fixture.controller.checkPhoneFolders();
+      await _Fixture.until(
+        () => libraryStatus(fixture.row).contains('All files access'),
+      );
+      await fixture.controller.stop();
+      expect(
+        File('${fixture.profile.path}/cloud-mutations').readAsStringSync(),
+        '0,0,0',
+      );
+    });
+    await tester.pumpAndSettle();
+    expect(_attention(tester, _path), isTrue);
+    expect(_attention(tester, 'Music'), isTrue);
+    expect(fixture.original.readAsStringSync(), _original);
+    fixture.read((store) {
+      final (kept, owner, _) = fixture.absent.first;
+      expect(store.operations[kept], isNotNull);
+      expect(store.operations[owner]!.data['releasing'], isNotNull);
+      expect(store.operations[fixture.absent.last.$1], isNull);
+      expect(store.operations['independent-download'], isNotNull);
+    });
+  });
+
+  for (final action in [
+    'delete',
+    'move',
+    'finish and move',
+    'finish a previously uploaded edit and move',
+    'cloud move',
+  ]) {
+    test('mapped $action settles with a sync peer', () async {
+      final move = action != 'delete';
+      final previouslyUploaded =
+          action == 'finish a previously uploaded edit and move';
+      final finishEdit = action == 'finish and move' || previouslyUploaded;
+      final cloudMove = action == 'cloud move';
+      await fixture.seed(
+        legacy: true,
+        fromCloud: true,
+        parkFirstCopy: move && !cloudMove,
+      );
+      fixture.markLegacyReleaseIntents();
+      final cloud = await _cloud();
+      final before = cloud.counter;
+      final fileId = cloud.fileIds[_path];
+      final peerProfile = Directory('${fixture.dir.path}/peer-profile');
+      final peerRoot = Directory('${fixture.dir.path}/peer-root')..createSync();
+      final peerStage = Directory('${fixture.dir.path}/peer-stage');
+      final peerSource = File('${peerRoot.path}/$_path');
+      const destination = 'Music/moved.mp3';
+      final phoneDestination = File('${fixture.access.base}/$destination');
+      final peerDestination = File('${peerRoot.path}/$destination');
+
+      Future<void> sync({bool act = false, bool finish = false}) async {
+        final store = Manifest(fixture.profile);
+        final routing = AndroidPhoneRootFs(
+          fixture.access.layout,
+          testNativeLibrary,
+        );
+        final phone = SyncEngine(
+          store,
+          RootTree(
+            Directory(store.setting('root')!),
+            Directory(store.setting('staging')!),
+            routing,
+          ),
+          cloud,
+        );
+        final peerStore = Manifest(peerProfile)
+          ..setSetting('retention', 'local');
+        final peer = SyncEngine(
+          peerStore,
+          RootTree(peerRoot, peerStage, NativeRootFs(testNativeLibrary)),
+          cloud,
+        );
+        try {
+          if (act) {
+            await phone.tick();
+            await peer.tick();
+            expect(peerSource.readAsStringSync(), _original);
+            expect(fixture.original.readAsStringSync(), _original);
+            expect(cloud.counter, before);
+            expect(cloud.deletes, 0);
+            expect(cloud.moves, isEmpty);
+            routing.setPaused(true);
+            await phone.tick();
+            await peer.tick();
+            expect(fixture.original.readAsStringSync(), _original);
+            expect(peerSource.readAsStringSync(), _original);
+            expect(cloud.counter, before);
+            expect(cloud.deletes, 0);
+            expect(cloud.moves, isEmpty);
+            routing.setPaused(false);
+            phone.requestFullVerification();
+            if (cloudMove) {
+              await cloud.move(
+                _path,
+                destination,
+                etag: cloud.versions[_path]!,
+              );
+              await peer.tick();
+              expect(peerDestination.readAsStringSync(), _original);
+            } else if (move) {
+              fixture.original.renameSync(phoneDestination.path);
+              phone.markDirty(_path);
+              phone.markDirty(destination);
+              final returned = fixture.absent.first.$3;
+              phone.barrier = (phase, _) {
+                if (phase == 'move-before-dispatch') {
+                  fixture.parkedCopy.renameSync(returned.path);
+                  returned.writeAsStringSync(_edit);
+                }
+              };
+              await phone.tick();
+              expect(cloud.moves, isEmpty);
+              expect(cloud.deletes, 0);
+              expect(cloud.files.keys, [_path]);
+              expect(returned.readAsStringSync(), _edit);
+              final held = await projectEntry(phone, store.entries[_path]!);
+              expect(held['status'], contains('editor copy evidence changed'));
+              expect(
+                finishableCopies(held).single['id'],
+                fixture.absent.first.$1,
+              );
+              phone.barrier = null;
+              if (finishEdit) {
+                if (previouslyUploaded) {
+                  await phone.tick();
+                  expect(cloud.files[_path], utf8.encode(_edit));
+                  // A client that uploaded before this fix recorded the
+                  // new cloud version as the Local baseline at the old name.
+                  final edited = _digest(returned);
+                  store.entries[_path]!
+                    ..etag = cloud.versions[_path]
+                    ..baselineHash = edited
+                    ..localHash = edited
+                    ..recordRemoteVersion(cloud.versions[_path]!, edited);
+                  store.save();
+                }
+                final row = await projectEntry(phone, store.entries[_path]!);
+                final copy = finishableCopies(row).single;
+                phone.editing.request(_path, [Map<String, dynamic>.from(copy)]);
+                expect(phone.editing.requests, hasLength(1));
+                expect(returned.readAsStringSync(), _edit);
+                expect(phoneDestination.readAsStringSync(), _original);
+                return;
+              }
+              returned.renameSync(fixture.parkedCopy.path);
+            } else {
+              fixture.original.deleteSync();
+              phone.markDirty(_path);
+              phone.debugElapsed = () => Duration.zero;
+              await phone.tick();
+              expect(cloud.deletes, 0);
+              phone.debugElapsed = () => const Duration(minutes: 1);
+            }
+          }
+          await phone.tick();
+          if (finish) {
+            expect(
+              phone.editing.requests,
+              isEmpty,
+              reason: store.entries[_path]?.status,
+            );
+            expect(fixture.absent.first.$3.existsSync(), isFalse);
+            expect(cloud.files[_path], utf8.encode(_edit));
+            expect(cloud.moves, isEmpty);
+            expect(phoneDestination.readAsStringSync(), _original);
+            return;
+          }
+          await peer.tick();
+          final phoneState = {
+            for (final entry in store.entries.values.where(
+              (e) => e.kind == ItemKind.file,
+            ))
+              entry.path: await projectEntry(phone, entry),
+          };
+          final operations = store.operations.values
+              .map((op) => '${op.kind}:${op.data['role']}:${op.path}')
+              .toList();
+          final diagnosis =
+              'cloud=${cloud.files.keys}, moves=${cloud.moves}, operations=$operations';
+          expect(fixture.original.existsSync(), isFalse);
+          expect(cloud.files, isNot(contains(_path)), reason: diagnosis);
+          expect(peerSource.existsSync(), isFalse, reason: diagnosis);
+          expect(cloud.deletes, move ? 0 : 1);
+          expect(cloud.moves, move ? ['$_path -> $destination'] : isEmpty);
+          if (move) {
+            final content = finishEdit ? _edit : _original;
+            expect(cloud.files[destination], utf8.encode(content));
+            expect(cloud.fileIds[destination], fileId);
+            expect(phoneDestination.readAsStringSync(), content);
+            expect(peerDestination.readAsStringSync(), content);
+            final moved = phoneState[destination]!;
+            if (finishEdit) {
+              final entry = store.entries[destination]!;
+              expect(phone.editing.requests, isEmpty);
+              expect(
+                entry.preservedCopies.map(
+                  (path) => phone.artifacts.resolve(path).readAsStringSync(),
+                ),
+                contains(_original),
+              );
+            } else {
+              expect(rowBadge(moved), RowBadge.local);
+            }
+            expect(
+              moved['workingCopy'],
+              store.operations[fixture.absent.last.$1]!.staged,
+            );
+            expect(
+              RegExp('Cleanup could not be confirmed')
+                  .allMatches(workingCopyDetails(moved)),
+              hasLength(finishEdit ? 1 : 2),
+            );
+          }
+          final old = store.entries[_path];
+          if (old != null) {
+            expect(
+              visibleInLibrary(phoneState[_path]!),
+              isFalse,
+              reason: diagnosis,
+            );
+          }
+          for (final (id, owner, staged) in fixture.absent) {
+            if (finishEdit && id == fixture.absent.first.$1) {
+              expect(store.operations[id], isNull);
+              expect(store.operations[owner], isNull);
+              continue;
+            }
+            expect(store.operations[id]!.path, move ? destination : _path);
+            final owned = store.operations[owner]!;
+            expect(owned.path, move ? destination : _path);
+            expect(owned.data['name'], p.basename(staged.path));
+            expect(owned.data['releasing'], owned.hash);
+          }
+        } finally {
+          peer.close();
+          phone.close();
+          routing.setPaused(true);
+        }
+      }
+
+      await sync(act: true);
+      if (finishEdit) {
+        await sync(finish: true);
+        await sync();
+      }
+      await sync();
+    });
+  }
+
+  for (final replaceAfterListing in [false, true]) {
+    test(
+      'mapped rename preserves both files and original sessions when the '
+      'cloud source is replaced ${replaceAfterListing ? 'after' : 'before'} listing',
+      () async {
+        await fixture.seed(legacy: true, fromCloud: true);
+        fixture.markLegacyReleaseIntents();
+        final cloud = await _cloud();
+        final originalId = cloud.fileIds[_path]!;
+        const replacement = 'different cloud song';
+        const destination = 'Music/renamed.mp3';
+        final renamed = File('${fixture.access.base}/$destination');
+        late int replacementId;
+        void replaceSource() {
+          cloud.remove(_path);
+          cloud.put(_path, replacement);
+          replacementId = cloud.fileIds[_path]!;
+          expect(replacementId, isNot(originalId));
+        }
+
+        for (var launch = 0; launch < 3; launch++) {
+          final store = Manifest(fixture.profile);
+          final routing = AndroidPhoneRootFs(
+            fixture.access.layout,
+            testNativeLibrary,
+          );
+          final phone = SyncEngine(
+            store,
+            RootTree(
+              Directory(store.setting('root')!),
+              Directory(store.setting('staging')!),
+              routing,
+            ),
+            cloud,
+          );
+          try {
+            if (launch == 0) {
+              await phone.tick();
+              fixture.original.renameSync(renamed.path);
+              phone.markDirty(_path);
+              phone.markDirty(destination);
+              if (replaceAfterListing) {
+                phone.barrier = (phase, _) {
+                  if (phase == 'move-before-dispatch') replaceSource();
+                };
+              } else {
+                replaceSource();
+              }
+            }
+            await phone.tick();
+            expect(cloud.files[_path], utf8.encode(replacement));
+            expect(cloud.fileIds[_path], replacementId);
+            expect(cloud.deletes, 0);
+            expect(renamed.readAsStringSync(), _original);
+            expect(
+              cloud.moves,
+              replaceAfterListing ? ['$_path -> $destination'] : isEmpty,
+            );
+            final source = store.entries[_path]!;
+            expect(source.fileId, originalId);
+            expect(
+              source.workingCopy,
+              store.operations[fixture.absent.last.$1]!.staged,
+            );
+            for (final (id, owner, staged) in fixture.absent) {
+              final session = store.operations[id]!;
+              final owned = store.operations[owner]!;
+              expect(session.path, _path);
+              expect(owned.path, _path);
+              expect(owned.staged, session.staged);
+              expect(owned.data['name'], p.basename(staged.path));
+              expect(owned.data['releasing'], session.hash);
+              expect(owned.hash, session.hash);
+            }
+            if (launch == 0 && replaceAfterListing) {
+              expect(phone.operation(_path, 'move'), isNotNull);
+              expect(cloud.files[destination], isNull);
+            } else {
+              expect(phone.operation(_path, 'move'), isNull);
+              expect(source.conflict, isNotNull);
+              expect(cloud.files[destination], utf8.encode(_original));
+              expect(store.entries[destination]!.workingCopy, isNull);
+              expect(
+                store
+                    .operationsAt(destination)
+                    .where((op) => op.kind == 'working'),
+                isEmpty,
+              );
+            }
+          } finally {
+            phone.close();
+            routing.setPaused(true);
+          }
+        }
+      },
+    );
+  }
+
+  for (final activeEdit in [true, false]) {
+    test(
+      'cloud move leaves ${activeEdit ? 'an active edit' : 'conflicting ownership'} with the source records',
+      () async {
+        await fixture.seed(
+          legacy: true,
+          fromCloud: true,
+          parkFirstCopy: activeEdit,
+        );
+        fixture.markLegacyReleaseIntents();
+        final store = Manifest(fixture.profile);
+        final routing = AndroidPhoneRootFs(
+          fixture.access.layout,
+          testNativeLibrary,
+        );
+        final cloud = await _cloud();
+        final phone = SyncEngine(
+          store,
+          RootTree(
+            Directory(store.setting('root')!),
+            Directory(store.setting('staging')!),
+            routing,
+          ),
+          cloud,
+        );
+        const destination = 'Music/other-name.mp3';
+        final (id, owner, staged) = fixture.absent.first;
+        try {
+          if (activeEdit) {
+            fixture.parkedCopy.renameSync(staged.path);
+            staged.writeAsStringSync(_edit);
+          } else {
+            store.operations['conflicting-owner'] = Operation.fromJson({
+              ...store.operations[owner]!.toJson(),
+              'id': 'conflicting-owner',
+              'path': destination,
+            });
+            store.save();
+          }
+          await cloud.move(_path, destination, etag: cloud.versions[_path]!);
+          await phone.tick();
+          await phone.tick();
+          final row = await projectEntry(phone, store.entries[destination]!);
+          expect(row['workingCopies'], isEmpty);
+          expect(store.operations[id]!.path, _path);
+          expect(store.operations[owner]!.path, _path);
+          if (activeEdit) expect(staged.readAsStringSync(), _edit);
+          expect(cloud.files.keys, [destination]);
+          expect(cloud.files[destination], utf8.encode(_original));
+        } finally {
+          phone.close();
+          routing.setPaused(true);
+        }
+      },
+    );
+  }
 
   test(
     'diagnostic reports independent relationships without side effects',
@@ -1193,7 +1838,10 @@ void main() {
           ? 'Finish receives a provider close reported during worker restart'
           : 'Finish waits for a reopened editor across worker restart',
       (tester) async {
-        await tester.runAsync(() => fixture.seed(mixed: true, legacy: true));
+        await tester.runAsync(() async {
+          await fixture.seed(mixed: true, legacy: true);
+          fixture.markLegacyReleaseIntents();
+        });
         await _mount(tester, fixture);
         await _confirmFinish(tester, fixture);
         final (id, owner, file) = fixture.present!;
@@ -1231,6 +1879,17 @@ void main() {
               contains('still has the editor copy open'),
             );
             expect(fixture.row['finishPending'], isTrue);
+            final rows = libraryRows(
+              fixture.controller.entries,
+              LibraryTab.home,
+              {},
+            );
+            for (final path in [_path, 'Music']) {
+              expect(
+                rows.singleWhere((row) => row.path == path).attention,
+                isTrue,
+              );
+            }
             checkToken();
           }
 
@@ -1278,7 +1937,10 @@ void main() {
           ? 'Interrupted Finish retains recovery records in replacement staging'
           : 'Interrupted Finish resumes in the original shared staging folder',
       (tester) async {
-        await tester.runAsync(() => fixture.seed(mixed: true, legacy: true));
+        await tester.runAsync(() async {
+          await fixture.seed(mixed: true, legacy: true);
+          fixture.markLegacyReleaseIntents();
+        });
         await _mount(tester, fixture);
         await _confirmFinish(tester, fixture);
         await tester.runAsync(() async {
@@ -1829,9 +2491,10 @@ void main() {
   testWidgets('a new hand-out on a legacy session keeps its own warning', (
     tester,
   ) async {
-    await tester.runAsync(
-      () => fixture.seed(legacy: true, paused: true, parkFirstCopy: true),
-    );
+    await tester.runAsync(() async {
+      await fixture.seed(legacy: true, paused: true, parkFirstCopy: true);
+      fixture.markLegacyReleaseIntents(slots: [0]);
+    });
     await _mount(tester, fixture);
     final (id, owner, file) = fixture.absent.first;
     fixture.parkedCopy.renameSync(file.path);
@@ -1866,6 +2529,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
+      expect(_attention(tester, _path), isTrue);
       expect(_attention(tester, 'Music'), isTrue);
       expect(File('/proc/self/fd/$fd').readAsStringSync(), _original);
       fixture.read((store) {
@@ -1879,13 +2543,18 @@ void main() {
       await fixture.controller.documentsCommand('closed', {'token': token});
       await _Fixture.until(
         () =>
-            editorWarningClaims(fixture.row).any((claim) => claim['id'] == id),
+            workingCopyDetails(fixture.row)
+                .contains('Cleanup could not be confirmed'),
       );
     });
+    await tester.pumpAndSettle();
+    expect(_attention(tester, _path), isFalse);
+    expect(_attention(tester, 'Music'), isFalse);
+    expect(editorWarningClaims(fixture.row), isEmpty);
     expect(missingEditorClaims(fixture.row), isEmpty);
     fixture.read((store) {
       expect(store.operations[id]!.data[providerClosureUnknownKey], isTrue);
-      expect(store.operations[owner], isNotNull);
+      expect(store.operations[owner]!.data['releasing'], isNotNull);
     });
   });
 }

@@ -1296,7 +1296,12 @@ class SyncEngine {
       if (entry == null || entry.kind != item.kind) continue;
       // Every row keeps its cloud file ID, folders too: a cloud move pairs
       // by it (spec #33 I2).
-      entry.fileId = item.fileId;
+      // A retained-editor rename keeps its original file identity while
+      // pending, including when recovery is needed after a replacement.
+      if (entry.conflict != _editorRenameIdentityConflict &&
+          operation(item.path, 'move')?.data['editorRecords'] == null) {
+        entry.fileId = item.fileId;
+      }
       entry.cloudName = names.listedCloudNames[item.path];
       if (item.kind == ItemKind.file) entry.remoteModified = item.modified;
     }
@@ -2802,9 +2807,13 @@ class SyncEngine {
 
   static String _moveTarget(Operation op) => op.data['to'] as String;
 
+  static const _editorRenameIdentityConflict =
+      'The original cloud file could not be verified for this rename. '
+      'The renamed Local file and its editor recovery records were kept.';
+
   /// Nothing under [path] is in flight or in conflict, apart from removals
-  /// never sent ([ignoreUnsentDeletes]), so the whole subtree can move.
-  bool _quietSubtree(String path, {bool ignoreUnsentDeletes = false}) =>
+  /// never sent and records proved safe to carry.
+  bool _quietSubtree(String path, Set<String> keptEditorRecords) =>
       !manifest.entries.values.any(
         (e) => withinOrAt(path, e.path) && e.conflict != null,
       ) &&
@@ -2812,8 +2821,135 @@ class SyncEngine {
         (o) =>
             withinOrAt(path, o.path) &&
             !_passiveOperations.contains(o.kind) &&
-            !(ignoreUnsentDeletes && _unsentDelete(o)),
+            !_unsentDelete(o) &&
+            !keptEditorRecords.contains(o.id),
       );
+
+  /// A mapped file move can carry the retained records for a Details-only
+  /// session. Its staging name, ownership, and release intent follow by ID.
+  Set<String>? _editorRecordsForMove(Entry entry, String to) {
+    if (entry.kind != ItemKind.file ||
+        !missingEditors.applies(entry.path) ||
+        !missingEditors.applies(to)) {
+      return const {};
+    }
+    final records = <String>{};
+    for (final work in manifest.operationsAt(entry.path)) {
+      if (work.kind != 'working') continue;
+      final proof = missingEditors.inspect(entry, work);
+      if (!proof.cleanupUnconfirmed) return null;
+      records.addAll([work.id, proof.owner!.id]);
+    }
+    // A separate artifact keeps its own recovery and presentation evidence.
+    if (_artifactsFor(entry.path).any((op) => !records.contains(op.id))) {
+      return null;
+    }
+    if (records.isNotEmpty) {
+      final target = manifest.entries[to];
+      if (target?.etag != null ||
+          target?.conflict != null ||
+          target?.workingCopy != null ||
+          target?.remoteCopy != null ||
+          target?.preservedCopies.isNotEmpty == true ||
+          manifest.operationsAt(to).isNotEmpty ||
+          _artifactsFor(to).isNotEmpty) {
+        return null;
+      }
+    }
+    return records;
+  }
+
+  void _moveEditorRecords(String from, String to, Iterable<String> ids) {
+    for (final id in ids) {
+      final record = manifest.operations[id];
+      if (record == null || record.path != from) continue;
+      final moved = Operation.fromJson({...record.toJson(), 'path': to});
+      if (record.data['entryPath'] == from) moved.data['entryPath'] = to;
+      manifest.operations[id] = moved;
+    }
+  }
+
+  /// The phone still holds the renamed item while its cloud MOVE is queued.
+  LocalItem? _editorMoveLocal(
+    Operation move,
+    Entry entry,
+    Map<String, LocalItem> local,
+  ) {
+    final to = _moveTarget(move);
+    final here = local[to];
+    if (local.containsKey(entry.path) ||
+        _held(to) ||
+        here == null ||
+        here.kind != ItemKind.file ||
+        here.identity == null ||
+        here.identity != entry.localIdentity) {
+      return null;
+    }
+    return here;
+  }
+
+  /// Finish at the cloud's current name while the two local names are held
+  /// out of ordinary reconciliation by the queued MOVE.
+  Future<void> _finishBeforeEditorMove(
+    Operation move,
+    Entry entry,
+    RemoteItem current,
+    Map<String, LocalItem> local,
+    List<String> editorRecords,
+  ) async {
+    if (!editing.requests.any((request) => request.path == entry.path)) return;
+    if (current.fileId == null ||
+        current.fileId != entry.fileId ||
+        viewOnly(entry.path)) {
+      entry.status =
+          'Finish pending: the cloud file changed. Review both versions.';
+      return;
+    }
+    final here = _editorMoveLocal(move, entry, local);
+    LocalItem? now;
+    try {
+      now = tree.statItem(_moveTarget(move));
+    } on FileSystemException {
+      // Retry when the renamed Local file can be checked.
+    }
+    if (here == null ||
+        now?.identity != here.identity ||
+        now?.scanStamp != here.scanStamp) {
+      entry.status = 'Finish pending: check that the renamed file is still at its new location.';
+      return;
+    }
+    // A client may have uploaded the returned edit before this fix and
+    // recorded it as the baseline even though the rename left the older
+    // Local bytes at the target. Recover that baseline only from the
+    // queued move's own release-intent records for its original version.
+    if (entry.etag != move.expectedEtag &&
+        entry.etag == current.etag &&
+        entry.baselineHash != here.hash) {
+      final baseline = _artifactsFor(entry.path).any(
+        (owner) =>
+            editorRecords.contains(owner.id) &&
+            owner.data['role'] == 'working' &&
+            owner.expectedEtag == move.expectedEtag &&
+            owner.hash != null &&
+            owner.hash == here.hash &&
+            owner.data['releasing'] == owner.hash,
+      );
+      if (!baseline) {
+        entry.status =
+            'Finish pending: move the Local file back before finishing.';
+        return;
+      }
+      entry
+        ..etag = move.expectedEtag
+        ..baselineHash = here.hash
+        ..localHash = here.hash;
+      manifest.save();
+    }
+    await editing.run(entry, current, retention(entry.path));
+    if (!editing.requests.any((request) => request.path == entry.path)) {
+      _localWork = true;
+    }
+  }
 
   /// A partial pass (any platform with a watcher) sees a path vanish when it
   /// is rescanned, which can happen before the other side of its rename has
@@ -3444,10 +3580,11 @@ class SyncEngine {
         // here (case only included), which is renamed for everyone after the
         // listing ([_renameRemovedMounts]), not moved here.
         _restoreReason(from, local) != null ||
-        isSyncExcluded(to) ||
-        !_quietSubtree(from, ignoreUnsentDeletes: true)) {
+        isSyncExcluded(to)) {
       return false;
     }
+    final editorRecords = _editorRecordsForMove(entry, to) ?? const <String>{};
+    if (!_quietSubtree(from, editorRecords)) return false;
     // Into a paused owner's folder (#80), or onto the new name of a share
     // folder waiting to be renamed for everyone (#155): nothing may be
     // inferred there, so the cloud item stays where it was, whichever
@@ -3467,21 +3604,26 @@ class SyncEngine {
     }
     _cancelUnsentDeletes(from);
     uploads.forget(to);
-    if (NamePolicy.sameInCloud(
-      names.cloudPath(from),
-      names.movedCloudPath(from, to),
-    )) {
+    if (editorRecords.isEmpty && _sameCloudName(from, to)) {
       _rekey(from, to, local);
       return true;
     }
     final op = intent(from, 'move', etag: entry.etag, persist: false);
     op.data['to'] = to;
+    if (editorRecords.isNotEmpty) {
+      op.data['editorRecords'] = editorRecords.toList();
+    }
     entry.status = 'rename queued';
     _dirty
       ..add(from)
       ..add(to);
     return true;
   }
+
+  bool _sameCloudName(String from, String to) => NamePolicy.sameInCloud(
+    names.cloudPath(from),
+    names.movedCloudPath(from, to),
+  );
 
   /// The removals inferred for [from] and beneath it, never sent, are
   /// withdrawn: the item was moved, not deleted.
@@ -3559,8 +3701,26 @@ class SyncEngine {
       if (op == null) break;
       seen.add(op.id);
       final from = op.path, to = _moveTarget(op);
+      final editorRecords =
+          (op.data['editorRecords'] as List?)?.cast<String>() ??
+          const <String>[];
       final entry = manifest.entries[from];
       final current = remote[from], target = remote[to];
+      final retainedEditorMove = editorRecords.isNotEmpty;
+      final originalId = entry?.fileId;
+      if (retainedEditorMove &&
+          entry != null &&
+          entry.conflict == null &&
+          current != null &&
+          (originalId == null || current.fileId != originalId)) {
+        // Keep the original row and its recovery records. Abandoning as a
+        // local removal would infer a delete at the replacement's name.
+        entry.expectedPresent = local.containsKey(from);
+        if (!entry.expectedPresent) entry.localIdentity = null;
+        conflict(entry, _editorRenameIdentityConflict);
+        _abandonMove(op, local);
+        continue;
+      }
       if (entry == null ||
           entry.conflict != null ||
           !local.containsKey(to) ||
@@ -3580,11 +3740,14 @@ class SyncEngine {
       if (current == null &&
           target != null &&
           target.kind == entry.kind &&
-          (entry.fileId == null ||
-              target.fileId == null ||
-              entry.fileId == target.fileId)) {
+          (retainedEditorMove
+              ? originalId != null && target.fileId == originalId
+              : originalId == null ||
+                    target.fileId == null ||
+                    target.fileId == originalId)) {
         // Already moved: a lost acknowledgement, or the same rename made
         // on another device.
+        _moveEditorRecords(from, to, editorRecords);
         _rekey(from, to, local);
         finish(op);
         continue;
@@ -3620,8 +3783,30 @@ class SyncEngine {
         durable = {for (final o in _moves) o.id};
       }
       barrier?.call('move-before-dispatch', op);
+      if (retainedEditorMove) {
+        final verified = _editorRecordsForMove(entry, to);
+        // An explicit Finish may have retired some of the queued records.
+        final remaining = editorRecords.where(manifest.operations.containsKey);
+        if (verified == null ||
+            verified.length != remaining.length ||
+            !verified.containsAll(remaining) ||
+            !_quietSubtree(from, {...verified, op.id})) {
+          entry.status = 'Rename pending: editor copy evidence changed.';
+          await _finishBeforeEditorMove(
+            op,
+            entry,
+            current,
+            local,
+            editorRecords,
+          );
+          manifest.save();
+          continue;
+        }
+      }
       try {
-        await cloud.move(from, to, etag: current.etag);
+        if (!retainedEditorMove || !_sameCloudName(from, to)) {
+          await cloud.move(from, to, etag: current.etag);
+        }
       } on NameNotPortable {
         // A name the cloud refuses (spec #49 residual): kept local at it,
         // where the ordinary create path shows why; the cloud item stays.
@@ -3639,6 +3824,7 @@ class SyncEngine {
         final moved = renamedPath(from, to, path);
         remote[moved] = _respelled(item, moved);
       }
+      _moveEditorRecords(from, to, editorRecords);
       _rekey(from, to, local);
       finish(op);
     }
@@ -3926,6 +4112,10 @@ class SyncEngine {
     Map<String, RemoteItem> remote,
   ) {
     final entry = manifest.entries[from]!;
+    final editorRecords =
+        entry.fileId != null && remote[to]?.fileId == entry.fileId
+        ? _editorRecordsForMove(entry, to) ?? const <String>{}
+        : const <String>{};
     final renamedHere = _renamedBothSides[from] ?? _parked[from];
     // Where the item is on disk: its row's path, or where a rename here
     // took it.
@@ -3957,7 +4147,7 @@ class SyncEngine {
         // file ID, so this is never reached by file ID; same-version
         // pairing never crosses either.
         _shareFolderOf(from) != _shareFolderOf(to) ||
-        !_cloudMovable(from, at, local)) {
+        !_cloudMovable(from, at, local, editorRecords)) {
       return false;
     }
     // A removal this partial pass holds: the other side of a local rename
@@ -3983,7 +4173,7 @@ class SyncEngine {
                 (entry.baselineHash == null ||
                     rawLocal[to]!.hash != entry.baselineHash)))) {
       final otherHere = rawLocal.containsKey(to);
-      _moveCloudRows(from, to, local);
+      _moveCloudRows(from, to, local, editorRecords);
       if (otherHere) {
         operation(to, 'delete')?.data['otherItemHere'] = true;
         manifest.save();
@@ -4009,7 +4199,7 @@ class SyncEngine {
       // Cloud-only, deleted here, or being restored: only the rows move (no
       // disk work), and a removal never sent follows the item to its new
       // path.
-      _moveCloudRows(from, to, local);
+      _moveCloudRows(from, to, local, editorRecords);
       return true;
     }
     // Defence in depth: the scan has already turned a changed kind into a
@@ -4111,7 +4301,7 @@ class SyncEngine {
       }
       _parked.remove(from);
     }
-    _moveCloudRows(from, to, local);
+    _moveCloudRows(from, to, local, editorRecords);
     if (renamedHere != null) {
       // Shown to the user: the cloud's spelling, never this device's local
       // alias (spec #49, decision #193).
@@ -4129,7 +4319,12 @@ class SyncEngine {
   /// with it: removals never sent, and uploads of a file still the local
   /// identity its row records (at [at], where the item is on disk). Any
   /// other work leaves the pair to the ordinary rules.
-  bool _cloudMovable(String from, String at, Map<String, LocalItem> local) {
+  bool _cloudMovable(
+    String from,
+    String at,
+    Map<String, LocalItem> local,
+    Set<String> editorRecords,
+  ) {
     if (manifest.entries.values.any(
       (e) => withinOrAt(from, e.path) && e.conflict != null,
     )) {
@@ -4138,7 +4333,8 @@ class SyncEngine {
     for (final op in manifest.operations.values) {
       if (!withinOrAt(from, op.path) ||
           _passiveOperations.contains(op.kind) ||
-          _unsentDelete(op)) {
+          _unsentDelete(op) ||
+          editorRecords.contains(op.id)) {
         continue;
       }
       if (op.kind == 'upload') {
@@ -4179,7 +4375,12 @@ class SyncEngine {
   /// delete here follows the item), and a pending upload, sent at the new
   /// path with If-Match on the version its edit started from, so a cloud
   /// edit meanwhile is the ordinary edit/edit conflict.
-  void _moveCloudRows(String from, String to, Map<String, LocalItem> local) {
+  void _moveCloudRows(
+    String from,
+    String to,
+    Map<String, LocalItem> local,
+    Set<String> editorRecords,
+  ) {
     for (final op
         in manifest.operations.values
             .where(
@@ -4224,6 +4425,7 @@ class SyncEngine {
         }
       }
     }
+    _moveEditorRecords(from, to, editorRecords);
     _rekey(from, to, local);
     for (final row in manifest.entries.values) {
       if (!withinOrAt(to, row.path)) continue;
@@ -4973,10 +5175,25 @@ class SyncEngine {
         continue;
       }
       final current = remote[work.path];
-      final here = local[work.path];
+      final move = operation(work.path, 'move');
+      final editorMove = move != null && move.data['editorRecords'] != null;
+      final here = editorMove
+          ? _editorMoveLocal(move, entry, local)
+          : local[work.path];
+      if (editorMove &&
+          (here == null ||
+              current?.fileId == null ||
+              current!.fileId != entry.fileId)) {
+        // An upload at the old name needs the same item's cloud version
+        // and a verified Local counterpart at the new name.
+        continue;
+      }
       if (operation(work.path, 'delete') != null ||
           current?.etag != work.expectedEtag ||
-          (here != null && here.hash != work.hash && here.hash != hash)) {
+          (here != null &&
+              here.hash != work.hash &&
+              here.hash != hash &&
+              !(editorMove && here.hash == entry.baselineHash))) {
         conflict(
           entry,
           'Working copy meets another edit or deletion. All copies retained.',
@@ -5020,15 +5237,20 @@ class SyncEngine {
         // Before the install: where installs rename (Android) the staged
         // file is the root file afterwards and its staging name is gone.
         final uploadSize = await upload.length();
-        if (here != null && here.hash != hash) {
+        if (!editorMove && here != null && here.hash != hash) {
           preserve(entry);
           installOwned(work.path, upload);
           entry.expectedPresent = true;
         }
-        entry.etag = version;
-        entry.baselineHash = hash;
-        if (!readBack) entry.recordRemoteVersion(version, hash);
-        entry.localHash = hash;
+        // With a queued move, keep the baseline of the Local file at its
+        // new name. After MOVE, ordinary reconciliation preserves that
+        // version before applying the edit from the cloud.
+        if (!editorMove) {
+          entry.etag = version;
+          entry.baselineHash = hash;
+          if (!readBack) entry.recordRemoteVersion(version, hash);
+          entry.localHash = hash;
+        }
         entry.status = 'working copy synchronized';
         work.hash = hash;
         work.expectedEtag = version;
@@ -5037,6 +5259,9 @@ class SyncEngine {
           ItemKind.file,
           version,
           size: uploadSize,
+          fileId: current?.fileId,
+          permissions: current?.permissions,
+          shared: current?.shared ?? false,
         );
         manifest.save();
         if (_watching && _view != null) {
@@ -7444,6 +7669,7 @@ class SyncEngine {
             // (decision #183); an unchanged one is reclaimed by a later pass.
             'edited': artifacts.workingEdited(op),
           };
+          var presentReleaseIntent = false;
           try {
             final staged = op.staged;
             if (staged != null) {
@@ -7463,6 +7689,7 @@ class SyncEngine {
                   ...preview.toJson(),
                   'directoryIdentity': tree.native.identity(tree.stageFd),
                 };
+                presentReleaseIntent = owned?.data['releasing'] != null;
               }
             }
           } on FileSystemException {
@@ -7474,7 +7701,10 @@ class SyncEngine {
             if (result['preview'] != null) missingEditors.observePresent(op);
             if (result['edited'] == true && result['preview'] == null) {
               proof = missingEditors.inspect(entry, op);
-              if (proof.reason case final reason?) {
+              if (proof.cleanupUnconfirmed) {
+                result['editorCleanupUnconfirmed'] = true;
+                result['detailsOnlyMissingArtifact'] = proof.owner!.id;
+              } else if (proof.reason case final reason?) {
                 if (reason == MissingEditorCopies.copyPresent) {
                   missingEditors.observePresent(op);
                 }
@@ -7495,11 +7725,13 @@ class SyncEngine {
             result.addAll(
               missingEditors.projectNotice(entry, op, editing.binding, proof),
             );
-            if (result['edited'] == true &&
-                result['preview'] != null &&
-                missingEditors.returned(op)) {
-              result['missingEditorProblem'] =
-                  'An editor copy has returned. Review its changes.';
+            if (result['edited'] == true && result['preview'] != null) {
+              if (missingEditors.returned(op)) {
+                result['missingEditorProblem'] =
+                    'An editor copy has returned. Review its changes.';
+              } else if (presentReleaseIntent) {
+                result['missingEditorProblem'] = 'An editor copy is available with changes. Review it before finishing.';
+              }
             }
           }
           return result;
@@ -7532,7 +7764,7 @@ class SyncEngine {
 
   ({NativeFileInfo? info, bool uncertain}) _readLocalArtifact(
     Operation record,
-    Set<String> dismissedMissingArtifacts, {
+    Set<String> detailsOnlyMissingArtifacts, {
     NativeFileInfo Function(Operation)? probeStaging,
   }) {
     try {
@@ -7541,30 +7773,32 @@ class SyncEngine {
           : probeStaging(record);
       return (info: info, uncertain: info.identity != record.data['identity']);
     } on FileSystemException catch (error) {
+      // Only verified absence of this owner can stay in Details. Failed
+      // reads and evidence about other owners still surface on the row.
       return (
         info: null,
         uncertain:
             error.osError?.errorCode != 2 ||
-            !dismissedMissingArtifacts.contains(record.id),
+            !detailsOnlyMissingArtifacts.contains(record.id),
       );
     }
   }
 
   bool hasUncertainLocalArtifacts(
     String path, {
-    required Set<String> dismissedMissingArtifacts,
+    required Set<String> detailsOnlyMissingArtifacts,
     required NativeFileInfo Function(Operation) probeStaging,
   }) => _artifactsFor(path).any(
     (record) => _readLocalArtifact(
       record,
-      dismissedMissingArtifacts,
+      detailsOnlyMissingArtifacts,
       probeStaging: probeStaging,
     ).uncertain,
   );
 
   Map<String, Object?> localArtifacts(
     String path, {
-    Set<String> dismissedMissingArtifacts = const {},
+    Set<String> detailsOnlyMissingArtifacts = const {},
   }) {
     var count = 0;
     var bytes = 0;
@@ -7585,7 +7819,7 @@ class SyncEngine {
       }
     }
     for (final record in records) {
-      final evidence = _readLocalArtifact(record, dismissedMissingArtifacts);
+      final evidence = _readLocalArtifact(record, detailsOnlyMissingArtifacts);
       if (evidence.uncertain) uncertain = true;
       final info = evidence.info;
       if (info == null || info.identity == live && !evidence.uncertain) {

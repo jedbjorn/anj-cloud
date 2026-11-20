@@ -46,7 +46,7 @@ class _EditorDiagnostic {
   final bool phoneStoragePaused;
   final List<Operation> operations;
   final _aliases = <String, String>{};
-  final _dismissedMissingArtifacts = <String>{};
+  final _detailsOnlyMissingArtifacts = <String>{};
   late final _entryOperations = operations.where((op) => op.path == entry.path);
   late final _sessions = _entryOperations.where((op) => op.kind == 'working');
   late final _byId = {for (final op in operations) op.id: op};
@@ -127,7 +127,7 @@ class _EditorDiagnostic {
         if (entry.conflict != null) 'conflict',
         if (engine.hasUncertainLocalArtifacts(
           entry.path,
-          dismissedMissingArtifacts: _dismissedMissingArtifacts,
+          detailsOnlyMissingArtifacts: _detailsOnlyMissingArtifacts,
           probeStaging: _artifactInfo,
         ))
           'staging artifacts uncertain',
@@ -401,7 +401,7 @@ class _EditorDiagnostic {
     final proof = edited && !preview && !phoneStoragePaused
         ? _inspect(work)
         : null;
-    final warning = proof?.reason;
+    final warning = proof?.cleanupUnconfirmed == true ? null : proof?.reason;
     final notice = engine.missingEditors.diagnosticNotice(
       entry,
       work,
@@ -410,8 +410,8 @@ class _EditorDiagnostic {
       recoveryAssessed: !edited || preview || proof != null,
       observedPresent: preview || warning == MissingEditorCopies.copyPresent,
     );
-    if (notice.dismissedMissingArtifact case final artifact?) {
-      _dismissedMissingArtifacts.add(artifact);
+    if (notice.detailsOnlyMissingArtifact case final artifact?) {
+      _detailsOnlyMissingArtifacts.add(artifact);
     }
     return {
       'slot': _alias(work),
@@ -466,7 +466,8 @@ class _EditorDiagnostic {
         if (edited && !preview && proof == null)
           'editor recovery assessment unknown',
         ?warning,
-        if (edited && proof != null && warning == null) 'missing editor copy',
+        if (edited && proof != null && proof.reason == null)
+          'missing editor copy',
         if (work.data['presentationError'] is String &&
             work.data['presentationError'] !=
                 MissingEditorCopies.missingWarning)
