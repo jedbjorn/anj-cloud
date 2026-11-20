@@ -318,6 +318,22 @@ class SharingTests(unittest.IsolatedAsyncioTestCase):
         status, body, _ = await self.call("GET", "/v1/household/users", self.as_bob())
         self.assertEqual([{"id": "alice", "display_name": "Alice"}], body)
 
+    async def test_library_move_stays_within_writable_incoming_share(self):
+        status, _, _ = await self.share()
+        self.assertEqual(201, status)
+        check = self.gateway.sharing.check_move_boundary
+        bob = self.gateway.registry.device(self.bob_id)
+        source, destination = "Shared/Photos/a.jpg", "Shared/Photos/sub/a.jpg"
+        await check(bob, source, destination)
+        for before, after in ((source, "Work/a.jpg"), ("Work/a.jpg", destination)):
+            with self.assertRaises(ShareError) as refused:
+                await check(bob, before, after)
+            self.assertEqual(403, refused.exception.status)
+        self.legacy_view("1")
+        with self.assertRaises(ShareError) as refused:
+            await check(bob, source, destination)
+        self.assertEqual(403, refused.exception.status)
+
     async def test_share_lifecycle_maps_permissions_and_scopes_lists_to_the_caller(self):
         status, row, headers = await self.share()
         self.assertEqual((201, "no-store"), (status, headers["Cache-Control"]))

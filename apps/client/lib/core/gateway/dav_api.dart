@@ -1112,25 +1112,56 @@ class DavCloud
     }
   }
 
+  Future<int> downloadFileId(String job) async {
+    if (!jobIdPattern.hasMatch(job)) {
+      throw const CloudFailure('Invalid download.');
+    }
+    final response = await _request(
+      'GET',
+      origin.replace(pathSegments: ['v1', 'fetch', 'jobs', job, 'file']),
+    );
+    final body = await boundedBody(response);
+    if (response.statusCode == 409 || response.statusCode == 404) {
+      throw const CloudFailure(
+        'The original download could not be identified. Choose the file itself in Library.',
+      );
+    }
+    if (response.statusCode != 200) failure(response.statusCode);
+    return (jsonDecode(body) as Map)['fileId'] as int;
+  }
+
   /// Query conditions require a gateway that verifies both identities under
   /// its write lock. Earlier gateways reject DAV queries.
   Future<void> moveLibraryFile(
-    RemoteItem file, String destination, int? parentId, String? job,
+    RemoteItem file,
+    String destination,
+    int? parentId,
+    String? job,
   ) async {
-    final response = await _request('MOVE', uri(file.path).replace(queryParameters: {
-      'fileId': file.fileId.toString(),
-      'parentId': parentId?.toString() ?? 'root',
-      'job': ?job,
-    }), headers: {
-      'Destination': uri(destination).toString(),
-      'If-Match': file.etag,
-      'Overwrite': 'F',
-    });
+    final response = await _request(
+      'MOVE',
+      uri(file.path).replace(
+        queryParameters: {
+          'fileId': file.fileId.toString(),
+          'parentId': parentId?.toString() ?? 'root',
+          'job': ?job,
+        },
+      ),
+      headers: {
+        'Destination': uri(destination).toString(),
+        'If-Match': file.etag,
+        'Overwrite': 'F',
+      },
+    );
     await _responseBody(response).drain<void>();
     if (response.statusCode == 412) {
-      throw const CloudFailure('The file or folder changed, or the name is already taken.');
+      throw const CloudFailure(
+        'The file or folder changed, or the name is already taken.',
+      );
     }
-    if (response.statusCode != 201 && response.statusCode != 204) failure(response.statusCode);
+    if (response.statusCode != 201 && response.statusCode != 204) {
+      failure(response.statusCode);
+    }
     forgetListing();
   }
 

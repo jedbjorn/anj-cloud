@@ -364,6 +364,8 @@ class Mutations:
                         content = b""
                     # Receipt of the completed backend response establishes this operation finished.
                     gateway.registry.mutation_finish()
+                    if request.method == "MOVE" and status in (201, 204) and current["fileid"]:
+                        gateway.registry.fetch_moved(device["uid"], current["fileid"], unquote(destination))
                     if request.method == "PUT" and status == 201:
                         self.note_added(device["uid"], response.headers.get("OC-FileId"))
                     elif (request.method == "PUT" and status in (200, 204) and current

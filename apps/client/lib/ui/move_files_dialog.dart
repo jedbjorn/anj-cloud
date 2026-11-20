@@ -9,9 +9,8 @@ Future<void> showMoveFiles(
   ClientController controller,
   List<Map<String, dynamic>> entries, {
   String? job,
-  int? fileId,
 }) async {
-  final choices = controller.documentsCommand('moveChoices', {
+  late final choices = controller.documentsCommand('moveChoices', {
     'files': [
       for (final entry in entries)
         {
@@ -22,7 +21,6 @@ Future<void> showMoveFiles(
         },
     ],
     'job': ?job,
-    'fileId': ?fileId,
   });
   final folder = await showDialog<String>(
     context: context,
@@ -34,13 +32,17 @@ Future<void> showMoveFiles(
           future: choices,
           builder: (context, snapshot) {
             if (snapshot.hasError) return Text('${snapshot.error}');
-            if (!snapshot.hasData)
+            if (!snapshot.hasData) {
               return const LinearProgressIndicator(
                 semanticsLabel: 'Loading folders',
               );
+            }
             final folders =
                 (snapshot.data!['folders'] as Map).keys.cast<String>().toList()
                   ..sort();
+            if (folders.isEmpty) {
+              return const Text('No writable destination folders are available.');
+            }
             return ListView.builder(
               shrinkWrap: true,
               itemCount: folders.length,
@@ -89,8 +91,9 @@ Future<void> showMoveFiles(
       ),
     );
   } catch (error) {
-    if (context.mounted)
+    if (context.mounted) {
       ScaffoldMessenger.of(context)
           .showSnackBar(SnackBar(content: Text('$error')));
+    }
   }
 }

@@ -268,7 +268,9 @@ class Sharing:
     async def check_move_boundary(self, device, source, destination):
         """A file may move within an incoming mount, never into or out of it."""
         shares = await self._read("GET", "", self.device_principal(device), {"shared_with_me": "true"})
-        for share in shares or []:
+        if not isinstance(shares, list):
+            raise ShareError(502, "Could not check shared folders")
+        for share in shares:
             mount = share.get("file_target", "").rstrip("/")
             if not mount:
                 continue

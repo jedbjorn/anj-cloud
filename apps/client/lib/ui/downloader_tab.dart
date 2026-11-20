@@ -17,6 +17,7 @@ class DownloaderTab extends StatefulWidget {
     required this.jobs,
     required this.links,
     required this.onShowInFolder,
+    required this.onMoveFile,
     this.touchInput = false,
   });
 
@@ -26,7 +27,8 @@ class DownloaderTab extends StatefulWidget {
   final TextEditingController links;
 
   /// The library's reveal for a placed file (its path in the account).
-  final ValueChanged<String> onShowInFolder;
+  final ValueChanged<FetchJob> onShowInFolder;
+  final Future<void> Function(FetchJob)? onMoveFile;
 
   /// Touch platforms (Android) also refresh by pulling the list down.
   final bool touchInput;
@@ -345,7 +347,23 @@ class _DownloaderTabState extends State<DownloaderTab> {
             'job-show:${job.id}',
             Icons.folder_open,
             'Show in folder',
-            () => widget.onShowInFolder(job.path!),
+            () => widget.onShowInFolder(job),
+          ),
+        if (job.state == FetchState.done && job.path != null && !job.folder)
+          _JobAction(
+            'job-move:${job.id}',
+            Icons.drive_file_move_outline,
+            'Move to…',
+            widget.onMoveFile == null || busy
+                ? null
+                : () async {
+                    setState(() => _acting.add(job.id));
+                    try {
+                      await widget.onMoveFile!(job);
+                    } finally {
+                      if (mounted) setState(() => _acting.remove(job.id));
+                    }
+                  },
           ),
         if (job.isFinished)
           _JobAction(
@@ -534,7 +552,7 @@ class _JobCard extends StatelessWidget {
             children: [
               Expanded(child: content),
               for (final action in actions)
-                if (constraints.maxWidth < 560)
+                if (constraints.maxWidth < (actions.length > 2 ? 760 : 560))
                   IconButton(
                     key: ValueKey(action.key),
                     onPressed: action.onPressed,

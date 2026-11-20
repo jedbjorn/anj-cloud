@@ -133,7 +133,12 @@ class DocumentsOps {
       case 'moveChoices':
       case 'moveFiles':
         _notPaused();
-        return LibraryMove(engine, registry, moveFile).handle(op, command);
+        return LibraryMove(
+          engine,
+          registry,
+          moveFile,
+          relocate: relocate,
+        ).handle(op, command);
       case 'addCheck':
         return adder.check(
           command['destination'] as String,

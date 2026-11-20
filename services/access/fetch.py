@@ -28,6 +28,7 @@ link, a title or a path; request lines carry only the route class `fetch`.
 """
 
 import asyncio
+from datetime import datetime
 import errno
 import json
 import logging
@@ -46,7 +47,7 @@ from aiohttp import BasicAuth, ClientTimeout, web
 from defusedxml import ElementTree as SafeET
 
 from . import portable_names
-from .mutations import OC_FILE_ID, bounded_body, file_id
+from .mutations import bounded_body, file_id
 from .protocol import Rejection, backend_root
 from .registry import AccountDisabled, FetchCap
 from .sharing import ShareError
@@ -180,6 +181,11 @@ def public_row(row):
     result = {"id": row["id"], "state": row["state"], "kind": row["kind"], "url": row["url"], "title": row["title"],
               "path": row["destination"], "message": row["message"], "submitted": row["submitted"], "finished": row["finished"],
               "height": (row["obtained"] or row["height"]) if row["kind"] == "video" else None}
+    # Playlist summaries finish with a folder and an "Added ... items" message.
+    if row["state"] == "done" and (row["message"] or "").startswith("Added "):
+        result["folder"] = True
+    if row.get("file_id") and row["state"] == "done":
+        result["fileId"] = row["file_id"]
     if row["state"] == "downloading":
         result["percent"] = max(0, min(100, int(row["percent"] or 0)))
     return result
@@ -374,6 +380,7 @@ class Fetch:
         router.add_post("/v1/fetch/jobs", self.submit_route)
         router.add_post("/v1/fetch/jobs/clear", self.clear_route)
         router.add_delete("/v1/fetch/jobs/{job_id}", self.delete_route)
+        router.add_get("/v1/fetch/jobs/{job_id}/file", self.file_route)
 
     def caller(self, request, write=False):
         device = self.gateway.identity(request)
@@ -382,6 +389,51 @@ class Fetch:
         if write and device["rights"] != "write":
             raise FetchError(403, "This device can only view")
         return device
+
+    async def file_route(self, request):
+        device = self.caller(request)
+        row = self.registry.fetch_job(request.match_info["job_id"])
+        if not row or row["uid"] != device["uid"] or row["state"] != "done":
+            raise FetchError(404, "This completed download is unavailable.")
+        identity = row["file_id"] or await self.legacy_file(device, row)
+        if not identity:
+            raise FetchError(409, "The original download could not be identified. Choose the file itself in Library.")
+        return web.json_response({"fileId": identity}, headers={"Cache-Control": "no-store"})
+
+    async def legacy_file(self, device, row):
+        """Old rows dropped their file ID. The added record only finds a candidate.
+        Prove its provenance with the backend's account-scoped temp-to-library MOVE
+        during this job's running slot. Never infer identity from the current path."""
+        if not row["started"] or not row["finished"] or not row["destination"]:
+            return None
+        added = self.registry.db.execute(
+            "SELECT fileid FROM files_added WHERE uid=? AND added_at BETWEEN ? AND ? ORDER BY seq DESC LIMIT 1",
+            (device["uid"], row["started"], row["finished"])).fetchone()
+        if not added:
+            return None
+        identity = added[0]
+        url = self.gateway.backend + "/ocs/v2.php/apps/activity/api/v2/activity/all"
+        query = {"format": "json", "object_type": "files", "object_id": str(identity), "sort": "asc", "limit": "50"}
+        async with self.gateway.session.get(url, params=query, headers={"OCS-APIRequest": "true"},
+                                            auth=BasicAuth(device["uid"], device["token"]), allow_redirects=False,
+                                            timeout=ClientTimeout(total=15)) as response:
+            if response.status != 200:
+                return None
+            events = json.loads(await bounded_body(response))["ocs"]["data"]
+        for event in events:
+            rich = event.get("subject_rich") or []
+            if len(rich) != 2 or not isinstance(rich[1], dict):
+                continue
+            old, new = rich[1].get("oldfile", {}), rich[1].get("newfile", {})
+            if (event.get("app") == "files" and event.get("user") == device["uid"]
+                    and str(event.get("object_id")) == str(identity) and str(old.get("id")) == str(identity)
+                    and str(new.get("id")) == str(identity)
+                    and re.fullmatch(r"\.anj-fetch-[0-9a-f]{24}\.tmp", old.get("path", ""))
+                    and new.get("path") == "anj-cloud/" + row["destination"]
+                    and int(row["started"]) <= datetime.fromisoformat(event["datetime"]).timestamp() <= row["finished"]):
+                self.registry.fetch_update(row["id"], file_id=identity)
+                return identity
+        return None
 
     async def list_route(self, request):
         device = self.caller(request)
@@ -840,8 +892,12 @@ class Fetch:
         if row["target"]:
             # An earlier MOVE's outcome was never learned (no answer, or a restart): read it back.
             found = await self.stat(device, row["target"])
-            if found and found[0] == size:
+            if found and found[0] == size and found[1] == row["file_id"]:
                 return self.placed(row, row["target"], found[1])
+            if found and found[0] == size and row["file_id"] is None:
+                # Preserve the old importer's restart semantics without binding
+                # a legacy job to a destination identified only by byte count.
+                return self.placed(row, row["target"], None)
             if found is None:
                 return "retry"
             self.registry.fetch_update(row["id"], target=None)
@@ -852,7 +908,10 @@ class Fetch:
             parent += await self.playlist_folder(device, top, row["folder"]) + "/"
         children = await self.children(device, parent)
         target = parent + unique_name(portable_stem(row["title"], row["media_id"] or "download"), extension, list(children))
-        self.registry.fetch_update(row["id"], target=target)
+        staged = await self.stat_url(device, self.temp_url(device["uid"], row["dispatch"]))
+        if not staged or staged[0] != size or not staged[1]:
+            return "retry"
+        self.registry.fetch_update(row["id"], target=target, file_id=staged[1])
         self.registry.mutation_begin(device["id"], target)
         try:
             async with self.gateway.session.request("MOVE", self.temp_url(device["uid"], row["dispatch"]),
@@ -868,8 +927,7 @@ class Fetch:
         if status is not None:
             self.registry.mutation_finish()  # a completed answer: the operation is over (as mutations.py)
             if status in (201, 204):
-                found = await self.stat(device, target)
-                return self.placed(row, target, found[1] if found else None)
+                return self.placed(row, target, staged[1])
             self.registry.fetch_update(row["id"], target=None)
             if status == 503:
                 raise BackendBusy()
@@ -878,7 +936,7 @@ class Fetch:
         if found is None:
             return "retry"  # unknown: the fence stays closed until the operator's recovery, then read back
         self.registry.mutation_finish()
-        if found and found[0] == size:
+        if found and found[0] == size and found[1] == staged[1]:
             return self.placed(row, target, found[1])
         self.registry.fetch_update(row["id"], target=None)
         return "retry"
