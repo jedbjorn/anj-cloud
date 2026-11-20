@@ -138,6 +138,7 @@ void main() {
 
   /// Folders whose next PROPFIND fails once with this status.
   final failing = <String, int>{};
+  bool stallRootErrorBody = false;
 
   setUpAll(() async {
     fixture = Directory.systemTemp.createTempSync('anj-incremental-');
@@ -232,6 +233,15 @@ void main() {
         final path = Uri.decodeFull(route.substring(5))
             .replaceAll(RegExp(r'/$'), '');
         propfinds.add(path);
+        if (path.isEmpty && stallRootErrorBody) {
+          stallRootErrorBody = false;
+          response.statusCode = 503;
+          response.contentLength = 50;
+          response.bufferOutput = false;
+          response.write('x');
+          await response.flush();
+          return;
+        }
         onPropfind?.call(path);
         if (failing.remove(path) case final status?) {
           response.statusCode = status;
@@ -284,6 +294,7 @@ void main() {
     now = Duration.zero;
     propfinds.clear();
     failing.clear();
+    stallRootErrorBody = false;
     wall = DateTime.utc(2026, 11, 4, 12);
     serverClock = wall;
     incomingStatus = 200;
@@ -762,6 +773,28 @@ void main() {
       await listsLikeAFullWalk();
       expect(propfinds, hasLength(folderCount()));
     });
+
+    test(
+      'a stalled root error body forces a full walk after restart',
+      () async {
+        await list();
+        expect(profile.setting(anchor), isNotNull);
+        restart();
+
+        stallRootErrorBody = true;
+        await expectLater(
+          api.prepareListingRoot().timeout(const Duration(seconds: 5)),
+          throwsA(
+            isA<CloudFailure>().having((error) => error.status, 'status', 503),
+          ),
+        );
+        expect(profile.setting(anchor), isNull);
+
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
 
     test('a late listing failure invalidates the generation on disk', () async {
       await list();

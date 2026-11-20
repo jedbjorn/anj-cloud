@@ -390,7 +390,9 @@ class DavCloud
       body: utf8.encode(propfind),
     );
     if (response.statusCode != 207) {
-      await _watchResponseBody(response).drain<void>();
+      // Cancel the unused body so the caller can handle the failure and
+      // invalidate the listing as soon as the status is known.
+      await response.listen(null).cancel();
       failure(response.statusCode);
     }
     final body = await boundedBody(response);
