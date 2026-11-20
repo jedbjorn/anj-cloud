@@ -14,7 +14,11 @@ import android.os.Looper
 /// is usable (validated internet), so a client that could not reach the server retries at once
 /// instead of waiting out its backoff.
 object NetworkMonitor {
-    @Volatile private var last: Pair<Boolean, Boolean>? = null
+    data class State(val wifi: Boolean, val online: Boolean, val route: Long?) {
+        fun fields(): Map<String, Any?> = mapOf("wifi" to wifi, "online" to online, "route" to route)
+    }
+
+    @Volatile private var last: State? = null
 
     fun wifi(caps: NetworkCapabilities?): Boolean {
         if (caps == null) return false
@@ -28,10 +32,14 @@ object NetworkMonitor {
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
     }
 
-    fun onWifi(context: Context): Boolean {
+    fun state(context: Context): State {
         val manager = context.getSystemService(ConnectivityManager::class.java)
-        return wifi(manager.getNetworkCapabilities(manager.activeNetwork))
+        val network = manager.activeNetwork
+        val caps = manager.getNetworkCapabilities(network)
+        return State(wifi(caps), caps != null && online(caps), network?.networkHandle)
     }
+
+    fun onWifi(context: Context): Boolean = state(context).wifi
 
     /// Registered once per process (AnjApplication); callbacks arrive on the main thread.
     fun start(context: Context) {
@@ -39,9 +47,11 @@ object NetworkMonitor {
         manager.registerDefaultNetworkCallback(
             object : ConnectivityManager.NetworkCallback() {
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
-                    report(wifi(caps), online(caps))
+                    report(State(wifi(caps), online(caps), network.networkHandle))
 
-                override fun onLost(network: Network) = report(wifi = false, online = false)
+                override fun onLost(network: Network) {
+                    if (last?.route == network.networkHandle) report(State(false, false, null))
+                }
             },
             Handler(Looper.getMainLooper()),
         )
@@ -51,10 +61,9 @@ object NetworkMonitor {
         caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
 
-    private fun report(wifi: Boolean, online: Boolean) {
-        val state = wifi to online
+    private fun report(state: State) {
         if (last == state) return
         last = state
-        BackgroundChannel.push("network", mapOf("wifi" to wifi, "online" to online))
+        BackgroundChannel.push("network", state.fields())
     }
 }

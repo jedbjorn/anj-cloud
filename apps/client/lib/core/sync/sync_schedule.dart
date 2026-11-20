@@ -219,6 +219,10 @@ enum SyncStatus {
   syncing('Syncing'),
   paused('Paused'),
 
+  checkingServer('Checking server'),
+  checkingChanges('Connected · Checking for changes'),
+  accessDenied('Access denied'),
+
   /// The cloud is unreachable; the worker keeps retrying on its own.
   offline('Reconnecting'),
 

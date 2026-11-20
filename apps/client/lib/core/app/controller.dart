@@ -45,6 +45,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     this.placement = const PickerOnlyPlacement(),
     this.pairingOptions = PairingOptions.desktop,
     this.defaultNetworkPolicy,
+    this.androidForeground = false,
     this.fetchTimeout = fetchReplyTimeout,
     this.workerEntry = syncWorker,
     this.phoneFolders,
@@ -119,6 +120,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
       !phoneFoldersAsked;
   final SecretStore secrets;
   final DesktopLauncher launcher;
+  final bool androidForeground;
 
   /// Where this platform allows the root (checked before a root is made).
   final RootLocationPolicy rootLocation;
@@ -250,6 +252,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   /// one exception: it continues so a reissued leaf is not missed.
   bool paused = false;
   SyncStatus status = SyncStatus.upToDate;
+  String? openNotice;
 
   /// Files the worker reports as uploading, downloading or queued for
   /// transfer in the running pass. Empty while paused: a paused client shows
@@ -436,6 +439,8 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         ? SyncStatus.paused
         : root == null || rootMovePending
         ? SyncStatus.attention
+        : androidForeground && pairingState == 'paired'
+        ? SyncStatus.checkingServer
         : status;
     final keyRef = DeviceIdentity(store, secrets).privateKeyRef;
     store.close();
@@ -519,7 +524,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
           _flushPendingPause();
           _flushDocumentCloses();
           final wifi = _onWifi;
-          if (wifi != null) _input!.send({'action': 'network', 'wifi': wifi});
+          if (wifi != null) reportNetwork(wifi: wifi, online: _networkOnline);
           _ready?.complete();
           unawaited(refreshAdmin());
           _adminPoll?.cancel();
@@ -534,15 +539,15 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
               .cast<Map>()
               .map((e) => Map<String, dynamic>.from(e))
               .toList();
-          message = event['message'] as String;
-          if (_pendingPause == null) paused = event['paused'] == true;
           finishingEdits = event['finishing'] == true;
           stateReceived = true;
-          networkPolicy = event['networkPolicy'] as String?;
-          transfersHeld = event['transfersHeld'] == true;
-          status = SyncStatus.values.asNameMap()[event['status']] ?? status;
-          notifyListeners();
+          _applyWorkerStatus(event);
           _probeFetch();
+        case 'foregroundStatus':
+          _applyWorkerStatus(event);
+        case 'openNotice':
+          openNotice = event['message'] as String?;
+          notifyListeners();
         case 'backgroundDone':
           _backgroundRuns
               .remove(event['request'])
@@ -728,6 +733,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
         'nativeLibrary': nativeLibrary,
         'settleStaging': placement.stagingInProfile,
         'networkPolicy': defaultNetworkPolicy,
+        'androidForeground': androidForeground,
         // Without a check (it failed), the folders stay paused.
         if (access != null)
           'phoneFolders':
@@ -750,6 +756,15 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
       if (!_checking) rethrow;
       await _ready!.future;
     }
+  }
+
+  void _applyWorkerStatus(Map event) {
+    message = event['message'] as String;
+    if (_pendingPause == null) paused = event['paused'] == true;
+    networkPolicy = event['networkPolicy'] as String?;
+    transfersHeld = event['transfersHeld'] == true;
+    status = SyncStatus.values.asNameMap()[event['status']] ?? status;
+    notifyListeners();
   }
 
   Future<void> openOnDesktop(
@@ -874,17 +889,28 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   void windowShown({bool verify = false}) =>
       _input?.send({'action': 'visible', if (verify) 'verify': true});
 
+  void foregroundLeft() => _input?.send({'action': 'foregroundLeft'});
+
   /// The platform's last connectivity report (Android): on Wi-Fi or
   /// Ethernet; null before the first report.
   bool? get onWifi => _onWifi;
 
   /// The platform's connectivity report (Android): on Wi-Fi or Ethernet, or
   /// not. Kept and re-sent to every worker start, so a worker never guesses.
-  /// [online]: the network was just reported usable, so an offline worker
-  /// retries now; not kept.
-  void reportNetwork({required bool wifi, bool online = false}) {
+  /// [online] is the platform's validation report when available.
+  bool? _networkOnline;
+  int? _networkRoute;
+
+  void reportNetwork({required bool wifi, bool? online, int? route}) {
     _onWifi = wifi;
-    _input?.send({'action': 'network', 'wifi': wifi, 'online': online});
+    _networkOnline = online ?? _networkOnline;
+    _networkRoute = route ?? _networkRoute;
+    _input?.send({
+      'action': 'network',
+      'wifi': wifi,
+      'online': _networkOnline,
+      'route': _networkRoute,
+    });
   }
 
   /// "Wi-Fi only" ('wifi') or "Wi-Fi or mobile data" ('any'), persisted in

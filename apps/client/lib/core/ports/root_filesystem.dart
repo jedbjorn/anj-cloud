@@ -22,6 +22,11 @@ typedef WritebackParameters = ({
   int laptopMode,
 });
 
+typedef RootScan = ({
+  List<Map<String, dynamic>> items,
+  List<Map<String, dynamic>> watches,
+});
+
 abstract interface class RootFilesystem implements RootIdentitySource {
   /// Writeback parameters, read again at every pass; null when the platform
   /// cannot read them, which turns the stamp fast path off (every file is
@@ -128,6 +133,15 @@ abstract interface class RootFilesystem implements RootIdentitySource {
   /// yields no items.
   ({List<Map<String, dynamic>> items, List<Map<String, dynamic>> watches})
   watchScan(Pointer<Void>? handle, int root, String path, bool recursive);
+
+  /// A full enumeration while the Android worker services file requests.
+  /// [watched] selects the audit listing, even if it has no [watch] handle.
+  /// The caller owns the root and watch descriptors until the future settles.
+  Future<RootScan> scanRootInBackground(
+    int root, {
+    required bool watched,
+    Pointer<Void>? watch,
+  });
 
   String copyAndHash(
     int root,
