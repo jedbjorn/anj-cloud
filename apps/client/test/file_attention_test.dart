@@ -246,10 +246,10 @@ void main() {
         await tester.pumpAndSettle();
 
         // Conflict tab.
-        await tester.tap(find.widgetWithText(Tab, 'Conflict'));
+        await tester.tap(find.byTooltip('Conflict'));
         await tester.pumpAndSettle();
         expectAmber(tester, ['Documents', 'Documents/plan.txt']);
-        await tester.tap(find.widgetWithText(Tab, 'Home'));
+        await tester.tap(find.byTooltip('Home'));
         await tester.pumpAndSettle();
 
         // File-only search results.

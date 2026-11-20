@@ -159,7 +159,7 @@ void main() {
             child: CloudApp(controller: controller),
           ),
         );
-        await tester.tap(find.text('Editing'));
+        await tester.tap(find.byTooltip('Editing'));
         await tester.pumpAndSettle();
         await search(tester, 'needle');
         expect(find.byType(LibraryEntryCard), findsOneWidget);

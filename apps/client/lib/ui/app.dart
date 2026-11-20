@@ -1174,16 +1174,6 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                 final compact = compactLayout(context);
                 final short =
                     MediaQuery.sizeOf(context).height < compactHeightBreakpoint;
-                final tabLabels = [
-                  'Home',
-                  'Editing',
-                  'Conflict',
-                  if (_hasDownloader) 'Downloader',
-                ];
-                // Three tabs lay out as they always have.
-                final tabLayout = _hasDownloader
-                    ? homeTabLayout(context, tabLabels, body.maxWidth)
-                    : (scrollable: false, labelPadding: null);
                 final top = <Widget>[
                   if (KeyUnavailableNotice.shown(controller))
                     Padding(
@@ -1290,12 +1280,19 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                   ),
                   TabBar(
                     controller: _tabs,
-                    isScrollable: tabLayout.scrollable,
-                    tabAlignment: tabLayout.scrollable
-                        ? TabAlignment.start
-                        : null,
-                    labelPadding: tabLayout.labelPadding,
-                    tabs: [for (final label in tabLabels) Tab(text: label)],
+                    tabs: [
+                      for (final (name, icon) in [
+                        ('Home', Icons.home),
+                        ('Editing', Icons.edit),
+                        ('Conflict', Icons.warning_amber_rounded),
+                        if (_hasDownloader) ('Downloader', Icons.move_to_inbox_outlined),
+                      ])
+                        Tooltip(
+                          message: name,
+                          excludeFromSemantics: true,
+                          child: Tab(icon: Icon(icon, semanticLabel: name)),
+                        ),
+                    ],
                   ),
                   // The library's filters and search do not apply to the
                   // Downloader.
