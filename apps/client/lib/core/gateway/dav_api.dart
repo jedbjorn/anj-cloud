@@ -1112,6 +1112,28 @@ class DavCloud
     }
   }
 
+  /// Query conditions require a gateway that verifies both identities under
+  /// its write lock. Earlier gateways reject DAV queries.
+  Future<void> moveLibraryFile(
+    RemoteItem file, String destination, int? parentId, String? job,
+  ) async {
+    final response = await _request('MOVE', uri(file.path).replace(queryParameters: {
+      'fileId': file.fileId.toString(),
+      'parentId': parentId?.toString() ?? 'root',
+      'job': ?job,
+    }), headers: {
+      'Destination': uri(destination).toString(),
+      'If-Match': file.etag,
+      'Overwrite': 'F',
+    });
+    await _responseBody(response).drain<void>();
+    if (response.statusCode == 412) {
+      throw const CloudFailure('The file or folder changed, or the name is already taken.');
+    }
+    if (response.statusCode != 201 && response.statusCode != 204) failure(response.statusCode);
+    forgetListing();
+  }
+
   @override
   bool get safeFolderDeletion => folderDeletionQualified;
   @override

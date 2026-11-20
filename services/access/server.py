@@ -562,11 +562,16 @@ class Gateway:
         device = self.identity(request)
         if request.method not in METHODS:
             raise web.HTTPMethodNotAllowed(request.method, sorted(METHODS))
-        if request.query_string or "If" in request.headers:
+        file_move = request.method == "MOVE" and "fileId" in request.query
+        if file_move:
+            if (set(request.query) - {"fileId", "parentId", "job"} or "parentId" not in request.query
+                    or any(len(request.query.getall(key)) != 1 for key in request.query)):
+                raise Rejection("Invalid file move conditions")
+        if (request.query_string and not file_move) or "If" in request.headers:
             raise Rejection("Queries and tagged DAV If headers are unsupported")
         if device["rights"] == "read" and request.method not in READ_METHODS:
             raise web.HTTPForbidden(text="Device is read-only")
-        raw = request.raw_path
+        raw = request.raw_path.partition("?")[0]
         if not raw.startswith("/dav/"):
             raise Rejection("Invalid DAV path")
         relative = canonical_path(raw[len("/dav/"):])

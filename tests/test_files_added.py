@@ -199,7 +199,7 @@ class MutationRecordingTests(unittest.IsolatedAsyncioTestCase):
         async def chunks(_):
             if body:
                 yield body
-        request = SimpleNamespace(method=method, content_length=len(body) if method == "PUT" else None,
+        request = SimpleNamespace(method=method, query={}, content_length=len(body) if method == "PUT" else None,
                                   content=SimpleNamespace(iter_chunked=chunks), headers=headers, can_read_body=False)
         forwarded = {key: value for key, value in headers.items() if key != "Destination"}
         if method == "MOVE":
