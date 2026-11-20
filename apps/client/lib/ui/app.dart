@@ -1250,6 +1250,8 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                               ? 'Quitting: stopping sync safely...'
                               : controller.message,
                         ),
+                        if (controller.openNotice case final notice?)
+                          Text(notice),
                         if (controller.secretsUnavailable != null &&
                             !(lifecycle?.quitting ?? false))
                           Align(
@@ -1956,6 +1958,9 @@ class _StatusLine extends StatelessWidget {
     SyncStatus.upToDate => Icons.cloud_done_outlined,
     SyncStatus.syncing => Icons.cloud_sync_outlined,
     SyncStatus.paused => Icons.pause_circle_outline,
+    SyncStatus.checkingServer => Icons.cloud_outlined,
+    SyncStatus.checkingChanges => Icons.cloud_sync_outlined,
+    SyncStatus.accessDenied => Icons.lock_outline,
     SyncStatus.offline => Icons.cloud_off_outlined,
     SyncStatus.waiting => Icons.wifi_off_outlined,
     SyncStatus.attention => Icons.error_outline,

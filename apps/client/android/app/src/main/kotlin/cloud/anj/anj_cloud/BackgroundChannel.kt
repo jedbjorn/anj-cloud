@@ -33,10 +33,8 @@ object BackgroundChannel {
                     "attach" -> {
                         attached.complete(Unit)
                         result.success(
-                            mapOf(
-                                "notifications" to Notifications.allowed(app),
-                                "wifi" to NetworkMonitor.onWifi(app),
-                            ),
+                            NetworkMonitor.state(app).fields() +
+                                ("notifications" to Notifications.allowed(app)),
                         )
                     }
                     "transfers" -> {

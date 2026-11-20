@@ -231,6 +231,19 @@ class SyncEngine {
   /// Whether the last pass listed the cloud, and whether that listing failed.
   bool remoteListed = false;
   bool remoteFailed = false;
+  Object? remoteError;
+
+  /// Android services selected-file requests while awaiting discovery and
+  /// between descriptor-bound file reads.
+  Future<void> Function()? yieldToForeground;
+  Future<T> Function<T>(Future<T>)? duringDiscovery;
+
+  /// Lets Android guard every folder request on the transport used by the
+  /// snapshot, including snapshots triggered by local changes.
+  Future<List<RemoteItem>> Function()? discoverSnapshot;
+  Future<List<RemoteItem>> _discoverSnapshot() =>
+      discoverSnapshot?.call() ?? cloud.snapshot();
+  bool _reconciling = false;
 
   /// Wi-Fi only on mobile data (Android, decision #108 Q4; spec #28 R3):
   /// file bytes wait, listings, deletions and folder creation do not. While
@@ -552,6 +565,8 @@ class SyncEngine {
   /// The local view for this pass: the full scan without a watcher, else
   /// the kept view refreshed for queued, due and engine-touched paths.
   Future<Map<String, LocalItem>> _localSnapshot() async {
+    final checkpoint = yieldToForeground;
+    final discovery = duringDiscovery;
     await _restartWatching();
     final w = watcher;
     _statted = 0;
@@ -560,7 +575,9 @@ class SyncEngine {
       _view = null;
       _localScan = 'full';
       fullScans++;
-      final items = await tree.snapshot(includeExcluded: true);
+      final items = checkpoint == null || discovery == null
+          ? await tree.snapshot(includeExcluded: true)
+          : await tree.snapshotCooperatively(checkpoint, discovery);
       lastPassReadWholeRoot = !tree.rootStampsTrusted;
       return items;
     }
@@ -597,14 +614,18 @@ class SyncEngine {
       // Everything queued so far is covered by the full scan. Between
       // verifications an event-driven stat audit (decision #137 (3), every
       // statAuditInterval) reads only files whose stat stamp changed.
-      w.beginFullAudit();
+      final cooperative = checkpoint != null && discovery != null;
+      w.beginFullAudit(deferEvents: cooperative);
       try {
-        final scan = tree.scanTree(
-          '',
-          recursive: true,
-          watch: w.handle,
-          reuse: _eventDrivenPass && !verify ? _view : null,
-        );
+        final reuse = _eventDrivenPass && !verify ? _view : null;
+        final scan = !cooperative
+            ? tree.scanTree('', recursive: true, watch: w.handle, reuse: reuse)
+            : await tree.scanAudit(
+                watch: w.handle,
+                reuse: reuse,
+                yieldToForeground: checkpoint,
+                duringEnumeration: discovery,
+              );
         _view = SplayTreeMap();
         _unstamped.clear();
         _confirmations.clear();
@@ -621,6 +642,8 @@ class SyncEngine {
       } catch (_) {
         w.fullAuditWanted = true;
         rethrow;
+      } finally {
+        w.endFullAudit();
       }
       _lastStatAudit = elapsed;
       _localScan = 'full';
@@ -876,7 +899,11 @@ class SyncEngine {
   }
 
   /// Remember paths changed by a command so a later pass reconciles them.
-  void markDirty(String path, {bool descendants = false}) {
+  void markDirty(
+    String path, {
+    bool descendants = false,
+    bool deferCurrentPass = true,
+  }) {
     final paths = <String>{path};
     if (descendants) {
       paths.addAll(
@@ -886,7 +913,7 @@ class SyncEngine {
     _dirty.addAll(paths);
     _localWork = true;
     _touched.addAll(paths);
-    if (_inPass) _deferred.addAll(paths);
+    if (_inPass && deferCurrentPass) _deferred.addAll(paths);
   }
 
   Retention get defaultRetention => Retention.local;
@@ -1029,6 +1056,7 @@ class SyncEngine {
     _inPass = true;
     remoteListed = false;
     remoteFailed = false;
+    remoteError = null;
     var candidates = 0;
     try {
       // Rows are compared once per audit cycle; the full path reconcile stays
@@ -1042,6 +1070,7 @@ class SyncEngine {
       _recordMountIdentities();
     } finally {
       _inPass = false;
+      _reconciling = false;
       // Every pass ends at a commit point (flag SC-051): grouped manifest
       // commits are flushed once here, not once each.
       manifest.commitPoint();
@@ -4658,6 +4687,8 @@ class SyncEngine {
     Future<bool> Function()? between,
     RemotePolicy remotePolicy,
   ) async {
+    Future<T> discover<T>(Future<T> pending) =>
+        duringDiscovery?.call(pending) ?? pending;
     _mountChanges.clear();
     _heldTargets.clear();
     _phonePausedThisPass = tree.phoneFolders?.paused == true;
@@ -4675,6 +4706,7 @@ class SyncEngine {
         final measured = scanning.elapsed;
         lastLocalScan = debugLocalScanDuration?.call(measured) ?? measured;
       }
+      if (stopRequested) return 0;
       // Before anything reads the scan: a top folder that is gone or
       // replaced is back before a missing item could read as a deletion.
       _migrateLegacyIdentities();
@@ -4724,7 +4756,8 @@ class SyncEngine {
             manifest.operations.isEmpty;
         migrationRemote = neverPaired
             ? {}
-            : {for (final item in await cloud.snapshot()) item.path: item};
+            : {for (final item in await _discoverSnapshot()) item.path: item};
+        if (stopRequested) return 0;
         if (!rootAvailable()) return 0;
         _migrateCloudRoot(rawLocal, migrationRemote);
         if (neverPaired) migrationRemote = null;
@@ -4991,17 +5024,21 @@ class SyncEngine {
     // paths come back under local spellings, from the recorded names until
     // this process has listed.
     if (lastListedAt == null) _recordedSpelling();
-    final incomingRead = migrationRemote != null || await _refreshIncoming();
+    final incomingRead =
+        migrationRemote != null || await discover(_refreshIncoming());
+    if (stopRequested) return 0;
     try {
       rawRemote =
           migrationRemote ??
-          {for (final item in await cloud.snapshot()) item.path: item};
+          {for (final item in await _discoverSnapshot()) item.path: item};
+      if (stopRequested) return 0;
       rawRemote = _localSpelling(rawRemote, rawLocal);
       remoteListed = true;
       lastListedAt = _clock.elapsed;
       _localWork = false;
     } catch (error) {
       remoteFailed = true;
+      remoteError = error;
       message =
           '${unreachableMessage(error)}'
           '${folderWarning == null ? '' : ' $folderWarning'}';
@@ -5010,6 +5047,7 @@ class SyncEngine {
     if (!rootAvailable()) {
       return 0;
     }
+    _reconciling = true;
     // Complete observed metadata is retained only for freezing future directory
     // delete intent. A queued intent is never refreshed from this new snapshot.
     manifest.setSetting(
@@ -7494,15 +7532,53 @@ class SyncEngine {
   /// when this hand-out goes through the documents provider's tracked open
   /// path; only a copy every hand-out of which did is cleared automatically
   /// while unchanged.
-  Future<String> openFile(String path, {bool providerTracked = false}) async {
+  Future<String> openFile(
+    String path, {
+    bool providerTracked = false,
+    bool requireWritable = false,
+    Future<RemoteItem> Function(String path, String etag)? checkRemote,
+    void Function()? checkTransferPolicy,
+    Future<void> Function(String path, File target, {required String etag})?
+    downloadSelected,
+  }) async {
     requireStorageReady();
-    final entry = manifest.entries[path]!;
-    if (entry.kind != ItemKind.file) {
-      throw const CloudFailure('Choose a regular file.');
+    final entry = manifest.entries[path];
+    if (entry == null || entry.kind != ItemKind.file) {
+      throw const CloudFailure('This file is no longer available.');
     }
+    final etag = entry.etag;
+    bool? remoteViewOnly;
     if (!entry.expectedPresent) {
+      if (checkRemote != null) {
+        if (etag == null) {
+          throw const CloudFailure('No remote version is available.');
+        }
+        checkTransferPolicy?.call();
+        final current = await checkRemote(path, etag);
+        checkTransferPolicy?.call();
+        if (entry.fileId != null &&
+            current.fileId != null &&
+            entry.fileId != current.fileId) {
+          throw const CloudFailure(
+            'This file was replaced on the server. Try again after the library refreshes.',
+          );
+        }
+        final permissions = current.permissions;
+        remoteViewOnly =
+            (mountOf(path) != null || permissions?.contains('S') == true) &&
+            (permissions == null ||
+                permissionsViewOnly(permissions, directory: false));
+        if (requireWritable && remoteViewOnly) {
+          throw const CloudFailure(
+            'This file is shared with you as View only.',
+          );
+        }
+      }
       final reuse = reusableWorkingCopy(path);
       if (reuse != null) {
+        if (remoteViewOnly != null) {
+          reuse.data['foregroundViewOnly'] = remoteViewOnly;
+        }
         workingCopyOpened(reuse, providerTracked: providerTracked);
         return reuse.staged!;
       }
@@ -7531,29 +7607,46 @@ class SyncEngine {
         }
       }
     } else {
-      if (entry.etag == null) {
+      if (etag == null) {
         throw const CloudFailure('No remote version is available.');
       }
-      await cloud.download(path, copy, etag: entry.etag!);
-      hash = await fileHash(copy, 'open');
+      try {
+        await (downloadSelected ?? cloud.download)(path, copy, etag: etag);
+        hash = await fileHash(copy, 'open');
+        checkTransferPolicy?.call();
+      } catch (_) {
+        if (checkRemote != null) {
+          // This new artifact was never handed to an editor. Release it
+          // only through the ordinary ownership and link-count checks.
+          try {
+            final partial = await fileHash(copy, 'open');
+            artifacts.complete(copy, hash: partial);
+            releases.release(artifacts.record(copy)!, partial);
+          } on FileSystemException {
+            // Ownership or storage unavailable: keep the staging record.
+          }
+        }
+        rethrow;
+      }
     }
     final op =
         Operation(
             uniqueId(),
             'working',
             path,
-            expectedEtag: entry.etag,
+            expectedEtag: etag,
             staged: tree.durablePath(copy),
             hash: hash,
           )
           ..data = {
             'handout': providerTracked ? 'provider' : 'untracked',
+            'foregroundViewOnly': ?remoteViewOnly,
             if (providerTracked && missingEditors.applies(path))
               providerOpenTokensKey: <String>[],
           };
     manifest.operations[op.id] = op;
-    markDirty(path);
-    artifacts.complete(copy, hash: hash, etag: entry.etag);
+    markDirty(path, deferCurrentPass: checkRemote == null || _reconciling);
+    artifacts.complete(copy, hash: hash, etag: etag);
     entry.workingCopy = tree.durablePath(copy);
     // Opening is not editing (decision #183): the row keeps its status until
     // the copy is changed (Evictions pins it then).

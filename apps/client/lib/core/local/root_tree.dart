@@ -365,16 +365,36 @@ class RootTree {
       "${item['volume']}:${item['inode']}:${item['size']}:"
       "${item['mtime']}:${item['ctime']}";
 
-  Future<Map<String, LocalItem>> snapshot({
-    bool includeExcluded = false,
-  }) async {
+  Future<Map<String, LocalItem>> snapshot({bool includeExcluded = false}) =>
+      _snapshot(includeExcluded, null);
+
+  Future<Map<String, LocalItem>> snapshotCooperatively(
+    Future<void> Function() yieldToForeground,
+    Future<T> Function<T>(Future<T>) duringEnumeration,
+  ) => _snapshot(true, yieldToForeground, duringEnumeration);
+
+  Future<Map<String, LocalItem>> _snapshot(
+    bool includeExcluded,
+    Future<void> Function()? yieldToForeground, [
+    Future<T> Function<T>(Future<T>)? duringEnumeration,
+  ]) async {
     native.checkRoot(fd, root.path);
     _readWriteback();
     busy.clear();
     busyIdentities.clear();
     final decide = _decider();
     final result = <String, LocalItem>{};
-    for (final item in native.scan(fd)) {
+    final listed = duringEnumeration == null
+        ? native.scan(fd)
+        : (await duringEnumeration(
+            native.scanRootInBackground(fd, watched: false),
+          )).items;
+    final slice = yieldToForeground == null ? null : (Stopwatch()..start());
+    for (final item in listed) {
+      if (slice != null && slice.elapsedMilliseconds >= 12) {
+        await yieldToForeground!();
+        slice.reset();
+      }
       final value = decide.call(item, includeExcluded);
       if (value != null) result[value.path] = value;
     }
@@ -402,6 +422,55 @@ class RootTree {
     Pointer<Void>? watch,
     Map<String, LocalItem>? reuse,
   }) {
+    final scan = _scanTree(
+      path,
+      recursive: recursive,
+      watch: watch,
+      reuse: reuse,
+    );
+    return (
+      items: {for (final item in scan.items) item.path: item},
+      watches: scan.watches,
+    );
+  }
+
+  /// The Android audit services foreground requests during enumeration and
+  /// between descriptor-bound file reads.
+  Future<({Map<String, LocalItem> items, List<Map<String, dynamic>> watches})>
+  scanAudit({
+    required Pointer<Void>? watch,
+    required Map<String, LocalItem>? reuse,
+    required Future<void> Function() yieldToForeground,
+    required Future<T> Function<T>(Future<T>) duringEnumeration,
+  }) async {
+    native.checkRoot(fd, root.path);
+    busy.clear();
+    busyIdentities.clear();
+    final scan = await duringEnumeration(
+      native.scanRootInBackground(fd, watched: true, watch: watch),
+    );
+    final decide = _decider(reuse: reuse);
+    final items = <String, LocalItem>{};
+    final slice = Stopwatch()..start();
+    for (final raw in scan.items) {
+      final item = decide.call(raw, true);
+      if (item != null) items[item.path] = item;
+      if (slice.elapsedMilliseconds >= 12) {
+        await yieldToForeground();
+        slice.reset();
+      }
+    }
+    _pruneSeen(decide.seen);
+    native.checkRoot(fd, root.path);
+    return (items: items, watches: scan.watches);
+  }
+
+  ({Iterable<LocalItem> items, List<Map<String, dynamic>> watches}) _scanTree(
+    String path, {
+    required bool recursive,
+    Pointer<Void>? watch,
+    Map<String, LocalItem>? reuse,
+  }) {
     if (path.isNotEmpty) validateRelative(path);
     native.checkRoot(fd, root.path);
     // What this listing reads is decided afresh, as in [snapshot].
@@ -416,14 +485,16 @@ class RootTree {
     busyIdentities.removeWhere((held, _) => !busy.contains(held));
     final listed = _exact(path, native.watchScan(watch, fd, path, recursive));
     final decide = _decider(reuse: reuse);
-    final items = <String, LocalItem>{};
-    for (final item in listed.items) {
-      final value = decide.call(item, true);
-      if (value != null) items[value.path] = value;
+    Iterable<LocalItem> items() sync* {
+      for (final item in listed.items) {
+        final value = decide.call(item, true);
+        if (value != null) yield value;
+      }
+      if (path.isEmpty && recursive) _pruneSeen(decide.seen);
+      native.checkRoot(fd, root.path);
     }
-    if (path.isEmpty && recursive) _pruneSeen(decide.seen);
-    native.checkRoot(fd, root.path);
-    return (items: items, watches: listed.watches);
+
+    return (items: items(), watches: listed.watches);
   }
 
   /// Whether this filesystem gives a change made after a stat a ctime

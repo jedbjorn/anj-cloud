@@ -1045,6 +1045,17 @@ void main() {
       },
     );
 
+    test('a foreground root can validate a reopened profile', () async {
+      await list();
+      restart();
+
+      await api.checkRoot(stillWanted: () => true, selectedRead: () => null);
+      await listsLikeAFullWalk();
+
+      expect(propfinds, ['']);
+      expect(profile.setting(anchor), isNotNull);
+    });
+
     for (final when in ['during', 'after']) {
       test(
         'another transport invalidating $when preparation forces a reread',

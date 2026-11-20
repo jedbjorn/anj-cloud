@@ -6,6 +6,7 @@ import 'package:crypto/crypto.dart';
 import '../../core/local/root_tree.dart' show uniqueId;
 import '../../core/ports/phone_folders.dart';
 import '../../core/ports/release_guard.dart';
+import '../../core/ports/root_filesystem.dart';
 import 'native_root_fs.dart';
 
 /// errno values of the Linux kernel (Android included).
@@ -371,6 +372,45 @@ class MappedRootFs extends NativeRootFs implements PhoneFolderRouting {
       items: listed.items.map(_renamed).toList(),
       watches: listed.watches.map(_renamed).toList(),
     );
+  }
+
+  @override
+  Future<RootScan> scanRootInBackground(
+    int root, {
+    required bool watched,
+    Pointer<Void>? watch,
+  }) async {
+    if (root != _root) {
+      return super.scanRootInBackground(root, watched: watched, watch: watch);
+    }
+    // Resolve top-folder spelling on the owner isolate, where the selected
+    // file also resolves its path. Apply storage permission changes only
+    // after the pass, once the helper has returned the borrowed descriptors.
+    if (!paused) _canonicalTops();
+    final private = await super.scanRootInBackground(
+      root,
+      watched: watched,
+      watch: watch,
+    );
+    final items = private.items.where((item) => !_privateTop(item)).toList();
+    final watches = private.watches
+        .where((item) => !_privateTop(item))
+        .toList();
+    if (!paused) {
+      for (final top in phoneFolderNames.keys) {
+        final phone = _phoneOf(top);
+        _touch('list', phone);
+        final area = await enumerateInIsolate(
+          _base!,
+          phone,
+          watched: true,
+          watch: watch,
+        );
+        items.addAll(area.items.map(_renamed));
+        watches.addAll(area.watches.map(_renamed));
+      }
+    }
+    return (items: items, watches: watches);
   }
 
   @override

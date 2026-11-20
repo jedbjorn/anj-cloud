@@ -55,6 +55,7 @@ const firstSyncPropfind =
 class DavCloud
     implements
         CloudApi,
+        ForegroundReads,
         SharingApi,
         AdminTransport,
         ReleaseTransport,
@@ -62,14 +63,14 @@ class DavCloud
         TrashApi {
   DavCloud(
     this.origin,
-    SecurityContext context, {
+    this._securityContext, {
     this.folderDeletionQualified = false,
     this.fullWalkInterval = listingFullWalkInterval,
     this.pruneShares = true,
     this.listingCache,
     Duration Function()? monotonic,
     DateTime Function()? wallClock,
-  }) : client = HttpClient(context: context),
+  }) : _client = _newClient(_securityContext),
        monotonic = monotonic ?? _uptime,
        wallClock = wallClock ?? DateTime.now {
     if (origin.scheme != 'https' ||
@@ -81,13 +82,28 @@ class DavCloud
         'Use an HTTPS server origin without a path, credentials or query.',
       );
     }
-    client.connectionTimeout = const Duration(seconds: 10);
-    client.autoUncompress = false;
   }
   final Uri origin;
-  final HttpClient client;
+  final SecurityContext _securityContext;
+  HttpClient _client;
+  HttpClient get client => _client;
   final bool folderDeletionQualified;
   final DavListingCache? listingCache;
+
+  static HttpClient _newClient(SecurityContext context) =>
+      HttpClient(context: context)
+        ..connectionTimeout = const Duration(seconds: 10)
+        ..autoUncompress = false;
+
+  @override
+  void networkChanged() {
+    discardPreparedListingRoot();
+    final previous = _client;
+    _client = _newClient(_securityContext);
+    // Finish outstanding requests, but never reuse their sockets for a
+    // check of the replacement network.
+    previous.close();
+  }
 
   /// The longest a listing may trust stored folder ETags (flag SC-057).
   final Duration fullWalkInterval;
@@ -192,19 +208,19 @@ class DavCloud
   int? uploadLimit;
 
   // request() only covers failures up to the response headers. Observe
-  // stream errors before the body reaches its consumer, including a file sink.
+  // stream errors before the body reaches its consumer.
   Stream<List<int>> _watchResponseBody(Stream<List<int>> body) =>
       body.handleError((Object error, StackTrace stack) {
         if (!_closed) forgetListing();
         Error.throwWithStackTrace(error, stack);
       });
 
+  Stream<List<int>> _responseBody(HttpClientResponse response) =>
+      _watchResponseBody(response.timeout(const Duration(seconds: 30)));
+
   Future<String> boundedBody(HttpClientResponse response) async {
     final data = <int>[];
-    final body = _watchResponseBody(
-      response.timeout(const Duration(seconds: 30)),
-    );
-    await for (final chunk in body) {
+    await for (final chunk in _responseBody(response)) {
       if (data.length + chunk.length > 2 * 1024 * 1024) {
         throw const CloudFailure(
           'Server listing exceeds the supported response size.',
@@ -260,6 +276,60 @@ class DavCloud
   /// Advanced by every [forgetListing]: a snapshot stores its listing only
   /// if no forget happened while it ran.
   int _generation = 0;
+
+  bool Function()? _listingWanted;
+  Future<void>? Function()? _selectedRead;
+
+  @override
+  Future<void> checkRoot({
+    required bool Function() stillWanted,
+    required Future<void>? Function() selectedRead,
+  }) async {
+    clearCheckedRoot();
+    guardListing(stillWanted: stillWanted, selectedRead: selectedRead);
+    final transport = _client;
+    final read = _readListingRoot();
+    final root = await read;
+    if (root.generation == _generation &&
+        identical(transport, _client) &&
+        stillWanted()) {
+      _preparedRoot = read;
+    }
+  }
+
+  @override
+  void guardListing({
+    required bool Function() stillWanted,
+    required Future<void>? Function() selectedRead,
+  }) {
+    _listingWanted = stillWanted;
+    _selectedRead = selectedRead;
+  }
+
+  @override
+  void clearCheckedRoot() {
+    discardPreparedListingRoot();
+    _listingWanted = null;
+    _selectedRead = null;
+  }
+
+  Future<void> _awaitListingTurn() async {
+    if (_selectedRead?.call() case final pending?) await pending;
+    if (_listingWanted?.call() == false) {
+      throw const CloudFailure('The server check was interrupted.');
+    }
+  }
+
+  @override
+  Future<RemoteItem> checkFile(String path, String etag) async {
+    final name = path.split('/').map(NamePolicy.nfc).join('/');
+    final items = await _listChildren(name, selectedItem: true);
+    final item = items.singleOrNull;
+    if (item == null || item.kind != ItemKind.file || item.etag != etag) {
+      failure(412);
+    }
+    return item;
+  }
 
   /// The last incoming-share list read; a change forces a full walk.
   String? _incomingFingerprint;
@@ -382,11 +452,16 @@ class DavCloud
     String propfind = listingPropfind,
     Map<String, int>? sizes,
     void Function(int?)? serverTime,
+    bool selectedItem = false,
   }) async {
+    if (!selectedItem && _listingWanted != null) await _awaitListingTurn();
     final response = await request(
       'PROPFIND',
       directory,
-      headers: {'Depth': '1', 'Content-Type': 'application/xml; charset=utf-8'},
+      headers: {
+        'Depth': selectedItem ? '0' : '1',
+        'Content-Type': 'application/xml; charset=utf-8',
+      },
       body: utf8.encode(propfind),
     );
     if (response.statusCode != 207) {
@@ -449,9 +524,9 @@ class DavCloud
       }
       if (path == directory) {
         sawDirectory = true;
-        continue;
-      }
-      if (p.posix.dirname(path) != (directory.isEmpty ? '.' : directory)) {
+        if (!selectedItem) continue;
+      } else if (selectedItem ||
+          p.posix.dirname(path) != (directory.isEmpty ? '.' : directory)) {
         throw const CloudFailure(
           'Cloud listing escaped its requested directory.',
         );
@@ -560,6 +635,7 @@ class DavCloud
     _preparedRoot = null;
     if (prepared != null) {
       final result = await prepared;
+      if (_listingWanted != null) await _awaitListingTurn();
       // Uptime can stop during suspend. Both clocks must put the read in
       // the freshness window and the profile must still trust its revision.
       if (result.generation == _generation &&
@@ -879,34 +955,35 @@ class DavCloud
       headers: {'If-Match': etag, 'Accept-Encoding': 'identity'},
     );
     if (response.statusCode != 200) {
-      await _watchResponseBody(response).drain<void>();
+      await _responseBody(response).drain<void>();
       failure(response.statusCode);
     }
     if (response.headers.value('etag') != etag) {
-      await _watchResponseBody(response).drain<void>();
+      await _responseBody(response).drain<void>();
       throw const CloudFailure('Download version changed.');
     }
-    final sink = target.openWrite();
+    RandomAccessFile? file;
+    var length = 0;
     try {
-      await sink.addStream(
-        _watchResponseBody(response.timeout(const Duration(seconds: 30))),
-      );
-      await sink.flush();
+      await for (final chunk in _responseBody(response)) {
+        file ??= await target.open(mode: FileMode.write);
+        await file.writeFrom(chunk);
+        length += chunk.length;
+      }
+      if (response.contentLength >= 0 && length != response.contentLength) {
+        forgetListing();
+        throw const HttpException('Incomplete download retained for retry.');
+      }
+      file ??= await target.open(mode: FileMode.write);
+      await file.flush();
     } catch (_) {
       try {
-        await sink.close();
+        await file?.close();
       } on FileSystemException {
-        // addStream can close the file on error. Preserve the original failure.
+        // Preserve the original response or write error if closing also fails.
       }
       rethrow;
     }
-    await sink.close();
-    if (response.contentLength >= 0 &&
-        await target.length() != response.contentLength) {
-      throw const CloudFailure('Incomplete download retained for retry.');
-    }
-    final file = await target.open(mode: FileMode.append);
-    await file.flush();
     await file.close();
   }
 

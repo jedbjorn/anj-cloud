@@ -38,11 +38,21 @@ import 'top_folders.dart';
 /// Names follow decision #120: a name other devices cannot hold is refused
 /// here, before anything is created, rather than kept local-only.
 class DocumentsOps {
-  DocumentsOps(this.engine, {OpenDocuments? registry, this.paused})
-    : registry = registry ?? openDocuments;
+  DocumentsOps(
+    this.engine, {
+    OpenDocuments? registry,
+    this.paused,
+    this.checkRemote,
+    this.checkTransferPolicy,
+    this.downloadSelected,
+  }) : registry = registry ?? openDocuments;
   final SyncEngine engine;
   final OpenDocuments registry;
   final bool Function()? paused;
+  final Future<RemoteItem> Function(String path, String etag)? checkRemote;
+  final void Function()? checkTransferPolicy;
+  final Future<void> Function(String path, File target, {required String etag})?
+  downloadSelected;
 
   RootTree get tree => engine.tree;
   DocumentsFilesystem get _fs {
@@ -186,7 +196,7 @@ class DocumentsOps {
     // Cloud-only: the Open action's private editor working copy. One
     // unchanged copy of the current version is reused, so an app that
     // reopens a file does not download it again.
-    final reuse = engine.reusableWorkingCopy(path);
+    final reuse = checkRemote == null ? engine.reusableWorkingCopy(path) : null;
     if (reuse != null) {
       return _openWorking(p.basename(reuse.staged!), write, token);
     }
@@ -198,7 +208,16 @@ class DocumentsOps {
     }
     final String staged;
     try {
-      staged = await engine.openFile(path, providerTracked: true);
+      staged = await engine.openFile(
+        path,
+        providerTracked: true,
+        requireWritable: write,
+        checkRemote: checkRemote,
+        checkTransferPolicy: checkTransferPolicy,
+        downloadSelected: downloadSelected,
+      );
+    } on TransfersHeld catch (error) {
+      throw DocumentsFailure('waitingForWifi', error.message);
     } on CloudFailure catch (error) {
       throw DocumentsFailure('unavailable', error.message);
     }
@@ -221,7 +240,8 @@ class DocumentsOps {
     }
     final work = owner.first;
     final path = work.path;
-    if (write && engine.viewOnly(path)) {
+    if (write &&
+        (work.data['foregroundViewOnly'] == true || engine.viewOnly(path))) {
       throw const DocumentsFailure(
         'readOnly',
         'This file is shared with you as View only.',

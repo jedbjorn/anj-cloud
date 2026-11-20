@@ -18,8 +18,9 @@ import 'test_platform.dart';
 // F_FULLFSYNC (about 5 ms on mac-test), so these 1,000- and 2,000-file runs
 // take 1.5 to 3.5 minutes (PR #59) against seconds on Linux's tmpfs. Only the
 // limit differs; every assertion is the same.
-final Timeout? flushBound =
-    Platform.isMacOS ? const Timeout(Duration(minutes: 6)) : null;
+final Timeout? flushBound = Platform.isMacOS
+    ? const Timeout(Duration(minutes: 6))
+    : null;
 
 void main() {
   // Deletions under Documents here are not about the settle time of spec
@@ -82,27 +83,33 @@ void main() {
     timeout: flushBound,
   );
 
-  test('one changed file writes the same rows at 200 and 2000 files', () async {
-    store.verifyTracking = false;
-    Future<(int, int)> changeOne(String path) async {
-      await Future<void>.delayed(racyMargin);
-      await pass();
-      await pass();
-      expect(await pass(), (0, 0));
-      local(path).writeAsStringSync('changed content!');
-      final changed = await pass();
-      final settle = await pass();
-      return (changed.$1 + settle.$1, changed.$2 + settle.$2);
-    }
+  test(
+    'one changed file writes the same rows at 200 and 2000 files',
+    () async {
+      store.verifyTracking = false;
+      Future<(int, int)> changeOne(String path) async {
+        await Future<void>.delayed(racyMargin);
+        await pass();
+        await pass();
+        expect(await pass(), (0, 0));
+        local(path).writeAsStringSync('changed content!');
+        final changed = await pass();
+        final settle = await pass();
+        return (changed.$1 + settle.$1, changed.$2 + settle.$2);
+      }
 
-    populate(200);
-    final small = await changeOne('Documents/d0/f0.txt');
-    populate(2000);
-    final large = await changeOne('Documents/d0/f1.txt');
-    expect(store.entries.length, greaterThan(2000));
-    expect(large, small);
-    expect(large.$1, lessThan(40));
-  }, timeout: flushBound);
+      populate(200);
+      final small = await changeOne('Documents/d0/f0.txt');
+      populate(2000);
+      final large = await changeOne('Documents/d0/f1.txt');
+      expect(store.entries.length, greaterThan(2000));
+      expect(large, small);
+      expect(large.$1, lessThan(40));
+    },
+    // Seeding 2,000 files with synchronous commits can exceed the default
+    // deadline on a hosted runner. The assertions compare write counts.
+    timeout: flushBound ?? const Timeout(Duration(minutes: 2)),
+  );
 
   group('manifest persistence', () {
     test('nested operation data changed after a save is still persisted', () {

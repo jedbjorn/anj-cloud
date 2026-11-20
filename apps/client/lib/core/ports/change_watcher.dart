@@ -117,8 +117,12 @@ abstract interface class ChangeWatcher {
   /// Puts back work whose scan failed.
   void requeue(WatchWork work);
 
-  /// The full audit is starting: everything queued so far is covered by it.
-  void beginFullAudit();
+  /// The full audit covers everything queued so far. When enumeration yields,
+  /// defer incoming records until it publishes the new watch descriptors.
+  void beginFullAudit({bool deferEvents = false});
+
+  /// Replays deferred events after the scan registered its watches.
+  void endFullAudit();
 
   /// Time until the next queued path matures or an unwatched subtree is due.
   Duration? nextDeadline();

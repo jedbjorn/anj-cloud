@@ -77,6 +77,7 @@ Future<void> mobileMain() async {
     profile,
     pairingOptions: androidPairing,
     defaultNetworkPolicy: 'wifi',
+    androidForeground: true,
     // Music, Videos and Documents in the phone's own folders (spec #52).
     phoneFolders: const AndroidPhoneFolders(),
   );
@@ -106,10 +107,14 @@ Future<void> mobileMain() async {
       onResume: () {
         // All files access first: coming back from its settings page
         // resumes the phone folders with a full verification (spec #52).
-        unawaited(controller.checkPhoneFolders());
-        controller.windowShown(verify: true);
+        unawaited(
+          controller.checkPhoneFolders().then((_) {
+            controller.windowShown(verify: true);
+          }),
+        );
         unawaited(updater.resumed());
       },
+      onHide: controller.foregroundLeft,
       // Android's install confirmation in front, or the user elsewhere.
       onInactive: updater.left,
     ),
