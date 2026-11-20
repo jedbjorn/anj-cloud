@@ -6,10 +6,13 @@
 // the on-device run is integration_test/android_engine_test.dart.
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 
 import 'package:anj_cloud/core/gateway/cloud_api.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
+import 'package:anj_cloud/core/ports/phone_folders.dart';
+import 'package:anj_cloud/core/ports/root_filesystem.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/artifacts.dart';
@@ -21,9 +24,20 @@ import 'package:anj_cloud/platform/android/android_root_fs.dart';
 import 'package:anj_cloud/platform/linux/linux_change_watchers.dart';
 import 'package:anj_cloud/platform/native/local_watcher.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
+import 'package:anj_cloud/platform/watchers.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'fakes.dart';
+
+class _ListedCloud extends FakeCloud {
+  int listings = 0;
+
+  @override
+  Future<List<RemoteItem>> snapshot() {
+    listings++;
+    return super.snapshot();
+  }
+}
 
 /// Android's filesystem adapter with a short verification interval.
 class _ShortVerification extends AndroidRootFs {
@@ -52,28 +66,58 @@ class _ShortVerification extends AndroidRootFs {
 }
 
 class _ForegroundFixture implements ForegroundReads {
-  _ForegroundFixture(this.cloud);
+  _ForegroundFixture(this.cloud, {this.beforeRoot, this.beforeFile});
   final FakeCloud cloud;
+  final Future<void> Function()? beforeRoot;
+  final Future<void> Function()? beforeFile;
 
   @override
   Future<void> checkRoot({
     required bool Function() stillWanted,
     required Future<void>? Function() selectedRead,
-  }) async => cloud.check();
+  }) async {
+    await beforeRoot?.call();
+    cloud.check();
+  }
 
   @override
-  Future<RemoteItem> checkFile(String path, String etag) async =>
-      RemoteItem(path, ItemKind.file, cloud.versions[path]!);
+  Future<RemoteItem> checkFile(String path, String etag) async {
+    await beforeFile?.call();
+    return RemoteItem(path, ItemKind.file, cloud.versions[path]!);
+  }
 
   @override
   void clearCheckedRoot() {}
+}
+
+class _SlowPhoneEnumeration extends AndroidPhoneRootFs {
+  _SlowPhoneEnumeration(super.layout);
+
+  final enumerating = Completer<void>();
+  final resume = Completer<void>();
+
+  @override
+  Future<RootScan> enumerateInIsolate(
+    int root,
+    String path, {
+    required bool watched,
+    Pointer<Void>? watch,
+  }) async {
+    if (path == 'Movies' && !enumerating.isCompleted) {
+      // The private root and Music have been read. Hold enumeration of
+      // Movies before any of the library's content is hashed.
+      enumerating.complete();
+      await resume.future;
+    }
+    return super.enumerateInIsolate(root, path, watched: watched, watch: watch);
+  }
 }
 
 void main() {
   late Directory fixture;
   late RootTree tree;
   late Manifest store;
-  late FakeCloud cloud;
+  late _ListedCloud cloud;
   late SyncEngine engine;
   late _ShortVerification fs;
   var closed = false;
@@ -85,6 +129,16 @@ void main() {
   }
 
   LocalWatcher watcher() => engine.watcher! as LocalWatcher;
+  const wait = Duration(seconds: 10);
+
+  void addCloudOnly(String selected) {
+    cloud.put(selected, 'selected file');
+    store.entries[selected] = Entry(selected, ItemKind.file)
+      ..etag = cloud.versions[selected]
+      ..override = Retention.cloud
+      ..status = 'cloud-only';
+    store.save();
+  }
 
   Future<void> pump(bool Function() done) async {
     final end = DateTime.now().add(const Duration(seconds: 30));
@@ -131,7 +185,7 @@ void main() {
     tree = RootTree.setup(fixture.path, 'events', fs);
     store = Manifest(Directory('${fixture.path}/profile'))
       ..setSetting('retention', 'local');
-    cloud = FakeCloud();
+    cloud = _ListedCloud();
     for (var i = 0; i < 20; i++) {
       local('Documents/f$i.txt')
         ..parent.createSync(recursive: true)
@@ -174,12 +228,7 @@ void main() {
     'connects before the first audit and opens between audit reads',
     () async {
       const selected = 'read-first.txt';
-      cloud.put(selected, 'selected file');
-      store.entries[selected] = Entry(selected, ItemKind.file)
-        ..etag = cloud.versions[selected]
-        ..override = Retention.cloud
-        ..status = 'cloud-only';
-      store.save();
+      addCloudOnly(selected);
 
       final input = StreamController<Object?>();
       final opened = Completer<String>();
@@ -231,6 +280,169 @@ void main() {
     },
   );
 
+  for (final watched in [true, false]) {
+    test(
+      'opens while mapped directory enumeration waits (watched: $watched)',
+      () async {
+        engine.close();
+        closed = true;
+        final base = Directory('${fixture.path}/phone')..createSync();
+        for (final name in phoneFolderNames.values) {
+          Directory('${base.path}/$name').createSync();
+        }
+        File('${base.path}/Movies/a.txt').writeAsStringSync('in Movies');
+        final phoneFs = _SlowPhoneEnumeration(
+          PhoneFolderLayout(
+            base: base.path,
+            staging: '${base.path}/staging',
+            paused: false,
+          ),
+        );
+        tree = RootTree(tree.root, tree.staging, phoneFs);
+        store = Manifest(Directory('${fixture.path}/profile'));
+        Directory('${tree.root.path}/Unrelated').createSync();
+        const selected = 'read-first.txt';
+        addCloudOnly(selected);
+        engine = SyncEngine(
+          store,
+          tree,
+          cloud,
+          watchers: watched
+              ? const AndroidChangeWatchers()
+              : const UnwatchedChangeWatchers(),
+        );
+        await engine.startWatching();
+        final w = engine.watcher as LocalWatcher?;
+        expect(w != null, watched);
+        final input = StreamController<Object?>();
+        final opened = Completer<String>();
+        final firstPass = Completer<void>();
+        final loop = WorkerLoop(
+          engine,
+          (event) {
+            final value = event as Map;
+            if (value['event'] == 'open') {
+              opened.complete(File(value['path'] as String).readAsStringSync());
+            }
+            if (value['event'] == 'state' &&
+                value['status'] == SyncStatus.upToDate.name &&
+                !firstPass.isCompleted) {
+              firstPass.complete();
+            }
+          },
+          interval: const Duration(milliseconds: 100),
+          foregroundReads: () => _ForegroundFixture(cloud),
+        );
+        final done = loop.run(input.stream);
+        try {
+          await phoneFs.enumerating.future.timeout(wait);
+          input.add({
+            'action': 'open',
+            'path': selected,
+            'providerTracked': true,
+          });
+          expect(await opened.future.timeout(wait), 'selected file');
+          expect(engine.lastPass, isNull);
+          expect(remote('Videos/a.txt'), isNull);
+          expect(phoneFs.meter.filesBy['scan'], isNull);
+          if (w != null) {
+            // This event comes from a watch attached by the private traversal
+            // whose descriptor has yet to be registered with the worker.
+            expect(w.watching('Unrelated'), isFalse);
+            final delivered = Completer<void>();
+            final onChange = w.onChange;
+            w.onChange = () {
+              onChange?.call();
+              if (!delivered.isCompleted) delivered.complete();
+            };
+            local('Unrelated/arrived.txt')
+                .writeAsStringSync('arrived mid-audit');
+            await delivered.future.timeout(wait);
+          }
+          phoneFs.resume.complete();
+          await firstPass.future.timeout(wait);
+          expect(remote('Videos/a.txt'), 'in Movies');
+          if (w != null) {
+            expect(w.watching('Unrelated'), isTrue);
+            final deadline = Stopwatch()..start();
+            while (remote('Unrelated/arrived.txt') == null) {
+              if (deadline.elapsed > wait) fail('mid-audit event was lost');
+              await Future<void>.delayed(const Duration(milliseconds: 10));
+            }
+            expect(remote('Unrelated/arrived.txt'), 'arrived mid-audit');
+            expect(engine.fullVerifications, 1);
+          }
+        } finally {
+          if (!phoneFs.resume.isCompleted) phoneFs.resume.complete();
+          input.add({'action': 'stop'});
+          await done;
+          await input.close();
+        }
+      },
+    );
+  }
+
+  for (final interrupt in [
+    {'action': 'network', 'online': false, 'wifi': false},
+    {'action': 'pause'},
+  ]) {
+    test(
+      'a selected response cannot connect after ${interrupt['action']}',
+      () async {
+        const selected = 'read-first.txt';
+        addCloudOnly(selected);
+        final root = Completer<void>();
+        final rootStarted = Completer<void>();
+        final file = Completer<void>();
+        final fileStarted = Completer<void>();
+        final input = StreamController<Object?>();
+        final observed = <String>[];
+        final openingDone = Completer<void>();
+        final loop = WorkerLoop(
+          engine,
+          (event) {
+            final value = event as Map;
+            if (value['status'] case final String status) observed.add(status);
+            if (value['event'] == 'openNotice' &&
+                (value['message'] as String?)?.startsWith('Opening') != true) {
+              if (!openingDone.isCompleted) openingDone.complete();
+            }
+          },
+          foregroundReads: () => _ForegroundFixture(
+            cloud,
+            beforeRoot: () {
+              if (!rootStarted.isCompleted) rootStarted.complete();
+              return root.future;
+            },
+            beforeFile: () {
+              fileStarted.complete();
+              return file.future;
+            },
+          ),
+        );
+        input.add({'action': 'network', 'online': true, 'wifi': true});
+        final done = loop.run(input.stream);
+        try {
+          await rootStarted.future.timeout(wait);
+          input.add({'action': 'open', 'path': selected});
+          await fileStarted.future.timeout(wait);
+          input.add(interrupt);
+          await Future<void>.delayed(Duration.zero);
+          file.complete();
+          await openingDone.future.timeout(wait);
+          expect(observed, isNot(contains(SyncStatus.checkingChanges.name)));
+        } finally {
+          if (!file.isCompleted) file.complete();
+          root.complete();
+          input.add({'action': 'stop'});
+          await done;
+          await input.close();
+          closed = true;
+        }
+      },
+    );
+  }
+
   test('the watch limit fallback verifies once, then audits by stat', () async {
     await engine.tick();
     await quiesce();
@@ -248,8 +460,7 @@ void main() {
     expect(engine.fullVerifications, after, reason: 'not repeated per pass');
   });
 
-  test('the app opening verifies every file; a desktop window shown does '
-      'not', () async {
+  test('foreground entry verifies and Downloader refresh only lists', () async {
     engine.close();
     closed = true;
     Future<int> verificationsAfter(Map<String, Object> shown) async {
@@ -267,21 +478,32 @@ void main() {
         (_) {},
         interval: const Duration(milliseconds: 100),
         schedule: RemoteSchedule(idle: const Duration(seconds: 30)),
+        foregroundReads: () => _ForegroundFixture(cloud),
       );
       final done = loop.run(input.stream);
-      final end = DateTime.now().add(const Duration(seconds: 20));
-      while (value.lastPass == null || value.lastPass!.filesHashed != 0) {
-        if (DateTime.now().isAfter(end)) fail('did not settle');
-        await Future<void>.delayed(const Duration(milliseconds: 100));
+      try {
+        final end = Stopwatch()..start();
+        while (value.lastPass == null || value.lastPass!.filesHashed != 0) {
+          if (end.elapsed > wait) fail('did not settle');
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        }
+        final before = value.fullVerifications;
+        final listedBefore = cloud.listings;
+        final hashedBefore = fs.meter.filesBy['scan'];
+        input.add(shown);
+        while (cloud.listings == listedBefore) {
+          if (end.elapsed > wait) fail('refresh did not list');
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        if (shown['verify'] != true) {
+          expect(fs.meter.filesBy['scan'], hashedBefore);
+        }
+        return value.fullVerifications - before;
+      } finally {
+        input.add({'action': 'stop'});
+        await done;
+        await input.close();
       }
-      final before = value.fullVerifications;
-      input.add(shown);
-      await Future<void>.delayed(const Duration(seconds: 1));
-      input.add({'action': 'stop'});
-      await done;
-      await input.close();
-      // The loop closed the engine when it stopped.
-      return value.fullVerifications - before;
     }
 
     expect(
@@ -292,7 +514,7 @@ void main() {
     expect(
       await verificationsAfter({'action': 'visible'}),
       0,
-      reason: 'desktop window shown (#135)',
+      reason: 'Downloader sends visible without verify',
     );
   });
 

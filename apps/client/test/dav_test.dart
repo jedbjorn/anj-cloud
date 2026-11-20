@@ -444,6 +444,7 @@ void main() {
       final store = Manifest(profile);
       final deviceOrigin = origin.replace(port: mutual.port).origin;
       const path = 'chosen.txt';
+      const early = 'early.txt';
       for (final setting in {
         'root': tree.root.path,
         'staging': tree.staging.path,
@@ -461,18 +462,20 @@ void main() {
       }.entries) {
         store.setSetting(setting.key, setting.value);
       }
-      store.entries[path] = Entry(path, ItemKind.file)
-        ..etag = '"v1"'
-        ..override = Retention.cloud
-        ..status = 'cloud-only'
-        ..size = 4;
+      for (final name in [path, early]) {
+        store.entries[name] = Entry(name, ItemKind.file)
+          ..etag = '"v1"'
+          ..override = Retention.cloud
+          ..status = 'cloud-only'
+          ..size = 4;
+      }
       store.save();
       store.close();
       tree.close();
 
       final walk = Completer<void>();
       final walking = Completer<void>();
-      final viewed = Completer<String>();
+      var viewed = Completer<String>();
       Completer<void>? rootReading;
       Completer<void>? rootRelease;
       var version = 'v1';
@@ -506,6 +509,7 @@ void main() {
                   response('/dav/$top/', directory: true),
                 response('/dav/Slow/', directory: true),
                 response('/dav/$path', version: version),
+                response('/dav/$early', version: 'v1'),
               ]),
             );
           case ('PROPFIND', '/dav/Slow'):
@@ -516,11 +520,11 @@ void main() {
           case ('PROPFIND', '/dav/Documents' || '/dav/Music' || '/dav/Videos'):
             reply.statusCode = 207;
             reply.write(listing([response('$uri/', directory: true)]));
-          case ('PROPFIND', '/dav/chosen.txt'):
+          case ('PROPFIND', '/dav/chosen.txt' || '/dav/early.txt'):
             expect(request.headers.value('depth'), '0');
             reply.statusCode = 207;
-            reply.write(listing([response('/dav/$path', version: version)]));
-          case ('GET', '/dav/chosen.txt'):
+            reply.write(listing([response(uri, version: version)]));
+          case ('GET', '/dav/chosen.txt' || '/dav/early.txt'):
             expect(request.headers.value('if-match'), '"$version"');
             reply.statusCode = rejectDownload ? 412 : 200;
             if (!rejectDownload) {
@@ -668,14 +672,28 @@ void main() {
         );
 
         denied = false;
-        rootReading = Completer<void>();
-        rootRelease = Completer<void>();
-        controller.windowShown(verify: true);
-        await rootReading.future.timeout(const Duration(seconds: 5));
-        expect(controller.status, SyncStatus.checkingServer);
-        rootRelease.complete();
-        rootRelease = null;
-        await until(() => controller.status == SyncStatus.upToDate);
+        for (var foreground = 0; foreground < 3; foreground++) {
+          rootReading = Completer<void>();
+          rootRelease = Completer<void>();
+          controller.foregroundLeft();
+          controller.windowShown(verify: true);
+          await rootReading.future.timeout(const Duration(seconds: 5));
+          await until(() => controller.status == SyncStatus.checkingServer);
+          if (foreground == 0) {
+            viewed = Completer<String>();
+            controller.command('open', early);
+            expect(
+              await viewed.future.timeout(const Duration(seconds: 5)),
+              'read',
+            );
+            expect(controller.status, SyncStatus.checkingChanges);
+          }
+          rootRelease.complete();
+          rootRelease = null;
+          // The last two returns have the same library and no background
+          // command to force a full state event.
+          await until(() => controller.status == SyncStatus.upToDate);
+        }
       } finally {
         if (!walk.isCompleted) walk.complete();
         if (rootRelease case final wait? when !wait.isCompleted) {

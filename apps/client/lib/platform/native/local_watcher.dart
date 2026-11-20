@@ -145,6 +145,7 @@ class LocalWatcher implements ChangeWatcher {
   final Set<int> _removing = {};
   final Set<int> _selfDeleted = {};
   final Map<String, _Pending> _queue = {};
+  List<Object?>? _auditRecords;
 
   /// Directories without a working watch: path -> next audit (monotonic us).
   final SplayTreeMap<String, int> _unwatched = SplayTreeMap();
@@ -358,6 +359,15 @@ class LocalWatcher implements ChangeWatcher {
 
   /// Applies one batch of `[wd, mask, cookie, name, ...]` records.
   void handleRecords(List records) {
+    if (_auditRecords case final deferred?) {
+      if (deferred.length + records.length <= queueBound * 4) {
+        deferred.addAll(records);
+      } else {
+        // As with a watcher backlog, the events are no longer complete.
+        fullAuditWanted = true;
+      }
+      return;
+    }
     final moves = <int, String>{};
     for (var i = 0; i + 3 < records.length; i += 4) {
       events++;
@@ -553,9 +563,17 @@ class LocalWatcher implements ChangeWatcher {
 
   /// The full audit is starting: everything queued so far is covered by it.
   @override
-  void beginFullAudit() {
+  void beginFullAudit({bool deferEvents = false}) {
     fullAuditWanted = false;
     _queue.clear();
+    if (deferEvents) _auditRecords = [];
+  }
+
+  @override
+  void endFullAudit() {
+    final deferred = _auditRecords;
+    _auditRecords = null;
+    if (deferred != null) handleRecords(deferred);
   }
 
   /// Time until the next queued path matures or an unwatched subtree is due.

@@ -361,6 +361,7 @@ class WorkerLoop {
   int _connectionGeneration = 0;
   int _passGeneration = 0;
   late bool _verifyPassWanted = _androidForeground;
+  bool _listPassWanted = false;
   bool _passWillVerify = false;
   bool _discovering = false;
   bool? _online;
@@ -382,6 +383,7 @@ class WorkerLoop {
   bool _paused = false;
   Timer? _abort;
   String? _lastState;
+  String? _lastStatus;
   Timer? _activityTimer;
   final Stopwatch _sinceActivity = Stopwatch();
   List<String> _lastActivity = const [];
@@ -524,17 +526,48 @@ class WorkerLoop {
                 : engine.message)
       : engine.message;
 
-  void _emitForegroundStatus() {
+  Map<String, Object?> _statusFields() {
     final status = _status;
-    send({
-      'event': 'foregroundStatus',
+    return {
       'status': status.name,
       'message': _statusMessage(status),
       'paused': _paused,
       'transfersHeld': engine.transfersHeld,
       'networkPolicy': _networkPolicy,
-    });
+    };
   }
+
+  void _emitForegroundStatus() {
+    final fields = _statusFields();
+    final encoded = jsonEncode(fields);
+    if (encoded == _lastStatus) return;
+    _lastStatus = encoded;
+    // A lightweight update changes what the controller displays, even if
+    // the next full state matches one it received before this update.
+    _lastState = null;
+    send({'event': 'foregroundStatus', ...fields});
+  }
+
+  void _foregroundReadSucceeded() {
+    if (_connection != SyncStatus.checkingChanges) _checkingChanges = true;
+    _connection = SyncStatus.checkingChanges;
+    _connectionMessage = null;
+    _emitForegroundStatus();
+  }
+
+  bool _foregroundResultCurrent(int generation) =>
+      !_paused &&
+      !_stopping &&
+      generation == _connectionGeneration &&
+      !_queue.any(
+        (command) => switch (command['action']) {
+          'pause' => true,
+          'network' =>
+            (command['online'] is bool && command['online'] != _online) ||
+                command['wifi'] != _onWifi,
+          _ => false,
+        },
+      );
 
   void _openNotice(String? message) =>
       send({'event': 'openNotice', 'message': message});
@@ -574,14 +607,18 @@ class WorkerLoop {
           finished = true;
           _wake();
         });
-    while (!_stopping) {
-      await _foregroundCheckpoint();
-      if (finished || _stopping) break;
-      final wake = _signal = Completer<void>();
-      await wake.future;
-      _signal = null;
+    try {
+      while (!_stopping) {
+        await _foregroundCheckpoint();
+        if (finished || _stopping) break;
+        final wake = _signal = Completer<void>();
+        await wake.future;
+        _signal = null;
+      }
+    } finally {
+      // An enumeration can still be using the root and watch descriptors.
+      await completion;
     }
-    await completion;
     if (failure case final error?) Error.throwWithStackTrace(error, trace!);
     return result;
   }
@@ -625,8 +662,14 @@ class WorkerLoop {
       );
     }
     final name = engine.names.cloudPath(path);
+    final generation = _connectionGeneration;
     try {
-      return await foregroundReads!().checkFile(name, etag);
+      final item = await foregroundReads!().checkFile(name, etag);
+      _checkOpenPolicy();
+      // Network reports queue while this command awaits the server. A
+      // response from the connection being replaced cannot establish status.
+      if (_foregroundResultCurrent(generation)) _foregroundReadSucceeded();
+      return item;
     } on CloudFailure catch (error) {
       switch (error.status) {
         case 404:
@@ -933,6 +976,10 @@ class WorkerLoop {
     _passGeneration = _connectionGeneration;
     _passWillVerify = _verifyPassWanted;
     _verifyPassWanted = false;
+    if (_listPassWanted) {
+      _listPassWanted = false;
+      schedule.reconnect();
+    }
     final remote = schedule.policy();
     _passLists = remote == RemotePolicy.always;
     _discovering = _androidForeground;
@@ -947,20 +994,22 @@ class WorkerLoop {
       }
       if (reads != null && current()) {
         try {
+          final generation = _passGeneration;
           await _duringDiscovery(
-            reads.checkRoot(
-              stillWanted: current,
-              selectedRead: () => _selectedRead,
-            ),
+            reads
+                .checkRoot(
+                  stillWanted: current,
+                  selectedRead: () => _selectedRead,
+                )
+                .then((_) {
+                  if (_foregroundResultCurrent(generation)) {
+                    _foregroundReadSucceeded();
+                  }
+                }),
           );
-          if (current()) {
-            if (_connection != SyncStatus.checkingChanges) {
-              _checkingChanges = true;
-            }
-            _connection = SyncStatus.checkingChanges;
-            _connectionMessage = null;
-            _emitForegroundStatus();
-          }
+          // An initial or Wi-Fi-only report may have been queued while the
+          // root replied without replacing this generation.
+          if (current()) _foregroundReadSucceeded();
         } catch (error) {
           probeError = error;
           if (current()) _foregroundReadFailed(error);
@@ -1112,21 +1161,17 @@ class WorkerLoop {
     for (final entry in engine.manifest.entries.values) {
       entries.add(await projectEntry(engine, entry));
     }
-    final status = _status;
+    final fields = _statusFields();
     final state = {
       'event': 'state',
-      'message': _statusMessage(status),
+      ...fields,
       'entries': entries,
       'operations': engine.manifest.operations.length,
       'storageReady':
           engine.manifest.setting('retention') != 'cloud' &&
           engine.rootAvailable(),
-      'paused': _paused,
       // A Finish editing still to complete (spec #37: an update waits).
       'finishing': engine.editing.requests.isNotEmpty,
-      'networkPolicy': _networkPolicy,
-      'transfersHeld': engine.transfersHeld,
-      'status': status.name,
     };
     String? encoded;
     try {
@@ -1136,6 +1181,7 @@ class WorkerLoop {
     }
     if (!force && encoded != null && encoded == _lastState) return;
     _lastState = encoded;
+    _lastStatus = jsonEncode(fields);
     emitted++;
     send({...state, 'passes': engine.passes});
   }
@@ -1499,15 +1545,20 @@ class WorkerLoop {
           // Android's app opening also verifies every file (#130 (3)): its
           // entry sends 'verify'. The always-on desktop does not (#135).
           // Unreachable, the next retry is seconds away, not minutes.
-          if (_androidForeground) {
+          final verify = command['verify'] == true;
+          if (_androidForeground && verify) {
             if (_paused || _passVerifies) break;
             if (!_verifyPassWanted) _restartForegroundCheck();
             _verifyPassWanted = true;
           }
-          schedule.reconnect();
-          if (command['verify'] == true || _androidForeground) {
-            engine.requestFullVerification();
+          if (_androidForeground && _inPass && !verify) {
+            // A Downloader refresh may arrive after the current listing.
+            // Keep its request through schedule.completed for this pass.
+            _listPassWanted = true;
+          } else {
+            schedule.reconnect();
           }
+          if (verify) engine.requestFullVerification();
           _passWanted = true;
         case 'foregroundLeft':
           if (_heldOpen != null) {

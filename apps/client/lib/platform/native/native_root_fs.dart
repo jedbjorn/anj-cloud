@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
 import 'package:ffi/ffi.dart';
@@ -294,6 +295,41 @@ class NativeRootFs implements RootFilesystem, DocumentsFilesystem {
       malloc.free(ptr);
     }
   }
+
+  @override
+  Future<RootScan> scanRootInBackground(
+    int root, {
+    required bool watched,
+    Pointer<Void>? watch,
+  }) => enumerateInIsolate(root, '', watched: watched, watch: watch);
+
+  Future<RootScan> enumerateInIsolate(
+    int root,
+    String path, {
+    required bool watched,
+    Pointer<Void>? watch,
+  }) =>
+      _enumerate(libraryPath, errnoLabel, root, path, watched, watch?.address);
+
+  static Future<RootScan> _enumerate(
+    String library,
+    String errnoLabel,
+    int root,
+    String path,
+    bool watched,
+    int? watchAddress,
+  ) => Isolate.run(() {
+    // Descriptors are process-wide. This isolate borrows them and owns its
+    // FFI binding, so it does not share any Dart filesystem state.
+    final fs = NativeRootFs(library, errnoLabel);
+    if (!watched) {
+      return (items: fs.scan(root), watches: <Map<String, dynamic>>[]);
+    }
+    final watch = watchAddress == null
+        ? null
+        : Pointer<Void>.fromAddress(watchAddress);
+    return fs.watchScan(watch, root, path, true);
+  });
 
   void watchDebugFailAdds(Pointer<Void> handle, String? prefix) {
     if (prefix == null) return _watchDebugFail(handle, nullptr);

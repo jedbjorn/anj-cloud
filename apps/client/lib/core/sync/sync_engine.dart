@@ -233,7 +233,8 @@ class SyncEngine {
   bool remoteFailed = false;
   Object? remoteError;
 
-  /// Android services selected-file requests at safe discovery boundaries.
+  /// Android services selected-file requests while awaiting discovery and
+  /// between descriptor-bound file reads.
   Future<void> Function()? yieldToForeground;
   Future<T> Function<T>(Future<T>)? duringDiscovery;
   bool _reconciling = false;
@@ -559,6 +560,7 @@ class SyncEngine {
   /// the kept view refreshed for queued, due and engine-touched paths.
   Future<Map<String, LocalItem>> _localSnapshot() async {
     final checkpoint = yieldToForeground;
+    final discovery = duringDiscovery;
     await _restartWatching();
     final w = watcher;
     _statted = 0;
@@ -567,9 +569,9 @@ class SyncEngine {
       _view = null;
       _localScan = 'full';
       fullScans++;
-      final items = checkpoint == null
+      final items = checkpoint == null || discovery == null
           ? await tree.snapshot(includeExcluded: true)
-          : await tree.snapshotCooperatively(checkpoint);
+          : await tree.snapshotCooperatively(checkpoint, discovery);
       lastPassReadWholeRoot = !tree.rootStampsTrusted;
       return items;
     }
@@ -606,15 +608,17 @@ class SyncEngine {
       // Everything queued so far is covered by the full scan. Between
       // verifications an event-driven stat audit (decision #137 (3), every
       // statAuditInterval) reads only files whose stat stamp changed.
-      w.beginFullAudit();
+      final cooperative = checkpoint != null && discovery != null;
+      w.beginFullAudit(deferEvents: cooperative);
       try {
         final reuse = _eventDrivenPass && !verify ? _view : null;
-        final scan = checkpoint == null
+        final scan = !cooperative
             ? tree.scanTree('', recursive: true, watch: w.handle, reuse: reuse)
             : await tree.scanAudit(
                 watch: w.handle,
                 reuse: reuse,
                 yieldToForeground: checkpoint,
+                duringEnumeration: discovery,
               );
         _view = SplayTreeMap();
         _unstamped.clear();
@@ -632,6 +636,8 @@ class SyncEngine {
       } catch (_) {
         w.fullAuditWanted = true;
         rethrow;
+      } finally {
+        w.endFullAudit();
       }
       _lastStatAudit = elapsed;
       _localScan = 'full';

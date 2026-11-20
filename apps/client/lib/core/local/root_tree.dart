@@ -370,20 +370,27 @@ class RootTree {
 
   Future<Map<String, LocalItem>> snapshotCooperatively(
     Future<void> Function() yieldToForeground,
-  ) => _snapshot(true, yieldToForeground);
+    Future<T> Function<T>(Future<T>) duringEnumeration,
+  ) => _snapshot(true, yieldToForeground, duringEnumeration);
 
   Future<Map<String, LocalItem>> _snapshot(
     bool includeExcluded,
-    Future<void> Function()? yieldToForeground,
-  ) async {
+    Future<void> Function()? yieldToForeground, [
+    Future<T> Function<T>(Future<T>)? duringEnumeration,
+  ]) async {
     native.checkRoot(fd, root.path);
     _readWriteback();
     busy.clear();
     busyIdentities.clear();
     final decide = _decider();
     final result = <String, LocalItem>{};
+    final listed = duringEnumeration == null
+        ? native.scan(fd)
+        : (await duringEnumeration(
+            native.scanRootInBackground(fd, watched: false),
+          )).items;
     final slice = yieldToForeground == null ? null : (Stopwatch()..start());
-    for (final item in native.scan(fd)) {
+    for (final item in listed) {
       if (slice != null && slice.elapsedMilliseconds >= 12) {
         await yieldToForeground!();
         slice.reset();
@@ -427,24 +434,34 @@ class RootTree {
     );
   }
 
-  /// A full audit can yield between descriptor-bound file reads. Incremental
-  /// rescans keep the synchronous path above.
+  /// The Android audit services foreground requests during enumeration and
+  /// between descriptor-bound file reads.
   Future<({Map<String, LocalItem> items, List<Map<String, dynamic>> watches})>
   scanAudit({
     required Pointer<Void>? watch,
     required Map<String, LocalItem>? reuse,
     required Future<void> Function() yieldToForeground,
+    required Future<T> Function<T>(Future<T>) duringEnumeration,
   }) async {
-    final scan = _scanTree('', recursive: true, watch: watch, reuse: reuse);
+    native.checkRoot(fd, root.path);
+    busy.clear();
+    busyIdentities.clear();
+    final scan = await duringEnumeration(
+      native.scanRootInBackground(fd, watched: true, watch: watch),
+    );
+    final decide = _decider(reuse: reuse);
     final items = <String, LocalItem>{};
     final slice = Stopwatch()..start();
-    for (final item in scan.items) {
-      items[item.path] = item;
+    for (final raw in scan.items) {
+      final item = decide.call(raw, true);
+      if (item != null) items[item.path] = item;
       if (slice.elapsedMilliseconds >= 12) {
         await yieldToForeground();
         slice.reset();
       }
     }
+    _pruneSeen(decide.seen);
+    native.checkRoot(fd, root.path);
     return (items: items, watches: scan.watches);
   }
 
