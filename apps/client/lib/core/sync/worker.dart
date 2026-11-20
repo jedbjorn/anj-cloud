@@ -354,6 +354,9 @@ class WorkerLoop {
   /// Opt-in JSON-lines file receiving one record per pass.
   final File? metrics;
   final Queue<Map> _queue = Queue();
+
+  /// Returns the active transport instance, which stays the same until the
+  /// connection is replaced, such as when the device certificate renews.
   final ForegroundReads Function()? foregroundReads;
   bool get _androidForeground => foregroundReads != null;
   SyncStatus _connection = SyncStatus.checkingServer;
@@ -586,7 +589,14 @@ class WorkerLoop {
       selectedRead: () => _selectedRead,
     );
     try {
-      return await _duringDiscovery(engine.cloud.snapshot());
+      final items = await _duringDiscovery(engine.cloud.snapshot());
+      // The certificate may have changed between the early probe and listing.
+      if (_connection == SyncStatus.checkingServer &&
+          _passCurrent() &&
+          identical(reads, foregroundReads!())) {
+        _foregroundReadSucceeded();
+      }
+      return items;
     } finally {
       reads.clearCheckedRoot();
     }

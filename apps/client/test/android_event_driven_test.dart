@@ -242,6 +242,7 @@ void main() {
       var hashesAtConnect = -1;
       var hashesAtOpen = -1;
       var scanReads = 0;
+      final reads = _ForegroundFixture(cloud);
       final loop = WorkerLoop(engine, (event) {
         final value = event as Map;
         if (value['status'] == SyncStatus.checkingChanges.name &&
@@ -256,7 +257,7 @@ void main() {
             !settled.isCompleted) {
           settled.complete();
         }
-      }, foregroundReads: () => _ForegroundFixture(cloud));
+      }, foregroundReads: () => reads);
       fs.beforeScanHash = () {
         if (++scanReads != 1) return;
         input
@@ -323,6 +324,7 @@ void main() {
         final input = StreamController<Object?>();
         final opened = Completer<String>();
         final firstPass = Completer<void>();
+        final reads = _ForegroundFixture(cloud);
         final loop = WorkerLoop(
           engine,
           (event) {
@@ -337,7 +339,7 @@ void main() {
             }
           },
           interval: const Duration(milliseconds: 100),
-          foregroundReads: () => _ForegroundFixture(cloud),
+          foregroundReads: () => reads,
         );
         final done = loop.run(input.stream);
         try {
@@ -388,12 +390,9 @@ void main() {
     );
   }
 
-  for (final interrupt in [
-    {'action': 'network', 'online': false, 'wifi': false},
-    {'action': 'pause'},
-  ]) {
+  for (final interrupt in ['network', 'pause', 'certificate renewal']) {
     test(
-      'a selected response cannot connect after ${interrupt['action']}',
+      'a selected response cannot publish Connected after $interrupt',
       () async {
         const selected = 'read-first.txt';
         addCloudOnly(selected);
@@ -404,42 +403,57 @@ void main() {
         final input = StreamController<Object?>();
         final observed = <String>[];
         final openingDone = Completer<void>();
-        final loop = WorkerLoop(
-          engine,
-          (event) {
-            final value = event as Map;
-            if (value['status'] case final String status) observed.add(status);
-            if (value['event'] == 'openNotice' &&
-                (value['message'] as String?)?.startsWith('Opening') != true) {
-              if (!openingDone.isCompleted) openingDone.complete();
-            }
+        final settled = Completer<void>();
+        var reads = _ForegroundFixture(
+          cloud,
+          beforeRoot: () {
+            if (!rootStarted.isCompleted) rootStarted.complete();
+            return root.future;
           },
-          foregroundReads: () => _ForegroundFixture(
-            cloud,
-            beforeRoot: () {
-              if (!rootStarted.isCompleted) rootStarted.complete();
-              return root.future;
-            },
-            beforeFile: () {
-              fileStarted.complete();
-              return file.future;
-            },
-          ),
+          beforeFile: () {
+            fileStarted.complete();
+            return file.future;
+          },
         );
+        final loop = WorkerLoop(engine, (event) {
+          final value = event as Map;
+          if (value['status'] case final String status) {
+            observed.add(status);
+            if (status == SyncStatus.upToDate.name && !settled.isCompleted) {
+              settled.complete();
+            }
+          }
+          if (value['event'] == 'openNotice' &&
+              (value['message'] as String?)?.startsWith('Opening') != true) {
+            if (!openingDone.isCompleted) openingDone.complete();
+          }
+        }, foregroundReads: () => reads);
         input.add({'action': 'network', 'online': true, 'wifi': true});
         final done = loop.run(input.stream);
         try {
           await rootStarted.future.timeout(wait);
           input.add({'action': 'open', 'path': selected});
           await fileStarted.future.timeout(wait);
-          input.add(interrupt);
+          switch (interrupt) {
+            case 'network':
+              input.add({'action': 'network', 'online': false, 'wifi': false});
+            case 'pause':
+              input.add({'action': 'pause'});
+            case 'certificate renewal':
+              reads = _ForegroundFixture(cloud);
+          }
           await Future<void>.delayed(Duration.zero);
           file.complete();
           await openingDone.future.timeout(wait);
           expect(observed, isNot(contains(SyncStatus.checkingChanges.name)));
+          if (interrupt == 'certificate renewal') {
+            root.complete();
+            await settled.future.timeout(wait);
+            expect(observed, contains(SyncStatus.checkingChanges.name));
+          }
         } finally {
           if (!file.isCompleted) file.complete();
-          root.complete();
+          if (!root.isCompleted) root.complete();
           input.add({'action': 'stop'});
           await done;
           await input.close();
@@ -479,12 +493,13 @@ void main() {
         ),
       );
       final input = StreamController<Object?>();
+      final reads = _ForegroundFixture(cloud);
       final loop = WorkerLoop(
         value,
         (_) {},
         interval: const Duration(milliseconds: 100),
         schedule: RemoteSchedule(idle: const Duration(seconds: 30)),
-        foregroundReads: () => _ForegroundFixture(cloud),
+        foregroundReads: () => reads,
       );
       final done = loop.run(input.stream);
       try {
