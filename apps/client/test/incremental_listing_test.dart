@@ -698,7 +698,10 @@ void main() {
           advance(const Duration(minutes: 1));
           restart();
           final writes = profile.rowsPersisted;
+          final reads = incomingReads;
+          await api.incomingShares();
           await listsLikeAFullWalk();
+          expect(incomingReads - reads, 1);
           expect(propfinds, ['']);
           expect(profile.rowsPersisted - writes, 1);
           expect(profile.setting(payload), data);
@@ -934,6 +937,59 @@ void main() {
         expect(propfinds.where((path) => path.isEmpty), hasLength(2));
       });
     }
+
+    for (final (name, elapsed) in [
+      ('Android suspend', const Duration(hours: 1)),
+      ('a wall-clock rollback', const Duration(minutes: -1)),
+    ]) {
+      test('share membership is reread after $name', () async {
+        const mount = 'Documents/Placed';
+        const file = '$mount/new.txt';
+        tree.folder('Documents');
+        tree.propagateFromShares = false;
+        await list();
+        advance(const Duration(hours: 1));
+        restart();
+        await api.incomingShares();
+        final reads = incomingReads;
+
+        // Uptime stays still. Even after rollback, wall time is newer than
+        // the saved listing, so its age cannot force a full walk by itself.
+        advance(elapsed, gateway: !elapsed.isNegative);
+        final parentEtag = tree.etags['Documents'];
+        tree.incoming = [
+          {
+            'share_id': '7',
+            'path': mount,
+            'owner_display_name': 'Bob',
+            'permission': 'view',
+          },
+        ];
+        tree.folder(mount, permission: 'RS');
+        tree.file(file);
+        expect(tree.etags['Documents'], parentEtag);
+
+        final resumed = await list();
+        expect(resumed.keys, containsAll([mount, file]));
+        expect(incomingReads - reads, 1);
+      });
+    }
+
+    test(
+      'an observation that expires during the root read forces a full walk',
+      () async {
+        await list();
+        restart();
+        await api.incomingShares();
+        onPropfind = (path) {
+          if (path.isEmpty) advance(const Duration(hours: 1));
+        };
+
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+        expect(profile.setting(anchor), isNull);
+      },
+    );
 
     test(
       'placed shares are walked with fresh rights even without DAV S marks',

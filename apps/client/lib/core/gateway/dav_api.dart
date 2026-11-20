@@ -245,7 +245,7 @@ class DavCloud
   /// The last incoming-share list read; a change forces a full walk.
   String? _incomingFingerprint;
   Set<String> _incomingMounts = {};
-  Duration? _incomingObserved;
+  ({Duration started, DateTime startedWall})? _incomingObserved;
   bool _incomingAvailable = false;
   Future<List<RemoteItem>>? _snapshotInFlight;
 
@@ -525,9 +525,13 @@ class DavCloud
 
   static const _foregroundReadLifetime = Duration(seconds: 30);
 
-  bool _fresh(Duration observed) {
-    final elapsed = monotonic() - observed;
-    return !elapsed.isNegative && elapsed < _foregroundReadLifetime;
+  bool _fresh(Duration started, DateTime startedWall) {
+    final elapsed = monotonic() - started;
+    final wallElapsed = wallClock().difference(startedWall);
+    return !elapsed.isNegative &&
+        elapsed < _foregroundReadLifetime &&
+        !wallElapsed.isNegative &&
+        wallElapsed < _foregroundReadLifetime;
   }
 
   Future<_ListingRoot> _takeListingRoot() async {
@@ -537,12 +541,9 @@ class DavCloud
       final result = await prepared;
       // Uptime can stop during suspend. Both clocks must put the read in
       // the freshness window and the profile must still trust its revision.
-      final wallElapsed = wallClock().difference(result.startedWall);
       if (result.generation == _generation &&
           result.revision == listingCache?.revision &&
-          _fresh(result.started) &&
-          !wallElapsed.isNegative &&
-          wallElapsed < _foregroundReadLifetime) {
+          _fresh(result.started, result.startedWall)) {
         return result;
       }
     }
@@ -589,14 +590,15 @@ class DavCloud
     final cache = listingCache;
     final persistent = cache != null;
     _loadListing();
+    var observed = _incomingObserved;
     if (persistent) {
-      final observed = _incomingObserved;
-      if (observed == null || !_fresh(observed)) {
+      if (observed == null || !_fresh(observed.started, observed.startedWall)) {
         try {
           await incomingShares();
         } on Exception {
           // A live full walk remains available without share cache trust.
         }
+        observed = _incomingObserved;
       }
       _incomingObserved = null;
     }
@@ -615,9 +617,14 @@ class DavCloud
     final wall = wallClock().millisecondsSinceEpoch;
     final server = root.serverTime;
     final saved = _savedAge;
+    // The share read can also expire while the root request is outstanding.
+    final sharesFresh =
+        _incomingAvailable &&
+        observed != null &&
+        _fresh(observed.started, observed.startedWall);
     final reusable =
         !persistent ||
-        (_incomingAvailable &&
+        (sharesFresh &&
             saved != null &&
             server != null &&
             wall >= saved.wall &&
@@ -710,7 +717,7 @@ class DavCloud
         _lastFullWalkWall = wallClock();
         fullWalks++;
       }
-      if (cache != null && _incomingAvailable && server != null) {
+      if (cache != null && sharesFresh && server != null) {
         final finished = wallClock().millisecondsSinceEpoch;
         if (finished >= wall) {
           final age = (
@@ -1073,6 +1080,8 @@ class DavCloud
   @override
   Future<List<IncomingShare>?> incomingShares() async {
     _loadListing();
+    final started = monotonic();
+    final startedWall = wallClock();
     try {
       final data = await _sharing(
         'GET',
@@ -1111,7 +1120,7 @@ class DavCloud
       _incomingAvailable = false;
       rethrow;
     } finally {
-      _incomingObserved = monotonic();
+      _incomingObserved = (started: started, startedWall: startedWall);
     }
   }
 
