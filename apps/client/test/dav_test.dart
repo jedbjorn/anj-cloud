@@ -432,7 +432,7 @@ void main() {
   });
 
   test(
-    'Android foreground Open hands out bytes before a cold DAV walk completes',
+    'Android foreground Open, pause, and reconnect while DAV walks are held',
     () async {
       final binding = _NetworkBinding();
       final identity = await enrolledIdentity();
@@ -445,6 +445,7 @@ void main() {
       final deviceOrigin = origin.replace(port: mutual.port).origin;
       const path = 'chosen.txt';
       const early = 'early.txt';
+      const unread = 'unread.txt';
       for (final setting in {
         'root': tree.root.path,
         'staging': tree.staging.path,
@@ -462,7 +463,7 @@ void main() {
       }.entries) {
         store.setSetting(setting.key, setting.value);
       }
-      for (final name in [path, early]) {
+      for (final name in [path, early, unread]) {
         store.entries[name] = Entry(name, ItemKind.file)
           ..etag = '"v1"'
           ..override = Retention.cloud
@@ -473,15 +474,20 @@ void main() {
       store.close();
       tree.close();
 
-      final walk = Completer<void>();
-      final walking = Completer<void>();
+      var walk = Completer<void>();
+      var walking = Completer<void>();
       var viewed = Completer<String>();
       Completer<void>? rootReading;
       Completer<void>? rootRelease;
+      Completer<void>? openReading;
+      Completer<void>? openRelease;
       var version = 'v1';
+      var folderVersion = 'v1';
       var offline = false;
       var denied = false;
       var rejectDownload = false;
+      var dropSelected = false;
+      var dropDownload = false;
       handler = (request) async {
         await request.drain<void>();
         final reply = request.response;
@@ -506,10 +512,15 @@ void main() {
               listing([
                 response('/dav/', directory: true),
                 for (final top in ['Documents', 'Music', 'Videos'])
-                  response('/dav/$top/', directory: true),
-                response('/dav/Slow/', directory: true),
+                  response(
+                    '/dav/$top/',
+                    directory: true,
+                    version: folderVersion,
+                  ),
+                response('/dav/Slow/', directory: true, version: folderVersion),
                 response('/dav/$path', version: version),
                 response('/dav/$early', version: 'v1'),
+                response('/dav/$unread', version: 'v1'),
               ]),
             );
           case ('PROPFIND', '/dav/Slow'):
@@ -520,17 +531,38 @@ void main() {
           case ('PROPFIND', '/dav/Documents' || '/dav/Music' || '/dav/Videos'):
             reply.statusCode = 207;
             reply.write(listing([response('$uri/', directory: true)]));
-          case ('PROPFIND', '/dav/chosen.txt' || '/dav/early.txt'):
+          case (
+            'PROPFIND',
+            '/dav/chosen.txt' || '/dav/early.txt' || '/dav/unread.txt',
+          ):
             expect(request.headers.value('depth'), '0');
+            if (openRelease case final wait?) {
+              openReading!.complete();
+              await wait.future;
+            }
+            if (dropSelected) {
+              (await reply.detachSocket(writeHeaders: false)).destroy();
+              return;
+            }
             reply.statusCode = 207;
             reply.write(listing([response(uri, version: version)]));
-          case ('GET', '/dav/chosen.txt' || '/dav/early.txt'):
+          case (
+            'GET',
+            '/dav/chosen.txt' || '/dav/early.txt' || '/dav/unread.txt',
+          ):
             expect(request.headers.value('if-match'), '"$version"');
+            if (dropDownload) {
+              (await reply.detachSocket(writeHeaders: false)).destroy();
+              return;
+            }
             reply.statusCode = rejectDownload ? 412 : 200;
             if (!rejectDownload) {
               reply.headers.set('etag', '"$version"');
               reply.write('read');
             }
+          case ('PUT', '/dav/changed.txt'):
+            reply.statusCode = 201;
+            reply.headers.set('etag', '"v1"');
           default:
             reply.statusCode = 404;
         }
@@ -570,10 +602,13 @@ void main() {
         return true;
       });
 
-      Future<void> until(bool Function() ready) async {
+      Future<void> until(
+        bool Function() ready, {
+        Duration timeout = const Duration(seconds: 5),
+      }) async {
         final deadline = Stopwatch()..start();
         while (!ready()) {
-          if (deadline.elapsed > const Duration(seconds: 5)) {
+          if (deadline.elapsed > timeout) {
             fail(
               'Foreground condition not reached: ${controller.status}, '
               '${controller.message}, ${controller.openNotice}, $requests',
@@ -582,6 +617,10 @@ void main() {
           await Future<void>.delayed(const Duration(milliseconds: 10));
         }
       }
+
+      int rootReads() => requests
+          .where((r) => r['method'] == 'PROPFIND' && r['path'] == '/dav/')
+          .length;
 
       try {
         controller.reportNetwork(wifi: false, online: true);
@@ -621,6 +660,7 @@ void main() {
               (controller.openNotice?.contains('changed') ?? false),
         );
         expect(viewed.isCompleted, isFalse);
+        expect(controller.status, SyncStatus.checkingChanges);
 
         rejectDownload = false;
         controller.command('open', path);
@@ -694,9 +734,134 @@ void main() {
           // command to force a full state event.
           await until(() => controller.status == SyncStatus.upToDate);
         }
+
+        // Returning from Home joins WorkManager's authenticated run, which
+        // still has a changed branch outstanding.
+        folderVersion = 'v2';
+        walk = Completer<void>();
+        walking = Completer<void>();
+        final beforeJoin = rootReads();
+        controller.foregroundLeft();
+        final workManager = controller.backgroundRun();
+        await walking.future.timeout(const Duration(seconds: 5));
+        controller.windowShown(verify: true);
+        await until(() => controller.status == SyncStatus.checkingChanges);
+        expect(rootReads(), beforeJoin + 1);
+        walk.complete();
+        expect((await workManager)['listed'], isTrue);
+        await until(() => controller.status == SyncStatus.upToDate);
+        expect(rootReads(), beforeJoin + 1);
+
+        // Local work can start a listing between scheduled cloud checks.
+        folderVersion = 'v3';
+        walk = Completer<void>();
+        walking = Completer<void>();
+        File('${tree.root.path}/changed.txt').writeAsStringSync('local edit');
+        await walking.future.timeout(const Duration(seconds: 10));
+        controller.setPaused(true);
+        await until(
+          () =>
+              controller.paused &&
+              controller.message.contains(
+                'Local changes sync after you resume',
+              ),
+        );
+        final beforePause = requests.length;
+        walk.complete();
+        await until(
+          () => controller.message.contains('will sync after you resume'),
+        );
+        expect(
+          requests.skip(beforePause).where((r) => r['method'] == 'PROPFIND'),
+          isEmpty,
+        );
+        controller.setPaused(false);
+        final resumed = await controller.backgroundRun();
+        expect(resumed['listed'], isTrue);
+        await until(() => controller.status == SyncStatus.upToDate);
+        expect(
+          requests
+              .skip(beforePause)
+              .where((r) => r['method'] == 'PROPFIND')
+              .map((r) => r['path']),
+          containsAll([
+            '/dav/',
+            '/dav/Slow',
+            '/dav/Videos',
+            '/dav/Music',
+            '/dav/Documents',
+          ]),
+        );
+
+        // An obsolete Open failure cannot publish Reconnecting. A failure
+        // from the current route must do so even with a DAV walk pending.
+        controller.setNetworkPolicy('any');
+        controller.reportNetwork(wifi: false, online: true, route: 1);
+        folderVersion = 'v4';
+        walk = Completer<void>();
+        walking = Completer<void>();
+        controller.windowShown(verify: true);
+        await walking.future.timeout(const Duration(seconds: 5));
+        await until(() => controller.status == SyncStatus.checkingChanges);
+        openReading = Completer<void>();
+        openRelease = Completer<void>();
+        controller.command('open', path);
+        await openReading.future.timeout(const Duration(seconds: 5));
+        controller.reportNetwork(wifi: false, online: true, route: 2);
+        dropSelected = true;
+        openRelease.complete();
+        openRelease = null;
+        await until(
+          () =>
+              controller.openNotice?.contains('Could not open') == true &&
+              controller.onWifi == false,
+        );
+        expect(controller.status, SyncStatus.checkingChanges);
+        controller.command('open', path);
+        await until(() => controller.status == SyncStatus.offline);
+        expect(walk.isCompleted, isFalse);
+        walk.complete();
+
+        final beforeRoute = rootReads();
+        dropSelected = false;
+        controller.reportNetwork(wifi: false, online: true, route: 2);
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+        expect(rootReads(), beforeRoute);
+        expect(controller.status, SyncStatus.offline);
+        // Validated mobile data to validated Wi-Fi must cut short backoff.
+        controller.reportNetwork(wifi: true, online: true, route: 3);
+        controller.reportNetwork(wifi: true, online: true, route: 3);
+        await until(
+          () => rootReads() > beforeRoute,
+          timeout: const Duration(milliseconds: 1200),
+        );
+        await until(() => controller.status == SyncStatus.upToDate);
+        expect(rootReads(), beforeRoute + 1);
+
+        // Metadata can authenticate successfully and the conditional GET can
+        // still lose the connection. Backoff retries with no lifecycle wake.
+        final beforeDownload = rootReads();
+        dropDownload = true;
+        controller.command('open', unread);
+        await until(() => controller.status == SyncStatus.offline);
+        expect(
+          requests.where(
+            (r) => r['method'] == 'GET' && r['path'] == '/dav/$unread',
+          ),
+          hasLength(1),
+        );
+        dropDownload = false;
+        await until(
+          () => controller.status == SyncStatus.upToDate,
+          timeout: const Duration(seconds: 12),
+        );
+        expect(rootReads(), beforeDownload + 1);
       } finally {
         if (!walk.isCompleted) walk.complete();
         if (rootRelease case final wait? when !wait.isCompleted) {
+          wait.complete();
+        }
+        if (openRelease case final wait? when !wait.isCompleted) {
           wait.complete();
         }
         await controller.stop();

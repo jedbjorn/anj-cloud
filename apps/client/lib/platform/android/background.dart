@@ -164,7 +164,11 @@ class AndroidBackground extends ChangeNotifier implements MobileSettings {
       _notifications = state['notifications'] == true;
       final wifi = state['wifi'];
       if (wifi is bool) {
-        controller.reportNetwork(wifi: wifi, online: state['online'] as bool?);
+        controller.reportNetwork(
+          wifi: wifi,
+          online: state['online'] as bool?,
+          route: state['route'] as int?,
+        );
       }
       _attached = true;
       notifyListeners();
@@ -188,6 +192,7 @@ class AndroidBackground extends ChangeNotifier implements MobileSettings {
         controller.reportNetwork(
           wifi: args['wifi'] == true,
           online: args['online'] == true,
+          route: args['route'] as int?,
         );
         return null;
       case 'foreground':

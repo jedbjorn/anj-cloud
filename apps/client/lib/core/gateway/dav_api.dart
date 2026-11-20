@@ -240,8 +240,7 @@ class DavCloud
     required Future<void>? Function() selectedRead,
   }) async {
     clearCheckedRoot();
-    _listingWanted = stillWanted;
-    _selectedRead = selectedRead;
+    guardListing(stillWanted: stillWanted, selectedRead: selectedRead);
     final generation = _generation;
     try {
       final children = await _listChildren('');
@@ -252,6 +251,15 @@ class DavCloud
       forgetListing();
       rethrow;
     }
+  }
+
+  @override
+  void guardListing({
+    required bool Function() stillWanted,
+    required Future<void>? Function() selectedRead,
+  }) {
+    _listingWanted = stillWanted;
+    _selectedRead = selectedRead;
   }
 
   @override

@@ -237,6 +237,12 @@ class SyncEngine {
   /// between descriptor-bound file reads.
   Future<void> Function()? yieldToForeground;
   Future<T> Function<T>(Future<T>)? duringDiscovery;
+
+  /// Lets Android guard every folder request on the transport used by the
+  /// snapshot, including snapshots triggered by local changes.
+  Future<List<RemoteItem>> Function()? discoverSnapshot;
+  Future<List<RemoteItem>> _discoverSnapshot() =>
+      discoverSnapshot?.call() ?? cloud.snapshot();
   bool _reconciling = false;
 
   /// Wi-Fi only on mobile data (Android, decision #108 Q4; spec #28 R3):
@@ -4750,10 +4756,7 @@ class SyncEngine {
             manifest.operations.isEmpty;
         migrationRemote = neverPaired
             ? {}
-            : {
-                for (final item in await discover(cloud.snapshot()))
-                  item.path: item,
-              };
+            : {for (final item in await _discoverSnapshot()) item.path: item};
         if (stopRequested) return 0;
         if (!rootAvailable()) return 0;
         _migrateCloudRoot(rawLocal, migrationRemote);
@@ -5027,10 +5030,7 @@ class SyncEngine {
     try {
       rawRemote =
           migrationRemote ??
-          {
-            for (final item in await discover(cloud.snapshot()))
-              item.path: item,
-          };
+          {for (final item in await _discoverSnapshot()) item.path: item};
       if (stopRequested) return 0;
       rawRemote = _localSpelling(rawRemote, rawLocal);
       remoteListed = true;
@@ -7538,6 +7538,8 @@ class SyncEngine {
     bool requireWritable = false,
     Future<RemoteItem> Function(String path, String etag)? checkRemote,
     void Function()? checkTransferPolicy,
+    Future<void> Function(String path, File target, {required String etag})?
+    downloadSelected,
   }) async {
     requireStorageReady();
     final entry = manifest.entries[path];
@@ -7609,7 +7611,7 @@ class SyncEngine {
         throw const CloudFailure('No remote version is available.');
       }
       try {
-        await cloud.download(path, copy, etag: etag);
+        await (downloadSelected ?? cloud.download)(path, copy, etag: etag);
         hash = await fileHash(copy, 'open');
         checkTransferPolicy?.call();
       } catch (_) {

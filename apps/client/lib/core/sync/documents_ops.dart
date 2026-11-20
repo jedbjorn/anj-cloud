@@ -44,12 +44,15 @@ class DocumentsOps {
     this.paused,
     this.checkRemote,
     this.checkTransferPolicy,
+    this.downloadSelected,
   }) : registry = registry ?? openDocuments;
   final SyncEngine engine;
   final OpenDocuments registry;
   final bool Function()? paused;
   final Future<RemoteItem> Function(String path, String etag)? checkRemote;
   final void Function()? checkTransferPolicy;
+  final Future<void> Function(String path, File target, {required String etag})?
+  downloadSelected;
 
   RootTree get tree => engine.tree;
   DocumentsFilesystem get _fs {
@@ -211,6 +214,7 @@ class DocumentsOps {
         requireWritable: write,
         checkRemote: checkRemote,
         checkTransferPolicy: checkTransferPolicy,
+        downloadSelected: downloadSelected,
       );
     } on TransfersHeld catch (error) {
       throw DocumentsFailure('waitingForWifi', error.message);

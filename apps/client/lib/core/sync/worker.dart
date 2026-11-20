@@ -322,6 +322,7 @@ class WorkerLoop {
     if (_androidForeground) {
       engine.yieldToForeground = _foregroundCheckpoint;
       engine.duringDiscovery = _duringDiscovery;
+      engine.discoverSnapshot = _discoverSnapshot;
     }
   }
   final SyncEngine engine;
@@ -365,6 +366,7 @@ class WorkerLoop {
   bool _passWillVerify = false;
   bool _discovering = false;
   bool? _online;
+  int? _networkRoute;
   Map? _heldOpen;
   Future<void>? _selectedRead;
 
@@ -375,6 +377,7 @@ class WorkerLoop {
     paused: () => _paused,
     checkRemote: _androidForeground ? _checkSelectedFile : null,
     checkTransferPolicy: _androidForeground ? _checkOpenPolicy : null,
+    downloadSelected: _androidForeground ? _downloadSelectedFile : null,
   );
   Completer<void>? _signal;
   Timer? _deadline;
@@ -549,7 +552,9 @@ class WorkerLoop {
   }
 
   void _foregroundReadSucceeded() {
-    if (_connection != SyncStatus.checkingChanges) _checkingChanges = true;
+    if (_connection != SyncStatus.checkingChanges || _passVerifies) {
+      _checkingChanges = true;
+    }
     _connection = SyncStatus.checkingChanges;
     _connectionMessage = null;
     _emitForegroundStatus();
@@ -564,10 +569,28 @@ class WorkerLoop {
           'pause' => true,
           'network' =>
             (command['online'] is bool && command['online'] != _online) ||
+                (command['route'] is int &&
+                    command['route'] != _networkRoute) ||
                 command['wifi'] != _onWifi,
           _ => false,
         },
       );
+
+  bool _passCurrent() =>
+      !_paused && !_stopping && _passGeneration == _connectionGeneration;
+
+  Future<List<RemoteItem>> _discoverSnapshot() async {
+    final reads = foregroundReads!();
+    reads.guardListing(
+      stillWanted: _passCurrent,
+      selectedRead: () => _selectedRead,
+    );
+    try {
+      return await _duringDiscovery(engine.cloud.snapshot());
+    } finally {
+      reads.clearCheckedRoot();
+    }
+  }
 
   void _openNotice(String? message) =>
       send({'event': 'openNotice', 'message': message});
@@ -662,29 +685,67 @@ class WorkerLoop {
       );
     }
     final name = engine.names.cloudPath(path);
-    final generation = _connectionGeneration;
-    try {
-      final item = await foregroundReads!().checkFile(name, etag);
-      _checkOpenPolicy();
-      // Network reports queue while this command awaits the server. A
-      // response from the connection being replaced cannot establish status.
-      if (_foregroundResultCurrent(generation)) _foregroundReadSucceeded();
-      return item;
-    } on CloudFailure catch (error) {
-      switch (error.status) {
-        case 404:
-          throw const CloudFailure(
-            'This file is no longer available.',
-            status: 404,
-          );
-        case 412:
-          throw const CloudFailure(
-            'This file changed on the server. Try again after the library refreshes.',
-            status: 412,
-          );
-        default:
-          rethrow;
+    return _readSelected((reads, current) async {
+      try {
+        final item = await reads.checkFile(name, etag);
+        _checkOpenPolicy();
+        if (current()) _foregroundReadSucceeded();
+        return item;
+      } on CloudFailure catch (error) {
+        switch (error.status) {
+          case 404:
+            throw const CloudFailure(
+              'This file is no longer available.',
+              status: 404,
+            );
+          case 412:
+            throw const CloudFailure(
+              'This file changed on the server. Try again after the library refreshes.',
+              status: 412,
+            );
+          default:
+            rethrow;
+        }
       }
+    });
+  }
+
+  Future<void> _downloadSelectedFile(
+    String path,
+    File target, {
+    required String etag,
+  }) =>
+      _readSelected((_, _) => engine.cloud.download(path, target, etag: etag));
+
+  Future<T> _readSelected<T>(
+    Future<T> Function(ForegroundReads, bool Function()) read,
+  ) async {
+    final reads = foregroundReads!();
+    final generation = _connectionGeneration;
+    // The worker queues network and pause commands while the read is pending.
+    bool current() =>
+        identical(reads, foregroundReads!()) &&
+        _foregroundResultCurrent(generation);
+    try {
+      return await read(reads, current);
+    } catch (error) {
+      if ((error is SocketException ||
+              error is HttpException ||
+              error is TlsException ||
+              error is TimeoutException ||
+              error is TransferInterrupted) &&
+          current()) {
+        // A discovery reply may still be in flight on this connection.
+        // Retire that pass and let the normal retry schedule obtain a fresh one.
+        _connectionGeneration++;
+        if (_inPass) engine.stopRequested = true;
+        if (!schedule.offline || schedule.untilDue == Duration.zero) {
+          schedule.completed(listed: false, failed: true);
+        }
+        _foregroundReadFailed(error);
+        if (!_inPass) _schedule(interval);
+      }
+      rethrow;
     }
   }
 
@@ -699,6 +760,7 @@ class WorkerLoop {
         providerTracked: command['providerTracked'] == true,
         checkRemote: _checkSelectedFile,
         checkTransferPolicy: _checkOpenPolicy,
+        downloadSelected: _downloadSelectedFile,
       );
       // The provider resolves the working-copy URI from the projected rows.
       // Publish its ID before the receiver is launched.
@@ -802,7 +864,11 @@ class WorkerLoop {
       send({
         'event': 'backgroundDone',
         'request': run.request,
-        'listed': !paused && !stopped && engine.remoteListed,
+        'listed':
+            !paused &&
+            !stopped &&
+            engine.remoteListed &&
+            (!_androidForeground || _passCurrent()),
         'offline': schedule.offline,
         'paused': paused,
         'stopped': stopped,
@@ -985,54 +1051,56 @@ class WorkerLoop {
     _discovering = _androidForeground;
     _lastPassFailed = true;
     final reads = _passLists ? foregroundReads?.call() : null;
-    bool current() =>
-        !_paused && !_stopping && _passGeneration == _connectionGeneration;
     Object? probeError;
     try {
       if (reads != null) {
         await _foregroundCheckpoint();
       }
-      if (reads != null && current()) {
+      if (reads != null && _passCurrent()) {
+        bool probeCurrent() =>
+            _passCurrent() && identical(reads, foregroundReads!());
         try {
           final generation = _passGeneration;
           await _duringDiscovery(
             reads
                 .checkRoot(
-                  stillWanted: current,
+                  stillWanted: probeCurrent,
                   selectedRead: () => _selectedRead,
                 )
                 .then((_) {
-                  if (_foregroundResultCurrent(generation)) {
+                  if (probeCurrent() && _foregroundResultCurrent(generation)) {
                     _foregroundReadSucceeded();
                   }
                 }),
           );
           // An initial or Wi-Fi-only report may have been queued while the
           // root replied without replacing this generation.
-          if (current()) _foregroundReadSucceeded();
+          if (probeCurrent()) _foregroundReadSucceeded();
         } catch (error) {
-          probeError = error;
-          if (current()) _foregroundReadFailed(error);
+          if (probeCurrent()) {
+            probeError = error;
+            _foregroundReadFailed(error);
+          }
         }
       }
-      if (!current()) {
+      if (!_passCurrent()) {
         engine.stopRequested = false;
-        return;
-      }
-      await engine.tick(
-        between: _between,
-        remote: probeError == null ? remote : RemotePolicy.never,
-      );
-      _lastPassFailed = false;
-      if ((_passWillVerify || engine.fullVerifications > _passVerifications) &&
-          engine.remoteListed) {
-        _verifiedSerial = _passSerial;
+      } else {
+        await engine.tick(
+          between: _between,
+          remote: probeError == null ? remote : RemotePolicy.never,
+        );
+        _lastPassFailed = false;
       }
       final pass = engine.lastPass;
-      if (engine.remoteListed && pass != null && pass.rowsWritten > 0) {
-        schedule.mutated();
-      }
-      if (current()) {
+      if (_passCurrent()) {
+        if (engine.remoteListed) {
+          if (_passWillVerify ||
+              engine.fullVerifications > _passVerifications) {
+            _verifiedSerial = _passSerial;
+          }
+          if (pass != null && pass.rowsWritten > 0) schedule.mutated();
+        }
         schedule.completed(
           listed: engine.remoteListed,
           failed: engine.remoteFailed || probeError != null,
@@ -1052,7 +1120,10 @@ class WorkerLoop {
       _inPass = false;
       _discovering = false;
       _connecting = false;
-      if (_androidForeground && !_stopping && !current() && _passWillVerify) {
+      if (_androidForeground &&
+          !_stopping &&
+          !_passCurrent() &&
+          _passWillVerify) {
         _verifyPassWanted = true;
         engine.requestFullVerification();
       }
@@ -1064,14 +1135,14 @@ class WorkerLoop {
       return;
     }
     await emit();
-    _answerBackground();
-    if (_background.isNotEmpty) {
+    if (_passCurrent() || schedule.offline) _answerBackground();
+    if (_background.isNotEmpty && !schedule.offline) {
       // Asked for during this pass: its completion just set the next
       // listing an idle period away, so ask again for the run's own pass.
       schedule.requestNow();
       _passWanted = true;
     }
-    _record();
+    if (_passCurrent() || !_lastPassFailed) _record();
     _sinceEnd
       ..reset()
       ..start();
@@ -1547,7 +1618,11 @@ class WorkerLoop {
           // Unreachable, the next retry is seconds away, not minutes.
           final verify = command['verify'] == true;
           if (_androidForeground && verify) {
-            if (_paused || _passVerifies) break;
+            if (_paused) break;
+            if (_passVerifies) {
+              _checkingChanges = true;
+              break;
+            }
             if (!_verifyPassWanted) _restartForegroundCheck();
             _verifyPassWanted = true;
           }
@@ -1627,16 +1702,27 @@ class WorkerLoop {
         case 'network':
           // The platform's connectivity report (Android). A network that
           // just became usable ends an offline wait at once.
-          _onWifi = command['wifi'] == true;
+          final wifi = command['wifi'] == true;
+          final route = command['route'] as int?;
+          final routeChanged =
+              (_onWifi != null && wifi != _onWifi) ||
+              (route != null &&
+                  _networkRoute != null &&
+                  route != _networkRoute);
+          _onWifi = wifi;
+          _networkRoute = route ?? _networkRoute;
           _applyNetwork();
           final online = command['online'];
-          final changed = online is bool && _online != online;
           final previous = _online;
-          if (changed) _online = online;
+          if (online is bool) _online = online;
+          final validationChanged = _online != previous;
+          final disconnected =
+              _connection == SyncStatus.offline ||
+              (_connection == SyncStatus.checkingServer && schedule.offline);
           if (_androidForeground &&
-              changed &&
               !_paused &&
-              (previous != null || _connection == SyncStatus.offline)) {
+              ((validationChanged && (previous != null || disconnected)) ||
+                  (routeChanged && _online == true && disconnected))) {
             _restartForegroundCheck();
             schedule.reconnect();
             _passWanted = true;

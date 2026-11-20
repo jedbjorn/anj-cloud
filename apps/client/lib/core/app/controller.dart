@@ -899,11 +899,18 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
   /// not. Kept and re-sent to every worker start, so a worker never guesses.
   /// [online] is the platform's validation report when available.
   bool? _networkOnline;
+  int? _networkRoute;
 
-  void reportNetwork({required bool wifi, bool? online}) {
+  void reportNetwork({required bool wifi, bool? online, int? route}) {
     _onWifi = wifi;
     _networkOnline = online ?? _networkOnline;
-    _input?.send({'action': 'network', 'wifi': wifi, 'online': _networkOnline});
+    _networkRoute = route ?? _networkRoute;
+    _input?.send({
+      'action': 'network',
+      'wifi': wifi,
+      'online': _networkOnline,
+      'route': _networkRoute,
+    });
   }
 
   /// "Wi-Fi only" ('wifi') or "Wi-Fi or mobile data" ('any'), persisted in

@@ -9,6 +9,10 @@ abstract interface class ForegroundReads {
     required bool Function() stillWanted,
     required Future<void>? Function() selectedRead,
   });
+  void guardListing({
+    required bool Function() stillWanted,
+    required Future<void>? Function() selectedRead,
+  });
   void clearCheckedRoot();
   Future<RemoteItem> checkFile(String path, String etag);
 }

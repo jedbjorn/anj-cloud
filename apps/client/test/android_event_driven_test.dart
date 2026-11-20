@@ -88,6 +88,12 @@ class _ForegroundFixture implements ForegroundReads {
 
   @override
   void clearCheckedRoot() {}
+
+  @override
+  void guardListing({
+    required bool Function() stillWanted,
+    required Future<void>? Function() selectedRead,
+  }) {}
 }
 
 class _SlowPhoneEnumeration extends AndroidPhoneRootFs {
