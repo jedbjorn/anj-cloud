@@ -71,13 +71,13 @@ class DavCloud
         TrashApi {
   DavCloud(
     this.origin,
-    SecurityContext context, {
+    this._securityContext, {
     this.folderDeletionQualified = false,
     this.fullWalkInterval = listingFullWalkInterval,
     this.pruneShares = true,
     Duration Function()? monotonic,
     DateTime Function()? wallClock,
-  }) : client = HttpClient(context: context),
+  }) : _client = _newClient(_securityContext),
        monotonic = monotonic ?? _uptime,
        wallClock = wallClock ?? DateTime.now {
     if (origin.scheme != 'https' ||
@@ -89,12 +89,26 @@ class DavCloud
         'Use an HTTPS server origin without a path, credentials or query.',
       );
     }
-    client.connectionTimeout = const Duration(seconds: 10);
-    client.autoUncompress = false;
   }
   final Uri origin;
-  final HttpClient client;
+  final SecurityContext _securityContext;
+  HttpClient _client;
+  HttpClient get client => _client;
   final bool folderDeletionQualified;
+
+  static HttpClient _newClient(SecurityContext context) =>
+      HttpClient(context: context)
+        ..connectionTimeout = const Duration(seconds: 10)
+        ..autoUncompress = false;
+
+  @override
+  void networkChanged() {
+    final previous = _client;
+    _client = _newClient(_securityContext);
+    // Finish outstanding requests, but never reuse their sockets for a
+    // check of the replacement network.
+    previous.close();
+  }
 
   /// The longest a listing may trust stored folder ETags (flag SC-057).
   final Duration fullWalkInterval;
@@ -175,9 +189,18 @@ class DavCloud
   @override
   int? uploadLimit;
 
+  Stream<List<int>> _responseBody(HttpClientResponse response) => response
+      .timeout(const Duration(seconds: 30))
+      .handleError((Object error, StackTrace trace) {
+        // Like a failure before the headers, an interrupted body leaves
+        // the cached listing unsafe to reuse on reconnect.
+        forgetListing();
+        Error.throwWithStackTrace(error, trace);
+      });
+
   Future<String> boundedBody(HttpClientResponse response) async {
     final data = <int>[];
-    await for (final chunk in response.timeout(const Duration(seconds: 30))) {
+    await for (final chunk in _responseBody(response)) {
       if (data.length + chunk.length > 2 * 1024 * 1024) {
         throw const CloudFailure(
           'Server listing exceeds the supported response size.',
@@ -244,7 +267,7 @@ class DavCloud
     final generation = _generation;
     try {
       final children = await _listChildren('');
-      if (generation == _generation) {
+      if (generation == _generation && stillWanted()) {
         _checkedRoot = (generation: generation, children: children);
       }
     } catch (_) {
@@ -388,7 +411,7 @@ class DavCloud
       body: utf8.encode(propfind),
     );
     if (response.statusCode != 207) {
-      await response.drain<void>();
+      await _responseBody(response).drain<void>();
       failure(response.statusCode);
     }
     final body = await boundedBody(response);
@@ -619,26 +642,35 @@ class DavCloud
       headers: {'If-Match': etag, 'Accept-Encoding': 'identity'},
     );
     if (response.statusCode != 200) {
-      await response.drain<void>();
+      await _responseBody(response).drain<void>();
       failure(response.statusCode);
     }
     if (response.headers.value('etag') != etag) {
-      await response.drain<void>();
+      await _responseBody(response).drain<void>();
       throw const CloudFailure('Download version changed.');
     }
-    final sink = target.openWrite();
+    RandomAccessFile? file;
+    var length = 0;
     try {
-      await sink.addStream(response.timeout(const Duration(seconds: 30)));
-      await sink.flush();
-    } finally {
-      await sink.close();
+      await for (final chunk in _responseBody(response)) {
+        file ??= await target.open(mode: FileMode.write);
+        await file.writeFrom(chunk);
+        length += chunk.length;
+      }
+      if (response.contentLength >= 0 && length != response.contentLength) {
+        forgetListing();
+        throw const HttpException('Incomplete download retained for retry.');
+      }
+      file ??= await target.open(mode: FileMode.write);
+      await file.flush();
+    } catch (_) {
+      try {
+        await file?.close();
+      } on FileSystemException {
+        // Preserve the original response or write error if closing also fails.
+      }
+      rethrow;
     }
-    if (response.contentLength >= 0 &&
-        await target.length() != response.contentLength) {
-      throw const CloudFailure('Incomplete download retained for retry.');
-    }
-    final file = await target.open(mode: FileMode.append);
-    await file.flush();
     await file.close();
   }
 

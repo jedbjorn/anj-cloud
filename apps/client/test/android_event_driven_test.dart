@@ -72,6 +72,9 @@ class _ForegroundFixture implements ForegroundReads {
   final Future<void> Function()? beforeFile;
 
   @override
+  void networkChanged() {}
+
+  @override
   Future<void> checkRoot({
     required bool Function() stillWanted,
     required Future<void>? Function() selectedRead,

@@ -1715,10 +1715,8 @@ class WorkerLoop {
           final wifi = command['wifi'] == true;
           final route = command['route'] as int?;
           final routeChanged =
-              (_onWifi != null && wifi != _onWifi) ||
-              (route != null &&
-                  _networkRoute != null &&
-                  route != _networkRoute);
+              route != null && _networkRoute != null && route != _networkRoute;
+          final wifiChanged = _onWifi != null && wifi != _onWifi;
           _onWifi = wifi;
           _networkRoute = route ?? _networkRoute;
           _applyNetwork();
@@ -1729,10 +1727,14 @@ class WorkerLoop {
           final disconnected =
               _connection == SyncStatus.offline ||
               (_connection == SyncStatus.checkingServer && schedule.offline);
+          if (_androidForeground && routeChanged) {
+            foregroundReads!().networkChanged();
+          }
           if (_androidForeground &&
               !_paused &&
-              ((validationChanged && (previous != null || disconnected)) ||
-                  (routeChanged && _online == true && disconnected))) {
+              (routeChanged ||
+                  (validationChanged && (previous != null || disconnected)) ||
+                  (wifiChanged && _online == true && disconnected))) {
             _restartForegroundCheck();
             schedule.reconnect();
             _passWanted = true;

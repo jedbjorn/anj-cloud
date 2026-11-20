@@ -66,6 +66,7 @@ void main() {
         'match': request.headers.value('if-match'),
         'none': request.headers.value('if-none-match'),
         'depth': request.headers.value('depth'),
+        'peerPort': request.connectionInfo?.remotePort.toString(),
       });
       await handler(request);
     });
@@ -355,6 +356,34 @@ void main() {
     expect(requests.single['match'], '"v1"');
     expect(output.existsSync(), isFalse);
   });
+  test('a local download error leaves the DAV listing reusable', () async {
+    handler = (request) async {
+      await request.drain<void>();
+      final reply = request.response;
+      if (request.method == 'GET') {
+        reply.headers.set('etag', '"v1"');
+        reply.write('data');
+      } else {
+        reply.statusCode = 207;
+        reply.write(
+          listing([
+            if (request.uri.path == '/dav/') response('/dav/', directory: true),
+            response('/dav/folder/', directory: true),
+          ]),
+        );
+      }
+      await reply.close();
+    };
+    await api.snapshot();
+    expect(api.fullWalks, 1);
+    await expectLater(
+      api.download('file', File(fixture.path), etag: '"v1"'),
+      throwsA(isA<FileSystemException>()),
+    );
+    requests.clear();
+    await api.snapshot();
+    expect(requests.map((r) => r['path']), ['/dav/']);
+  });
   test(
     'TLS hostname mismatch fails without insecure certificate callback',
     () async {
@@ -487,7 +516,16 @@ void main() {
       var denied = false;
       var rejectDownload = false;
       var dropSelected = false;
-      var dropDownload = false;
+      var truncateDownload = false;
+      var truncateSelected = false;
+
+      Future<void> truncated(HttpResponse reply, String wire) async {
+        final socket = await reply.detachSocket(writeHeaders: false);
+        socket.add(ascii.encode(wire));
+        await socket.flush();
+        await socket.close();
+      }
+
       handler = (request) async {
         await request.drain<void>();
         final reply = request.response;
@@ -544,6 +582,14 @@ void main() {
               (await reply.detachSocket(writeHeaders: false)).destroy();
               return;
             }
+            if (truncateSelected) {
+              await truncated(
+                reply,
+                'HTTP/1.1 207 Multi-Status\r\nContent-Length: 100\r\n'
+                'Connection: close\r\n\r\n<d:',
+              );
+              return;
+            }
             reply.statusCode = 207;
             reply.write(listing([response(uri, version: version)]));
           case (
@@ -551,8 +597,12 @@ void main() {
             '/dav/chosen.txt' || '/dav/early.txt' || '/dav/unread.txt',
           ):
             expect(request.headers.value('if-match'), '"$version"');
-            if (dropDownload) {
-              (await reply.detachSocket(writeHeaders: false)).destroy();
+            if (truncateDownload) {
+              await truncated(
+                reply,
+                'HTTP/1.1 200 OK\r\nETag: "$version"\r\nContent-Length: 4\r\n'
+                'Connection: close\r\n\r\nr',
+              );
               return;
             }
             reply.statusCode = rejectDownload ? 412 : 200;
@@ -814,9 +864,16 @@ void main() {
         await until(
           () =>
               controller.openNotice?.contains('Could not open') == true &&
-              controller.onWifi == false,
+              controller.status == SyncStatus.checkingServer,
         );
-        expect(controller.status, SyncStatus.checkingChanges);
+        walk.complete();
+        await until(() => controller.status == SyncStatus.upToDate);
+
+        folderVersion = 'v5';
+        walk = Completer<void>();
+        walking = Completer<void>();
+        controller.windowShown(verify: true);
+        await walking.future.timeout(const Duration(seconds: 5));
         controller.command('open', path);
         await until(() => controller.status == SyncStatus.offline);
         expect(walk.isCompleted, isFalse);
@@ -838,10 +895,42 @@ void main() {
         await until(() => controller.status == SyncStatus.upToDate);
         expect(rootReads(), beforeRoute + 1);
 
-        // Metadata can authenticate successfully and the conditional GET can
-        // still lose the connection. Backoff retries with no lifecycle wake.
-        final beforeDownload = rootReads();
-        dropDownload = true;
+        // A successful reply from the old route arrives after the Wi-Fi hold
+        // has acknowledged the replacement. Only a fresh read can connect it.
+        controller.setNetworkPolicy('wifi');
+        rootReading = Completer<void>();
+        rootRelease = Completer<void>();
+        controller.windowShown(verify: true);
+        await rootReading.future.timeout(const Duration(seconds: 5));
+        await until(() => controller.status == SyncStatus.checkingServer);
+        final oldRoot = requests.last;
+        final startHandover = requests.length;
+        final handoverStatuses = <SyncStatus>[];
+        void collectHandoverStatus() => handoverStatuses.add(controller.status);
+        controller.addListener(collectHandoverStatus);
+        controller.reportNetwork(wifi: false, online: true, route: 4);
+        await until(() => controller.transfersHeld);
+        controller.reportNetwork(wifi: false, online: true, route: 4);
+        offline = true;
+        rootRelease.complete();
+        rootRelease = null;
+        await until(() => controller.status == SyncStatus.offline);
+        controller.removeListener(collectHandoverStatus);
+        expect(handoverStatuses, isNot(contains(SyncStatus.checkingChanges)));
+        expect(handoverStatuses, isNot(contains(SyncStatus.upToDate)));
+        final replacementRoot = requests.skip(startHandover).single;
+        expect(replacementRoot['path'], '/dav/');
+        expect(replacementRoot['peerPort'], isNot(oldRoot['peerPort']));
+        offline = false;
+        controller.reportNetwork(wifi: true, online: true, route: 5);
+        await until(() => controller.status == SyncStatus.upToDate);
+
+        // A short body after successful headers is still a transport
+        // interruption. The viewer gets no partial file, and both failures
+        // must retry from the root and walk every otherwise reusable folder.
+        viewed = Completer<String>();
+        final beforeDownload = requests.length;
+        truncateDownload = true;
         controller.command('open', unread);
         await until(() => controller.status == SyncStatus.offline);
         expect(
@@ -850,12 +939,47 @@ void main() {
           ),
           hasLength(1),
         );
-        dropDownload = false;
-        await until(
-          () => controller.status == SyncStatus.upToDate,
-          timeout: const Duration(seconds: 12),
+        expect(viewed.isCompleted, isFalse);
+        truncateDownload = false;
+
+        Future<void> expectFullRecovery(int after) async {
+          await until(
+            () => controller.status == SyncStatus.upToDate,
+            timeout: const Duration(seconds: 12),
+          );
+          final folders = requests
+              .skip(after)
+              .where((r) => r['depth'] == '1')
+              .map((r) => r['path']);
+          expect(
+            folders,
+            unorderedEquals([
+              '/dav/',
+              '/dav/Slow',
+              '/dav/Videos',
+              '/dav/Music',
+              '/dav/Documents',
+            ]),
+          );
+        }
+
+        await expectFullRecovery(beforeDownload);
+        final beforeMetadata = requests.length;
+        truncateSelected = true;
+        controller.command('open', unread);
+        await until(() => controller.status == SyncStatus.offline);
+        truncateSelected = false;
+        await expectFullRecovery(beforeMetadata);
+        expect(
+          requests
+              .skip(beforeMetadata)
+              .where(
+                (r) => r['method'] == 'GET' && r['path'] == '/dav/$unread',
+              ),
+          isEmpty,
         );
-        expect(rootReads(), beforeDownload + 1);
+        controller.command('open', unread);
+        expect(await viewed.future.timeout(const Duration(seconds: 5)), 'read');
       } finally {
         if (!walk.isCompleted) walk.complete();
         if (rootRelease case final wait? when !wait.isCompleted) {
