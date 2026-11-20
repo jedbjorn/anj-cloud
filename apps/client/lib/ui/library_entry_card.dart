@@ -103,6 +103,77 @@ String? incomingShareLine(Map<String, dynamic> entry) {
   ].join(' · ');
 }
 
+Widget _entryIcon(LibraryRow row, String basename, Color color) {
+  final key = ValueKey('entry-icon:${row.path}');
+  if (row.entry['kind'] == 'unsupported') {
+    return Icon(Icons.block, key: key, size: 24, color: color);
+  }
+
+  final name = basename.toLowerCase();
+  if (row.directory) {
+    final category = switch (name) {
+      'music' => Icons.music_note_outlined,
+      'documents' => Icons.description_outlined,
+      'videos' || 'movies' => Icons.theaters_outlined,
+      'pictures' || 'photos' || 'screenshots' => Icons.image_outlined,
+      'presentations' => Icons.slideshow_outlined,
+      _ => null,
+    };
+    final folder = Icon(
+      Icons.folder_outlined,
+      key: key,
+      size: 24,
+      color: color,
+    );
+    if (category == null) return folder;
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        folder,
+        Padding(
+          padding: const EdgeInsets.only(top: 3),
+          child: Icon(category, size: 12, color: color),
+        ),
+      ],
+    );
+  }
+
+  final glyph = switch (p.posix.extension(name)) {
+    '.mp3' ||
+    '.m4a' ||
+    '.aac' ||
+    '.flac' ||
+    '.wav' ||
+    '.ogg' ||
+    '.opus' ||
+    '.aiff' ||
+    '.wma' => Icons.music_note_outlined,
+    '.pdf' ||
+    '.doc' ||
+    '.docx' ||
+    '.odt' ||
+    '.rtf' ||
+    '.txt' ||
+    '.md' => Icons.description_outlined,
+    '.mp4' ||
+    '.m4v' ||
+    '.mov' ||
+    '.mkv' ||
+    '.webm' ||
+    '.avi' => Icons.theaters_outlined,
+    '.png' ||
+    '.jpg' ||
+    '.jpeg' ||
+    '.gif' ||
+    '.webp' ||
+    '.heic' ||
+    '.svg' => Icons.image_outlined,
+    '.ppt' || '.pptx' || '.odp' => Icons.slideshow_outlined,
+    _ => Icons.insert_drive_file_outlined,
+  };
+  return Icon(glyph, key: key, size: 24, color: color);
+}
+
 class LibraryEntryCard extends StatefulWidget {
   const LibraryEntryCard({
     super.key,
@@ -243,6 +314,7 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
   Widget build(BuildContext context) {
     final row = widget.row;
     final entry = row.entry;
+    final basename = p.posix.basename(row.shown);
     final scheme = Theme.of(context).colorScheme;
     final summary = librarySummary(entry);
     final badge = rowBadge(entry);
@@ -314,17 +386,12 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
                             row.directory && row.syncingWithin && !row.attention
                             ? 'Syncing inside this folder'
                             : null,
-                        child: Icon(
-                          key: ValueKey('entry-icon:${row.path}'),
-                          entry['kind'] == 'unsupported'
-                              ? Icons.block
-                              : row.directory
-                              ? Icons.folder_outlined
-                              : Icons.insert_drive_file_outlined,
-                          color: widget.color == null
+                        child: _entryIcon(
+                          row,
+                          basename,
+                          widget.color == null
                               ? scheme.primary
                               : Color(widget.color!),
-                          size: 24,
                         ),
                       ),
                     const SizedBox(width: 12),
@@ -336,7 +403,7 @@ class _LibraryEntryCardState extends State<LibraryEntryCard> {
                             children: [
                               Flexible(
                                 child: Text(
-                                  p.posix.basename(row.shown),
+                                  basename,
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: Theme.of(context).textTheme.titleSmall,
