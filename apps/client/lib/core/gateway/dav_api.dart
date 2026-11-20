@@ -37,7 +37,10 @@ const listingFullWalkInterval = Duration(hours: 6);
 typedef _ListingRoot = ({
   List<RemoteItem> children,
   int? serverTime,
-  Duration observed,
+  Duration started,
+  DateTime startedWall,
+  int generation,
+  int? revision,
 });
 
 /// The first-sync listing (decision #118): the listing's properties plus
@@ -169,9 +172,20 @@ class DavCloud
   @override
   int? uploadLimit;
 
+  // request() only covers failures up to the response headers. Observe
+  // stream errors before the body reaches its consumer, including a file sink.
+  Stream<List<int>> _watchResponseBody(Stream<List<int>> body) =>
+      body.handleError((Object error, StackTrace stack) {
+        if (!_closed) forgetListing();
+        Error.throwWithStackTrace(error, stack);
+      });
+
   Future<String> boundedBody(HttpClientResponse response) async {
     final data = <int>[];
-    await for (final chunk in response.timeout(const Duration(seconds: 30))) {
+    final body = _watchResponseBody(
+      response.timeout(const Duration(seconds: 30)),
+    );
+    await for (final chunk in body) {
       if (data.length + chunk.length > 2 * 1024 * 1024) {
         throw const CloudFailure(
           'Server listing exceeds the supported response size.',
@@ -357,7 +371,7 @@ class DavCloud
       body: utf8.encode(propfind),
     );
     if (response.statusCode != 207) {
-      await response.drain<void>();
+      await _watchResponseBody(response).drain<void>();
       failure(response.statusCode);
     }
     final body = await boundedBody(response);
@@ -474,6 +488,10 @@ class DavCloud
   }
 
   Future<_ListingRoot> _readListingRoot() async {
+    final generation = _generation;
+    final revision = listingCache?.revision;
+    final started = monotonic();
+    final startedWall = wallClock();
     try {
       int? serverTime;
       final children = await _listChildren(
@@ -483,7 +501,10 @@ class DavCloud
       return (
         children: children,
         serverTime: serverTime,
-        observed: monotonic(),
+        started: started,
+        startedWall: startedWall,
+        generation: generation,
+        revision: revision,
       );
     } catch (_) {
       forgetListing();
@@ -502,9 +523,11 @@ class DavCloud
 
   void discardPreparedListingRoot() => _preparedRoot = null;
 
+  static const _foregroundReadLifetime = Duration(seconds: 30);
+
   bool _fresh(Duration observed) {
     final elapsed = monotonic() - observed;
-    return !elapsed.isNegative && elapsed < const Duration(seconds: 30);
+    return !elapsed.isNegative && elapsed < _foregroundReadLifetime;
   }
 
   Future<_ListingRoot> _takeListingRoot() async {
@@ -512,7 +535,16 @@ class DavCloud
     _preparedRoot = null;
     if (prepared != null) {
       final result = await prepared;
-      if (_fresh(result.observed)) return result;
+      // Uptime can stop during suspend. Both clocks must put the read in
+      // the freshness window and the profile must still trust its revision.
+      final wallElapsed = wallClock().difference(result.startedWall);
+      if (result.generation == _generation &&
+          result.revision == listingCache?.revision &&
+          _fresh(result.started) &&
+          !wallElapsed.isNegative &&
+          wallElapsed < _foregroundReadLifetime) {
+        return result;
+      }
     }
     return _readListingRoot();
   }
@@ -592,7 +624,7 @@ class DavCloud
             server >= saved.server &&
             server -
                     saved.fullServer +
-                    (monotonic() - root.observed).inMilliseconds <
+                    (monotonic() - root.started).inMilliseconds <
                 fullWalkInterval.inMilliseconds);
     final previous = _fullWalkDue || !reusable ? null : _listing;
     if (cache != null && previous == null) {
@@ -762,20 +794,28 @@ class DavCloud
       headers: {'If-Match': etag, 'Accept-Encoding': 'identity'},
     );
     if (response.statusCode != 200) {
-      await response.drain<void>();
+      await _watchResponseBody(response).drain<void>();
       failure(response.statusCode);
     }
     if (response.headers.value('etag') != etag) {
-      await response.drain<void>();
+      await _watchResponseBody(response).drain<void>();
       throw const CloudFailure('Download version changed.');
     }
     final sink = target.openWrite();
     try {
-      await sink.addStream(response.timeout(const Duration(seconds: 30)));
+      await sink.addStream(
+        _watchResponseBody(response.timeout(const Duration(seconds: 30))),
+      );
       await sink.flush();
-    } finally {
-      await sink.close();
+    } catch (_) {
+      try {
+        await sink.close();
+      } on FileSystemException {
+        // addStream can close the file on error. Preserve the original failure.
+      }
+      rethrow;
     }
+    await sink.close();
     if (response.contentLength >= 0 &&
         await target.length() != response.contentLength) {
       throw const CloudFailure('Incomplete download retained for retry.');
@@ -835,7 +875,7 @@ class DavCloud
       }
       throw UploadTooLarge(limit: limit, size: actual ?? size);
     }
-    await response.drain<void>();
+    await _watchResponseBody(response).drain<void>();
     if (response.statusCode >= 500) {
       throw TransferInterrupted(
         failureMessage(response.statusCode),
@@ -850,7 +890,7 @@ class DavCloud
     if (version == null) {
       lastUploadReadBack = true;
       final head = await request('HEAD', path);
-      await head.drain<void>();
+      await _watchResponseBody(head).drain<void>();
       if (head.statusCode != 200) failure(head.statusCode);
       version = head.headers.value('etag');
     }
@@ -870,7 +910,7 @@ class DavCloud
       headers: {'If-None-Match': '*'},
     );
     if (response.statusCode == 422) await nameRefusal(response);
-    await response.drain<void>();
+    await _watchResponseBody(response).drain<void>();
     if (response.statusCode != 201) {
       failure(response.statusCode);
     }
@@ -879,7 +919,7 @@ class DavCloud
   @override
   Future<void> deleteFile(String path, {required String etag}) async {
     final response = await request('DELETE', path, headers: {'If-Match': etag});
-    await response.drain<void>();
+    await _watchResponseBody(response).drain<void>();
     if (response.statusCode != 204 && response.statusCode != 404) {
       failure(response.statusCode);
     }
@@ -901,7 +941,7 @@ class DavCloud
       },
     );
     if (response.statusCode == 422) await nameRefusal(response);
-    await response.drain<void>();
+    await _watchResponseBody(response).drain<void>();
     if (response.statusCode != 201 && response.statusCode != 204) {
       failure(response.statusCode);
     }

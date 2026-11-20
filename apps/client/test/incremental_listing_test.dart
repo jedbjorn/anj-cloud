@@ -123,6 +123,7 @@ void main() {
   late int incomingStatus;
   late int incomingReads;
   late int fileReads;
+  String? interruptedDownload;
 
   /// The folder the sharing routes share.
   const sharePath = 'T2/L0/x3';
@@ -244,6 +245,14 @@ void main() {
         } else {
           fileReads++;
           response.headers.set('etag', etag);
+          if (path == interruptedDownload) {
+            response.contentLength = 100;
+            final socket = await response.detachSocket();
+            socket.add([97]);
+            await socket.flush();
+            await socket.close();
+            return;
+          }
           response.write('fixture');
         }
       } else {
@@ -264,6 +273,7 @@ void main() {
     incomingStatus = 200;
     incomingReads = 0;
     fileReads = 0;
+    interruptedDownload = null;
     onPropfind = null;
     server = await serve();
     api = connect();
@@ -757,6 +767,28 @@ void main() {
     );
 
     test(
+      'a truncated download invalidates the listing across restart',
+      () async {
+        const path = 'interrupted-download';
+        tree.file(path);
+        final listed = await list();
+        expect(profile.setting(anchor), isNotNull);
+        interruptedDownload = path;
+        final target = File('${directory.path}/partial');
+        await expectLater(
+          api.download(path, target, etag: listed[path]!.etag),
+          throwsA(isA<HttpException>()),
+        );
+        expect(fileReads, 1);
+        expect(profile.setting(anchor), isNull);
+
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test(
       'an invalidation in flight discards the result and cannot republish',
       () async {
         await list();
@@ -864,6 +896,44 @@ void main() {
         expect(propfinds, ['', '']);
       },
     );
+
+    for (final when in ['during', 'after']) {
+      test(
+        'another transport invalidating $when preparation forces a reread',
+        () async {
+          await list();
+          restart();
+          final other = connect(listingCache: DavListingCache(profile));
+          addTearDown(other.close);
+          if (when == 'during') onPropfind = (_) => other.forgetListing();
+          await api.prepareListingRoot();
+          onPropfind = null;
+          if (when == 'after') other.forgetListing();
+          tree.file('after-invalidation');
+
+          await listsLikeAFullWalk();
+          expect(propfinds, hasLength(folderCount() + 1));
+          expect(propfinds.where((path) => path.isEmpty), hasLength(2));
+        },
+      );
+    }
+
+    for (final (name, elapsed) in [
+      ('suspend past the full-walk deadline', const Duration(hours: 7)),
+      ('a wall-clock rollback', const Duration(minutes: -1)),
+    ]) {
+      test('a prepared root is reread after $name', () async {
+        await list();
+        restart();
+        await api.prepareListingRoot();
+        advance(elapsed);
+        tree.file('after-clock-change');
+
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount() + 1));
+        expect(propfinds.where((path) => path.isEmpty), hasLength(2));
+      });
+    }
 
     test(
       'placed shares are walked with fresh rights even without DAV S marks',
