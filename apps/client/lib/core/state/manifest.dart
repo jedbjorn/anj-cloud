@@ -200,6 +200,11 @@ class Manifest implements RowTracker {
   int rowsPersisted = 0;
   int transactions = 0;
 
+  int _cacheRowsPersisted = 0;
+
+  /// Settings for a derived cache do not indicate changes to sync.
+  int get syncRowsPersisted => rowsPersisted - _cacheRowsPersisted;
+
   /// Grouped commits (flag SC-051), null where every commit is durable.
   CommitDurability? _durability;
 
@@ -318,10 +323,11 @@ class Manifest implements RowTracker {
             key,
           ]).firstOrNull?['value']
           as String?;
-  void setSetting(String key, String value) {
+  void setSetting(String key, String value, {bool cache = false}) {
     if (setting(key) == value) return;
     db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', [key, value]);
     rowsPersisted++;
+    if (cache) _cacheRowsPersisted++;
     if (db.autocommit) {
       transactions++;
       // Settings (pause, retention) are rare and decisive: a commit point.
@@ -329,10 +335,11 @@ class Manifest implements RowTracker {
     }
   }
 
-  void deleteSetting(String key) {
+  void deleteSetting(String key, {bool cache = false}) {
     if (setting(key) == null) return;
     db.execute('DELETE FROM settings WHERE key=?', [key]);
     rowsPersisted += db.updatedRows;
+    if (cache) _cacheRowsPersisted += db.updatedRows;
     if (db.autocommit) {
       transactions++;
       _committedDurably();

@@ -10,6 +10,7 @@ class PassMetrics {
     required this.bytesHashed,
     required this.filesHashedBy,
     required this.rowsWritten,
+    required this.syncRowsWritten,
     required this.transactions,
     required this.durationMicros,
     this.localScan = 'full',
@@ -38,6 +39,9 @@ class PassMetrics {
   final int bytesHashed;
   final Map<String, int> filesHashedBy;
   final int rowsWritten;
+
+  /// Writes that may require a follow-up pass, excluding derived caches.
+  final int syncRowsWritten;
   final int transactions;
   final int durationMicros;
   Map<String, Object> toJson() => {

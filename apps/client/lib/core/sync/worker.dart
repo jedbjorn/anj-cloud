@@ -1113,7 +1113,7 @@ class WorkerLoop {
               engine.fullVerifications > _passVerifications) {
             _verifiedSerial = _passSerial;
           }
-          if (pass != null && pass.rowsWritten > 0) schedule.mutated();
+          if (pass != null && pass.syncRowsWritten > 0) schedule.mutated();
         }
         schedule.completed(
           listed: engine.remoteListed,
@@ -1177,7 +1177,7 @@ class WorkerLoop {
         pass != null &&
         !_lastPassFailed &&
         pass.candidates == 0 &&
-        pass.rowsWritten == 0 &&
+        pass.syncRowsWritten == 0 &&
         pass.filesHashed == 0;
     if (!engine.eventDriven || !quiet) return interval;
     final due = schedule.untilDue;

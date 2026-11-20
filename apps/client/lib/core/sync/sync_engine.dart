@@ -1047,6 +1047,7 @@ class SyncEngine {
     final files = meter.files, bytes = meter.bytes;
     final filesBy = Map<String, int>.of(meter.filesBy);
     final rows = manifest.rowsPersisted, transactions = manifest.transactions;
+    final syncRows = manifest.syncRowsPersisted;
     final audit =
         _fullPending ||
         _lastAudit == null ||
@@ -1090,6 +1091,7 @@ class SyncEngine {
               v.key: v.value - (filesBy[v.key] ?? 0),
         },
         rowsWritten: manifest.rowsPersisted - rows,
+        syncRowsWritten: manifest.syncRowsPersisted - syncRows,
         transactions: manifest.transactions - transactions,
         durationMicros: watch.elapsedMicroseconds,
         localScan: _localScan,
