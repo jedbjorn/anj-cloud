@@ -1139,12 +1139,9 @@ class DavCloud
         queryParameters: {'after': '$after'},
       ),
     );
-    if (response.statusCode == 404) {
-      await _watchResponseBody(response).drain<void>();
-      return null;
-    }
     if (response.statusCode != 200) {
-      await _watchResponseBody(response).drain<void>();
+      await _responseBody(response).drain<void>();
+      if (response.statusCode == 404) return null;
       failure(response.statusCode);
     }
     return parseAddedPage(await boundedBody(response));
@@ -1190,7 +1187,7 @@ class DavCloud
       body: body == null ? null : utf8.encode(jsonEncode(body)),
     );
     if (missingIsNull && response.statusCode == 404) {
-      await _watchResponseBody(response).drain<void>();
+      await _responseBody(response).drain<void>();
       return null;
     }
     final text = await boundedBody(response);

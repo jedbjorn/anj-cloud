@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -122,9 +123,11 @@ void main() {
   late DateTime serverClock;
   late int incomingStatus;
   late int incomingReads;
+  bool stallMissingShares = false;
   late int outgoingStatus;
   late int outgoingReads;
   bool interruptedAddedPage = false;
+  bool stallMissingDates = false;
   late int fileReads;
   String? interruptedDownload;
 
@@ -184,6 +187,14 @@ void main() {
         listingCache: listingCache,
       );
 
+  Future<void> stallBody(HttpResponse response, int status) async {
+    response.statusCode = status;
+    response.contentLength = 50;
+    response.bufferOutput = false;
+    response.write('x');
+    await response.flush();
+  }
+
   Future<HttpServer> serve([int port = 0]) async {
     final result = await HttpServer.bindSecure(
       InternetAddress.loopbackIPv4,
@@ -202,6 +213,10 @@ void main() {
       final route = request.uri.path;
       if (route == '/v1/shares/incoming') {
         incomingReads++;
+        if (stallMissingShares) {
+          await stallBody(response, 404);
+          return;
+        }
         response.statusCode = incomingStatus;
         response.headers.contentType = ContentType.json;
         response.write(jsonEncode(tree.incoming));
@@ -235,11 +250,7 @@ void main() {
         propfinds.add(path);
         if (path.isEmpty && stallRootErrorBody) {
           stallRootErrorBody = false;
-          response.statusCode = 503;
-          response.contentLength = 50;
-          response.bufferOutput = false;
-          response.write('x');
-          await response.flush();
+          await stallBody(response, 503);
           return;
         }
         onPropfind?.call(path);
@@ -253,6 +264,10 @@ void main() {
         }
       } else if (route == '/v1/files/added') {
         response.statusCode = 404;
+        if (stallMissingDates) {
+          await stallBody(response, 404);
+          return;
+        }
         if (interruptedAddedPage) {
           response.contentLength = 100;
           final socket = await response.detachSocket();
@@ -299,9 +314,11 @@ void main() {
     serverClock = wall;
     incomingStatus = 200;
     incomingReads = 0;
+    stallMissingShares = false;
     outgoingStatus = 200;
     outgoingReads = 0;
     interruptedAddedPage = false;
+    stallMissingDates = false;
     fileReads = 0;
     interruptedDownload = null;
     onPropfind = null;
@@ -845,6 +862,20 @@ void main() {
       },
     );
 
+    test('a stalled file-date 404 invalidates the saved listing', () async {
+      await list();
+      restart();
+      expect(profile.setting(anchor), isNotNull);
+      stallMissingDates = true;
+
+      await expectLater(api.addedSince(0), throwsA(isA<TimeoutException>()));
+      expect(profile.setting(anchor), isNull);
+
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+    }, timeout: const Timeout(Duration(seconds: 45)));
+
     for (final wasShared in [false, true]) {
       test(
         'a cold check discovers an outgoing share ${wasShared ? 'removal' : 'creation'}',
@@ -1202,6 +1233,24 @@ void main() {
         expect(target.existsSync(), isFalse);
         expect(fileReads, 0);
       },
+    );
+
+    test(
+      'a stalled incoming-share 404 drops trust and walks the live tree',
+      () async {
+        await list();
+        restart();
+        expect(profile.setting(anchor), isNotNull);
+        stallMissingShares = true;
+        onPropfind = (path) {
+          if (path.isEmpty) expect(profile.setting(anchor), isNull);
+        };
+
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+        expect(profile.setting(anchor), isNull);
+      },
+      timeout: const Timeout(Duration(seconds: 45)),
     );
 
     test(
