@@ -146,16 +146,21 @@ async def run_fixture(stack, run):
         print("PASS three quiet restarts, interrupted publish, and four deep changes agree with fresh walks",
               flush=True)
 
-        body, _ = await writer.request(
-            "POST", "/v1/shares", headers={"Content-Type": "application/json"}, expected=(201,),
-            data=json.dumps({"path": deep, "recipient_id": FIXTURE_USERS[1], "permission": "view"}),
-        )
-        share_id = json.loads(body)["share_id"]
+        recipient = await pair(stack, operator, FIXTURE_USERS[1], clients / "recipient")
         try:
-            shared = await check("cached", "outgoing-created")
-            shared_fresh = await check("fresh", "fresh-outgoing-created")
+            body, _ = await writer.request(
+                "POST", "/v1/shares", headers={"Content-Type": "application/json"}, expected=(201,),
+                data=json.dumps({"path": deep, "recipient_id": FIXTURE_USERS[1], "permission": "edit"}),
+            )
+            share_id = json.loads(body)["share_id"]
+            try:
+                shared = await check("cached", "outgoing-created")
+                shared_fresh = await check("fresh", "fresh-outgoing-created")
+            finally:
+                await writer.request("DELETE", f"/v1/shares/{share_id}")
         finally:
-            await writer.request("DELETE", f"/v1/shares/{share_id}")
+            await recipient.close()
+            await asyncio.to_thread(operator.revoke, recipient.identity)
         unshared = await check("cached", "outgoing-removed")
         unshared_fresh = await check("fresh", "fresh-outgoing-removed")
         for expected, cached, walked in [(True, shared, shared_fresh), (False, unshared, unshared_fresh)]:
