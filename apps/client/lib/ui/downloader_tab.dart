@@ -555,35 +555,3 @@ class _JobCard extends StatelessWidget {
     );
   }
 }
-
-/// How the home tab bar lays out [labels] in [width]: equal tabs when every
-/// label fits (with the usual padding, or a tighter one on a phone), and
-/// otherwise tabs that scroll sideways from the start, as the Admin tabs do.
-({bool scrollable, EdgeInsetsGeometry? labelPadding}) homeTabLayout(
-  BuildContext context,
-  List<String> labels,
-  double width,
-) {
-  var widest = 0.0;
-  for (final label in labels) {
-    final painter = TextPainter(
-      text: TextSpan(
-        text: label,
-        style: Theme.of(context).textTheme.titleSmall,
-      ),
-      textDirection: TextDirection.ltr,
-      textScaler: MediaQuery.textScalerOf(context),
-    )..layout();
-    if (painter.width > widest) widest = painter.width;
-    painter.dispose();
-  }
-  final each = width / labels.length;
-  if (widest + 32 <= each) return (scrollable: false, labelPadding: null);
-  if (widest + 8 <= each) {
-    return (
-      scrollable: false,
-      labelPadding: const EdgeInsets.symmetric(horizontal: 4),
-    );
-  }
-  return (scrollable: true, labelPadding: null);
-}

@@ -177,13 +177,13 @@ Future<_Home> _open(
   return _Home(controller, fetch, jobs);
 }
 
-/// Selects a home tab; at a large font the tabs may scroll sideways.
+/// Selects a destination on the main tab bar.
 Future<void> _tab(
   WidgetTester tester,
   String label, {
   bool settle = true,
 }) async {
-  final tab = find.widgetWithText(Tab, label);
+  final tab = find.byTooltip(label);
   await tester.ensureVisible(tab);
   await tester.pump();
   await tester.tap(tab);
@@ -260,7 +260,6 @@ Future<void> _check(WidgetTester tester, String screen) async {
   for (final element in find.byWidgetPredicate(control).evaluate()) {
     final box = element.renderObject;
     if (box is! RenderBox || !box.hasSize || !box.attached) continue;
-    // The home tabs may scroll sideways at a large font, as the Admin tabs.
     if (Scrollable.maybeOf(element, axis: Axis.horizontal) != null) continue;
     final rect = box.localToGlobal(Offset.zero) & box.size;
     expect(
@@ -301,6 +300,32 @@ Future<void> _preview(WidgetTester tester, String screen) async {
   });
 }
 
+Future<void> _checkTooltip(
+  WidgetTester tester,
+  String name, {
+  required bool touch,
+}) async {
+  final tab = find.byTooltip(name);
+  final text = find.text(name, findRichText: true);
+  // An entry badge on this screen may already display the destination name.
+  final before = text.evaluate().length;
+  if (touch) {
+    await tester.longPress(tab);
+    await tester.pump();
+    expect(text, findsNWidgets(before + 1));
+  } else {
+    final mouse = await tester.createGesture(kind: ui.PointerDeviceKind.mouse);
+    await mouse.addPointer();
+    await mouse.moveTo(tester.getCenter(tab));
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pumpAndSettle();
+    expect(text, findsNWidgets(before + 1));
+    await mouse.removePointer();
+  }
+  await tester.pump(const Duration(seconds: 2));
+  await tester.pumpAndSettle();
+}
+
 void main() {
   setUpAll(loadPreviewFonts);
 
@@ -309,26 +334,20 @@ void main() {
       final home = await _open(tester, probe: false);
       expect(home.jobs.availability, FetchAvailability.unknown);
       expect(find.byType(Tab), findsNWidgets(3));
-      expect(find.widgetWithText(Tab, 'Downloader'), findsNothing);
+      expect(find.byTooltip('Downloader'), findsNothing);
     });
 
     testWidgets('is hidden on a server without it', (tester) async {
       final home = await _open(tester, rows: null);
       expect(home.jobs.availability, FetchAvailability.absent);
       expect(find.byType(Tab), findsNWidgets(3));
-      expect(find.widgetWithText(Tab, 'Downloader'), findsNothing);
+      expect(find.byTooltip('Downloader'), findsNothing);
     });
 
-    testWidgets('is the fourth tab, without the library toolbar', (
+    testWidgets('shows the Downloader without the library toolbar', (
       tester,
     ) async {
       await _open(tester);
-      expect(tester.widgetList<Tab>(find.byType(Tab)).map((tab) => tab.text), [
-        'Home',
-        'Editing',
-        'Conflict',
-        'Downloader',
-      ]);
       expect(find.byType(LibraryToolbar), findsOneWidget);
       await _tab(tester, 'Downloader');
       expect(find.byType(DownloaderTab), findsOneWidget);
@@ -337,6 +356,108 @@ void main() {
       await _tab(tester, 'Home');
       expect(find.byType(DownloaderTab), findsNothing);
       expect(find.byType(LibraryToolbar), findsOneWidget);
+    });
+
+    for (final phone in [false, true]) {
+      final layout = phone ? 'compact' : 'desktop';
+      testWidgets(
+        'icon navigation at $layout with three and four destinations',
+        (tester) async {
+          final home = await _open(
+            tester,
+            probe: false,
+            size: phone ? const Size(360, 800) : const Size(1280, 720),
+            scale: phone ? 1.3 : 1,
+            touch: phone,
+          );
+          const destinations = [
+            ('Home', Icons.home, 'row:Documents'),
+            ('Editing', Icons.edit, 'finish:notes.txt'),
+            ('Conflict', Icons.warning_amber_rounded, 'row:budget.ods'),
+            ('Downloader', Icons.move_to_inbox_outlined, 'downloader-empty'),
+          ];
+          for (final count in [3, 4]) {
+            if (count == 4) {
+              await home.jobs.probe('https://gateway.example.com');
+              await tester.pumpAndSettle();
+              expect(_selectedTab(tester), 2);
+            }
+            final bar = find.byType(TabBar);
+            expect(find.byType(Tab), findsNWidgets(count));
+            expect(
+              find.descendant(of: bar, matching: find.byType(Text)),
+              findsNothing,
+            );
+            for (var index = 0; index < count; index++) {
+              final (name, icon, contentKey) = destinations[index];
+              final tab = find.byTooltip(name);
+              expect(
+                find.descendant(of: tab, matching: find.byIcon(icon)),
+                findsOneWidget,
+              );
+              final target = find
+                  .ancestor(of: tab, matching: find.byType(InkWell))
+                  .first;
+              final bounds = tester.getRect(target);
+              expect(bounds.width, greaterThanOrEqualTo(48));
+              expect(bounds.height, greaterThanOrEqualTo(48));
+              expect(
+                bounds.left,
+                closeTo(index * tester.getSize(bar).width / count, 0.1),
+              );
+              await tester.tap(tab.hitTestable());
+              await tester.pumpAndSettle();
+              expect(_selectedTab(tester), index);
+              expect(find.byKey(ValueKey(contentKey)), findsOneWidget);
+              if (index == 0) {
+                for (final chip in ['All', 'Recent', 'New', 'Cloud', 'Local']) {
+                  expect(
+                    find.widgetWithText(ChoiceChip, chip).hitTestable(),
+                    findsOneWidget,
+                  );
+                }
+              }
+              for (final (other, _, _) in destinations.take(count)) {
+                final node = tester.getSemantics(find.byTooltip(other));
+                expect(node.role, ui.SemanticsRole.tab);
+                expect(other.allMatches(node.label), hasLength(1));
+                expect(node.tooltip, isEmpty);
+                expect(
+                  node.flagsCollection.isSelected,
+                  other == name ? ui.Tristate.isTrue : ui.Tristate.isFalse,
+                );
+              }
+              await _preview(tester, 'navigation-$layout-$count-$name');
+              await _checkTooltip(tester, name, touch: phone);
+            }
+          }
+          home.fetch.rows = null;
+          await home.jobs.refresh();
+          await tester.pumpAndSettle();
+          expect(_selectedTab(tester), 0);
+          expect(find.byTooltip('Downloader'), findsNothing);
+          expect(find.byKey(const ValueKey('row:Documents')), findsOneWidget);
+          expect(tester.takeException(), isNull);
+        },
+        variant: TargetPlatformVariant.only(
+          phone ? TargetPlatform.android : TargetPlatform.linux,
+        ),
+      );
+    }
+
+    testWidgets('keyboard traversal activates the Editing tab', (tester) async {
+      await _open(tester);
+      final tab = find.byTooltip('Editing');
+      final tabFocus = Focus.of(tester.element(tab));
+      for (var i = 0; i < 20 && !tabFocus.hasPrimaryFocus; i++) {
+        await tester.sendKeyEvent(LogicalKeyboardKey.tab);
+        await tester.pumpAndSettle();
+      }
+      expect(tabFocus.hasPrimaryFocus, isTrue);
+      await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+      await tester.pumpAndSettle();
+      expect(_selectedTab(tester), 1);
+      expect(find.byKey(const ValueKey('finish:notes.txt')), findsOneWidget);
     });
 
     testWidgets('appears while another tab is selected, which stays', (

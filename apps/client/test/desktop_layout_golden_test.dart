@@ -60,7 +60,7 @@ void main() {
 
   testWidgets('conflict tab, row menu and select mode at 1280', (tester) async {
     await _pumpHome(tester, const Size(1280, 720));
-    await tester.tap(find.widgetWithText(Tab, 'Conflict'));
+    await tester.tap(find.byTooltip('Conflict'));
     await tester.pumpAndSettle();
     await _golden('conflict-1280');
     await tester.tap(find.byTooltip('File actions').first);
@@ -68,7 +68,7 @@ void main() {
     await _golden('row-menu-1280');
     await tester.tapAt(const Offset(5, 5));
     await tester.pumpAndSettle();
-    await tester.tap(find.widgetWithText(Tab, 'Home'));
+    await tester.tap(find.byTooltip('Home'));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey('select-button')));
     await tester.pumpAndSettle();

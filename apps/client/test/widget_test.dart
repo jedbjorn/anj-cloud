@@ -303,7 +303,7 @@ void main() {
               },
             ];
       await tester.pumpWidget(CloudApp(controller: controller));
-      await tester.tap(find.widgetWithText(Tab, 'Editing'));
+      await tester.tap(find.byTooltip('Editing'));
       await tester.pumpAndSettle();
       // The Cloud chip; the row's badge reads Editing (decision #60), and
       // its tooltip still states the unchanged Cloud policy.
@@ -448,7 +448,7 @@ void main() {
       expect(border.left.width, 3);
       expect(border.left.color, Colors.amber);
       expect(find.text('Needs attention in this folder'), findsOneWidget);
-      await tester.tap(find.text('Editing'));
+      await tester.tap(find.byTooltip('Editing'));
       await tester.pumpAndSettle();
       expect(find.text('edit.txt'), findsOneWidget);
       expect(find.text('Documents/deep/edit.txt'), findsOneWidget);
@@ -471,14 +471,14 @@ void main() {
       await tester.tap(find.byTooltip('Collapse Documents/deep'));
       await tester.pumpAndSettle();
       expect(find.text('edit.txt'), findsNothing);
-      await tester.tap(find.text('Conflict'));
+      await tester.tap(find.byTooltip('Conflict'));
       await tester.pumpAndSettle();
       expect(find.text('conflict.txt'), findsOneWidget);
       expect(find.text('edit.txt'), findsNothing);
-      await tester.tap(find.text('Editing'));
+      await tester.tap(find.byTooltip('Editing'));
       await tester.pumpAndSettle();
       expect(find.text('edit.txt'), findsNothing);
-      await tester.tap(find.text('Home'));
+      await tester.tap(find.byTooltip('Home'));
       await tester.pumpAndSettle();
       expect(find.byTooltip('Expand Documents'), findsOneWidget);
       controller.entries = [

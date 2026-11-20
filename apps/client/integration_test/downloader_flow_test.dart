@@ -186,7 +186,7 @@ void main() {
       final jobs = controller.fetchJobs;
 
       // 1. The tab appears from the real gateway's answer.
-      final tab = find.widgetWithText(Tab, 'Downloader');
+      final tab = find.byTooltip('Downloader');
       await until(tab);
       expect(jobs.availability, FetchAvailability.available);
       record('tab shown after the gateway answered the job list');

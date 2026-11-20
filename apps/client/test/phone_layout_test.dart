@@ -155,7 +155,7 @@ Future<void> _adminTab(WidgetTester tester, AdminView view) async {
 }
 
 Future<void> _tapTab(WidgetTester tester, String label) async {
-  await tester.tap(find.widgetWithText(Tab, label));
+  await tester.tap(find.byTooltip(label));
   await tester.pumpAndSettle();
 }
 
@@ -552,7 +552,7 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(status.hitTestable(), findsOneWidget, reason: 'header is back');
     expect(documents.hitTestable(), findsOneWidget, reason: 'list at its top');
-    expect(find.widgetWithText(Tab, 'Home').hitTestable(), findsOneWidget);
+    expect(find.byTooltip('Home').hitTestable(), findsOneWidget);
 
     // Scroll down: the header goes again and the list reaches the target.
     for (var i = 0; i < 40 && target.hitTestable().evaluate().isEmpty; i++) {

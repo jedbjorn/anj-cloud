@@ -75,16 +75,16 @@ void main() {
       () => Future<void>.delayed(const Duration(milliseconds: 500)),
     );
     await shot('home');
-    await tap(find.widgetWithText(Tab, 'Editing'));
+    await tap(find.byTooltip('Editing'));
     await shot('editing');
-    await tap(find.widgetWithText(Tab, 'Conflict'));
+    await tap(find.byTooltip('Conflict'));
     await shot('conflict');
     await tap(find.byTooltip('File actions').first);
     await shot('row-menu');
     await tester.tapAt(const Offset(8, 8));
     await tester.pumpAndSettle();
     await tap(
-      find.widgetWithText(Tab, 'Home'),
+      find.byTooltip('Home'),
       within: find.byType(Scaffold).first,
       delta: -80,
     );

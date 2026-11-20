@@ -353,7 +353,7 @@ void main() {
         await tester.pump();
         await tester.tap(find.byKey(const ValueKey('select-card:note.txt')));
         await tester.pump();
-        await tester.tap(find.text('Editing'));
+        await tester.tap(find.byTooltip('Editing'));
         await tester.pumpAndSettle();
         expect(find.text('0 selected'), findsOneWidget);
       },
