@@ -52,10 +52,16 @@ String workingCopyDetails(Map<String, dynamic> entry) {
 String _editorCopyDetails(List<Map> copies) {
   if (copies.isEmpty) return 'none';
   return copies
-      .map(
-        (copy) =>
-            "${copy['path']} (${copy['size'] == null ? 'size unavailable' : '${copy['size']} bytes'})${copy['modified'] == null ? '' : '\nSaved: ${copy['modified']}'}${copy['undoEditorWarningClaim'] == null ? '' : '\nWarning dismissed'}",
-      )
+      .map((copy) {
+        final size = copy['size'];
+        return [
+          "${copy['path']} (${size == null ? 'size unavailable' : '$size bytes'})",
+          if (copy['modified'] case final modified?) 'Saved: $modified',
+          if (copy['undoEditorWarningClaim'] != null) 'Warning dismissed',
+          if (copy['editorCleanupUnconfirmed'] == true)
+            'Cleanup could not be confirmed. This editor session was kept.',
+        ].join('\n');
+      })
       .join('\n');
 }
 

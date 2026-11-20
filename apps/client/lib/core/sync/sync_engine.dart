@@ -2804,7 +2804,7 @@ class SyncEngine {
 
   /// Nothing under [path] is in flight or in conflict, apart from removals
   /// never sent ([ignoreUnsentDeletes]), so the whole subtree can move.
-  bool _quietSubtree(String path, {bool ignoreUnsentDeletes = false}) =>
+  bool _quietSubtree(String path, Set<String> keptEditorRecords) =>
       !manifest.entries.values.any(
         (e) => withinOrAt(path, e.path) && e.conflict != null,
       ) &&
@@ -2812,8 +2812,41 @@ class SyncEngine {
         (o) =>
             withinOrAt(path, o.path) &&
             !_passiveOperations.contains(o.kind) &&
-            !(ignoreUnsentDeletes && _unsentDelete(o)),
+            !_unsentDelete(o) &&
+            !keptEditorRecords.contains(o.id),
       );
+
+  /// A mapped file move can carry the retained records for a Details-only
+  /// session. Its staging name, ownership, and release intent follow by ID.
+  Set<String> _editorRecordsForMove(Entry entry, String to) {
+    if (entry.kind != ItemKind.file ||
+        !missingEditors.applies(entry.path) ||
+        !missingEditors.applies(to)) {
+      return const {};
+    }
+    final records = <String>{};
+    for (final work in manifest.operationsAt(entry.path)) {
+      if (work.kind != 'working') continue;
+      final proof = missingEditors.inspect(entry, work);
+      if (!proof.cleanupUnconfirmed) return const {};
+      records.addAll([work.id, proof.owner!.id]);
+    }
+    // A separate artifact keeps its own recovery and presentation evidence.
+    if (_artifactsFor(entry.path).any((op) => !records.contains(op.id))) {
+      return const {};
+    }
+    return records;
+  }
+
+  void _moveEditorRecords(String from, String to, Iterable<String> ids) {
+    for (final id in ids) {
+      final record = manifest.operations[id];
+      if (record == null || record.path != from) continue;
+      final moved = Operation.fromJson({...record.toJson(), 'path': to});
+      if (record.data['entryPath'] == from) moved.data['entryPath'] = to;
+      manifest.operations[id] = moved;
+    }
+  }
 
   /// A partial pass (any platform with a watcher) sees a path vanish when it
   /// is rescanned, which can happen before the other side of its rename has
@@ -3444,10 +3477,11 @@ class SyncEngine {
         // here (case only included), which is renamed for everyone after the
         // listing ([_renameRemovedMounts]), not moved here.
         _restoreReason(from, local) != null ||
-        isSyncExcluded(to) ||
-        !_quietSubtree(from, ignoreUnsentDeletes: true)) {
+        isSyncExcluded(to)) {
       return false;
     }
+    final editorRecords = _editorRecordsForMove(entry, to);
+    if (!_quietSubtree(from, editorRecords)) return false;
     // Into a paused owner's folder (#80), or onto the new name of a share
     // folder waiting to be renamed for everyone (#155): nothing may be
     // inferred there, so the cloud item stays where it was, whichever
@@ -3471,11 +3505,15 @@ class SyncEngine {
       names.cloudPath(from),
       names.movedCloudPath(from, to),
     )) {
+      _moveEditorRecords(from, to, editorRecords);
       _rekey(from, to, local);
       return true;
     }
     final op = intent(from, 'move', etag: entry.etag, persist: false);
     op.data['to'] = to;
+    if (editorRecords.isNotEmpty) {
+      op.data['editorRecords'] = editorRecords.toList();
+    }
     entry.status = 'rename queued';
     _dirty
       ..add(from)
@@ -3559,6 +3597,9 @@ class SyncEngine {
       if (op == null) break;
       seen.add(op.id);
       final from = op.path, to = _moveTarget(op);
+      final editorRecords =
+          (op.data['editorRecords'] as List?)?.cast<String>() ??
+          const <String>[];
       final entry = manifest.entries[from];
       final current = remote[from], target = remote[to];
       if (entry == null ||
@@ -3585,6 +3626,7 @@ class SyncEngine {
               entry.fileId == target.fileId)) {
         // Already moved: a lost acknowledgement, or the same rename made
         // on another device.
+        _moveEditorRecords(from, to, editorRecords);
         _rekey(from, to, local);
         finish(op);
         continue;
@@ -3620,6 +3662,16 @@ class SyncEngine {
         durable = {for (final o in _moves) o.id};
       }
       barrier?.call('move-before-dispatch', op);
+      if (editorRecords.isNotEmpty) {
+        final verified = _editorRecordsForMove(entry, to);
+        if (verified.length != editorRecords.length ||
+            !verified.containsAll(editorRecords) ||
+            !_quietSubtree(from, {...verified, op.id})) {
+          entry.status = 'Rename pending: editor copy evidence changed.';
+          manifest.save();
+          continue;
+        }
+      }
       try {
         await cloud.move(from, to, etag: current.etag);
       } on NameNotPortable {
@@ -3639,6 +3691,7 @@ class SyncEngine {
         final moved = renamedPath(from, to, path);
         remote[moved] = _respelled(item, moved);
       }
+      _moveEditorRecords(from, to, editorRecords);
       _rekey(from, to, local);
       finish(op);
     }
@@ -7444,6 +7497,7 @@ class SyncEngine {
             // (decision #183); an unchanged one is reclaimed by a later pass.
             'edited': artifacts.workingEdited(op),
           };
+          var presentReleaseIntent = false;
           try {
             final staged = op.staged;
             if (staged != null) {
@@ -7463,6 +7517,7 @@ class SyncEngine {
                   ...preview.toJson(),
                   'directoryIdentity': tree.native.identity(tree.stageFd),
                 };
+                presentReleaseIntent = owned?.data['releasing'] != null;
               }
             }
           } on FileSystemException {
@@ -7474,7 +7529,10 @@ class SyncEngine {
             if (result['preview'] != null) missingEditors.observePresent(op);
             if (result['edited'] == true && result['preview'] == null) {
               proof = missingEditors.inspect(entry, op);
-              if (proof.reason case final reason?) {
+              if (proof.cleanupUnconfirmed) {
+                result['editorCleanupUnconfirmed'] = true;
+                result['detailsOnlyMissingArtifact'] = proof.owner!.id;
+              } else if (proof.reason case final reason?) {
                 if (reason == MissingEditorCopies.copyPresent) {
                   missingEditors.observePresent(op);
                 }
@@ -7495,11 +7553,13 @@ class SyncEngine {
             result.addAll(
               missingEditors.projectNotice(entry, op, editing.binding, proof),
             );
-            if (result['edited'] == true &&
-                result['preview'] != null &&
-                missingEditors.returned(op)) {
-              result['missingEditorProblem'] =
-                  'An editor copy has returned. Review its changes.';
+            if (result['edited'] == true && result['preview'] != null) {
+              if (missingEditors.returned(op)) {
+                result['missingEditorProblem'] =
+                    'An editor copy has returned. Review its changes.';
+              } else if (presentReleaseIntent) {
+                result['missingEditorProblem'] = 'An editor copy is available with changes. Review it before finishing.';
+              }
             }
           }
           return result;
@@ -7532,7 +7592,7 @@ class SyncEngine {
 
   ({NativeFileInfo? info, bool uncertain}) _readLocalArtifact(
     Operation record,
-    Set<String> dismissedMissingArtifacts, {
+    Set<String> detailsOnlyMissingArtifacts, {
     NativeFileInfo Function(Operation)? probeStaging,
   }) {
     try {
@@ -7541,30 +7601,32 @@ class SyncEngine {
           : probeStaging(record);
       return (info: info, uncertain: info.identity != record.data['identity']);
     } on FileSystemException catch (error) {
+      // Only verified absence of this owner can stay in Details. Failed
+      // reads and evidence about other owners still surface on the row.
       return (
         info: null,
         uncertain:
             error.osError?.errorCode != 2 ||
-            !dismissedMissingArtifacts.contains(record.id),
+            !detailsOnlyMissingArtifacts.contains(record.id),
       );
     }
   }
 
   bool hasUncertainLocalArtifacts(
     String path, {
-    required Set<String> dismissedMissingArtifacts,
+    required Set<String> detailsOnlyMissingArtifacts,
     required NativeFileInfo Function(Operation) probeStaging,
   }) => _artifactsFor(path).any(
     (record) => _readLocalArtifact(
       record,
-      dismissedMissingArtifacts,
+      detailsOnlyMissingArtifacts,
       probeStaging: probeStaging,
     ).uncertain,
   );
 
   Map<String, Object?> localArtifacts(
     String path, {
-    Set<String> dismissedMissingArtifacts = const {},
+    Set<String> detailsOnlyMissingArtifacts = const {},
   }) {
     var count = 0;
     var bytes = 0;
@@ -7585,7 +7647,7 @@ class SyncEngine {
       }
     }
     for (final record in records) {
-      final evidence = _readLocalArtifact(record, dismissedMissingArtifacts);
+      final evidence = _readLocalArtifact(record, detailsOnlyMissingArtifacts);
       if (evidence.uncertain) uncertain = true;
       final info = evidence.info;
       if (info == null || info.identity == live && !evidence.uncertain) {

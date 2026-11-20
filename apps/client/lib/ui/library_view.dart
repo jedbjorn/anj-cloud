@@ -130,7 +130,11 @@ List<Map> openedCopies(Map<String, dynamic> entry) => [
 ];
 
 bool hasEditing(Map<String, dynamic> entry) =>
-    editedCopies(entry).any((copy) => copy['editorWarningDismissed'] != true) ||
+    editedCopies(entry).any(
+      (copy) =>
+          copy['editorWarningDismissed'] != true &&
+          copy['editorCleanupUnconfirmed'] != true,
+    ) ||
     entry['finishPending'] == true;
 
 const terminalDeletionStatuses = {

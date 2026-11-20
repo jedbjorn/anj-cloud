@@ -57,9 +57,9 @@ Future<Map<String, Object?>> projectEntry(
     (operation) =>
         const {'upload', 'delete', 'preserve'}.contains(operation.kind),
   );
-  final dismissedArtifacts = {
+  final detailsOnlyArtifacts = {
     for (final copy in copies)
-      if (copy['dismissedMissingArtifact'] case final String id) id,
+      if (copy['detailsOnlyMissingArtifact'] case final String id) id,
   };
   final errors = {
     // Too large for the server: shown, and amber, until the file changes.
@@ -148,7 +148,7 @@ Future<Map<String, Object?>> projectEntry(
     )
     ..['localArtifacts'] = engine.localArtifacts(
       entry.path,
-      dismissedMissingArtifacts: dismissedArtifacts,
+      detailsOnlyMissingArtifacts: detailsOnlyArtifacts,
     )
     // Retained recovery copies Recover and Dismiss act on (spec #25).
     ..['recoveryCopies'] = engine.recovery.describe(entry.path)
