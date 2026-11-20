@@ -812,6 +812,104 @@ void main() {
     });
   }
 
+  for (final replaceAfterListing in [false, true]) {
+    test(
+      'mapped rename preserves both files and original sessions when the '
+      'cloud source is replaced ${replaceAfterListing ? 'after' : 'before'} listing',
+      () async {
+        await fixture.seed(legacy: true, fromCloud: true);
+        fixture.markLegacyReleaseIntents();
+        final cloud = await _cloud();
+        final originalId = cloud.fileIds[_path]!;
+        const replacement = 'different cloud song';
+        const destination = 'Music/renamed.mp3';
+        final renamed = File('${fixture.access.base}/$destination');
+        late int replacementId;
+        void replaceSource() {
+          cloud.remove(_path);
+          cloud.put(_path, replacement);
+          replacementId = cloud.fileIds[_path]!;
+          expect(replacementId, isNot(originalId));
+        }
+
+        for (var launch = 0; launch < 3; launch++) {
+          final store = Manifest(fixture.profile);
+          final routing = AndroidPhoneRootFs(
+            fixture.access.layout,
+            testNativeLibrary,
+          );
+          final phone = SyncEngine(
+            store,
+            RootTree(
+              Directory(store.setting('root')!),
+              Directory(store.setting('staging')!),
+              routing,
+            ),
+            cloud,
+          );
+          try {
+            if (launch == 0) {
+              await phone.tick();
+              fixture.original.renameSync(renamed.path);
+              phone.markDirty(_path);
+              phone.markDirty(destination);
+              if (replaceAfterListing) {
+                phone.barrier = (phase, _) {
+                  if (phase == 'move-before-dispatch') replaceSource();
+                };
+              } else {
+                replaceSource();
+              }
+            }
+            await phone.tick();
+            expect(cloud.files[_path], utf8.encode(replacement));
+            expect(cloud.fileIds[_path], replacementId);
+            expect(cloud.deletes, 0);
+            expect(renamed.readAsStringSync(), _original);
+            expect(
+              cloud.moves,
+              replaceAfterListing ? ['$_path -> $destination'] : isEmpty,
+            );
+            final source = store.entries[_path]!;
+            expect(source.fileId, originalId);
+            expect(
+              source.workingCopy,
+              store.operations[fixture.absent.last.$1]!.staged,
+            );
+            for (final (id, owner, staged) in fixture.absent) {
+              final session = store.operations[id]!;
+              final owned = store.operations[owner]!;
+              expect(session.path, _path);
+              expect(owned.path, _path);
+              expect(owned.staged, session.staged);
+              expect(owned.data['name'], p.basename(staged.path));
+              expect(owned.data['releasing'], session.hash);
+              expect(owned.hash, session.hash);
+            }
+            if (launch == 0 && replaceAfterListing) {
+              expect(phone.operation(_path, 'move'), isNotNull);
+              expect(cloud.files[destination], isNull);
+            } else {
+              expect(phone.operation(_path, 'move'), isNull);
+              expect(source.conflict, isNotNull);
+              expect(cloud.files[destination], utf8.encode(_original));
+              expect(store.entries[destination]!.workingCopy, isNull);
+              expect(
+                store
+                    .operationsAt(destination)
+                    .where((op) => op.kind == 'working'),
+                isEmpty,
+              );
+            }
+          } finally {
+            phone.close();
+            routing.setPaused(true);
+          }
+        }
+      },
+    );
+  }
+
   for (final activeEdit in [true, false]) {
     test(
       'cloud move leaves ${activeEdit ? 'an active edit' : 'conflicting ownership'} with the source records',

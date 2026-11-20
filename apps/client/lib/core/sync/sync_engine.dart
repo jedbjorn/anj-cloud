@@ -1296,7 +1296,12 @@ class SyncEngine {
       if (entry == null || entry.kind != item.kind) continue;
       // Every row keeps its cloud file ID, folders too: a cloud move pairs
       // by it (spec #33 I2).
-      entry.fileId = item.fileId;
+      // A retained-editor rename keeps its original file identity while
+      // pending, including when recovery is needed after a replacement.
+      if (entry.conflict != _editorRenameIdentityConflict &&
+          operation(item.path, 'move')?.data['editorRecords'] == null) {
+        entry.fileId = item.fileId;
+      }
       entry.cloudName = names.listedCloudNames[item.path];
       if (item.kind == ItemKind.file) entry.remoteModified = item.modified;
     }
@@ -2802,6 +2807,10 @@ class SyncEngine {
 
   static String _moveTarget(Operation op) => op.data['to'] as String;
 
+  static const _editorRenameIdentityConflict =
+      'The original cloud file could not be verified for this rename. '
+      'The renamed Local file and its editor recovery records were kept.';
+
   /// Nothing under [path] is in flight or in conflict, apart from removals
   /// never sent and records proved safe to carry.
   bool _quietSubtree(String path, Set<String> keptEditorRecords) =>
@@ -3595,11 +3604,7 @@ class SyncEngine {
     }
     _cancelUnsentDeletes(from);
     uploads.forget(to);
-    if (NamePolicy.sameInCloud(
-      names.cloudPath(from),
-      names.movedCloudPath(from, to),
-    )) {
-      _moveEditorRecords(from, to, editorRecords);
+    if (editorRecords.isEmpty && _sameCloudName(from, to)) {
       _rekey(from, to, local);
       return true;
     }
@@ -3614,6 +3619,11 @@ class SyncEngine {
       ..add(to);
     return true;
   }
+
+  bool _sameCloudName(String from, String to) => NamePolicy.sameInCloud(
+    names.cloudPath(from),
+    names.movedCloudPath(from, to),
+  );
 
   /// The removals inferred for [from] and beneath it, never sent, are
   /// withdrawn: the item was moved, not deleted.
@@ -3696,6 +3706,21 @@ class SyncEngine {
           const <String>[];
       final entry = manifest.entries[from];
       final current = remote[from], target = remote[to];
+      final retainedEditorMove = editorRecords.isNotEmpty;
+      final originalId = entry?.fileId;
+      if (retainedEditorMove &&
+          entry != null &&
+          entry.conflict == null &&
+          current != null &&
+          (originalId == null || current.fileId != originalId)) {
+        // Keep the original row and its recovery records. Abandoning as a
+        // local removal would infer a delete at the replacement's name.
+        entry.expectedPresent = local.containsKey(from);
+        if (!entry.expectedPresent) entry.localIdentity = null;
+        conflict(entry, _editorRenameIdentityConflict);
+        _abandonMove(op, local);
+        continue;
+      }
       if (entry == null ||
           entry.conflict != null ||
           !local.containsKey(to) ||
@@ -3715,9 +3740,11 @@ class SyncEngine {
       if (current == null &&
           target != null &&
           target.kind == entry.kind &&
-          (entry.fileId == null ||
-              target.fileId == null ||
-              entry.fileId == target.fileId)) {
+          (retainedEditorMove
+              ? originalId != null && target.fileId == originalId
+              : originalId == null ||
+                    target.fileId == null ||
+                    target.fileId == originalId)) {
         // Already moved: a lost acknowledgement, or the same rename made
         // on another device.
         _moveEditorRecords(from, to, editorRecords);
@@ -3756,7 +3783,7 @@ class SyncEngine {
         durable = {for (final o in _moves) o.id};
       }
       barrier?.call('move-before-dispatch', op);
-      if (editorRecords.isNotEmpty) {
+      if (retainedEditorMove) {
         final verified = _editorRecordsForMove(entry, to);
         // An explicit Finish may have retired some of the queued records.
         final remaining = editorRecords.where(manifest.operations.containsKey);
@@ -3777,7 +3804,9 @@ class SyncEngine {
         }
       }
       try {
-        await cloud.move(from, to, etag: current.etag);
+        if (!retainedEditorMove || !_sameCloudName(from, to)) {
+          await cloud.move(from, to, etag: current.etag);
+        }
       } on NameNotPortable {
         // A name the cloud refuses (spec #49 residual): kept local at it,
         // where the ordinary create path shows why; the cloud item stays.
