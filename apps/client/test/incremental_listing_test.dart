@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:anj_cloud/core/gateway/dav_api.dart';
+import 'package:anj_cloud/core/gateway/dav_listing_cache.dart';
 import 'package:anj_cloud/core/gateway/sharing.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
@@ -118,6 +120,16 @@ void main() {
   late _Tree tree;
   late Duration now;
   late DateTime wall;
+  late DateTime serverClock;
+  late int incomingStatus;
+  late int incomingReads;
+  bool stallMissingShares = false;
+  late int outgoingStatus;
+  late int outgoingReads;
+  bool interruptedAddedPage = false;
+  bool stallMissingDates = false;
+  late int fileReads;
+  String? interruptedDownload;
 
   /// The folder the sharing routes share.
   const sharePath = 'T2/L0/x3';
@@ -129,6 +141,7 @@ void main() {
 
   /// Folders whose next PROPFIND fails once with this status.
   final failing = <String, int>{};
+  bool stallRootErrorBody = false;
 
   setUpAll(() async {
     fixture = Directory.systemTemp.createTempSync('anj-incremental-');
@@ -163,13 +176,24 @@ void main() {
   });
   tearDownAll(() => fixture.deleteSync(recursive: true));
 
-  DavCloud connect({bool pruneShares = false}) => DavCloud(
-    Uri.parse('https://127.0.0.1:${server.port}'),
-    SecurityContext(withTrustedRoots: false)..setTrustedCertificates(ca.path),
-    monotonic: () => now,
-    wallClock: () => wall,
-    pruneShares: pruneShares,
-  );
+  DavCloud connect({bool pruneShares = false, DavListingCache? listingCache}) =>
+      DavCloud(
+        Uri.parse('https://127.0.0.1:${server.port}'),
+        SecurityContext(withTrustedRoots: false)
+          ..setTrustedCertificates(ca.path),
+        monotonic: () => now,
+        wallClock: () => wall,
+        pruneShares: pruneShares,
+        listingCache: listingCache,
+      );
+
+  Future<void> stallBody(HttpResponse response, int status) async {
+    response.statusCode = status;
+    response.contentLength = 50;
+    response.bufferOutput = false;
+    response.write('x');
+    await response.flush();
+  }
 
   Future<HttpServer> serve([int port = 0]) async {
     final result = await HttpServer.bindSecure(
@@ -182,15 +206,24 @@ void main() {
     result.listen((request) async {
       await request.drain<void>();
       final response = request.response;
+      response.headers.set(
+        HttpHeaders.dateHeader,
+        HttpDate.format(serverClock),
+      );
       final route = request.uri.path;
       if (route == '/v1/shares/incoming') {
+        incomingReads++;
+        if (stallMissingShares) {
+          await stallBody(response, 404);
+          return;
+        }
+        response.statusCode = incomingStatus;
         response.headers.contentType = ContentType.json;
         response.write(jsonEncode(tree.incoming));
       } else if (route.startsWith('/v1/shares')) {
-        // Outgoing shares by id: '7' is the one share, of [sharePath].
-        final outgoing = {
+        Map<String, String> outgoing(String path) => {
           'share_id': '7',
-          'path': sharePath,
+          'path': path,
           'recipient_id': 'bob',
           'recipient_display_name': 'Bob',
           'permission': 'edit',
@@ -198,19 +231,28 @@ void main() {
         response.headers.contentType = ContentType.json;
         if (request.method == 'POST') tree.sharedOut.add(sharePath);
         if (request.method == 'DELETE') tree.sharedOut.remove(sharePath);
+        if (route == '/v1/shares/outgoing') {
+          outgoingReads++;
+          response.statusCode = outgoingStatus;
+        }
         response.write(
           jsonEncode(
             route == '/v1/shares/outgoing'
-                ? [outgoing]
+                ? tree.sharedOut.map(outgoing).toList()
                 : request.method == 'DELETE'
                 ? {}
-                : outgoing,
+                : outgoing(sharePath),
           ),
         );
       } else if (request.method == 'PROPFIND' && route.startsWith('/dav/')) {
         final path = Uri.decodeFull(route.substring(5))
             .replaceAll(RegExp(r'/$'), '');
         propfinds.add(path);
+        if (path.isEmpty && stallRootErrorBody) {
+          stallRootErrorBody = false;
+          await stallBody(response, 503);
+          return;
+        }
         onPropfind?.call(path);
         if (failing.remove(path) case final status?) {
           response.statusCode = status;
@@ -219,6 +261,40 @@ void main() {
         } else {
           response.statusCode = 207;
           response.write(tree.listing(path));
+        }
+      } else if (route == '/v1/files/added') {
+        response.statusCode = 404;
+        if (stallMissingDates) {
+          await stallBody(response, 404);
+          return;
+        }
+        if (interruptedAddedPage) {
+          response.contentLength = 100;
+          final socket = await response.detachSocket();
+          socket.add([97]);
+          await socket.flush();
+          await socket.close();
+          return;
+        }
+      } else if (request.method == 'GET' && route.startsWith('/dav/')) {
+        final path = Uri.decodeFull(route.substring(5));
+        final etag = tree.etags[path];
+        if (etag == null) {
+          response.statusCode = 404;
+        } else if (request.headers.value('if-match') != etag) {
+          response.statusCode = 412;
+        } else {
+          fileReads++;
+          response.headers.set('etag', etag);
+          if (path == interruptedDownload) {
+            response.contentLength = 100;
+            final socket = await response.detachSocket();
+            socket.add([97]);
+            await socket.flush();
+            await socket.close();
+            return;
+          }
+          response.write('fixture');
         }
       } else {
         response.statusCode = 404;
@@ -233,7 +309,18 @@ void main() {
     now = Duration.zero;
     propfinds.clear();
     failing.clear();
+    stallRootErrorBody = false;
     wall = DateTime.utc(2026, 11, 4, 12);
+    serverClock = wall;
+    incomingStatus = 200;
+    incomingReads = 0;
+    stallMissingShares = false;
+    outgoingStatus = 200;
+    outgoingReads = 0;
+    interruptedAddedPage = false;
+    stallMissingDates = false;
+    fileReads = 0;
+    interruptedDownload = null;
     onPropfind = null;
     server = await serve();
     api = connect();
@@ -610,6 +697,580 @@ void main() {
       await list();
       expect(propfinds.length, lessThanOrEqualTo(9));
     });
+  });
+
+  group('profile listing across restarts', () {
+    late Directory directory;
+    late Manifest profile;
+    const anchor = 'davListingAnchorV1';
+    const payload = 'davListingTreeV1';
+
+    void restart() {
+      api.close();
+      profile.close();
+      profile = Manifest(directory);
+      now = Duration.zero;
+      propfinds.clear();
+      api = connect(pruneShares: true, listingCache: DavListingCache(profile));
+    }
+
+    void advance(Duration elapsed, {bool gateway = true}) {
+      wall = wall.add(elapsed);
+      if (gateway) serverClock = serverClock.add(elapsed);
+    }
+
+    setUp(() {
+      directory = Directory.systemTemp.createTempSync('anj-listing-profile-');
+      profile = Manifest(directory);
+      profile.setSetting('server', api.origin.origin);
+      profile.setSetting('accountUid', 'alice');
+      profile.setSetting('deviceId', 'device-1');
+      restart();
+      library(tops: [0, 1]);
+    });
+
+    tearDown(() {
+      api.close();
+      profile.close();
+      directory.deleteSync(recursive: true);
+    });
+
+    test(
+      'reuses a complete generation and does not rewrite unchanged rows',
+      () async {
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+        final data = profile.setting(payload);
+        for (var i = 0; i < 3; i++) {
+          advance(const Duration(minutes: 1));
+          restart();
+          final writes = profile.rowsPersisted;
+          final reads = incomingReads;
+          final outgoing = outgoingReads;
+          await api.incomingShares();
+          await listsLikeAFullWalk();
+          expect(incomingReads - reads, 1);
+          expect(outgoingReads - outgoing, 1);
+          expect(propfinds, ['']);
+          expect(profile.rowsPersisted - writes, 1);
+          expect(profile.setting(payload), data);
+        }
+        expect(fileReads, 0);
+      },
+    );
+
+    test(
+      'incremental cold checks never extend the six-hour deadline',
+      () async {
+        await list();
+        advance(const Duration(hours: 5, minutes: 59));
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, ['']);
+        advance(const Duration(minutes: 1));
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test('clock rollback or unverifiable gateway age walks in full', () async {
+      await list();
+      advance(const Duration(hours: 1));
+      restart();
+      await list();
+      expect(propfinds, ['']);
+      advance(const Duration(minutes: -5), gateway: false);
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+
+      serverClock = serverClock.subtract(const Duration(minutes: 1));
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+    });
+
+    test(
+      'a stalled root error body forces a full walk after restart',
+      () async {
+        await list();
+        expect(profile.setting(anchor), isNotNull);
+        restart();
+
+        stallRootErrorBody = true;
+        await expectLater(
+          api.prepareListingRoot().timeout(const Duration(seconds: 5)),
+          throwsA(
+            isA<CloudFailure>().having((error) => error.status, 'status', 503),
+          ),
+        );
+        expect(profile.setting(anchor), isNull);
+
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test('a late listing failure invalidates the generation on disk', () async {
+      await list();
+      restart();
+      tree.file('T0/L0/x0/f0.txt');
+      failing['T0/L0/x0'] = 503;
+      await expectLater(api.snapshot(), throwsA(isA<CloudFailure>()));
+      expect(profile.setting(anchor), isNull);
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+    });
+
+    for (final (route, read) in <(String, Future<Object?> Function(DavCloud))>[
+      ('DAV', (cloud) => cloud.request('HEAD', '')),
+      ('outgoing shares', (cloud) => cloud.outgoingShares()),
+      ('file dates', (cloud) => cloud.addedSince(0)),
+    ]) {
+      test('a $route connection failure persists invalidation', () async {
+        await list();
+        expect(profile.setting(anchor), isNotNull);
+        final port = server.port;
+        await server.close(force: true);
+        await expectLater(read(api), throwsA(isA<IOException>()));
+        expect(profile.setting(anchor), isNull);
+        server = await serve(port);
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      });
+    }
+
+    test(
+      'a missing file-date route keeps trust unless its body fails',
+      () async {
+        await list();
+        final trusted = profile.setting(anchor);
+        expect(trusted, isNotNull);
+        expect(await api.addedSince(0), isNull);
+        expect(profile.setting(anchor), trusted);
+
+        interruptedAddedPage = true;
+        await expectLater(api.addedSince(0), throwsA(isA<HttpException>()));
+        expect(profile.setting(anchor), isNull);
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test('a stalled file-date 404 invalidates the saved listing', () async {
+      await list();
+      restart();
+      expect(profile.setting(anchor), isNotNull);
+      stallMissingDates = true;
+
+      await expectLater(api.addedSince(0), throwsA(isA<TimeoutException>()));
+      expect(profile.setting(anchor), isNull);
+
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+    }, timeout: const Timeout(Duration(seconds: 45)));
+
+    for (final wasShared in [false, true]) {
+      test(
+        'a cold check discovers an outgoing share ${wasShared ? 'removal' : 'creation'}',
+        () async {
+          tree.folder('T2');
+          tree.folder('T2/L0');
+          tree.folder(sharePath);
+          if (wasShared) tree.sharedOut.add(sharePath);
+          expect((await list())[sharePath]!.shared, wasShared);
+          api.close();
+          final other = connect();
+          addTearDown(other.close);
+          final etags = Map.of(tree.etags);
+          if (wasShared) {
+            await other.removeShare('7');
+          } else {
+            await other.createShare(sharePath, 'bob', SharePermission.edit);
+          }
+          expect(tree.etags, etags);
+
+          restart();
+          final reused = await listsLikeAFullWalkWith();
+          expect(reused[sharePath]!.shared, !wasShared);
+          expect(propfinds, unorderedEquals(['', 'T2', 'T2/L0', sharePath]));
+          final reference = connect();
+          addTearDown(reference.close);
+          expect(reused.map((path, item) => MapEntry(path, item.shared)), {
+            for (final item in await reference.snapshot())
+              item.path: item.shared,
+          });
+          restart();
+          expect((await list())[sharePath]!.shared, !wasShared);
+          expect(propfinds, ['']);
+        },
+      );
+    }
+
+    test('a prepared root predating a share change is read again', () async {
+      await list();
+      restart();
+      await api.prepareListingRoot();
+      tree.sharedOut.add('T0');
+      expect((await list())['T0']!.shared, isTrue);
+      expect(propfinds.where((path) => path.isEmpty), hasLength(2));
+    });
+
+    test(
+      'an unavailable outgoing list uses live DAV without persisting trust',
+      () async {
+        tree.folder('T2');
+        tree.folder('T2/L0');
+        tree.folder(sharePath);
+        await list();
+        tree.sharedOut.add(sharePath);
+        for (final status in [404, 503]) {
+          restart();
+          outgoingStatus = status;
+          expect((await list())[sharePath]!.shared, isTrue);
+          expect(propfinds, hasLength(folderCount()));
+          expect(profile.setting(anchor), isNull);
+        }
+        outgoingStatus = 200;
+        restart();
+        expect((await list())[sharePath]!.shared, isTrue);
+        expect(propfinds, hasLength(folderCount()));
+        expect(profile.setting(anchor), isNotNull);
+      },
+    );
+
+    test(
+      'a truncated download invalidates the listing across restart',
+      () async {
+        const path = 'interrupted-download';
+        tree.file(path);
+        final listed = await list();
+        expect(profile.setting(anchor), isNotNull);
+        interruptedDownload = path;
+        final target = File('${directory.path}/partial');
+        await expectLater(
+          api.download(path, target, etag: listed[path]!.etag),
+          throwsA(isA<HttpException>()),
+        );
+        expect(fileReads, 1);
+        expect(profile.setting(anchor), isNull);
+
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test(
+      'an invalidation in flight discards the result and cannot republish',
+      () async {
+        await list();
+        tree.file('T0/L0/x0/f0.txt');
+        onPropfind = (path) {
+          if (path == 'T0/L0/x0') api.forgetListing();
+        };
+        await expectLater(api.snapshot(), throwsA(isA<CloudFailure>()));
+        expect(profile.setting(anchor), isNull);
+        onPropfind = null;
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test('another transport cannot republish an invalidated profile', () async {
+      await list();
+      final other = connect(listingCache: DavListingCache(profile));
+      addTearDown(other.close);
+      tree.file('T0/L0/x0/f0.txt');
+      onPropfind = (path) {
+        if (path == 'T0/L0/x0') other.forgetListing();
+      };
+      await expectLater(api.snapshot(), throwsA(isA<CloudFailure>()));
+      expect(profile.setting(anchor), isNull);
+      onPropfind = null;
+      propfinds.clear();
+      await other.snapshot();
+      expect(propfinds, hasLength(folderCount()));
+    });
+
+    test(
+      'uncommitted replacement and corrupt committed data are distinct',
+      () async {
+        await list();
+        final data = profile.setting(payload);
+        profile.db.execute('BEGIN IMMEDIATE');
+        profile.setSetting(payload, '{"":[] }');
+        profile.db.execute('ROLLBACK');
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, ['']);
+        expect(profile.setting(payload), data);
+
+        profile.setSetting(payload, '{"":[] }');
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test('foreign identity and profile reset drop trust', () async {
+      await list();
+      for (final (key, value) in [
+        ('accountUid', 'bob'),
+        ('deviceId', 'device-2'),
+        ('server', 'https://different.example'),
+      ]) {
+        profile.setSetting(key, value);
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      }
+      profile.setSetting('server', api.origin.origin);
+      restart();
+      await list();
+      profile.transaction(() => DavListingCache.clear(profile));
+      expect(profile.setting(payload), isNull);
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+    });
+
+    test(
+      'a local share mutation invalidates before the server handles it',
+      () async {
+        await list();
+        final creating = api.createShare(
+          sharePath,
+          'bob',
+          SharePermission.edit,
+        );
+        expect(profile.setting(anchor), isNull);
+        await creating;
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test(
+      'a prepared root is used once and a discarded one is read again',
+      () async {
+        await api.prepareListingRoot();
+        expect(propfinds, ['']);
+        await api.incomingShares();
+        await listsLikeAFullWalk();
+        expect(incomingReads, 1);
+        expect(propfinds.where((path) => path.isEmpty), hasLength(1));
+        propfinds.clear();
+        await api.prepareListingRoot();
+        api.discardPreparedListingRoot();
+        await listsLikeAFullWalk();
+        expect(propfinds, ['', '']);
+      },
+    );
+
+    test('a foreground root can validate a reopened profile', () async {
+      await list();
+      restart();
+
+      await api.checkRoot(stillWanted: () => true, selectedRead: () => null);
+      await listsLikeAFullWalk();
+
+      expect(propfinds, ['']);
+      expect(profile.setting(anchor), isNotNull);
+    });
+
+    for (final when in ['during', 'after']) {
+      test(
+        'another transport invalidating $when preparation forces a reread',
+        () async {
+          await list();
+          restart();
+          final other = connect(listingCache: DavListingCache(profile));
+          addTearDown(other.close);
+          if (when == 'during') onPropfind = (_) => other.forgetListing();
+          await api.prepareListingRoot();
+          onPropfind = null;
+          if (when == 'after') other.forgetListing();
+          tree.file('after-invalidation');
+
+          await listsLikeAFullWalk();
+          expect(propfinds, hasLength(folderCount() + 1));
+          expect(propfinds.where((path) => path.isEmpty), hasLength(2));
+        },
+      );
+    }
+
+    for (final (name, elapsed) in [
+      ('suspend past the full-walk deadline', const Duration(hours: 7)),
+      ('a wall-clock rollback', const Duration(minutes: -1)),
+    ]) {
+      test('a prepared root is reread after $name', () async {
+        await list();
+        restart();
+        await api.prepareListingRoot();
+        advance(elapsed);
+        tree.file('after-clock-change');
+
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount() + 1));
+        expect(propfinds.where((path) => path.isEmpty), hasLength(2));
+      });
+    }
+
+    for (final (name, elapsed) in [
+      ('Android suspend', const Duration(hours: 1)),
+      ('a wall-clock rollback', const Duration(minutes: -1)),
+    ]) {
+      test('share membership is reread after $name', () async {
+        const mount = 'Documents/Placed';
+        const file = '$mount/new.txt';
+        tree.folder('Documents');
+        tree.propagateFromShares = false;
+        await list();
+        advance(const Duration(hours: 1));
+        restart();
+        await api.incomingShares();
+        final reads = incomingReads;
+
+        // Uptime stays still. Even after rollback, wall time is newer than
+        // the saved listing, so its age cannot force a full walk by itself.
+        advance(elapsed, gateway: !elapsed.isNegative);
+        final parentEtag = tree.etags['Documents'];
+        tree.incoming = [
+          {
+            'share_id': '7',
+            'path': mount,
+            'owner_display_name': 'Bob',
+            'permission': 'view',
+          },
+        ];
+        tree.folder(mount, permission: 'RS');
+        tree.file(file);
+        expect(tree.etags['Documents'], parentEtag);
+
+        final resumed = await list();
+        expect(resumed.keys, containsAll([mount, file]));
+        expect(incomingReads - reads, 1);
+      });
+    }
+
+    test(
+      'an observation that expires during the root read forces a full walk',
+      () async {
+        await list();
+        restart();
+        await api.incomingShares();
+        onPropfind = (path) {
+          if (path.isEmpty) advance(const Duration(hours: 1));
+        };
+
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+        expect(profile.setting(anchor), isNull);
+      },
+    );
+
+    test(
+      'placed shares are walked with fresh rights even without DAV S marks',
+      () async {
+        const mount = 'Documents/Placed';
+        const deep = '$mount/inside/again';
+        const file = '$deep/shared.txt';
+        tree.folder('Documents');
+        tree.folder(mount);
+        tree.folder('$mount/inside');
+        tree.folder(deep);
+        tree.file(file);
+        tree.permissions[file] = 'RGW';
+        final grant = {
+          'share_id': '7',
+          'path': mount,
+          'owner_display_name': 'Bob',
+          'permission': 'edit',
+        };
+        tree.incoming = [grant];
+        final first = await list();
+        restart();
+        // Change deep metadata with unchanged ancestor versions.
+        tree.etags[file] = '"new"';
+        final changed = await listsLikeAFullWalkWith();
+        expect(changed[file]!.etag, isNot(first[file]!.etag));
+        expect(propfinds.toSet(), {
+          '',
+          'Documents',
+          mount,
+          '$mount/inside',
+          deep,
+        });
+
+        restart();
+        tree.incoming = [
+          {...grant, 'permission': 'view'},
+        ];
+        tree.permissions[file] = 'RG';
+        final view = await listsLikeAFullWalkWith();
+        expect(view[file]!.permissions, 'RG');
+        expect(propfinds, hasLength(folderCount()));
+
+        restart();
+        tree.incoming = [];
+        tree.delete(mount);
+        final revoked = await listsLikeAFullWalkWith();
+        expect(revoked[file], isNull);
+        final target = File('${directory.path}/unauthorized');
+        await expectLater(
+          api.download(file, target, etag: view[file]!.etag),
+          throwsA(isA<CloudFailure>()),
+        );
+        expect(target.existsSync(), isFalse);
+        expect(fileReads, 0);
+      },
+    );
+
+    test(
+      'a stalled incoming-share 404 drops trust and walks the live tree',
+      () async {
+        await list();
+        restart();
+        expect(profile.setting(anchor), isNotNull);
+        stallMissingShares = true;
+        onPropfind = (path) {
+          if (path.isEmpty) expect(profile.setting(anchor), isNull);
+        };
+
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+        expect(profile.setting(anchor), isNull);
+      },
+      timeout: const Timeout(Duration(seconds: 45)),
+    );
+
+    test(
+      'unavailable sharing routes fall back without persisting trust',
+      () async {
+        await list();
+        for (final status in [404, 503]) {
+          restart();
+          incomingStatus = status;
+          await listsLikeAFullWalk();
+          expect(propfinds, hasLength(folderCount()));
+          expect(profile.setting(anchor), isNull);
+        }
+        restart();
+        incomingStatus = 200;
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+        expect(profile.setting(anchor), isNotNull);
+      },
+    );
   });
 
   test('the engine sees a deep cloud change on its next check', () async {
