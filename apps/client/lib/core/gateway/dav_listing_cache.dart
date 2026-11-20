@@ -53,8 +53,8 @@ class DavListingCache {
   static void clear(Manifest profile) {
     final cache = _forProfile[profile];
     if (cache != null) cache.revision++;
-    profile.deleteSetting(_anchor);
-    profile.deleteSetting(_tree);
+    profile.deleteSetting(_anchor, cache: true);
+    profile.deleteSetting(_tree, cache: true);
   }
 
   String? _binding(Uri origin) {
@@ -82,7 +82,7 @@ class DavListingCache {
 
   void invalidate() {
     revision++;
-    profile.deleteSetting(_anchor);
+    profile.deleteSetting(_anchor, cache: true);
   }
 
   void beginMutation() {
@@ -178,11 +178,11 @@ class DavListingCache {
       'digest': payload == null ? previousDigest : _digest(payload),
     });
     if (payload == null) {
-      profile.setSetting(_anchor, anchor);
+      profile.setSetting(_anchor, anchor, cache: true);
     } else {
       profile.transaction(() {
-        profile.setSetting(_tree, payload);
-        profile.setSetting(_anchor, anchor);
+        profile.setSetting(_tree, payload, cache: true);
+        profile.setSetting(_anchor, anchor, cache: true);
       });
     }
     revision++;

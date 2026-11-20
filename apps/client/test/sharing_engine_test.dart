@@ -264,6 +264,23 @@ void main() {
 
   int attempts() => cloud.uploadAttempts + cloud.deletes;
 
+  test('an absent Cloud-only Shared folder does not force a cloud poll', () async {
+    cloud.directories.add('Shared');
+    cloud.versions['Shared'] = '"shared"';
+    store.entries['Shared'] = Entry('Shared', ItemKind.directory)
+      ..override = Retention.cloud;
+    await engine.tick();
+    expect(store.entries['Shared']!.expectedPresent, isFalse);
+    expect(Directory('${tree.root.path}/Shared').existsSync(), isFalse);
+
+    final reads = cloud.incomingCalls;
+    await engine.tick(remote: RemotePolicy.ifLocalWork);
+    expect(engine.remoteListed, isFalse);
+    expect(cloud.incomingCalls, reads);
+    expect(cloud.left, isEmpty);
+    expect(cloud.deletes, 0);
+  });
+
   test('decision #160: a Shared/ mount deleted and a new folder made there '
       'on its reused file number: no MOVE, the share is left, the new folder '
       'uploads as this account\'s own', () async {

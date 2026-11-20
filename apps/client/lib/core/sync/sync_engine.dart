@@ -1047,6 +1047,7 @@ class SyncEngine {
     final files = meter.files, bytes = meter.bytes;
     final filesBy = Map<String, int>.of(meter.filesBy);
     final rows = manifest.rowsPersisted, transactions = manifest.transactions;
+    final syncRows = manifest.syncRowsPersisted;
     final audit =
         _fullPending ||
         _lastAudit == null ||
@@ -1090,6 +1091,7 @@ class SyncEngine {
               v.key: v.value - (filesBy[v.key] ?? 0),
         },
         rowsWritten: manifest.rowsPersisted - rows,
+        syncRowsWritten: manifest.syncRowsPersisted - syncRows,
         transactions: manifest.transactions - transactions,
         durationMicros: watch.elapsedMicroseconds,
         localScan: _localScan,
@@ -2698,7 +2700,7 @@ class SyncEngine {
     if (item == null ||
         item.kind != ItemKind.directory ||
         !_sameFolder(sharedFolder, item)) {
-      _takeBackUnsentDeletes(
+      var needsRestore = _takeBackUnsentDeletes(
         (path) => withinOrAt(sharedFolder, path),
         inferredOnly: true,
       );
@@ -2714,9 +2716,13 @@ class SyncEngine {
           ..restoring = true
           ..status = sharedFolderRestoring;
         _dirty.add(entry.path);
+        needsRestore = true;
       }
-      _localWork = true;
-      manifest.save();
+      // An intentionally Cloud-only Shared folder is normally absent.
+      if (needsRestore) {
+        _localWork = true;
+        manifest.save();
+      }
     }
     // The scan records the folder's new identity on its row (spec #33 I1).
   }
@@ -3666,23 +3672,24 @@ class SyncEngine {
   /// deletion at a path [where] accepts is withdrawn, its row is expected
   /// here again, and its settle hold ([_holdTopDeletion]) ends with it.
   /// [inferredOnly] keeps an explicit Delete everywhere.
-  void _takeBackUnsentDeletes(
+  bool _takeBackUnsentDeletes(
     bool Function(String path) where, {
     required bool inferredOnly,
   }) {
-    for (final op
-        in manifest.operations.values
-            .where(
-              (o) =>
-                  _unsentDelete(o) &&
-                  (!inferredOnly || o.data['inferred'] == true) &&
-                  where(o.path),
-            )
-            .toList()) {
+    final unsent = manifest.operations.values
+        .where(
+          (o) =>
+              _unsentDelete(o) &&
+              (!inferredOnly || o.data['inferred'] == true) &&
+              where(o.path),
+        )
+        .toList();
+    for (final op in unsent) {
       manifest.operations.remove(op.id);
       _deleteHeldSince.remove(op.id);
       manifest.entries[op.path]?.expectedPresent = true;
     }
+    return unsent.isNotEmpty;
   }
 
   /// Keeps the cloud item at [from] while the item is local at [to].

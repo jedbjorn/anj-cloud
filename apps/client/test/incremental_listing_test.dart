@@ -9,6 +9,8 @@ import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
 import 'package:anj_cloud/core/state/model.dart';
 import 'package:anj_cloud/core/sync/sync_engine.dart';
+import 'package:anj_cloud/core/sync/sync_schedule.dart';
+import 'package:anj_cloud/core/sync/worker.dart';
 import 'package:anj_cloud/platform/native/native_root_fs.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -376,6 +378,66 @@ void main() {
 
   int folderCount() =>
       tree.kinds.values.where((k) => k == ItemKind.directory).length;
+
+  test('saving a refreshed listing keeps the normal idle interval', () async {
+    final directory = Directory.systemTemp.createTempSync('anj-listing-idle-');
+    addTearDown(() => directory.deleteSync(recursive: true));
+    final profile = Manifest(Directory('${directory.path}/profile'));
+    profile.setSetting('server', api.origin.origin);
+    profile.setSetting('accountUid', 'alice');
+    profile.setSetting('deviceId', 'device-1');
+    api.close();
+    api = connect(listingCache: DavListingCache(profile));
+    for (final folder in ['Documents', 'Music', 'Videos']) {
+      tree.folder(folder);
+    }
+    final root = RootTree.setup(directory.path, 'idle', NativeRootFs());
+    final engine = SyncEngine(profile, root, api);
+    final schedule = RemoteSchedule(clock: () => now);
+    final input = StreamController<Object?>();
+    var finished = Completer<Map>();
+    final loop = WorkerLoop(
+      engine,
+      (event) {
+        final message = event as Map;
+        if (message['event'] == 'backgroundDone') finished.complete(message);
+      },
+      interval: const Duration(minutes: 5),
+      schedule: schedule,
+      foregroundReads: () => api,
+    );
+    final run = loop.run(input.stream);
+    var request = 0;
+    Future<void> backgroundPass() async {
+      finished = Completer<Map>();
+      input.add({'action': 'background', 'request': ++request});
+      final reply = await finished.future.timeout(const Duration(seconds: 10));
+      expect(reply['listed'], isTrue, reason: '$reply');
+    }
+
+    try {
+      await backgroundPass();
+      // One more pass records the top folders' local identities.
+      await backgroundPass();
+
+      now += const Duration(minutes: 1);
+      wall = wall.add(const Duration(minutes: 1));
+      serverClock = serverClock.add(const Duration(minutes: 1));
+      propfinds.clear();
+      await backgroundPass();
+      expect(propfinds, ['']);
+      expect(engine.lastPass!.rowsWritten, 1, reason: 'durable cache anchor');
+      expect(schedule.untilDue, schedule.idle);
+
+      tree.folder('New folder');
+      await backgroundPass();
+      expect(schedule.untilDue, schedule.fast);
+    } finally {
+      input.add({'action': 'stop'});
+      await run;
+      await input.close();
+    }
+  });
 
   test(
     'an unchanged tree costs one PROPFIND after the first full walk',
@@ -1086,6 +1148,23 @@ void main() {
       expect(propfinds, ['']);
       expect(profile.setting(anchor), isNotNull);
     });
+
+    test(
+      'a damaged cache falls back using the fresh foreground root',
+      () async {
+        await list();
+        profile.setSetting(payload, '{}');
+        restart();
+
+        await api.checkRoot(stillWanted: () => true, selectedRead: () => null);
+        expect(profile.setting(anchor), isNull);
+        await listsLikeAFullWalk();
+
+        expect(propfinds, hasLength(folderCount()));
+        expect(propfinds.where((path) => path.isEmpty), hasLength(1));
+        expect(profile.setting(anchor), isNotNull);
+      },
+    );
 
     for (final when in ['during', 'after']) {
       test(
