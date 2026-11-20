@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:anj_cloud/core/gateway/dav_api.dart';
+import 'package:anj_cloud/core/gateway/dav_listing_cache.dart';
 import 'package:anj_cloud/core/gateway/sharing.dart';
 import 'package:anj_cloud/core/local/root_tree.dart';
 import 'package:anj_cloud/core/state/manifest.dart';
@@ -118,6 +119,10 @@ void main() {
   late _Tree tree;
   late Duration now;
   late DateTime wall;
+  late DateTime serverClock;
+  late int incomingStatus;
+  late int incomingReads;
+  late int fileReads;
 
   /// The folder the sharing routes share.
   const sharePath = 'T2/L0/x3';
@@ -163,13 +168,16 @@ void main() {
   });
   tearDownAll(() => fixture.deleteSync(recursive: true));
 
-  DavCloud connect({bool pruneShares = false}) => DavCloud(
-    Uri.parse('https://127.0.0.1:${server.port}'),
-    SecurityContext(withTrustedRoots: false)..setTrustedCertificates(ca.path),
-    monotonic: () => now,
-    wallClock: () => wall,
-    pruneShares: pruneShares,
-  );
+  DavCloud connect({bool pruneShares = false, DavListingCache? listingCache}) =>
+      DavCloud(
+        Uri.parse('https://127.0.0.1:${server.port}'),
+        SecurityContext(withTrustedRoots: false)
+          ..setTrustedCertificates(ca.path),
+        monotonic: () => now,
+        wallClock: () => wall,
+        pruneShares: pruneShares,
+        listingCache: listingCache,
+      );
 
   Future<HttpServer> serve([int port = 0]) async {
     final result = await HttpServer.bindSecure(
@@ -182,8 +190,14 @@ void main() {
     result.listen((request) async {
       await request.drain<void>();
       final response = request.response;
+      response.headers.set(
+        HttpHeaders.dateHeader,
+        HttpDate.format(serverClock),
+      );
       final route = request.uri.path;
       if (route == '/v1/shares/incoming') {
+        incomingReads++;
+        response.statusCode = incomingStatus;
         response.headers.contentType = ContentType.json;
         response.write(jsonEncode(tree.incoming));
       } else if (route.startsWith('/v1/shares')) {
@@ -220,6 +234,18 @@ void main() {
           response.statusCode = 207;
           response.write(tree.listing(path));
         }
+      } else if (request.method == 'GET' && route.startsWith('/dav/')) {
+        final path = Uri.decodeFull(route.substring(5));
+        final etag = tree.etags[path];
+        if (etag == null) {
+          response.statusCode = 404;
+        } else if (request.headers.value('if-match') != etag) {
+          response.statusCode = 412;
+        } else {
+          fileReads++;
+          response.headers.set('etag', etag);
+          response.write('fixture');
+        }
       } else {
         response.statusCode = 404;
       }
@@ -234,6 +260,10 @@ void main() {
     propfinds.clear();
     failing.clear();
     wall = DateTime.utc(2026, 11, 4, 12);
+    serverClock = wall;
+    incomingStatus = 200;
+    incomingReads = 0;
+    fileReads = 0;
     onPropfind = null;
     server = await serve();
     api = connect();
@@ -610,6 +640,306 @@ void main() {
       await list();
       expect(propfinds.length, lessThanOrEqualTo(9));
     });
+  });
+
+  group('profile listing across restarts', () {
+    late Directory directory;
+    late Manifest profile;
+    const anchor = 'davListingAnchorV1';
+    const payload = 'davListingTreeV1';
+
+    void restart() {
+      api.close();
+      profile.close();
+      profile = Manifest(directory);
+      now = Duration.zero;
+      propfinds.clear();
+      api = connect(pruneShares: true, listingCache: DavListingCache(profile));
+    }
+
+    void advance(Duration elapsed, {bool gateway = true}) {
+      wall = wall.add(elapsed);
+      if (gateway) serverClock = serverClock.add(elapsed);
+    }
+
+    setUp(() {
+      directory = Directory.systemTemp.createTempSync('anj-listing-profile-');
+      profile = Manifest(directory);
+      profile.setSetting('server', api.origin.origin);
+      profile.setSetting('accountUid', 'alice');
+      profile.setSetting('deviceId', 'device-1');
+      restart();
+      library(tops: [0, 1]);
+    });
+
+    tearDown(() {
+      api.close();
+      profile.close();
+      directory.deleteSync(recursive: true);
+    });
+
+    test(
+      'reuses a complete generation and does not rewrite unchanged rows',
+      () async {
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+        final data = profile.setting(payload);
+        for (var i = 0; i < 3; i++) {
+          advance(const Duration(minutes: 1));
+          restart();
+          final writes = profile.rowsPersisted;
+          await listsLikeAFullWalk();
+          expect(propfinds, ['']);
+          expect(profile.rowsPersisted - writes, 1);
+          expect(profile.setting(payload), data);
+        }
+        expect(fileReads, 0);
+      },
+    );
+
+    test(
+      'incremental cold checks never extend the six-hour deadline',
+      () async {
+        await list();
+        advance(const Duration(hours: 5, minutes: 59));
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, ['']);
+        advance(const Duration(minutes: 1));
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test('clock rollback or unverifiable gateway age walks in full', () async {
+      await list();
+      advance(const Duration(hours: 1));
+      restart();
+      await list();
+      expect(propfinds, ['']);
+      advance(const Duration(minutes: -5), gateway: false);
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+
+      serverClock = serverClock.subtract(const Duration(minutes: 1));
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+    });
+
+    test('a late listing failure invalidates the generation on disk', () async {
+      await list();
+      restart();
+      tree.file('T0/L0/x0/f0.txt');
+      failing['T0/L0/x0'] = 503;
+      await expectLater(api.snapshot(), throwsA(isA<CloudFailure>()));
+      expect(profile.setting(anchor), isNull);
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+    });
+
+    test(
+      'a connection failure outside listing persists invalidation',
+      () async {
+        await list();
+        final port = server.port;
+        await server.close(force: true);
+        await expectLater(api.request('HEAD', ''), throwsA(isA<Exception>()));
+        expect(profile.setting(anchor), isNull);
+        server = await serve(port);
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test(
+      'an invalidation in flight discards the result and cannot republish',
+      () async {
+        await list();
+        tree.file('T0/L0/x0/f0.txt');
+        onPropfind = (path) {
+          if (path == 'T0/L0/x0') api.forgetListing();
+        };
+        await expectLater(api.snapshot(), throwsA(isA<CloudFailure>()));
+        expect(profile.setting(anchor), isNull);
+        onPropfind = null;
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test('another transport cannot republish an invalidated profile', () async {
+      await list();
+      final other = connect(listingCache: DavListingCache(profile));
+      addTearDown(other.close);
+      tree.file('T0/L0/x0/f0.txt');
+      onPropfind = (path) {
+        if (path == 'T0/L0/x0') other.forgetListing();
+      };
+      await expectLater(api.snapshot(), throwsA(isA<CloudFailure>()));
+      expect(profile.setting(anchor), isNull);
+      onPropfind = null;
+      propfinds.clear();
+      await other.snapshot();
+      expect(propfinds, hasLength(folderCount()));
+    });
+
+    test(
+      'uncommitted replacement and corrupt committed data are distinct',
+      () async {
+        await list();
+        final data = profile.setting(payload);
+        profile.db.execute('BEGIN IMMEDIATE');
+        profile.setSetting(payload, '{"":[] }');
+        profile.db.execute('ROLLBACK');
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, ['']);
+        expect(profile.setting(payload), data);
+
+        profile.setSetting(payload, '{"":[] }');
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test('foreign identity and profile reset drop trust', () async {
+      await list();
+      for (final (key, value) in [
+        ('accountUid', 'bob'),
+        ('deviceId', 'device-2'),
+        ('server', 'https://different.example'),
+      ]) {
+        profile.setSetting(key, value);
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      }
+      profile.setSetting('server', api.origin.origin);
+      restart();
+      await list();
+      profile.transaction(() => DavListingCache.clear(profile));
+      expect(profile.setting(payload), isNull);
+      restart();
+      await listsLikeAFullWalk();
+      expect(propfinds, hasLength(folderCount()));
+    });
+
+    test(
+      'a local share mutation invalidates before the server handles it',
+      () async {
+        await list();
+        final creating = api.createShare(
+          sharePath,
+          'bob',
+          SharePermission.edit,
+        );
+        expect(profile.setting(anchor), isNull);
+        await creating;
+        restart();
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+      },
+    );
+
+    test(
+      'a prepared root is used once and a discarded one is read again',
+      () async {
+        await api.prepareListingRoot();
+        expect(propfinds, ['']);
+        await api.incomingShares();
+        await listsLikeAFullWalk();
+        expect(incomingReads, 1);
+        expect(propfinds.where((path) => path.isEmpty), hasLength(1));
+        propfinds.clear();
+        await api.prepareListingRoot();
+        api.discardPreparedListingRoot();
+        await listsLikeAFullWalk();
+        expect(propfinds, ['', '']);
+      },
+    );
+
+    test(
+      'placed shares are walked with fresh rights even without DAV S marks',
+      () async {
+        const mount = 'Documents/Placed';
+        const deep = '$mount/inside/again';
+        const file = '$deep/shared.txt';
+        tree.folder('Documents');
+        tree.folder(mount);
+        tree.folder('$mount/inside');
+        tree.folder(deep);
+        tree.file(file);
+        tree.permissions[file] = 'RGW';
+        final grant = {
+          'share_id': '7',
+          'path': mount,
+          'owner_display_name': 'Bob',
+          'permission': 'edit',
+        };
+        tree.incoming = [grant];
+        final first = await list();
+        restart();
+        // Change deep metadata with unchanged ancestor versions.
+        tree.etags[file] = '"new"';
+        final changed = await listsLikeAFullWalkWith();
+        expect(changed[file]!.etag, isNot(first[file]!.etag));
+        expect(propfinds.toSet(), {
+          '',
+          'Documents',
+          mount,
+          '$mount/inside',
+          deep,
+        });
+
+        restart();
+        tree.incoming = [
+          {...grant, 'permission': 'view'},
+        ];
+        tree.permissions[file] = 'RG';
+        final view = await listsLikeAFullWalkWith();
+        expect(view[file]!.permissions, 'RG');
+        expect(propfinds, hasLength(folderCount()));
+
+        restart();
+        tree.incoming = [];
+        tree.delete(mount);
+        final revoked = await listsLikeAFullWalkWith();
+        expect(revoked[file], isNull);
+        final target = File('${directory.path}/unauthorized');
+        await expectLater(
+          api.download(file, target, etag: view[file]!.etag),
+          throwsA(isA<CloudFailure>()),
+        );
+        expect(target.existsSync(), isFalse);
+        expect(fileReads, 0);
+      },
+    );
+
+    test(
+      'unavailable sharing routes fall back without persisting trust',
+      () async {
+        await list();
+        for (final status in [404, 503]) {
+          restart();
+          incomingStatus = status;
+          await listsLikeAFullWalk();
+          expect(propfinds, hasLength(folderCount()));
+          expect(profile.setting(anchor), isNull);
+        }
+        restart();
+        incomingStatus = 200;
+        await listsLikeAFullWalk();
+        expect(propfinds, hasLength(folderCount()));
+        expect(profile.setting(anchor), isNotNull);
+      },
+    );
   });
 
   test('the engine sees a deep cloud change on its next check', () async {

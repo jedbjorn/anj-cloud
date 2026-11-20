@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import '../gateway/dav_api.dart';
+import '../gateway/dav_listing_cache.dart';
 import '../../platform/adapters.dart';
 import '../gateway/identity.dart';
 import '../gateway/admin_api.dart';
@@ -1762,6 +1763,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
             store.setting(firstSyncSetting) != 'done' &&
             store.entries.values.every((entry) => entry.etag == null);
         store.transaction(() {
+          DavListingCache.clear(store);
           if (firstSync) store.setSetting(firstSyncSetting, 'pending');
           store.deleteSetting('keyRecovery');
           store.setSetting('certificate', result['certificate'] as String);
@@ -1854,6 +1856,7 @@ class ClientController extends ChangeNotifier implements DocumentsHost {
     final store = Manifest(profile);
     try {
       store.transaction(() {
+        DavListingCache.clear(store);
         for (final key in [
           'csr',
           'fingerprint',

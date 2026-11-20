@@ -8,6 +8,7 @@ import 'package:xml/xml.dart';
 
 import 'admin_api.dart';
 import 'cloud_api.dart';
+import 'dav_listing_cache.dart';
 import 'fetch_api.dart';
 import 'releases_api.dart';
 import '../state/model.dart';
@@ -33,23 +34,11 @@ const listingPropfind =
 /// every folder again (spec #33 I4; a tuning value, shown in the doc).
 const listingFullWalkInterval = Duration(hours: 6);
 
-/// One folder as a complete listing saw it (flag SC-057): the folder as its
-/// parent listed it (null for the root) and its direct children.
-class ListedFolder {
-  ListedFolder(this.self, this.children);
-  final RemoteItem? self;
-  final List<RemoteItem> children;
-
-  /// It, or anything beneath it, reached this account by a share.
-  bool holdsShare = false;
-
-  /// The same folder at the same version: ETag, and file ID when known.
-  bool matches(RemoteItem item) =>
-      self != null &&
-      item.kind == ItemKind.directory &&
-      self!.etag == item.etag &&
-      self!.fileId == item.fileId;
-}
+typedef _ListingRoot = ({
+  List<RemoteItem> children,
+  int? serverTime,
+  Duration observed,
+});
 
 /// The first-sync listing (decision #118): the listing's properties plus
 /// `oc:size`, Nextcloud's total size of a folder.
@@ -74,6 +63,7 @@ class DavCloud
     this.folderDeletionQualified = false,
     this.fullWalkInterval = listingFullWalkInterval,
     this.pruneShares = true,
+    this.listingCache,
     Duration Function()? monotonic,
     DateTime Function()? wallClock,
   }) : client = HttpClient(context: context),
@@ -94,6 +84,7 @@ class DavCloud
   final Uri origin;
   final HttpClient client;
   final bool folderDeletionQualified;
+  final DavListingCache? listingCache;
 
   /// The longest a listing may trust stored folder ETags (flag SC-057).
   final Duration fullWalkInterval;
@@ -157,8 +148,12 @@ class DavCloud
     } catch (_) {
       // The connection failed: whatever changed meanwhile is unknown, so
       // the next listing walks every folder (a reconnect, flag SC-057).
-      forgetListing();
+      if (!_closed) forgetListing();
       rethrow;
+    }
+    if (listingCache != null &&
+        (response.statusCode == 401 || response.statusCode == 403)) {
+      forgetListing();
     }
     final limit = int.tryParse(
       response.headers.value(uploadLimitHeader)?.trim() ?? '',
@@ -217,13 +212,17 @@ class DavCloud
 
   /// The cloud tree as the last complete listing saw it, by folder path
   /// (`''` is the root); null until a listing completes, and again after any
-  /// listing error or failed request (flag SC-057). Kept in memory only, so
-  /// every engine start begins with a full walk.
+  /// listing error or failed request (flag SC-057).
   Map<String, ListedFolder>? _listing;
 
   /// When the last full walk completed, on [monotonic] and [wallClock].
   Duration? _lastFullWalk;
   DateTime? _lastFullWalkWall;
+  ListingAge? _savedAge;
+  bool _cacheLoaded = false;
+  int? _cacheRevision;
+  bool _closed = false;
+  Future<_ListingRoot>? _preparedRoot;
 
   /// Advanced by every [forgetListing]: a snapshot stores its listing only
   /// if no forget happened while it ran.
@@ -231,6 +230,10 @@ class DavCloud
 
   /// The last incoming-share list read; a change forces a full walk.
   String? _incomingFingerprint;
+  Set<String> _incomingMounts = {};
+  Duration? _incomingObserved;
+  bool _incomingAvailable = false;
+  Future<List<RemoteItem>>? _snapshotInFlight;
 
   /// Full walks completed and folders reused unlisted (test seam, metrics).
   int fullWalks = 0;
@@ -249,7 +252,10 @@ class DavCloud
   /// a listing running now, forgets everything instead.
   void _shareChanged(String? path) {
     final listing = _listing;
-    if (path == null || listing == null || _listingsRunning > 0) {
+    if (listingCache != null ||
+        path == null ||
+        listing == null ||
+        _listingsRunning > 0) {
       forgetListing();
       return;
     }
@@ -264,8 +270,38 @@ class DavCloud
 
   /// Forgets the stored listing: the next [snapshot] walks every folder.
   void forgetListing() {
+    _clearListing();
+    if (!_closed) {
+      listingCache?.invalidate();
+      _cacheRevision = listingCache?.revision;
+    }
+  }
+
+  void _clearListing() {
     _listing = null;
+    _savedAge = null;
+    _cacheLoaded = true;
+    _preparedRoot = null;
+    _incomingObserved = null;
     _generation++;
+  }
+
+  void _loadListing() {
+    final cache = listingCache;
+    if (cache == null || _closed) return;
+    if (_cacheLoaded && _cacheRevision == cache.revision) return;
+    if (_cacheLoaded) _clearListing();
+    _cacheLoaded = true;
+    final now = wallClock();
+    final saved = cache.load(origin, now, fullWalkInterval);
+    _cacheRevision = cache.revision;
+    if (saved == null) return;
+    _listing = saved.folders;
+    _incomingFingerprint = saved.shares;
+    _savedAge = saved.age;
+    final full = DateTime.fromMillisecondsSinceEpoch(saved.age.fullWall);
+    _lastFullWalkWall = full;
+    _lastFullWalk = monotonic() - now.difference(full);
   }
 
   /// Due when nothing is stored, or [fullWalkInterval] has passed on the
@@ -278,6 +314,7 @@ class DavCloud
     final now = monotonic();
     if (now < last || now - last >= fullWalkInterval) return true;
     final since = wallClock().difference(wall);
+    if (listingCache != null && since.isNegative) return true;
     return !since.isNegative && since >= fullWalkInterval;
   }
 
@@ -311,6 +348,7 @@ class DavCloud
     String directory, {
     String propfind = listingPropfind,
     Map<String, int>? sizes,
+    void Function(int?)? serverTime,
   }) async {
     final response = await request(
       'PROPFIND',
@@ -428,35 +466,145 @@ class DavCloud
         'Cloud listing did not confirm the requested directory.',
       );
     }
+    if (serverTime != null) {
+      final date = parseHttpDate(response.headers.value('date'));
+      serverTime(date == null ? null : date * 1000);
+    }
     return children;
+  }
+
+  Future<_ListingRoot> _readListingRoot() async {
+    try {
+      int? serverTime;
+      final children = await _listChildren(
+        '',
+        serverTime: (time) => serverTime = time,
+      );
+      return (
+        children: children,
+        serverTime: serverTime,
+        observed: monotonic(),
+      );
+    } catch (_) {
+      forgetListing();
+      rethrow;
+    }
+  }
+
+  /// Start the authenticated root read ahead of unrelated work. A nearby
+  /// snapshot can consume it once. The caller may discard it when the
+  /// foreground attempt is superseded or paused.
+  Future<void> prepareListingRoot() async {
+    final read = _readListingRoot();
+    _preparedRoot = read;
+    await read;
+  }
+
+  void discardPreparedListingRoot() => _preparedRoot = null;
+
+  bool _fresh(Duration observed) {
+    final elapsed = monotonic() - observed;
+    return !elapsed.isNegative && elapsed < const Duration(seconds: 30);
+  }
+
+  Future<_ListingRoot> _takeListingRoot() async {
+    final prepared = _preparedRoot;
+    _preparedRoot = null;
+    if (prepared != null) {
+      final result = await prepared;
+      if (_fresh(result.observed)) return result;
+    }
+    return _readListingRoot();
   }
 
   /// The whole tree (flag SC-057). The root is always listed. A folder whose
   /// ETag and file ID equal those the last complete listing recorded for it
   /// reuses that listing's subtree without a request: Nextcloud changes a
   /// folder's ETag whenever anything beneath it changes. Incoming shares
-  /// are reused only when [pruneShares] (their owner's changes reach the
-  /// recipient's folder ETags); otherwise every folder holding one is
-  /// listed. A full walk runs when nothing is stored (engine start, after
+  /// in a cache-enabled profile always get a fresh traversal. In-memory-only
+  /// transport may prune them when [pruneShares] is enabled. A full walk
+  /// runs when no trusted generation is available (after
   /// an error or failed request, after the incoming shares changed) and at
   /// least every [fullWalkInterval]. Only a listing that completes is
   /// stored, so a partial listing never seeds a later one.
   @override
   Future<List<RemoteItem>> snapshot() async {
+    if (listingCache == null) return _runSnapshot();
+    final active = _snapshotInFlight;
+    if (active != null) return active;
+    final run = _runSnapshot();
+    _snapshotInFlight = run;
+    try {
+      return await run;
+    } finally {
+      _snapshotInFlight = null;
+    }
+  }
+
+  Future<List<RemoteItem>> _runSnapshot() async {
     _listingsRunning++;
     try {
       return await _snapshot();
+    } catch (_) {
+      forgetListing();
+      rethrow;
     } finally {
       _listingsRunning--;
     }
   }
 
   Future<List<RemoteItem>> _snapshot() async {
-    final previous = _fullWalkDue ? null : _listing;
-    _listing = null;
+    final cache = listingCache;
+    final persistent = cache != null;
+    _loadListing();
+    if (persistent) {
+      final observed = _incomingObserved;
+      if (observed == null || !_fresh(observed)) {
+        try {
+          await incomingShares();
+        } on Exception {
+          // A live full walk remains available without share cache trust.
+        }
+      }
+      _incomingObserved = null;
+    }
     final generation = _generation;
+    final revision = cache?.revision;
+    if (cache != null && _cacheRevision != revision) {
+      _listing = null;
+      _savedAge = null;
+      discardPreparedListingRoot();
+    }
+    final root = await _takeListingRoot();
+    if (cache != null &&
+        (generation != _generation || revision != cache.revision)) {
+      throw const CloudFailure('Cloud listing changed during validation.');
+    }
+    final wall = wallClock().millisecondsSinceEpoch;
+    final server = root.serverTime;
+    final saved = _savedAge;
+    final reusable =
+        !persistent ||
+        (_incomingAvailable &&
+            saved != null &&
+            server != null &&
+            wall >= saved.wall &&
+            server >= saved.server &&
+            server -
+                    saved.fullServer +
+                    (monotonic() - root.observed).inMilliseconds <
+                fullWalkInterval.inMilliseconds);
+    final previous = _fullWalkDue || !reusable ? null : _listing;
+    if (cache != null && previous == null) {
+      cache.invalidate();
+      _savedAge = null;
+    }
+    final traversalRevision = cache?.revision;
+    if (persistent && previous != null) _markShareFolders(previous);
+    _listing = null;
     final folders = <String, ListedFolder>{};
     final entries = <String, RemoteItem>{};
+    var changed = previous == null;
     void add(RemoteItem item) {
       if (entries.containsKey(item.path)) {
         throw const CloudFailure('Duplicate cloud listing path.');
@@ -471,14 +619,16 @@ class DavCloud
 
     // Folders still to visit: the item as its parent listed it (null for
     // the root), read before any of its children.
-    final pending = <(String, RemoteItem?)>[('', null)];
+    final pending = <(String, RemoteItem?, bool)>[('', null, false)];
     while (pending.isNotEmpty) {
-      final (directory, self) = pending.removeLast();
+      final (directory, self, inheritedShare) = pending.removeLast();
+      final insideShare = inheritedShare || _isShareFolder(directory, self);
       final stored = previous?[directory];
       if (self != null &&
           stored != null &&
-          stored.matches(self) &&
-          (pruneShares || !stored.holdsShare)) {
+          stored.matches(self, persistent: persistent) &&
+          ((!persistent && pruneShares) ||
+              (!insideShare && !stored.holdsShare))) {
         // Unchanged since the last complete listing: its stored subtree.
         final reuse = [directory];
         while (reuse.isNotEmpty) {
@@ -490,48 +640,110 @@ class DavCloud
             add(child);
             if (child.kind != ItemKind.directory) continue;
             final inner = previous[child.path];
-            if (inner != null && inner.matches(child)) {
+            if (inner != null && inner.matches(child, persistent: persistent)) {
               reuse.add(child.path);
             } else {
-              pending.add((child.path, child)); // never stored: listed
+              pending.add((child.path, child, false)); // never stored: listed
             }
           }
         }
         continue;
       }
-      final children = await _listChildren(directory);
+      final children = self == null
+          ? root.children
+          : await _listChildren(directory);
       folders[directory] = ListedFolder(self, children);
+      if (persistent && !changed) {
+        changed = stored == null || !_sameChildren(stored.children, children);
+      }
       for (final child in children) {
         add(child);
         if (child.kind == ItemKind.directory) {
-          pending.add((child.path, child));
+          pending.add((child.path, child, persistent && insideShare));
         }
       }
     }
+    _markShareFolders(folders);
+    // A cache-enabled snapshot can feed reconciliation only while its
+    // generation is current. Preserve the existing desktop behavior.
+    if (cache != null &&
+        (generation != _generation ||
+            traversalRevision != cache.revision ||
+            cache.mutating)) {
+      throw const CloudFailure('Cloud listing changed during validation.');
+    }
+    if (generation == _generation) {
+      if (previous == null) {
+        _lastFullWalk = monotonic();
+        _lastFullWalkWall = wallClock();
+        fullWalks++;
+      }
+      if (cache != null && _incomingAvailable && server != null) {
+        final finished = wallClock().millisecondsSinceEpoch;
+        if (finished >= wall) {
+          final age = (
+            fullWall: previous == null ? finished : saved!.fullWall,
+            fullServer: previous == null ? server : saved!.fullServer,
+            wall: finished,
+            server: server,
+          );
+          cache.save(
+            origin,
+            folders,
+            age,
+            _incomingFingerprint!,
+            changed: changed,
+          );
+          _savedAge = age;
+        } else {
+          cache.invalidate();
+          _savedAge = null;
+        }
+      }
+      _listing = folders;
+      _cacheRevision = cache?.revision;
+    }
+    return entries.values.toList();
+  }
+
+  bool _isShareFolder(String path, RemoteItem? item) =>
+      _sharedWithMe(item) ||
+      (listingCache != null &&
+          (inSharedFolder(path) || _incomingMounts.contains(path)));
+
+  void _markShareFolders(Map<String, ListedFolder> folders) {
     // Deepest first, so each folder sees its subfolders' answer.
     final order = folders.keys.toList()
       ..sort((a, b) => b.length.compareTo(a.length));
     for (final path in order) {
       final folder = folders[path]!;
       folder.holdsShare =
-          _sharedWithMe(folder.self) ||
+          _isShareFolder(path, folder.self) ||
           folder.children.any(
             (child) =>
                 _sharedWithMe(child) ||
                 (folders[child.path]?.holdsShare ?? false),
           );
     }
-    // A forget while this listing ran (a failed request, a share change)
-    // means it may already be stale: return it, but never store it.
-    if (generation == _generation) {
-      _listing = folders;
-      if (previous == null) {
-        _lastFullWalk = monotonic();
-        _lastFullWalkWall = wallClock();
-        fullWalks++;
+  }
+
+  static bool _sameChildren(List<RemoteItem> before, List<RemoteItem> after) {
+    if (before.length != after.length) return false;
+    for (var i = 0; i < before.length; i++) {
+      final a = before[i];
+      final b = after[i];
+      if (a.path != b.path ||
+          a.kind != b.kind ||
+          a.etag != b.etag ||
+          a.size != b.size ||
+          a.fileId != b.fileId ||
+          a.modified != b.modified ||
+          a.permissions != b.permissions ||
+          a.shared != b.shared) {
+        return false;
       }
     }
-    return entries.values.toList();
+    return true;
   }
 
   /// Nextcloud's `S` permission: the item reached this account by a share.
@@ -751,6 +963,31 @@ class DavCloud
     Map<String, Object?>? body,
     bool missingIsNull = false,
   }) async {
+    final cache =
+        method != 'GET' &&
+            (path.startsWith('/v1/shares') || path.endsWith('/restore'))
+        ? listingCache
+        : null;
+    // The process may never learn whether this request took effect.
+    cache?.beginMutation();
+    try {
+      return await _sharingRequest(
+        method,
+        path,
+        body: body,
+        missingIsNull: missingIsNull,
+      );
+    } finally {
+      cache?.endMutation();
+    }
+  }
+
+  Future<Object?> _sharingRequest(
+    String method,
+    String path, {
+    Map<String, Object?>? body,
+    required bool missingIsNull,
+  }) async {
     final req = await client.openUrl(method, origin.replace(path: path));
     req.followRedirects = false;
     if (body != null) {
@@ -795,21 +1032,47 @@ class DavCloud
 
   @override
   Future<List<IncomingShare>?> incomingShares() async {
-    final data = await _sharing(
-      'GET',
-      '/v1/shares/incoming',
-      missingIsNull: true,
-    );
-    final shares = data == null
-        ? null
-        : _list(data).map(IncomingShare.fromJson).toList();
-    // A share added, removed or changed: walk everything next (SC-057).
-    final fingerprint = jsonEncode([
-      for (final share in shares ?? const <IncomingShare>[]) share.toJson(),
-    ]);
-    if (fingerprint != _incomingFingerprint) forgetListing();
-    _incomingFingerprint = fingerprint;
-    return shares;
+    _loadListing();
+    try {
+      final data = await _sharing(
+        'GET',
+        '/v1/shares/incoming',
+        missingIsNull: true,
+      );
+      final shares = data == null
+          ? null
+          : _list(data).map(IncomingShare.fromJson).toList();
+      final rows = [
+        for (final share in shares ?? const <IncomingShare>[])
+          jsonEncode([
+            share.shareId,
+            share.path,
+            share.permission.name,
+            share.ownerUnavailable,
+          ]),
+      ]..sort();
+      final fingerprint = jsonEncode(rows);
+      // A share added, removed or changed: walk everything next (SC-057).
+      if (listingCache == null
+          ? fingerprint != _incomingFingerprint
+          : shares == null ||
+                (_incomingFingerprint != null &&
+                    fingerprint != _incomingFingerprint)) {
+        forgetListing();
+      }
+      _incomingFingerprint = fingerprint;
+      _incomingAvailable = shares != null;
+      _incomingMounts = {
+        for (final share in shares ?? const <IncomingShare>[]) share.path,
+      };
+      return shares;
+    } catch (_) {
+      if (listingCache != null) forgetListing();
+      _incomingAvailable = false;
+      rethrow;
+    } finally {
+      _incomingObserved = monotonic();
+    }
   }
 
   @override
@@ -1050,7 +1313,8 @@ class DavCloud
 
   @override
   void close() {
-    forgetListing();
+    _closed = true;
+    _clearListing();
     client.close(force: true);
   }
 }
