@@ -583,12 +583,28 @@ void main() {
     });
   });
 
-  for (final move in [false, true]) {
-    test('mapped ${move ? 'move' : 'delete'} settles with a sync peer', () async {
-      await fixture.seed(legacy: true, fromCloud: true, parkFirstCopy: move);
+  for (final action in [
+    'delete',
+    'move',
+    'finish and move',
+    'finish a previously uploaded edit and move',
+    'cloud move',
+  ]) {
+    test('mapped $action settles with a sync peer', () async {
+      final move = action != 'delete';
+      final previouslyUploaded =
+          action == 'finish a previously uploaded edit and move';
+      final finishEdit = action == 'finish and move' || previouslyUploaded;
+      final cloudMove = action == 'cloud move';
+      await fixture.seed(
+        legacy: true,
+        fromCloud: true,
+        parkFirstCopy: move && !cloudMove,
+      );
       fixture.markLegacyReleaseIntents();
       final cloud = await _cloud();
       final before = cloud.counter;
+      final fileId = cloud.fileIds[_path];
       final peerProfile = Directory('${fixture.dir.path}/peer-profile');
       final peerRoot = Directory('${fixture.dir.path}/peer-root')..createSync();
       final peerStage = Directory('${fixture.dir.path}/peer-stage');
@@ -597,7 +613,7 @@ void main() {
       final phoneDestination = File('${fixture.access.base}/$destination');
       final peerDestination = File('${peerRoot.path}/$destination');
 
-      Future<void> sync({bool act = false}) async {
+      Future<void> sync({bool act = false, bool finish = false}) async {
         final store = Manifest(fixture.profile);
         final routing = AndroidPhoneRootFs(
           fixture.access.layout,
@@ -638,7 +654,15 @@ void main() {
             expect(cloud.moves, isEmpty);
             routing.setPaused(false);
             phone.requestFullVerification();
-            if (move) {
+            if (cloudMove) {
+              await cloud.move(
+                _path,
+                destination,
+                etag: cloud.versions[_path]!,
+              );
+              await peer.tick();
+              expect(peerDestination.readAsStringSync(), _original);
+            } else if (move) {
               fixture.original.renameSync(phoneDestination.path);
               phone.markDirty(_path);
               phone.markDirty(destination);
@@ -660,8 +684,30 @@ void main() {
                 finishableCopies(held).single['id'],
                 fixture.absent.first.$1,
               );
-              returned.renameSync(fixture.parkedCopy.path);
               phone.barrier = null;
+              if (finishEdit) {
+                if (previouslyUploaded) {
+                  await phone.tick();
+                  expect(cloud.files[_path], utf8.encode(_edit));
+                  // A client that uploaded before this fix recorded the
+                  // new cloud version as the Local baseline at the old name.
+                  final edited = _digest(returned);
+                  store.entries[_path]!
+                    ..etag = cloud.versions[_path]
+                    ..baselineHash = edited
+                    ..localHash = edited
+                    ..recordRemoteVersion(cloud.versions[_path]!, edited);
+                  store.save();
+                }
+                final row = await projectEntry(phone, store.entries[_path]!);
+                final copy = finishableCopies(row).single;
+                phone.editing.request(_path, [Map<String, dynamic>.from(copy)]);
+                expect(phone.editing.requests, hasLength(1));
+                expect(returned.readAsStringSync(), _edit);
+                expect(phoneDestination.readAsStringSync(), _original);
+                return;
+              }
+              returned.renameSync(fixture.parkedCopy.path);
             } else {
               fixture.original.deleteSync();
               phone.markDirty(_path);
@@ -672,6 +718,18 @@ void main() {
             }
           }
           await phone.tick();
+          if (finish) {
+            expect(
+              phone.editing.requests,
+              isEmpty,
+              reason: store.entries[_path]?.status,
+            );
+            expect(fixture.absent.first.$3.existsSync(), isFalse);
+            expect(cloud.files[_path], utf8.encode(_edit));
+            expect(cloud.moves, isEmpty);
+            expect(phoneDestination.readAsStringSync(), _original);
+            return;
+          }
           await peer.tick();
           final phoneState = {
             for (final entry in store.entries.values.where(
@@ -690,16 +748,33 @@ void main() {
           expect(cloud.deletes, move ? 0 : 1);
           expect(cloud.moves, move ? ['$_path -> $destination'] : isEmpty);
           if (move) {
-            expect(cloud.files[destination], utf8.encode(_original));
-            expect(phoneDestination.readAsStringSync(), _original);
-            expect(peerDestination.readAsStringSync(), _original);
+            final content = finishEdit ? _edit : _original;
+            expect(cloud.files[destination], utf8.encode(content));
+            expect(cloud.fileIds[destination], fileId);
+            expect(phoneDestination.readAsStringSync(), content);
+            expect(peerDestination.readAsStringSync(), content);
             final moved = phoneState[destination]!;
-            expect(rowBadge(moved), RowBadge.local);
+            if (finishEdit) {
+              final entry = store.entries[destination]!;
+              expect(phone.editing.requests, isEmpty);
+              expect(
+                entry.preservedCopies.map(
+                  (path) => phone.artifacts.resolve(path).readAsStringSync(),
+                ),
+                contains(_original),
+              );
+            } else {
+              expect(rowBadge(moved), RowBadge.local);
+            }
             expect(
               moved['workingCopy'],
               store.operations[fixture.absent.last.$1]!.staged,
             );
-            expect(moved['workingCopies'], hasLength(2));
+            expect(
+              RegExp('Cleanup could not be confirmed')
+                  .allMatches(workingCopyDetails(moved)),
+              hasLength(finishEdit ? 1 : 2),
+            );
           }
           final old = store.entries[_path];
           if (old != null) {
@@ -709,10 +784,17 @@ void main() {
               reason: diagnosis,
             );
           }
-          for (final (id, owner, _) in fixture.absent) {
+          for (final (id, owner, staged) in fixture.absent) {
+            if (finishEdit && id == fixture.absent.first.$1) {
+              expect(store.operations[id], isNull);
+              expect(store.operations[owner], isNull);
+              continue;
+            }
             expect(store.operations[id]!.path, move ? destination : _path);
-            expect(store.operations[owner]!.path, move ? destination : _path);
-            expect(store.operations[owner]!.data['releasing'], isNotNull);
+            final owned = store.operations[owner]!;
+            expect(owned.path, move ? destination : _path);
+            expect(owned.data['name'], p.basename(staged.path));
+            expect(owned.data['releasing'], owned.hash);
           }
         } finally {
           peer.close();
@@ -722,8 +804,69 @@ void main() {
       }
 
       await sync(act: true);
+      if (finishEdit) {
+        await sync(finish: true);
+        await sync();
+      }
       await sync();
     });
+  }
+
+  for (final activeEdit in [true, false]) {
+    test(
+      'cloud move leaves ${activeEdit ? 'an active edit' : 'conflicting ownership'} with the source records',
+      () async {
+        await fixture.seed(
+          legacy: true,
+          fromCloud: true,
+          parkFirstCopy: activeEdit,
+        );
+        fixture.markLegacyReleaseIntents();
+        final store = Manifest(fixture.profile);
+        final routing = AndroidPhoneRootFs(
+          fixture.access.layout,
+          testNativeLibrary,
+        );
+        final cloud = await _cloud();
+        final phone = SyncEngine(
+          store,
+          RootTree(
+            Directory(store.setting('root')!),
+            Directory(store.setting('staging')!),
+            routing,
+          ),
+          cloud,
+        );
+        const destination = 'Music/other-name.mp3';
+        final (id, owner, staged) = fixture.absent.first;
+        try {
+          if (activeEdit) {
+            fixture.parkedCopy.renameSync(staged.path);
+            staged.writeAsStringSync(_edit);
+          } else {
+            store.operations['conflicting-owner'] = Operation.fromJson({
+              ...store.operations[owner]!.toJson(),
+              'id': 'conflicting-owner',
+              'path': destination,
+            });
+            store.save();
+          }
+          await cloud.move(_path, destination, etag: cloud.versions[_path]!);
+          await phone.tick();
+          await phone.tick();
+          final row = await projectEntry(phone, store.entries[destination]!);
+          expect(row['workingCopies'], isEmpty);
+          expect(store.operations[id]!.path, _path);
+          expect(store.operations[owner]!.path, _path);
+          if (activeEdit) expect(staged.readAsStringSync(), _edit);
+          expect(cloud.files.keys, [destination]);
+          expect(cloud.files[destination], utf8.encode(_original));
+        } finally {
+          phone.close();
+          routing.setPaused(true);
+        }
+      },
+    );
   }
 
   test(
