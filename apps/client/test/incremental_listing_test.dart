@@ -1087,6 +1087,23 @@ void main() {
       expect(profile.setting(anchor), isNotNull);
     });
 
+    test(
+      'a damaged cache falls back using the fresh foreground root',
+      () async {
+        await list();
+        profile.setSetting(payload, '{}');
+        restart();
+
+        await api.checkRoot(stillWanted: () => true, selectedRead: () => null);
+        expect(profile.setting(anchor), isNull);
+        await listsLikeAFullWalk();
+
+        expect(propfinds, hasLength(folderCount()));
+        expect(propfinds.where((path) => path.isEmpty), hasLength(1));
+        expect(profile.setting(anchor), isNotNull);
+      },
+    );
+
     for (final when in ['during', 'after']) {
       test(
         'another transport invalidating $when preparation forces a reread',

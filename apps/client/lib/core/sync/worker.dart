@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import '../gateway/certificate_renewal.dart';
 import '../gateway/cloud_api.dart';
 import '../gateway/dav_api.dart';
+import '../gateway/dav_listing_cache.dart';
 import '../gateway/fetch_api.dart';
 import '../gateway/admin_api.dart';
 import '../gateway/releases_api.dart';
@@ -145,16 +146,19 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
   CloudApi cloud = const DisconnectedCloud();
   RenewableCloud? renewable;
   CertificateRenewal? renewal;
+  final androidForeground = initial['androidForeground'] == true;
   if (initial['privateKey'] != null &&
       manifest.setting('certificate') != null &&
       manifest.setting('accountUid') != null) {
     final pickup = CertificatePickup(manifest, initial['privateKey'] as String);
+    final listingCache = androidForeground ? DavListingCache(manifest) : null;
     // The shipped gateway serializes every mutation and checks a fresh
     // concrete collection ETag. Qualified against the real two-profile fixture.
     DavCloud connect(String certificate) => DavCloud(
       Uri.parse(manifest.setting('server')!),
       pickup.context(certificate),
       folderDeletionQualified: true,
+      listingCache: listingCache,
     );
     final connection = RenewableCloud(
       connect(manifest.setting('certificate')!),
@@ -207,7 +211,7 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
     fetch: cloud is FetchTransport ? cloud as FetchTransport : null,
     defaultNetworkPolicy: initial['networkPolicy'] as String?,
     pickupIfDue: renewal?.runIfDue,
-    foregroundReads: initial['androidForeground'] == true && renewable != null
+    foregroundReads: androidForeground && renewable != null
         ? () => renewable!.current as ForegroundReads
         : null,
   );

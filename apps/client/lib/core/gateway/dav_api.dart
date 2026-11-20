@@ -287,6 +287,9 @@ class DavCloud
   }) async {
     clearCheckedRoot();
     guardListing(stillWanted: stillWanted, selectedRead: selectedRead);
+    // Loading can invalidate a stale generation. Bind the live root to the
+    // revision that the following share checks and fallback walk will use.
+    _loadListing();
     final transport = _client;
     final read = _readListingRoot();
     final root = await read;

@@ -242,6 +242,7 @@ void main() {
       final input = StreamController<Object?>();
       final opened = Completer<String>();
       final settled = Completer<void>();
+      final background = Completer<Map>();
       var hashesAtConnect = -1;
       var hashesAtOpen = -1;
       var scanReads = 0;
@@ -256,6 +257,7 @@ void main() {
           hashesAtOpen = scanReads;
           opened.complete(File(value['path'] as String).readAsStringSync());
         }
+        if (value['event'] == 'backgroundDone') background.complete(value);
         if (value['status'] == SyncStatus.upToDate.name &&
             !settled.isCompleted) {
           settled.complete();
@@ -265,6 +267,7 @@ void main() {
         if (++scanReads != 1) return;
         input
           ..add({'action': 'visible', 'verify': true})
+          ..add({'action': 'background', 'request': 'during-audit'})
           ..add({'action': 'open', 'path': selected, 'providerTracked': true});
         // One deliberately slow descriptor-bound read, to exercise the
         // checkpoint while the nineteen other audit reads are still pending.
@@ -277,6 +280,9 @@ void main() {
           'selected file',
         );
         await settled.future.timeout(const Duration(seconds: 5));
+        final joined = await background.future.timeout(wait);
+        expect(joined['listed'], isTrue);
+        expect(joined['fullVerifications'], 1);
         expect(hashesAtConnect, 0);
         expect(hashesAtOpen, inInclusiveRange(1, 19));
         expect(engine.fullVerifications, 1);

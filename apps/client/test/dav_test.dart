@@ -484,6 +484,7 @@ void main() {
         'server': deviceOrigin,
         'accountOrigin': deviceOrigin,
         'accountUid': 'fixture-user',
+        'deviceId': 'fixture-device',
         'ca': ca.path,
         'certificate': identity.cert.readAsStringSync(),
         'certificateExpires': DateTime.now()
@@ -536,6 +537,9 @@ void main() {
           return;
         }
         switch ((request.method, uri)) {
+          case ('GET', '/v1/shares/incoming' || '/v1/shares/outgoing'):
+            reply.headers.contentType = ContentType.json;
+            reply.write('[]');
           case ('PROPFIND', '/dav/'):
             if (offline) {
               (await reply.detachSocket(writeHeaders: false)).destroy();
@@ -684,6 +688,7 @@ void main() {
 
         controller.windowShown(verify: true);
         controller.windowShown(verify: true);
+        final rootsBeforeJoin = rootReads();
         final background = controller.backgroundRun();
         controller.command('open', path);
         await until(() => controller.status == SyncStatus.waiting);
@@ -720,6 +725,8 @@ void main() {
         walk.complete();
         expect((await background)['listed'], isTrue);
         await until(() => controller.status == SyncStatus.upToDate);
+        expect(rootReads(), rootsBeforeJoin);
+        expect(rootsBeforeJoin, 1);
         expect(requests.where((r) => r['path'] == '/dav/Slow'), hasLength(1));
 
         controller.setPaused(true);
