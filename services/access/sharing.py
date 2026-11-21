@@ -265,6 +265,19 @@ class Sharing:
             if isinstance(mount, str) and mount.rstrip("/") and (target == mount.rstrip("/") or target.startswith(mount.rstrip("/") + "/")):
                 raise ShareError(422, "Folders shared with you cannot be shared")
 
+    async def check_move_boundary(self, device, source, destination):
+        """A file may move within an incoming mount, never into or out of it."""
+        shares = await self._read("GET", "", self.device_principal(device), {"shared_with_me": "true"})
+        if not isinstance(shares, list):
+            raise ShareError(502, "Could not check shared folders")
+        for share in shares:
+            mount = share.get("file_target", "").rstrip("/")
+            if not mount:
+                continue
+            inside = (ROOT + source).startswith(mount + "/")
+            if inside != (ROOT + destination).startswith(mount + "/") or (inside and int(share["permissions"]) & 2 == 0):
+                raise ShareError(403, "Items shared with you must stay in their writable share")
+
     def _owned(self, principal, data):
         """The share row when the caller owns it as a user share of a folder in its own root."""
         if isinstance(data, list):

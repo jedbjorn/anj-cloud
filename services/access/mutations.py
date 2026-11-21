@@ -217,6 +217,28 @@ class Mutations:
             headers.pop("If-Match", None)
         return current
 
+    async def check_file_move(self, request, device, source, destination, current):
+        """Conditions selected in the picker, rechecked under the DAV mutation lock.
+        The query also makes older gateways reject the operation before dispatch."""
+        identity = file_id(request.query["fileId"])
+        parent, name = split_leaf(destination)
+        if (identity is None or current["collection"] or current["fileid"] != identity
+                or split_leaf(source)[1] != name):
+            raise web.HTTPPreconditionFailed(text="The selected file changed")
+        if parent:
+            folder = await self.current(device, parent)
+            expected = file_id(request.query["parentId"])
+            if expected is None or not folder or not folder["collection"] or folder["fileid"] != expected:
+                raise web.HTTPPreconditionFailed(text="The destination folder changed")
+        elif request.query["parentId"] != "root":
+            raise web.HTTPPreconditionFailed(text="The destination folder changed")
+        await self.gateway.sharing.check_move_boundary(device, unquote(source), unquote(destination))
+        if "job" in request.query:
+            job = self.gateway.registry.fetch_job(request.query["job"])
+            if (not job or job["uid"] != device["uid"] or job["state"] != "done"
+                    or job["file_id"] != identity):
+                raise web.HTTPPreconditionFailed(text="This download is no longer available")
+
     async def siblings(self, device, parent):
         """Decoded names directly inside the encoded folder `parent`; empty when it is missing."""
         url = self.gateway.backend + backend_root(device["uid"]) + parent
@@ -301,6 +323,8 @@ class Mutations:
                         if not target.startswith(prefix) or not target[len(prefix):]:
                             raise Rejection("MOVE destination must stay beneath the enrolled root")
                         destination = target[len(prefix):]
+                    if "fileId" in request.query:
+                        await self.check_file_move(request, device, relative, destination, current)
                     refused = self.refused(destination)
                 elif request.method in {"PUT", "MKCOL"} and current is None:
                     refused = self.refused(relative)
@@ -340,6 +364,8 @@ class Mutations:
                         content = b""
                     # Receipt of the completed backend response establishes this operation finished.
                     gateway.registry.mutation_finish()
+                    if request.method == "MOVE" and status in (201, 204) and current["fileid"]:
+                        gateway.registry.fetch_moved(device["uid"], current["fileid"], unquote(destination))
                     if request.method == "PUT" and status == 201:
                         self.note_added(device["uid"], response.headers.get("OC-FileId"))
                     elif (request.method == "PUT" and status in (200, 204) and current

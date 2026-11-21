@@ -193,13 +193,13 @@ class MutationRecordingTests(unittest.IsolatedAsyncioTestCase):
         self.registry.db.close()
         self.temporary.cleanup()
 
-    async def send(self, method, relative, body=b"", headers=None):
+    async def send(self, method, relative, body=b"", headers=None, query=None):
         headers = dict(headers or {})
 
         async def chunks(_):
             if body:
                 yield body
-        request = SimpleNamespace(method=method, content_length=len(body) if method == "PUT" else None,
+        request = SimpleNamespace(method=method, query=query or {}, content_length=len(body) if method == "PUT" else None,
                                   content=SimpleNamespace(iter_chunked=chunks), headers=headers, can_read_body=False)
         forwarded = {key: value for key, value in headers.items() if key != "Destination"}
         if method == "MOVE":
@@ -221,6 +221,17 @@ class MutationRecordingTests(unittest.IsolatedAsyncioTestCase):
         overwrite = await self.send("PUT", "Documents/a.txt", b"two", {"If-Match": etag})
         self.assertEqual(204, overwrite.status)
         self.assertEqual({"641": 1_800_000_000.0}, self.added())
+
+    async def test_file_move_rechecks_identity_and_destination_even_when_etag_matches(self):
+        original = ('"same"', 701, False)
+        self.backend.items.update({"old/name.txt": original, "new/": ('"folder"', 702, True)})
+        headers = {"If-Match": '"same"', "Overwrite": "F", "Destination": "new/name.txt"}
+        for source, folder in ((700, 702), (701, 703)):
+            with self.assertRaises(web.HTTPPreconditionFailed):
+                await self.send("MOVE", "old/name.txt", headers=headers, query={"fileId": str(source), "parentId": str(folder)})
+            self.assertEqual(original, self.backend.items["old/name.txt"])
+            self.assertNotIn("new/name.txt", self.backend.items)
+        self.assertTrue(self.registry.mutation_ready())
 
     async def test_move_mkcol_and_failed_put_record_nothing(self):
         self.assertEqual(201, (await self.send("MKCOL", "Documents/folder", headers={"If-None-Match": "*"})).status)

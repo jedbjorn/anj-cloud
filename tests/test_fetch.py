@@ -5,6 +5,7 @@ in-process fake Nextcloud for the files service. No network, no container.
 """
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,8 @@ class FakeNextcloud:
     def __init__(self):
         self.files = {}
         self.temps = {}
+        self.activity = []
+        self.ids = {}
         self.next_id = 700
         self.drop_move = False
         self.puts = []          # (uid, temporary name) of every completed upload
@@ -70,7 +73,7 @@ class FakeNextcloud:
                                                      "/" if folder and path else "")
             body += ("<d:response><d:href>%s</d:href><d:propstat><d:prop><d:resourcetype>%s</d:resourcetype>"
                      "<d:getcontentlength>%s</d:getcontentlength><oc:fileid>%d</oc:fileid></d:prop></d:propstat></d:response>"
-                     % (href, "<d:collection/>" if folder else "", "" if folder else len(value), 1 + hash(path) % 999))
+                     % (href, "<d:collection/>" if folder else "", "" if folder else len(value), self.ids.setdefault((uid, prefix, path), 700 + len(self.ids))))
         return web.Response(status=207, body=(body + "</d:multistatus>").encode())
 
     def split(self, path):
@@ -85,6 +88,8 @@ class FakeNextcloud:
             self.busy -= 1
             await request.read()
             return web.Response(status=503)
+        if request.path == "/ocs/v2.php/apps/activity/api/v2/activity/all":
+            return web.json_response({"ocs": {"data": self.activity}})
         uid, area, relative = self.split(request.path)
         tree, temps = self.tree(uid), self.temp(uid)
         if request.method == "PROPFIND":
@@ -126,6 +131,7 @@ class FakeNextcloud:
             if target in tree:
                 return web.Response(status=412)
             tree[target] = temps.pop(relative)
+            self.ids[uid, "anj-cloud/", target] = self.ids.pop((uid, "", relative))
             self.moves.append((uid, target))
             if self.drop_move:
                 self.drop_move = False
@@ -291,6 +297,25 @@ class RouteTests(FetchTestCase):
         status, listed, response = await self.call("GET", "/v1/fetch/jobs")
         self.assertEqual((200, "no-store"), (status, response.headers["Cache-Control"]))
         self.assertEqual([row["id"] for row in rows], [row["id"] for row in listed["jobs"]])
+
+    async def test_completed_file_identity_requires_own_job_and_proven_legacy_placement(self):
+        job, = await self.submit(["https://media.example/track"])
+        row = await self.finish_item(job)
+        identity = row["file_id"]
+        route = "/v1/fetch/jobs/%s/file" % job
+        self.assertEqual((200, {"fileId": identity}), (await self.call("GET", route))[:2])
+        self.assertEqual(404, (await self.call("GET", route, "bob-1"))[0])
+        self.gateway.registry.fetch_update(job, file_id=None)
+        old = {"id": str(identity), "path": "ordinary-file.m4a"}
+        new = {"id": str(identity), "path": "anj-cloud/" + row["destination"]}
+        self.nextcloud.activity = [{"app": "files", "user": "alice", "object_id": identity,
+                                    "datetime": datetime.fromtimestamp(self.clock(), timezone.utc).isoformat(),
+                                    "subject_rich": ["move", {"oldfile": old, "newfile": new}]}]
+        self.assertEqual(409, (await self.call("GET", route))[0])
+        self.assertIsNone(self.row(job)["file_id"])
+        old["path"] = ".anj-fetch-" + "ab" * 12 + ".tmp"
+        self.assertEqual((200, {"fileId": identity}), (await self.call("GET", route))[:2])
+        self.assertEqual(identity, self.row(job)["file_id"])
 
     async def test_refusals(self):
         cases = [({"urls": ["ftp://media.example/a"], "kind": "audio"}, 400), ({"urls": ["javascript:alert(1)"], "kind": "audio"}, 400),

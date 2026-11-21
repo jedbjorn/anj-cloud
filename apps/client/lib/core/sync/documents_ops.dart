@@ -7,6 +7,7 @@ import '../local/root_tree.dart';
 import '../ports/documents_filesystem.dart';
 import '../state/model.dart';
 import 'file_adder.dart';
+import 'library_move.dart';
 import 'name_rule.dart';
 import 'open_documents.dart';
 import 'sync_engine.dart';
@@ -43,11 +44,13 @@ class DocumentsOps {
     OpenDocuments? registry,
     this.paused,
     this.checkRemote,
+    this.moveFile,
     this.checkTransferPolicy,
     this.downloadSelected,
   }) : registry = registry ?? openDocuments;
   final SyncEngine engine;
   final OpenDocuments registry;
+  final SendLibraryMove? moveFile;
   final bool Function()? paused;
   final Future<RemoteItem> Function(String path, String etag)? checkRemote;
   final void Function()? checkTransferPolicy;
@@ -127,6 +130,15 @@ class DocumentsOps {
       case 'delete':
         delete(command['path'] as String);
         return const {};
+      case 'moveChoices':
+      case 'moveFiles':
+        _notPaused();
+        return LibraryMove(
+          engine,
+          registry,
+          moveFile,
+          relocate: relocate,
+        ).handle(op, command);
       case 'addCheck':
         return adder.check(
           command['destination'] as String,

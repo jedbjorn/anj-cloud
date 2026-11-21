@@ -84,6 +84,8 @@ class FetchJob {
     this.url,
     this.percent,
     this.path,
+    this.fileId,
+    this.folder = false,
     this.message,
     this.height,
     this.submitted,
@@ -109,6 +111,8 @@ class FetchJob {
 
   /// Where the file was placed (relative to the account), once placed.
   final String? path;
+  final int? fileId;
+  final bool folder;
 
   /// The gateway's one plain sentence for a terminal row.
   final String? message;
@@ -146,6 +150,8 @@ class FetchJob {
           ? percent.toDouble().clamp(0, 100).toDouble()
           : null,
       path: _text(json['path']),
+      fileId: json['fileId'] is int ? json['fileId'] as int : null,
+      folder: json['folder'] == true,
       message: _text(json['message']),
       height: height is int && height > 0 ? height : null,
       submitted: _time(json['submitted']),
@@ -161,6 +167,8 @@ class FetchJob {
     'url': ?url,
     'percent': ?percent,
     'path': ?path,
+    'fileId': ?fileId,
+    if (folder) 'folder': true,
     'message': ?message,
     'height': ?height,
     'submitted': ?_seconds(submitted),

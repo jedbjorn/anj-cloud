@@ -209,6 +209,13 @@ Future<void> syncWorker(Map<String, Object?> initial) async {
     releases: cloud is ReleaseTransport ? cloud as ReleaseTransport : null,
     // Media fetch job routes (spec #42): not file sync either.
     fetch: cloud is FetchTransport ? cloud as FetchTransport : null,
+    downloadFileId: renewable == null
+        ? null
+        : (id) => (renewable!.current as DavCloud).downloadFileId(id),
+    moveFile: renewable == null
+        ? null
+        : (file, destination, parentId, job) => (renewable!.current as DavCloud)
+              .moveLibraryFile(file, destination, parentId, job),
     defaultNetworkPolicy: initial['networkPolicy'] as String?,
     pickupIfDue: renewal?.runIfDue,
     foregroundReads: androidForeground && renewable != null
@@ -314,6 +321,8 @@ class WorkerLoop {
     this.activityInterval = const Duration(milliseconds: 500),
     this.releases,
     this.fetch,
+    this.moveFile,
+    this.downloadFileId,
     this.defaultNetworkPolicy,
     this.pickupIfDue,
     this.joinedListingAge = const Duration(seconds: 60),
@@ -345,6 +354,8 @@ class WorkerLoop {
 
   /// The media fetch job routes (spec #42); null while unpaired.
   final FetchTransport? fetch;
+  final Future<int> Function(String)? downloadFileId;
+  final Future<void> Function(RemoteItem, String, int?, String?)? moveFile;
 
   /// The running download's request and its cancel signal.
   final _releaseCancels = <Object?, Completer<void>>{};
@@ -382,6 +393,7 @@ class WorkerLoop {
   late final DocumentsOps documents = DocumentsOps(
     engine,
     paused: () => _paused,
+    moveFile: moveFile,
     checkRemote: _androidForeground ? _checkSelectedFile : null,
     checkTransferPolicy: _androidForeground ? _checkOpenPolicy : null,
     downloadSelected: _androidForeground ? _downloadSelectedFile : null,
@@ -1278,8 +1290,14 @@ class WorkerLoop {
     final op = command['op'] as String;
     final args = Map<String, Object?>.from(command['args'] as Map);
     try {
+      if (op == 'moveChoices' && args['job'] is String) {
+        if (_paused || downloadFileId == null) {
+          throw const CloudFailure('Connect and resume sync to move files.');
+        }
+        args['fileId'] = await downloadFileId!(args['job'] as String);
+      }
       final data = await documents.handle(op, args);
-      if (op != 'open') {
+      if (op != 'open' && op != 'moveChoices') {
         if (!_paused) schedule.mutated();
         _passWanted = true;
       }

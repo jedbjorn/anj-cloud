@@ -10,6 +10,7 @@ import 'admin_section.dart';
 import '../core/app/add_files.dart';
 import '../core/app/controller.dart';
 import '../core/app/fetch_jobs.dart';
+import '../core/gateway/fetch_api.dart' show FetchJob;
 import '../core/sync/bulk_targets.dart';
 import '../core/sync/editor_diagnostic.dart';
 import '../core/ports/phone_folders.dart';
@@ -17,6 +18,7 @@ import 'recovery_actions.dart';
 import 'create_folder_dialog.dart';
 import 'downloader_tab.dart';
 import 'rename_dialog.dart';
+import 'move_files_dialog.dart';
 import 'root_setup_dialog.dart';
 import '../core/app/lifecycle.dart';
 import '../core/ports/autostart.dart';
@@ -298,6 +300,21 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
     _revealHighlightTimer?.cancel();
     _revealedPath = null;
     _highlightedPath = null;
+  }
+
+  void _showDownloadedFile(FetchJob job) {
+    final path = job.fileId == null
+        ? job.path
+        : controller.entries
+            .where((entry) => entry['kind'] == 'file' &&
+                entry['fileId'] == job.fileId && visibleInLibrary(entry))
+            .singleOrNull?['path'] as String?;
+    _showInFolder(
+      path ?? '',
+      missing: job.fileId == null
+          ? 'That file is not in the library yet. It appears after the next sync.'
+          : 'This device cannot find that file in the library. Sync and try again.',
+    );
   }
 
   void _showInFolder(
@@ -1370,6 +1387,27 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                             child: const Text('Cloud Only'),
                           ),
                           FilledButton(
+                            key: const ValueKey('bulk-move'),
+                            onPressed:
+                                !_bulkBusy &&
+                                    !controller.paused &&
+                                    controller.accountRights != 'read' &&
+                                    _selected.isNotEmpty &&
+                                    _selected.values.every(
+                                      (e) =>
+                                          e['kind'] == 'file' &&
+                                          e['viewOnly'] != true &&
+                                          !dismissOnly(e),
+                                    )
+                                ? () => showMoveFiles(
+                                    context,
+                                    controller,
+                                    _selected.values.toList(),
+                                  )
+                                : null,
+                            child: const Text('Move to…'),
+                          ),
+                          FilledButton(
                             key: const ValueKey('bulk-delete'),
                             onPressed:
                                 _selected.isNotEmpty &&
@@ -1407,10 +1445,20 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                           jobs: _jobs,
                           links: _fetchLinks,
                           touchInput: widget.touchInput,
-                          onShowInFolder: (path) => _showInFolder(
-                            path,
-                            missing: 'That file is not in the library yet. It appears after the next sync.',
-                          ),
+                          onMoveFile:
+                              controller.accountRights == 'read' ||
+                                  controller.paused
+                              ? null
+                              : (job) async {
+                                  await showMoveFiles(
+                                    context,
+                                    controller,
+                                    [],
+                                    job: job.id,
+                                  );
+                                  if (mounted) await _jobs.refresh();
+                                },
+                          onShowInFolder: _showDownloadedFile,
                         ),
                       )
                     : items.isEmpty
@@ -1582,6 +1630,12 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                             path,
                                             value: action,
                                           );
+                                        case 'move':
+                                          unawaited(
+                                            showMoveFiles(context, controller, [
+                                              entry,
+                                            ]),
+                                          );
                                         case 'delete':
                                           unawaited(delete(context, entry));
                                         case 'share':
@@ -1687,6 +1741,16 @@ class _ClientHomeState extends State<ClientHome> with TickerProviderStateMixin {
                                       }
                                     },
                                     itemBuilder: (context) => [
+                                      if (file && !dismissOnly(entry))
+                                        PopupMenuItem(
+                                          value: 'move',
+                                          enabled:
+                                              !controller.paused &&
+                                              controller.accountRights !=
+                                                  'read' &&
+                                              entry['viewOnly'] != true,
+                                          child: const Text('Move to…'),
+                                        ),
                                       if (hasRecoveryCopies(entry)) ...[
                                         PopupMenuItem(
                                           key: ValueKey('recover:$path'),

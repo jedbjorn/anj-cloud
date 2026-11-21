@@ -160,6 +160,10 @@ class Registry:
             -- When each account's last job left the running slot: the queue's turn order (decision #180).
             CREATE TABLE IF NOT EXISTS fetch_turns (uid TEXT PRIMARY KEY, served REAL NOT NULL);
         """)
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            if "file_id" not in {row[1] for row in self.db.execute("PRAGMA table_info(fetch_jobs)")}:
+                self.db.execute("ALTER TABLE fetch_jobs ADD COLUMN file_id INTEGER")
         self._upgrade_devices()
         self._upgrade_invitation_labels()
         self._upgrade_last_seen()
@@ -883,7 +887,7 @@ class Registry:
 
     FETCH_UNFINISHED = ("waiting", "checking", "downloading", "placing")
     FETCH_COLUMNS = frozenset({"state", "title", "media_id", "obtained", "percent", "destination", "message", "started",
-                               "finished", "interrupted", "dispatch", "target", "target_size", "folder", "expand"})
+                               "finished", "interrupted", "dispatch", "target", "target_size", "folder", "expand", "file_id"})
 
     def fetch_add(self, uid, device, kind, height, urls, *, cap, folder=None, expand=True):
         """Queue one waiting row per link in one transaction, or none: FetchCap when the account
@@ -926,6 +930,11 @@ class Registry:
             self.db.execute("UPDATE fetch_jobs SET " + ",".join(name + "=?" for name in fields) + " WHERE id=?",
                             (*fields.values(), identity))
         return self.fetch_job(identity)
+
+    def fetch_moved(self, uid, fileid, destination):
+        with self.db:
+            self.db.execute("UPDATE fetch_jobs SET destination=? WHERE uid=? AND file_id=? AND state='done'",
+                            (destination, uid, fileid))
 
     def fetch_remove(self, uid, identity):
         with self.db:
