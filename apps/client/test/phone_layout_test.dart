@@ -186,7 +186,10 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('Keep both versions'), findsOneWidget);
         await _check(tester, '$at-04-row-menu');
-        await tester.tap(find.text('Details and preserved copies'));
+        final details = find.text('Details and preserved copies');
+        await tester.ensureVisible(details);
+        await tester.pumpAndSettle();
+        await tester.tap(details);
         await tester.pumpAndSettle();
         await _check(tester, '$at-05-details');
         await tester.tap(find.text('Close'));
@@ -229,7 +232,12 @@ void main() {
         await tester.tap(card);
         await tester.pumpAndSettle();
         expect(find.text('1 selected'), findsOneWidget);
-        for (final action in ['bulk-local', 'bulk-cloud', 'bulk-delete']) {
+        for (final action in [
+          'bulk-local',
+          'bulk-cloud',
+          'bulk-move',
+          'bulk-delete',
+        ]) {
           final rect = tester.getRect(find.byKey(ValueKey(action)));
           expect(rect.bottom, lessThanOrEqualTo(size.height), reason: action);
         }
