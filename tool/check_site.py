@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Validate the buildless public site without network access or dependencies."""
-from html.parser import HTMLParser
-from pathlib import Path
+import json
 import re
 import sys
-from urllib.parse import unquote, urlsplit
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "site"
+PUBLIC_URL = "https://jedbjorn.github.io/anj-cloud/"
 errors = []
 
 
@@ -19,6 +21,8 @@ class Page(HTMLParser):
         self.links = []
         self.h1s = 0
         self.images = 0
+        self.in_structured_data = False
+        self.structured_data = []
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -34,15 +38,46 @@ class Page(HTMLParser):
             self.images += 1
             if "alt" not in attrs or not all(attrs.get(k) for k in ("width", "height")):
                 errors.append(f"Image needs alt and dimensions: {attrs.get('src')}")
-        if tag in ("script", "iframe") or any(k.startswith("on") for k in attrs):
+        if tag == "script" and attrs == {"type": "application/ld+json"}:
+            self.structured_data.append("")
+            self.in_structured_data = True
+        elif tag in ("script", "iframe"):
             errors.append(f"Unexpected active content: {tag}")
+        if any(k.startswith("on") for k in attrs):
+            errors.append(f"Unexpected event handler: {tag}")
         for key in ("href", "src"):
             if key in attrs:
                 self.links.append((tag, key, attrs[key]))
 
+    def handle_data(self, data):
+        if self.in_structured_data:
+            self.structured_data[-1] += data
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self.in_structured_data = False
+
 
 page = Page()
 page.feed((SITE / "index.html").read_text())
+try:
+    if len(page.structured_data) != 1:
+        raise ValueError("Expected one JSON-LD block")
+    app = json.loads(page.structured_data[0])
+    if (
+        not isinstance(app, dict)
+        or app.get("@type") != "SoftwareApplication"
+        or app.get("url") != PUBLIC_URL
+    ):
+        errors.append("JSON-LD must describe the software at its public URL")
+except ValueError:
+    errors.append("Missing or invalid JSON-LD")
+
+sitemap = ET.parse(SITE / "sitemap.xml")
+ns = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+if [loc.text for loc in sitemap.findall("s:url/s:loc", ns)] != [PUBLIC_URL]:
+    errors.append("Expected the public landing page in the sitemap")
+
 if page.h1s != 1:
     errors.append(f"Expected one h1, found {page.h1s}")
 for tag, attr, link in page.links:
@@ -74,7 +109,7 @@ for tag, attr, link in page.links:
 for asset in SITE.rglob("*"):
     if asset.is_symlink():
         errors.append(f"Symlink in published assets: {asset}")
-    if asset.is_file() and asset.suffix not in {".html", ".css", ".svg", ".png", ""}:
+    if asset.is_file() and asset != SITE / "sitemap.xml" and asset.suffix not in {".html", ".css", ".svg", ".png", ""}:
         errors.append(f"Unexpected published file: {asset}")
     if asset.suffix == ".svg":
         svg = ET.parse(asset)
