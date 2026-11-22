@@ -1,9 +1,10 @@
 # Public website
 
 The project website is a buildless static page in `site/`, published at
-<https://jedbjorn.github.io/anj-cloud/> through GitHub Pages. It has no JavaScript,
+<https://anj-cloud.designs-os.com/> through GitHub Pages. It has no JavaScript,
 external fonts, analytics, package installation, server secrets, or deployment
-profile. Relative asset links work under the `/anj-cloud/` project path.
+profile. Relative asset links work at the domain root and under the old
+`/anj-cloud/` project path, which now redirects to the custom domain.
 
 ## Publishing
 
@@ -33,8 +34,8 @@ linked source documents and headings, image descriptions/dimensions, and the
 absence of active HTML/SVG content or external assets. It does not replace browser
 layout, assistive technology, or public-link availability checks.
 
-For local preview, serve the repository root and open `/site/` (or mount `site/`
-under `/anj-cloud/` to exercise the production URL prefix). Follow the seat's
+For local preview, serve `site/` and open `/` (production serves it from the
+root of `anj-cloud.designs-os.com`). Follow the seat's
 preview policy and stop any preview process you start.
 
 ## Content and assets
