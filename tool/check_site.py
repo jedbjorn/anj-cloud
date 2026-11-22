@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "site"
-PUBLIC_URL = "https://jedbjorn.github.io/anj-cloud/"
+PUBLIC_URL = "https://anj-cloud.designs-os.com/"
 errors = []
 
 
@@ -85,7 +85,7 @@ for tag, attr, link in page.links:
     if parsed.scheme or parsed.netloc:
         if parsed.scheme != "https":
             errors.append(f"Non-HTTPS external link: {link}")
-        if tag == "img" or (tag == "link" and "github.io" not in parsed.netloc):
+        if tag == "img" or (tag == "link" and not parsed.netloc.endswith(("github.io", "designs-os.com"))):
             errors.append(f"External asset: {link}")
         prefix = "/jedbjorn/anj-cloud/blob/main/"
         if parsed.netloc == "github.com" and parsed.path.startswith(prefix):
