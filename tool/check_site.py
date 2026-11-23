@@ -109,7 +109,7 @@ for tag, attr, link in page.links:
 for asset in SITE.rglob("*"):
     if asset.is_symlink():
         errors.append(f"Symlink in published assets: {asset}")
-    if asset.is_file() and asset != SITE / "sitemap.xml" and asset.suffix not in {".html", ".css", ".svg", ".png", ""}:
+    if asset.is_file() and asset not in {SITE / "sitemap.xml", SITE / "robots.txt"} and asset.suffix not in {".html", ".css", ".svg", ".png", ""}:
         errors.append(f"Unexpected published file: {asset}")
     if asset.suffix == ".svg":
         svg = ET.parse(asset)
