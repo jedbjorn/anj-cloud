@@ -1,5 +1,7 @@
 # AnJ Cloud
 
+[![Release downloads](https://img.shields.io/github/downloads/jedbjorn/anj-cloud/total?label=release%20downloads&style=flat-square)](https://github.com/jedbjorn/anj-cloud/releases)
+
 Household file sync and private inference access, from a gateway you host yourself. AnJ Cloud is built on
 [Nextcloud](https://nextcloud.com/) for file storage and sharing, adding device pairing, per-device access control
 and client updates. One small server at home, matching apps on Linux, macOS, Windows and Android, and one place to
